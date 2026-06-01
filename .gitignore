@@ -1,0 +1,11 @@
+build/
+vendor/minecraft/*/server.jar
+*.log
+hs_err_pid*.log
+/worlds/
+/quality/
+/quality-acceptance-*/
+/preview-*/
+/agent-runs/
+/server/logs/
+*.tmp

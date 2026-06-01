@@ -1,0 +1,12 @@
+{
+  "project": "super-rapid-earthmap-generator",
+  "phase": "active-prototype",
+  "javaLanguageVersion": 25,
+  "minecraftTarget": "1.21.11",
+  "gameplayProfile": "survival-complete",
+  "serverProfile": "nation-war",
+  "status": "active-prototype-not-production-ready",
+  "productionReadiness": "NO-GO",
+  "qualityStrategy": "visual-first-metric-backed",
+  "defaultTextureMode": "photo"
+}

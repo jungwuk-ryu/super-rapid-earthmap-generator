@@ -1,0 +1,9 @@
+// Experimental parity-only carriers. These artificial/over-bright blocks are forbidden in
+// production photo-surface selection unless a later design explicitly promotes a capped recipe.
+id,rgb
+white_concrete,#D1D7D8
+white_wool,#E9ECEC
+white_concrete_powder,#E1E3E3
+white_glazed_terracotta,#BCD0CB
+smooth_quartz,#ECE5DC
+snow_reference,#E8EEEC

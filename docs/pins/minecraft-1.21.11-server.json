@@ -1,0 +1,27 @@
+{
+  "id": "1.21.11",
+  "type": "release",
+  "releaseTime": "2025-12-09T21:23:30+09:00",
+  "metadataUrl": "https://piston-meta.mojang.com/v1/packages/832e5108e7b1b292d5d5b1695fe6430eb09179c5/1.21.11.json",
+  "serverUrl": "https://piston-data.mojang.com/v1/objects/64bb6d763bed0a9f1d632ec347938594144943ed/server.jar",
+  "serverSha1": "64bb6d763bed0a9f1d632ec347938594144943ed",
+  "serverSize": 56327581,
+  "worldVersion": 4671,
+  "protocolVersion": 774,
+  "packVersion": {
+    "resourceMajor": 75,
+    "resourceMinor": 0,
+    "dataMajor": 94,
+    "dataMinor": 1
+  },
+  "serverBuildTime": "2025-12-09T12:20:42+00:00",
+  "serverJavaVersion": 21,
+  "localJar": "D:\\earthmap\\super-rapid-earthmap-generator\\vendor\\minecraft\\1.21.11\\server.jar",
+  "verified": true,
+  "verificationEvidence": "D:\\earthmap\\agent-runs\\20260526-233855-phase0-bootstrap\\VALIDATION\\minecraft-1.21.11-server-pin.json",
+  "notes": [
+    "This pin is for the official Mojang 1.21.11 server jar.",
+    "worldVersion/protocolVersion/packVersion are extracted from server.jar version.json.",
+    "Full registry reports are not yet extracted; complete P1.2 before writing production worlds."
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "project": "DivineMC",
+  "minecraftVersion": "1.21.11",
+  "build": 27,
+  "channel": "STABLE",
+  "artifact": "divinemc-1.21.11-27.jar",
+  "downloadUrl": "https://files.bxteam.org/divinemc/versions/1.21.11/27/divinemc-1.21.11-27.jar",
+  "sha256": "856e7aec61e5656caa59305b79127c56ca1fc65de8cfd355b9351c54c25ad5c8",
+  "sizeBytes": 68631344,
+  "commit": "7619684c62d06744887fdc100c38efbb63e5da02",
+  "commitUrl": "https://github.com/BX-Team/DivineMC/commit/7619684c62d06744887fdc100c38efbb63e5da02",
+  "sourceBranch": "ver/1.21.11",
+  "sourceTag": "ver-1.21.11",
+  "buildTimeUtc": "2026-04-27T22:56:27Z",
+  "localJar": "D:\\earthmap\\super-rapid-earthmap-generator\\vendor\\divinemc\\1.21.11\\27\\divinemc-1.21.11-27.jar",
+  "javaRuntimeTested": "25.0.2",
+  "javaNotes": [
+    "BX Team installation docs require Java 25 or newer at the time this pin was verified.",
+    "BX Team API metadata for version 1.21.11 reports minimum Java 21.",
+    "P1.11 validation ran with Java 25.0.2 and --add-modules=jdk.incubator.vector."
+  ],
+  "verification": {
+    "status": "verified",
+    "evidenceFolder": "D:\\earthmap\\agent-runs\\20260527-022000-p1-divinemc-pinning",
+    "bootLog": "D:\\earthmap\\agent-runs\\20260527-022000-p1-divinemc-pinning\\SERVER_LOGS\\divinemc-boot1.log",
+    "rebootLog": "D:\\earthmap\\agent-runs\\20260527-022000-p1-divinemc-pinning\\SERVER_LOGS\\divinemc-boot2-reboot.log"
+  },
+  "sources": [
+    "https://api.bxteam.org/v2/projects/divinemc/versions/1.21.11/builds",
+    "https://bxteam.org/downloads/divinemc",
+    "https://bxteam.org/docs/divinemc/getting-started/installation",
+    "https://github.com/BX-Team/DivineMC"
+  ]
+}
