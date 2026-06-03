@@ -1730,6 +1730,15 @@ fn classify_surface_material_by_semantic_intent(
         semantic_terrain,
         java_standard_terrain,
     );
+    let token_dry_surface = terrain.confident()
+        && matches!(
+            terrain.kind,
+            MetTerrainKind::Sand
+                | MetTerrainKind::RedSand
+                | MetTerrainKind::CoarseDirt
+                | MetTerrainKind::Gravel
+                | MetTerrainKind::Rock
+        );
 
     if sample.snow_cover_ratio() >= 0.35 || climate == 29 || climate == 30 {
         return Some(surface_material_with_surface(
@@ -2184,6 +2193,24 @@ fn classify_surface_material_by_semantic_intent(
             sample.slope_ratio(),
         )
         && (elevation_meters >= 700.0 || local_relief_meters >= 240.0)
+    {
+        return Some(highland_rock_surface(
+            base,
+            metrics,
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        ));
+    }
+
+    if token_dry_surface
+        && java_standard_terrain
+        && !vegetation_evidence
+        && !token_vegetated
+        && (sahara_score >= 0.35
+            || is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence))
+        && matches!(terrain.kind, MetTerrainKind::Gravel | MetTerrainKind::Rock)
+        && (elevation_meters >= 700.0 || local_relief_meters >= 200.0)
     {
         return Some(highland_rock_surface(
             base,
@@ -13733,6 +13760,63 @@ mod tests {
         );
         assert_eq!(highland_rock.biome_id, "minecraft:wooded_badlands");
         assert_eq!(highland_rock.decision_source, "intent");
+
+        let java_standard_rock_token = SurfaceMaterialSample::new(
+            RgbColor::of(64, 64, 64),
+            RgbColor::of(64, 64, 64),
+            TerrainTokenSource::JavaStandardPalette,
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+        let java_standard_rock_metrics = SurfaceColorMetrics::from(java_standard_rock_token.color);
+        let java_standard_rock_terrain =
+            surface_material_met_terrain(&java_standard_rock_token, java_standard_rock_metrics);
+        assert_eq!(java_standard_rock_terrain.kind, MetTerrainKind::Rock);
+        assert!(java_standard_rock_terrain.confident());
+        let (standard_rock_longitude, standard_rock_latitude) = (-20..=60)
+            .flat_map(|longitude| (18..=34).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                surface_material_sahara_score(longitude, latitude) >= 0.35
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+            })
+            .expect("test fixture should find a JavaStandard rock highland coordinate");
+        let standard_rock_highland = apply_test_surface_material_sample(
+            &base_land,
+            java_standard_rock_token,
+            2_400.0,
+            f64::from(standard_rock_longitude),
+            f64::from(standard_rock_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            standard_rock_highland.top_block_state_id,
+            block_state_ids::STONE
+        );
+        assert_eq!(
+            standard_rock_highland.filler_block_state_id,
+            block_state_ids::STONE
+        );
+        assert_eq!(standard_rock_highland.biome_id, "minecraft:windswept_hills");
+        assert_eq!(standard_rock_highland.decision_source, "intent");
 
         let savanna_like_highland_candidate = SurfaceMaterialSample::land(
             RgbColor::of(181, 96, 46),
