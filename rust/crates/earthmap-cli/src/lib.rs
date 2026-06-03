@@ -370,6 +370,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.landShallowTopoPhotoSamplerBootstrap - LandShallowTopoPhotoSampler discovers west/east topographic GeoTIFF halves and EarthDataSurfaceMaterialSampler.sample_photo follows Java photo-source preference, coarse evidence, and terrain-token rules."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.naturalSurfacePolicyBootstrap - NaturalSurfaceBlockPolicy and CoastalSurfaceCleaner production-safe surface cleanup contracts are ported for Java fixture cases."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",

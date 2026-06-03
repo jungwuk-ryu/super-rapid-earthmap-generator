@@ -610,8 +610,11 @@ Bootstrap implementation status on 2026-06-03:
 - Rust `LandShallowTopoPhotoSampler` bootstrap discovers Java's west/east `land_shallow_topo_*.tif` halves, samples
   topographic colors with Java half-world coordinate mapping, and lets `EarthDataSurfaceMaterialSampler.sample_photo`
   follow Java photo-source preference, coarse evidence caching, and terrain-token attachment rules.
-- Remaining Phase 5 work: photo solver, smoothing/coastal policies, OSM overlay, surface biome cell writing, and
-  fixed-region `generate-surface-region` payload parity.
+- Rust production surface cleanup bootstrap ports Java `NaturalSurfaceBlockPolicy` and `CoastalSurfaceCleaner` fixture
+  cases for replacing artificial palette carrier blocks with natural top/filler blocks; production chunk-output wiring
+  remains part of fixed-region `generate-surface-region` parity.
+- Remaining Phase 5 work: photo solver, broader `SurfaceClassSmoother`/biome intent smoothing, OSM overlay,
+  surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

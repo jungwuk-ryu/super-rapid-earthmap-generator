@@ -4020,6 +4020,624 @@ pub fn normalize_surface_column_for_chunk(column: &EarthSurfaceColumn) -> EarthS
     normalized
 }
 
+pub fn sanitize_surface_column_for_production(column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
+    let mut top =
+        production_surface_top_for_water(column.top_block_state_id, &column.biome_id, column.water);
+    let mut filler = production_surface_filler(
+        column.filler_block_state_id,
+        top,
+        &column.biome_id,
+        column.water,
+    );
+    if column.water && (top == block_state_ids::GRAVEL || is_sand_like_surface(top)) {
+        top = stable_water_floor_replacement(column);
+        filler = top;
+    }
+    if !column.water
+        && is_sand_like_surface(top)
+        && (column.ground_surface_y <= SEA_LEVEL_Y + 6
+            || !is_true_sandy_land_biome(&column.biome_id))
+    {
+        top = if is_wet_surface_biome(&column.biome_id) {
+            block_state_ids::MUD
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
+        filler = filler_for_production_top(top);
+    }
+    if !column.water && should_soften_temperate_rock(column, top) {
+        top = temperate_rock_replacement(&column.biome_id);
+        filler = filler_for_production_top(top);
+    }
+    if !column.water && should_regreen_temperate_earth(column, top) {
+        top = temperate_earth_replacement(&column.biome_id);
+        filler = filler_for_production_top(top);
+    }
+    if top == column.top_block_state_id && filler == column.filler_block_state_id {
+        return column.clone();
+    }
+    replace_surface_blocks(column, top, filler, "natural-surface")
+}
+
+pub fn is_allowed_production_top(block: i32, _biome: &str) -> bool {
+    is_allowed_natural_surface_top(block)
+}
+
+pub fn production_surface_top(block: i32, biome: &str) -> i32 {
+    production_surface_top_for_water(block, biome, false)
+}
+
+fn production_surface_top_for_water(block: i32, biome: &str, water: bool) -> i32 {
+    if is_allowed_natural_surface_top(block) {
+        return block;
+    }
+    if water || is_coast_surface_biome(biome) {
+        return coastal_replacement(block, biome);
+    }
+    match block {
+        block_state_ids::OAK_LEAVES
+        | block_state_ids::JUNGLE_LEAVES
+        | block_state_ids::DARK_OAK_LEAVES
+        | block_state_ids::SPRUCE_LEAVES
+        | block_state_ids::GREEN_TERRACOTTA
+        | block_state_ids::LIME_TERRACOTTA => vegetated_replacement(biome),
+        block_state_ids::YELLOW_TERRACOTTA
+        | block_state_ids::WHITE_TERRACOTTA
+        | block_state_ids::LIGHT_GRAY_TERRACOTTA
+        | block_state_ids::QUARTZ_BLOCK
+        | block_state_ids::BONE_BLOCK
+        | block_state_ids::END_STONE
+        | block_state_ids::END_STONE_BRICKS
+        | block_state_ids::SMOOTH_SANDSTONE
+        | block_state_ids::CUT_SANDSTONE
+        | block_state_ids::CHISELED_SANDSTONE => pale_dry_replacement(biome),
+        block_state_ids::TERRACOTTA
+        | block_state_ids::ORANGE_TERRACOTTA
+        | block_state_ids::BROWN_TERRACOTTA
+        | block_state_ids::RED_TERRACOTTA
+        | block_state_ids::SMOOTH_RED_SANDSTONE
+        | block_state_ids::CUT_RED_SANDSTONE
+        | block_state_ids::CHISELED_RED_SANDSTONE
+        | block_state_ids::PACKED_MUD
+        | block_state_ids::MUD_BRICKS
+        | block_state_ids::DRIPSTONE_BLOCK => warm_earth_replacement(biome),
+        block_state_ids::GRAY_TERRACOTTA
+        | block_state_ids::BLACK_TERRACOTTA
+        | block_state_ids::CYAN_TERRACOTTA
+        | block_state_ids::BLACK_CONCRETE => dark_rock_replacement(biome),
+        block_state_ids::OAK_LOG | block_state_ids::JUNGLE_LOG => block_state_ids::DIRT,
+        _ => fallback_for_surface_biome(biome),
+    }
+}
+
+pub fn production_surface_filler(
+    filler: i32,
+    production_top: i32,
+    biome: &str,
+    water: bool,
+) -> i32 {
+    if water {
+        return production_top;
+    }
+    if is_allowed_production_top(filler, biome) {
+        return filler;
+    }
+    filler_for_production_top(production_top)
+}
+
+fn filler_for_production_top(top: i32) -> i32 {
+    match top {
+        block_state_ids::SAND
+        | block_state_ids::SANDSTONE
+        | block_state_ids::RED_SAND
+        | block_state_ids::ROOTED_DIRT
+        | block_state_ids::MYCELIUM => top,
+        block_state_ids::STONE
+        | block_state_ids::DEEPSLATE
+        | block_state_ids::GRAVEL
+        | block_state_ids::CLAY
+        | block_state_ids::CALCITE
+        | block_state_ids::TUFF
+        | block_state_ids::ANDESITE
+        | block_state_ids::GRANITE
+        | block_state_ids::DIORITE => block_state_ids::STONE,
+        block_state_ids::MUD => block_state_ids::MUD,
+        block_state_ids::SNOW_BLOCK => block_state_ids::SNOW_BLOCK,
+        _ => block_state_ids::DIRT,
+    }
+}
+
+fn is_allowed_natural_surface_top(block: i32) -> bool {
+    matches!(
+        block,
+        block_state_ids::GRASS_BLOCK
+            | block_state_ids::DIRT
+            | block_state_ids::COARSE_DIRT
+            | block_state_ids::ROOTED_DIRT
+            | block_state_ids::PODZOL
+            | block_state_ids::MYCELIUM
+            | block_state_ids::MOSS_BLOCK
+            | block_state_ids::MUD
+            | block_state_ids::SAND
+            | block_state_ids::RED_SAND
+            | block_state_ids::SANDSTONE
+            | block_state_ids::GRAVEL
+            | block_state_ids::CLAY
+            | block_state_ids::STONE
+            | block_state_ids::DEEPSLATE
+            | block_state_ids::TUFF
+            | block_state_ids::ANDESITE
+            | block_state_ids::GRANITE
+            | block_state_ids::DIORITE
+            | block_state_ids::CALCITE
+            | block_state_ids::SNOW_BLOCK
+            | block_state_ids::ICE
+    )
+}
+
+fn is_sand_like_surface(block: i32) -> bool {
+    matches!(
+        block,
+        block_state_ids::SAND
+            | block_state_ids::RED_SAND
+            | block_state_ids::SANDSTONE
+            | block_state_ids::SMOOTH_SANDSTONE
+            | block_state_ids::CUT_SANDSTONE
+            | block_state_ids::CHISELED_SANDSTONE
+            | block_state_ids::SMOOTH_RED_SANDSTONE
+            | block_state_ids::CUT_RED_SANDSTONE
+            | block_state_ids::CHISELED_RED_SANDSTONE
+    )
+}
+
+fn coastal_replacement(block: i32, biome: &str) -> i32 {
+    match block {
+        block_state_ids::OAK_LEAVES
+        | block_state_ids::JUNGLE_LEAVES
+        | block_state_ids::DARK_OAK_LEAVES
+        | block_state_ids::SPRUCE_LEAVES
+        | block_state_ids::GREEN_TERRACOTTA
+        | block_state_ids::LIME_TERRACOTTA => {
+            if is_wet_surface_biome(biome) {
+                block_state_ids::MUD
+            } else {
+                block_state_ids::GRASS_BLOCK
+            }
+        }
+        block_state_ids::YELLOW_TERRACOTTA
+        | block_state_ids::WHITE_TERRACOTTA
+        | block_state_ids::LIGHT_GRAY_TERRACOTTA
+        | block_state_ids::QUARTZ_BLOCK
+        | block_state_ids::BONE_BLOCK
+        | block_state_ids::END_STONE
+        | block_state_ids::END_STONE_BRICKS
+        | block_state_ids::SMOOTH_SANDSTONE
+        | block_state_ids::CUT_SANDSTONE
+        | block_state_ids::CHISELED_SANDSTONE => block_state_ids::SAND,
+        block_state_ids::TERRACOTTA
+        | block_state_ids::ORANGE_TERRACOTTA
+        | block_state_ids::BROWN_TERRACOTTA
+        | block_state_ids::RED_TERRACOTTA
+        | block_state_ids::SMOOTH_RED_SANDSTONE
+        | block_state_ids::CUT_RED_SANDSTONE
+        | block_state_ids::CHISELED_RED_SANDSTONE
+        | block_state_ids::PACKED_MUD
+        | block_state_ids::MUD_BRICKS
+        | block_state_ids::DRIPSTONE_BLOCK => {
+            if is_dry_surface_biome(biome) {
+                block_state_ids::RED_SAND
+            } else {
+                block_state_ids::SAND
+            }
+        }
+        block_state_ids::GRAY_TERRACOTTA
+        | block_state_ids::BLACK_TERRACOTTA
+        | block_state_ids::CYAN_TERRACOTTA
+        | block_state_ids::BLACK_CONCRETE => {
+            if is_wet_surface_biome(biome) {
+                block_state_ids::CLAY
+            } else {
+                block_state_ids::SAND
+            }
+        }
+        _ => block_state_ids::SAND,
+    }
+}
+
+fn vegetated_replacement(biome: &str) -> i32 {
+    if is_wet_surface_biome(biome) {
+        return block_state_ids::MUD;
+    }
+    if is_forest_surface_biome(biome) || is_jungle_surface_biome(biome) {
+        return block_state_ids::GRASS_BLOCK;
+    }
+    if is_dry_surface_biome(biome) {
+        return block_state_ids::COARSE_DIRT;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn pale_dry_replacement(biome: &str) -> i32 {
+    if is_snowy_surface_biome(biome) {
+        return block_state_ids::SNOW_BLOCK;
+    }
+    if is_rocky_surface_biome(biome) {
+        return block_state_ids::CALCITE;
+    }
+    block_state_ids::SAND
+}
+
+fn warm_earth_replacement(biome: &str) -> i32 {
+    if is_dry_surface_biome(biome) {
+        return block_state_ids::RED_SAND;
+    }
+    if is_rocky_surface_biome(biome) {
+        return block_state_ids::GRANITE;
+    }
+    if is_wet_surface_biome(biome) {
+        return block_state_ids::MUD;
+    }
+    block_state_ids::COARSE_DIRT
+}
+
+fn dark_rock_replacement(biome: &str) -> i32 {
+    if is_coast_surface_biome(biome) {
+        return block_state_ids::STONE;
+    }
+    if is_wet_surface_biome(biome) {
+        return block_state_ids::CLAY;
+    }
+    if is_snowy_surface_biome(biome) {
+        return block_state_ids::STONE;
+    }
+    if is_rocky_surface_biome(biome) {
+        block_state_ids::DEEPSLATE
+    } else {
+        block_state_ids::STONE
+    }
+}
+
+fn fallback_for_surface_biome(biome: &str) -> i32 {
+    if is_coast_surface_biome(biome) {
+        return block_state_ids::SAND;
+    }
+    if is_snowy_surface_biome(biome) {
+        return block_state_ids::SNOW_BLOCK;
+    }
+    if is_dry_surface_biome(biome) {
+        return block_state_ids::SAND;
+    }
+    if is_rocky_surface_biome(biome) {
+        return block_state_ids::STONE;
+    }
+    if is_wet_surface_biome(biome) {
+        return block_state_ids::MUD;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn should_soften_temperate_rock(column: &EarthSurfaceColumn, top: i32) -> bool {
+    if !is_drab_temperate_surface(top)
+        || is_snowy_surface_biome(&column.biome_id)
+        || is_arid_bare_surface_biome(&column.biome_id)
+        || is_coast_surface_biome(&column.biome_id)
+    {
+        return false;
+    }
+    let y = column.ground_surface_y;
+    if is_hard_alpine_surface_biome(&column.biome_id) {
+        return y <= SEA_LEVEL_Y + 82;
+    }
+    if is_temperate_vegetated_surface_biome(&column.biome_id) {
+        return y <= SEA_LEVEL_Y + 90;
+    }
+    if is_rocky_surface_biome(&column.biome_id) {
+        return y <= SEA_LEVEL_Y + 76;
+    }
+    y <= SEA_LEVEL_Y + 40
+}
+
+fn should_regreen_temperate_earth(column: &EarthSurfaceColumn, top: i32) -> bool {
+    if !is_drab_temperate_earth(top)
+        || is_snowy_surface_biome(&column.biome_id)
+        || is_arid_bare_surface_biome(&column.biome_id)
+        || is_coast_surface_biome(&column.biome_id)
+    {
+        return false;
+    }
+    let y = column.ground_surface_y;
+    if is_temperate_vegetated_surface_biome(&column.biome_id)
+        || is_wet_surface_biome(&column.biome_id)
+    {
+        return y <= SEA_LEVEL_Y + 96;
+    }
+    if is_dry_surface_biome(&column.biome_id) {
+        return y <= SEA_LEVEL_Y + 64;
+    }
+    y <= SEA_LEVEL_Y + 48
+}
+
+fn stable_water_floor_replacement(column: &EarthSurfaceColumn) -> i32 {
+    let depth = 1.max(column.water_surface_y - column.ground_surface_y);
+    if depth <= 8 || is_wet_surface_biome(&column.biome_id) {
+        block_state_ids::CLAY
+    } else {
+        block_state_ids::STONE
+    }
+}
+
+fn temperate_rock_replacement(biome: &str) -> i32 {
+    if is_wet_surface_biome(biome) {
+        return block_state_ids::MOSS_BLOCK;
+    }
+    let lower = lower_surface_biome(biome);
+    if lower.contains("taiga") || lower.contains("old_growth") {
+        return block_state_ids::PODZOL;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn temperate_earth_replacement(biome: &str) -> i32 {
+    if is_wet_surface_biome(biome) {
+        block_state_ids::MOSS_BLOCK
+    } else {
+        block_state_ids::GRASS_BLOCK
+    }
+}
+
+fn is_bare_rock_like_surface(block: i32) -> bool {
+    matches!(
+        block,
+        block_state_ids::GRAVEL
+            | block_state_ids::STONE
+            | block_state_ids::DEEPSLATE
+            | block_state_ids::TUFF
+            | block_state_ids::ANDESITE
+            | block_state_ids::GRANITE
+            | block_state_ids::DIORITE
+    )
+}
+
+fn is_drab_temperate_surface(block: i32) -> bool {
+    is_bare_rock_like_surface(block)
+        || matches!(block, block_state_ids::CLAY | block_state_ids::CALCITE)
+}
+
+fn is_drab_temperate_earth(block: i32) -> bool {
+    matches!(
+        block,
+        block_state_ids::MUD
+            | block_state_ids::COARSE_DIRT
+            | block_state_ids::PODZOL
+            | block_state_ids::MYCELIUM
+            | block_state_ids::DIRT
+    )
+}
+
+fn is_temperate_vegetated_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("forest")
+        || lower.contains("taiga")
+        || lower.contains("jungle")
+        || lower.contains("plains")
+        || lower.contains("meadow")
+        || lower.contains("grove")
+        || lower.contains("windswept")
+        || lower.contains("mountain")
+        || lower.contains("hill")
+}
+
+fn is_hard_alpine_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("stony") || lower.contains("peak") || lower.contains("jagged")
+}
+
+fn is_coast_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("beach")
+        || lower.contains("ocean")
+        || lower.contains("river")
+        || lower.contains("shore")
+}
+
+fn is_dry_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("desert")
+        || lower.contains("badlands")
+        || lower.contains("savanna")
+        || lower.contains("steppe")
+        || lower.contains("grassland")
+}
+
+fn is_arid_bare_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("desert") || lower.contains("badlands") || lower.contains("steppe")
+}
+
+fn is_true_sandy_land_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("desert") || lower.contains("badlands")
+}
+
+fn is_wet_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("swamp") || lower.contains("mangrove") || lower.contains("wetland")
+}
+
+fn is_snowy_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("snow") || lower.contains("frozen") || lower.contains("ice")
+}
+
+fn is_rocky_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("mountain")
+        || lower.contains("peak")
+        || lower.contains("stony")
+        || lower.contains("windswept")
+}
+
+fn is_forest_surface_biome(biome: &str) -> bool {
+    let lower = lower_surface_biome(biome);
+    lower.contains("forest") || lower.contains("taiga")
+}
+
+fn is_jungle_surface_biome(biome: &str) -> bool {
+    lower_surface_biome(biome).contains("jungle")
+}
+
+const IMMEDIATE_COAST_FACTOR: f64 = 0.985;
+const SHALLOW_WATER_COAST_FACTOR: f64 = 0.86;
+const NEAR_COAST_FACTOR: f64 = 0.70;
+
+pub fn clean_coastal_surface_columns(
+    columns: &[EarthSurfaceColumn],
+    coast_factors: &[f64],
+    width: usize,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    if width == 0 || !columns.len().is_multiple_of(width) || coast_factors.len() != columns.len() {
+        return Err(SurfaceError::invalid(
+            "width must divide columns and coastFactors must match columns",
+        ));
+    }
+    Ok(columns
+        .iter()
+        .zip(coast_factors.iter())
+        .map(|(column, &coast_factor)| clean_coastal_surface_column(column, coast_factor))
+        .collect())
+}
+
+pub fn clean_coastal_surface_column(
+    column: &EarthSurfaceColumn,
+    coast_factor: f64,
+) -> EarthSurfaceColumn {
+    let cleaned = if column.water {
+        clean_water_surface_column(column, coast_factor)
+    } else {
+        clean_land_surface_column(column, coast_factor)
+    };
+    sanitize_surface_column_for_production(&cleaned)
+}
+
+fn clean_land_surface_column(column: &EarthSurfaceColumn, coast_factor: f64) -> EarthSurfaceColumn {
+    if coast_factor < NEAR_COAST_FACTOR
+        || column.ground_surface_y > SEA_LEVEL_Y + 4
+        || (!is_rock_surface_top(column.top_block_state_id)
+            && !is_sand_surface_top(column.top_block_state_id))
+    {
+        return column.clone();
+    }
+    let top = land_shore_top(&column.biome_id);
+    replace_surface_blocks(column, top, land_shore_filler(top), "coastal-cleanup")
+}
+
+fn clean_water_surface_column(
+    column: &EarthSurfaceColumn,
+    coast_factor: f64,
+) -> EarthSurfaceColumn {
+    if coast_factor < SHALLOW_WATER_COAST_FACTOR
+        || (!is_rock_surface_top(column.top_block_state_id)
+            && !is_sand_surface_top(column.top_block_state_id))
+    {
+        return column.clone();
+    }
+    let depth = 0.max(column.water_surface_y - column.ground_surface_y);
+    if depth > 9 && coast_factor < IMMEDIATE_COAST_FACTOR {
+        return column.clone();
+    }
+    let top = water_floor_top(&column.biome_id, depth);
+    replace_surface_blocks(column, top, top, "coastal-water-cleanup")
+}
+
+fn land_shore_top(biome: &str) -> i32 {
+    let lower = lower_surface_biome(biome);
+    if lower.contains("swamp") || lower.contains("mangrove") || lower.contains("wetland") {
+        return block_state_ids::MUD;
+    }
+    if lower.contains("badlands") || lower.contains("savanna") {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if lower.contains("desert") {
+        return block_state_ids::GRASS_BLOCK;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn land_shore_filler(top: i32) -> i32 {
+    match top {
+        block_state_ids::SAND | block_state_ids::RED_SAND | block_state_ids::MUD => top,
+        block_state_ids::STONE
+        | block_state_ids::DEEPSLATE
+        | block_state_ids::GRAVEL
+        | block_state_ids::CLAY
+        | block_state_ids::CALCITE
+        | block_state_ids::TUFF
+        | block_state_ids::ANDESITE
+        | block_state_ids::GRANITE
+        | block_state_ids::DIORITE => block_state_ids::STONE,
+        _ => block_state_ids::DIRT,
+    }
+}
+
+fn water_floor_top(biome: &str, depth: i32) -> i32 {
+    let lower = lower_surface_biome(biome);
+    if lower.contains("swamp") || lower.contains("mangrove") || lower.contains("wetland") {
+        return block_state_ids::CLAY;
+    }
+    if depth <= 6 {
+        return block_state_ids::CLAY;
+    }
+    block_state_ids::STONE
+}
+
+fn is_rock_surface_top(block: i32) -> bool {
+    matches!(
+        block,
+        block_state_ids::GRAVEL
+            | block_state_ids::STONE
+            | block_state_ids::DEEPSLATE
+            | block_state_ids::TUFF
+            | block_state_ids::ANDESITE
+            | block_state_ids::GRANITE
+            | block_state_ids::DIORITE
+            | block_state_ids::CALCITE
+    )
+}
+
+fn is_sand_surface_top(block: i32) -> bool {
+    matches!(
+        block,
+        block_state_ids::SAND | block_state_ids::RED_SAND | block_state_ids::SANDSTONE
+    )
+}
+
+fn replace_surface_blocks(
+    column: &EarthSurfaceColumn,
+    top: i32,
+    filler: i32,
+    source_suffix: &str,
+) -> EarthSurfaceColumn {
+    if top == column.top_block_state_id && filler == column.filler_block_state_id {
+        return column.clone();
+    }
+    let mut replaced = EarthSurfaceColumn::new(
+        column.water,
+        column.ground_surface_y,
+        column.water_surface_y,
+        top,
+        filler,
+        column.biome_id.clone(),
+        format!("{}+{}", column.decision_source, source_suffix),
+    );
+    replaced.terrain_token_source = column.terrain_token_source;
+    replaced.data_evidence_flags = column.data_evidence_flags;
+    replaced
+}
+
+fn lower_surface_biome(biome: &str) -> String {
+    biome.to_ascii_lowercase()
+}
+
 pub fn require_valid_vertical_scale(vertical_scale: f64) -> Result<f64> {
     if !vertical_scale.is_finite()
         || !(MIN_VERTICAL_SCALE..=MAX_VERTICAL_SCALE).contains(&vertical_scale)
@@ -4780,6 +5398,201 @@ mod tests {
 
         let korea = classify_shaped_surface(320.0, 126.9, 36.0, false, 0.0).unwrap();
         assert_eq!(korea.biome_id, "minecraft:forest");
+    }
+
+    #[test]
+    fn natural_surface_block_policy_matches_java_contract_cases() {
+        for block in [
+            block_state_ids::OAK_LEAVES,
+            block_state_ids::JUNGLE_LEAVES,
+            block_state_ids::DARK_OAK_LEAVES,
+            block_state_ids::SPRUCE_LEAVES,
+            block_state_ids::TERRACOTTA,
+            block_state_ids::ORANGE_TERRACOTTA,
+            block_state_ids::BROWN_TERRACOTTA,
+            block_state_ids::RED_TERRACOTTA,
+            block_state_ids::YELLOW_TERRACOTTA,
+            block_state_ids::WHITE_TERRACOTTA,
+            block_state_ids::LIGHT_GRAY_TERRACOTTA,
+            block_state_ids::GRAY_TERRACOTTA,
+            block_state_ids::BLACK_TERRACOTTA,
+            block_state_ids::GREEN_TERRACOTTA,
+            block_state_ids::CYAN_TERRACOTTA,
+            block_state_ids::LIME_TERRACOTTA,
+            block_state_ids::BLACK_CONCRETE,
+            block_state_ids::QUARTZ_BLOCK,
+            block_state_ids::BONE_BLOCK,
+            block_state_ids::END_STONE,
+            block_state_ids::END_STONE_BRICKS,
+            block_state_ids::SMOOTH_SANDSTONE,
+            block_state_ids::CUT_SANDSTONE,
+            block_state_ids::CHISELED_SANDSTONE,
+            block_state_ids::SMOOTH_RED_SANDSTONE,
+            block_state_ids::CUT_RED_SANDSTONE,
+            block_state_ids::CHISELED_RED_SANDSTONE,
+            block_state_ids::PACKED_MUD,
+            block_state_ids::MUD_BRICKS,
+            block_state_ids::DRIPSTONE_BLOCK,
+        ] {
+            assert!(!is_allowed_production_top(block, "minecraft:plains"));
+            let replacement = production_surface_top(block, "minecraft:plains");
+            assert!(
+                is_allowed_production_top(replacement, "minecraft:plains"),
+                "palette block replacement is natural: {block} -> {replacement}"
+            );
+        }
+
+        assert_eq!(
+            production_surface_top(block_state_ids::BLACK_TERRACOTTA, "minecraft:beach"),
+            block_state_ids::SAND
+        );
+        assert_eq!(
+            production_surface_top(block_state_ids::BROWN_TERRACOTTA, "minecraft:beach"),
+            block_state_ids::SAND
+        );
+        assert_eq!(
+            production_surface_top(block_state_ids::DARK_OAK_LEAVES, "minecraft:dark_forest"),
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            production_surface_top(block_state_ids::OAK_LEAVES, "minecraft:savanna"),
+            block_state_ids::COARSE_DIRT
+        );
+
+        let rocky_korea = surface_column(
+            false,
+            SEA_LEVEL_Y + 34,
+            i32::MIN,
+            block_state_ids::ANDESITE,
+            block_state_ids::STONE,
+            "minecraft:windswept_hills",
+        );
+        let cleaned = sanitize_surface_column_for_production(&rocky_korea);
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::DIRT);
+
+        let alpine = surface_column(
+            false,
+            SEA_LEVEL_Y + 90,
+            i32::MIN,
+            block_state_ids::STONE,
+            block_state_ids::STONE,
+            "minecraft:stony_peaks",
+        );
+        let cleaned = sanitize_surface_column_for_production(&alpine);
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::STONE);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::STONE);
+
+        let dark_forest_podzol = surface_column(
+            false,
+            SEA_LEVEL_Y + 18,
+            i32::MIN,
+            block_state_ids::PODZOL,
+            block_state_ids::PODZOL,
+            "minecraft:dark_forest",
+        );
+        let cleaned = sanitize_surface_column_for_production(&dark_forest_podzol);
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::GRASS_BLOCK);
+
+        let wet_mud = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::MUD,
+            block_state_ids::MUD,
+            "minecraft:swamp",
+        );
+        let cleaned = sanitize_surface_column_for_production(&wet_mud);
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::MOSS_BLOCK);
+
+        let shallow_ocean = surface_column(
+            true,
+            SEA_LEVEL_Y - 4,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            "minecraft:ocean",
+        );
+        let cleaned = sanitize_surface_column_for_production(&shallow_ocean);
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::CLAY);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::CLAY);
+    }
+
+    #[test]
+    fn coastal_surface_cleaner_matches_java_contract_cases() {
+        let cleaned = clean_single_coastal_column(
+            land_surface_column(block_state_ids::STONE, "minecraft:beach", SEA_LEVEL_Y + 1),
+            0.99,
+        );
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::DIRT);
+
+        let cleaned = clean_single_coastal_column(
+            land_surface_column(
+                block_state_ids::ANDESITE,
+                "minecraft:plains",
+                SEA_LEVEL_Y + 2,
+            ),
+            0.91,
+        );
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::DIRT);
+
+        let cleaned = clean_single_coastal_column(
+            land_surface_column(block_state_ids::GRAVEL, "minecraft:plains", SEA_LEVEL_Y + 1),
+            0.95,
+        );
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::DIRT);
+
+        let cleaned = clean_single_coastal_column(
+            surface_column(
+                true,
+                SEA_LEVEL_Y - 2,
+                SEA_LEVEL_Y,
+                block_state_ids::STONE,
+                block_state_ids::STONE,
+                "minecraft:warm_ocean",
+            ),
+            0.99,
+        );
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::CLAY);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::CLAY);
+
+        let cleaned = clean_single_coastal_column(
+            surface_column(
+                true,
+                SEA_LEVEL_Y - 5,
+                SEA_LEVEL_Y,
+                block_state_ids::GRAVEL,
+                block_state_ids::GRAVEL,
+                "minecraft:ocean",
+            ),
+            0.90,
+        );
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::CLAY);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::CLAY);
+
+        let inland = land_surface_column(
+            block_state_ids::STONE,
+            "minecraft:stony_peaks",
+            SEA_LEVEL_Y + 90,
+        );
+        assert_eq!(clean_single_coastal_column(inland.clone(), 0.0), inland);
+
+        let cleaned = clean_single_coastal_column(
+            land_surface_column(
+                block_state_ids::GREEN_TERRACOTTA,
+                "minecraft:dark_forest",
+                SEA_LEVEL_Y + 20,
+            ),
+            0.0,
+        );
+        assert_eq!(cleaned.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(cleaned.filler_block_state_id, block_state_ids::DIRT);
+
+        assert!(clean_coastal_surface_columns(&[inland.clone()], &[0.0], 0).is_err());
+        assert!(clean_coastal_surface_columns(&[inland], &[], 1).is_err());
     }
 
     #[test]
@@ -5862,6 +6675,38 @@ mod tests {
         fn sample(&self, _longitude: f64, _latitude: f64) -> EcoregionSample {
             EcoregionSample::unknown()
         }
+    }
+
+    fn surface_column(
+        water: bool,
+        ground_surface_y: i32,
+        water_surface_y: i32,
+        top: i32,
+        filler: i32,
+        biome: &str,
+    ) -> EarthSurfaceColumn {
+        EarthSurfaceColumn::new(
+            water,
+            ground_surface_y,
+            water_surface_y,
+            top,
+            filler,
+            biome,
+            "test",
+        )
+    }
+
+    fn land_surface_column(top: i32, biome: &str, y: i32) -> EarthSurfaceColumn {
+        surface_column(false, y, i32::MIN, top, top, biome)
+    }
+
+    fn clean_single_coastal_column(
+        column: EarthSurfaceColumn,
+        coast_factor: f64,
+    ) -> EarthSurfaceColumn {
+        clean_coastal_surface_columns(&[column], &[coast_factor], 1)
+            .unwrap()
+            .remove(0)
     }
 
     fn synthetic_wwf_ecoregion_cache() -> Vec<u8> {
