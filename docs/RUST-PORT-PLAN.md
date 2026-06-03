@@ -473,6 +473,8 @@ Bootstrap implementation status on 2026-06-03:
     prefetch counters, and cached sampler two-row local memo behavior
   - Rust CLI `inspect-heightmap` and `locate-heightmap-point` diagnostics backed by the file-backed GeoTIFF reader and
     Java-compatible `EarthScaleMapping`
+  - Rust CLI `sample-vrt-rgb` diagnostic backed by `VrtRgbMosaicReader`, reporting Java-compatible nearest RGB samples,
+    source lookup shape, lazy reader counts, and tile cache counters for real-data smoke checks
   - Rust `earthmap-surface` height-only region bootstrap matching Java `HeightOnlyRegionGenerator`: Java-style
     `Math.round` height scaling, bedrock/stone/dirt/grass column fill, level.dat write, exploration-only survival
     manifest, MCA/Linear region output, and Java-compatible CLI report lines
@@ -486,7 +488,7 @@ Bootstrap implementation status on 2026-06-03:
   Classic TIFF fixture path, pixel values, unavailable out-of-range samples, near-black color semantics, and tile cache
   statistics. VRT tests cover the Java `GeoTiffRgbReaderTest` single-source and split-source VRT fixtures, indexed
   source lookup cells, nearest RGB sampling, lazy reader opens, and aggregated tile cache statistics. CLI tests cover
-  Java-compatible diagnostic stdout for a synthetic BigTIFF fixture.
+  Java-compatible diagnostic stdout for synthetic BigTIFF and VRT RGB fixtures.
 - Verified locally with
   `cargo test --manifest-path rust/Cargo.toml -p earthmap-geo --locked`,
   `cargo test --manifest-path rust/Cargo.toml -p earthmap-cli --locked`, and
@@ -495,6 +497,10 @@ Bootstrap implementation status on 2026-06-03:
   - Java/Rust `inspect-heightmap E:\HQheightmap.tif` stdout parity OK
   - Java/Rust `locate-heightmap-point E:\HQheightmap.tif 5000 0.0 0.0` stdout parity OK
   - evidence folder: `D:\earthmap\rust-port-golden\phase4-real-heightmap-smoke-20260603-0002`
+- Real VRT RGB smoke checks against `D:\earthmap\TifFiles\terrain\TrueMarble.vrt` passed on 2026-06-03:
+  - Java `VrtRgbMosaicReader` oracle / Rust `sample-vrt-rgb` stdout parity OK
+  - sample points: `(0.0, 0.0)`, `(32.0, 0.0)`, `(-73.9857, 40.7484)`, `(139.6917, 35.6895)`
+  - evidence folder: `D:\earthmap\rust-port-golden\phase4-real-vrt-rgb-smoke-20260603-0001`
 - Height-only region parity against `E:\HQheightmap.tif` passed on 2026-06-03 for region `r.0.0` at scale `1:5000`:
   - Linear V2 Java/Rust region SHA-256:
     `4764167E5820E9A2E5BD834053C22393563FD9FC4D2D896DC06BEE1AE77B9EC0`
@@ -506,8 +512,7 @@ Bootstrap implementation status on 2026-06-03:
   - evidence folders:
     `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0001`
     and `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0002-mca`
-- Remaining Phase 4 work: exercise real RGB/VRT inputs and expand the height-only corpus beyond one real region before
-  promotion.
+- Remaining Phase 4 work: expand the height-only corpus beyond one real region before promotion.
 
 ## Phase 5: Surface Rules And Photo Solver
 
