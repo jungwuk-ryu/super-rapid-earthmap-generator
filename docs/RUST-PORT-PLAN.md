@@ -676,6 +676,8 @@ Bootstrap implementation status on 2026-06-03:
   temperate-grassland transition gates before JavaStandard and exposed-rock fallback intents.
 - Rust JavaStandard dry GRAVEL/ROCK token intent now mirrors Java's secondary `HIGHLAND_ROCK` compiler branch for
   high-elevation or high-relief dry terrain-token evidence.
+- Rust dry-core ecoregion transition intent now mirrors Java's confidence/noise blended `DESERT_EDGE` compiler branch
+  so uncertain desert cores can resolve to savanna edge before broad hot-desert fallback.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
   remaining dry-savanna/desert-edge intent predicates, ecoregion transition, broader compiler-backed intent, and
   environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface

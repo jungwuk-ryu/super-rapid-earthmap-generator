@@ -1718,6 +1718,7 @@ fn classify_surface_material_by_semantic_intent(
     let forest_like = is_forest_like_ecoregion(sample);
     let savanna_like = is_savanna_like_ecoregion(sample);
     let vegetation_evidence = has_vegetation_evidence(sample, metrics);
+    let ecoregion_dry_core = is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence);
     let dry_tropical_woodland =
         latitude.abs() <= 25.0 && dry_savanna_score >= 0.20 && !is_tropical_rain_climate(climate);
     let java_standard_terrain = sample.terrain_token_source
@@ -2219,6 +2220,38 @@ fn classify_surface_material_by_semantic_intent(
             patch_noise,
             fine_noise,
         ));
+    }
+
+    if ecoregion_dry_core
+        && dry_savanna_score >= 0.32
+        && sample.ecoregion_confidence < 0.92
+        && latitude.abs() <= 42.0
+        && metrics.value < 0.78
+    {
+        let transition_noise =
+            surface_material_ecology_noise(longitude, latitude, 1.25, 0x4bd1a7240f78c8d3);
+        let confidence_blend = (0.92 - sample.ecoregion_confidence) / 0.92;
+        let dry_savanna_blend =
+            clamp_unit(0.22 + (dry_savanna_score * 0.28) + (confidence_blend * 0.35));
+        if transition_noise < dry_savanna_blend {
+            let dry_score = sahel_score.max(dry_savanna_score).max(0.58);
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
+                patch_noise,
+                fine_noise,
+                dry_score,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
+            );
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ));
+        }
     }
 
     if is_desert_climate(climate) {
@@ -13817,6 +13850,67 @@ mod tests {
         );
         assert_eq!(standard_rock_highland.biome_id, "minecraft:windswept_hills");
         assert_eq!(standard_rock_highland.decision_source, "intent");
+
+        let dry_core_transition_candidate = SurfaceMaterialSample::land(
+            RgbColor::of(166, 152, 126),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Dry desert transition",
+            "minecraft:desert",
+            0.80,
+        );
+        let dry_core_transition_metrics =
+            SurfaceColorMetrics::from(dry_core_transition_candidate.color);
+        assert!(is_dry_core_ecoregion_evidence(
+            &dry_core_transition_candidate,
+            dry_core_transition_metrics,
+            false
+        ));
+        let (dry_core_transition_longitude, dry_core_transition_latitude) = (-180..=180)
+            .flat_map(|longitude| (-42..=42).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let dry_savanna = surface_material_dry_savanna_score(longitude, latitude);
+                let transition_noise =
+                    surface_material_ecology_noise(longitude, latitude, 1.25, 0x4bd1a7240f78c8d3);
+                let confidence_blend =
+                    (0.92 - dry_core_transition_candidate.ecoregion_confidence) / 0.92;
+                let dry_savanna_blend =
+                    clamp_unit(0.22 + (dry_savanna * 0.28) + (confidence_blend * 0.35));
+                !is_sahel_latitude(latitude)
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && dry_savanna >= 0.32
+                    && dry_savanna < 0.35
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && transition_noise < dry_savanna_blend
+            })
+            .expect("test fixture should find a dry-core ecoregion transition coordinate");
+        let dry_core_transition = apply_test_surface_material_sample(
+            &base_land,
+            dry_core_transition_candidate,
+            420.0,
+            f64::from(dry_core_transition_longitude),
+            f64::from(dry_core_transition_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            dry_core_transition.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert_eq!(dry_core_transition.biome_id, "minecraft:savanna");
+        assert_eq!(dry_core_transition.decision_source, "intent-ecoregion");
 
         let savanna_like_highland_candidate = SurfaceMaterialSample::land(
             RgbColor::of(181, 96, 46),
