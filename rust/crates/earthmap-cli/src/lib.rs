@@ -354,6 +354,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.earthDataEcoregionEvidenceBootstrap - EcoregionSample normalization and EarthData ecoregion family-confidence aggregation match Java fixture cases with bounded access-order cache reuse."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.wwfEcoregionCacheBootstrap - WwfEcoregionSampler reads Java-generated ecoregion cache files and EarthDataSurfaceMaterialSampler auto-loads cache-backed ecoregion evidence when present."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",

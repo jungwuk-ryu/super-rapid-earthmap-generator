@@ -2,7 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -881,20 +882,12 @@ impl EarthDataSurfaceMaterialSampler {
             ocean_temperature: open_surface_raster(tif_root.as_deref(), "ocean_temp_infill.tif")?,
             bathymetry: open_surface_float_raster(tif_root.as_deref(), "bathymetry.tif")?,
             slope: open_surface_raster(tif_root.as_deref(), "slope.tif")?,
-            ecoregions: None,
+            ecoregions: WwfEcoregionSampler::open_auto_cache(true_marble_path)?
+                .map(|sampler| Box::new(sampler) as Box<dyn EcoregionSampler>),
             material_cache: Mutex::new(BoundedAccessCache::new(Self::MATERIAL_CACHE_ENTRIES)),
             ocean_cache: Mutex::new(BoundedAccessCache::new(Self::OCEAN_CACHE_ENTRIES)),
             ecoregion_cache: Mutex::new(BoundedAccessCache::new(Self::ECOREGION_CACHE_ENTRIES)),
         })
-    }
-
-    #[cfg(test)]
-    fn with_ecoregion_sampler_for_tests(
-        mut self,
-        sampler: impl EcoregionSampler + 'static,
-    ) -> Self {
-        self.ecoregions = Some(Box::new(sampler));
-        self
     }
 
     pub fn raster_stats(&self) -> SurfaceMaterialRasterStats {
@@ -1227,6 +1220,214 @@ impl EcoregionEvidence {
 
 trait EcoregionSampler: fmt::Debug + Send + Sync {
     fn sample(&self, longitude: f64, latitude: f64) -> EcoregionSample;
+}
+
+#[derive(Debug)]
+pub struct WwfEcoregionSampler {
+    polygons: Vec<WwfEcoregionPolygon>,
+    grid: Vec<Vec<usize>>,
+    last_hit: Mutex<Option<usize>>,
+}
+
+impl WwfEcoregionSampler {
+    const CACHE_MAGIC: i32 = 0x4552_4731;
+    const CACHE_VERSION: i32 = 2;
+    const MIN_LONGITUDE: f64 = -180.0;
+    const MIN_LATITUDE: f64 = -90.0;
+    const CELL_DEGREES: f64 = 0.5;
+    const GRID_WIDTH: usize = 720;
+    const GRID_HEIGHT: usize = 360;
+
+    pub fn open_cache(path: impl AsRef<Path>) -> Result<Self> {
+        let mut file = File::open(path)?;
+        Self::read_cache(&mut file)
+    }
+
+    fn open_auto_cache(true_marble_path: &Path) -> Result<Option<Self>> {
+        for root in wwf_candidate_roots(true_marble_path) {
+            let shape = root
+                .join("ShapeFiles")
+                .join("ecoregionsOrig")
+                .join("wwf_terr_ecos.shp");
+            let dbf = shape.with_extension("dbf");
+            let mapping = root.join("ecoregions.csv");
+            let cache = root
+                .join(".earthmap-cache")
+                .join(format!("wwf-ecoregions-v{}.bin", Self::CACHE_VERSION));
+            if !shape.is_file()
+                || !dbf.is_file()
+                || !mapping.is_file()
+                || !is_fresh_wwf_cache(&cache, &[shape, dbf, mapping])
+            {
+                continue;
+            }
+            if let Ok(sampler) = Self::open_cache(cache) {
+                return Ok(Some(sampler));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn sample(&self, longitude: f64, latitude: f64) -> EcoregionSample {
+        self.sample_internal(longitude, latitude)
+    }
+
+    fn read_cache(input: &mut impl Read) -> Result<Self> {
+        if read_i32_be(input)? != Self::CACHE_MAGIC || read_i32_be(input)? != Self::CACHE_VERSION {
+            return Err(SurfaceError::invalid("unsupported ecoregion cache version"));
+        }
+        let polygon_count = read_nonnegative_usize(input, "ecoregion polygon count")?;
+        let mut polygons = Vec::with_capacity(polygon_count);
+        for _ in 0..polygon_count {
+            let min_x = read_f64_be(input)?;
+            let min_y = read_f64_be(input)?;
+            let max_x = read_f64_be(input)?;
+            let max_y = read_f64_be(input)?;
+            let parts = read_usize_array_be(input, "ecoregion polygon parts")?;
+            let xs = read_f64_array_be(input, "ecoregion polygon x coordinates")?;
+            let ys = read_f64_array_be(input, "ecoregion polygon y coordinates")?;
+            if parts.len() < 2 || xs.len() != ys.len() {
+                return Err(SurfaceError::invalid("malformed ecoregion polygon"));
+            }
+            let point_count = xs.len();
+            if parts
+                .windows(2)
+                .any(|pair| pair[0] > pair[1] || pair[1] > point_count)
+            {
+                return Err(SurfaceError::invalid(
+                    "ecoregion polygon part index outside point array",
+                ));
+            }
+            let name = read_java_utf(input)?;
+            let biome = read_java_utf(input)?;
+            polygons.push(WwfEcoregionPolygon {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+                parts,
+                xs,
+                ys,
+                sample: EcoregionSample::new(name, biome),
+            });
+        }
+        let grid_length = read_i32_be(input)?;
+        if grid_length != (Self::GRID_WIDTH * Self::GRID_HEIGHT) as i32 {
+            return Err(SurfaceError::invalid("ecoregion cache grid size mismatch"));
+        }
+        let mut grid = Vec::with_capacity(Self::GRID_WIDTH * Self::GRID_HEIGHT);
+        for _ in 0..(Self::GRID_WIDTH * Self::GRID_HEIGHT) {
+            let cell = read_usize_array_be(input, "ecoregion grid cell")?;
+            if cell.iter().any(|&candidate| candidate >= polygons.len()) {
+                return Err(SurfaceError::invalid(
+                    "ecoregion grid candidate outside polygon array",
+                ));
+            }
+            grid.push(cell);
+        }
+        Ok(Self {
+            polygons,
+            grid,
+            last_hit: Mutex::new(None),
+        })
+    }
+
+    fn sample_internal(&self, longitude: f64, latitude: f64) -> EcoregionSample {
+        if longitude.is_nan() || latitude.is_nan() || !(-90.0..=90.0).contains(&latitude) {
+            return EcoregionSample::unknown();
+        }
+        let lon = normalize_longitude(longitude);
+        if let Ok(mut last_hit) = self.last_hit.lock() {
+            if let Some(previous) = *last_hit {
+                if self
+                    .polygons
+                    .get(previous)
+                    .is_some_and(|polygon| polygon.contains(lon, latitude))
+                {
+                    return self.polygons[previous].sample.clone();
+                }
+            }
+            let cell = self.cell_index(lon, latitude);
+            let Some(candidates) = self.grid.get(cell) else {
+                *last_hit = None;
+                return EcoregionSample::unknown();
+            };
+            for &candidate in candidates {
+                let polygon = &self.polygons[candidate];
+                if polygon.contains(lon, latitude) {
+                    *last_hit = Some(candidate);
+                    return polygon.sample.clone();
+                }
+            }
+            *last_hit = None;
+            return EcoregionSample::unknown();
+        }
+        EcoregionSample::unknown()
+    }
+
+    fn cell_index(&self, longitude: f64, latitude: f64) -> usize {
+        (self.grid_y(latitude) * Self::GRID_WIDTH) + self.grid_x(longitude)
+    }
+
+    fn grid_x(&self, longitude: f64) -> usize {
+        let raw = ((normalize_longitude(longitude) - Self::MIN_LONGITUDE) / Self::CELL_DEGREES)
+            .floor() as i32;
+        clamp_i32(raw, 0, (Self::GRID_WIDTH - 1) as i32) as usize
+    }
+
+    fn grid_y(&self, latitude: f64) -> usize {
+        let raw = ((latitude - Self::MIN_LATITUDE) / Self::CELL_DEGREES).floor() as i32;
+        clamp_i32(raw, 0, (Self::GRID_HEIGHT - 1) as i32) as usize
+    }
+}
+
+impl EcoregionSampler for WwfEcoregionSampler {
+    fn sample(&self, longitude: f64, latitude: f64) -> EcoregionSample {
+        self.sample_internal(longitude, latitude)
+    }
+}
+
+#[derive(Debug)]
+struct WwfEcoregionPolygon {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+    parts: Vec<usize>,
+    xs: Vec<f64>,
+    ys: Vec<f64>,
+    sample: EcoregionSample,
+}
+
+impl WwfEcoregionPolygon {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        if x < self.min_x || x > self.max_x || y < self.min_y || y > self.max_y {
+            return false;
+        }
+        let mut inside = false;
+        for part in 0..self.parts.len() - 1 {
+            let start = self.parts[part];
+            let end = self.parts[part + 1];
+            if start >= end {
+                continue;
+            }
+            let mut j = end - 1;
+            for i in start..end {
+                let yi = self.ys[i];
+                let yj = self.ys[j];
+                if (yi > y) != (yj > y) {
+                    let xi = self.xs[i];
+                    let xj = self.xs[j];
+                    let intersection_x = ((xj - xi) * (y - yi) / (yj - yi)) + xi;
+                    if x < intersection_x {
+                        inside = !inside;
+                    }
+                }
+                j = i;
+            }
+        }
+        inside
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1920,6 +2121,139 @@ fn biome_family(biome: &str) -> &str {
     } else {
         biome
     }
+}
+
+fn wwf_candidate_roots(true_marble_path: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::with_capacity(4);
+    let terrain = true_marble_path
+        .canonicalize()
+        .unwrap_or_else(|_| true_marble_path.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf);
+    let tif_root = terrain.as_ref().and_then(|path| path.parent());
+    if let Some(root) = tif_root.and_then(|path| path.parent()) {
+        push_distinct_path(&mut roots, root.to_path_buf());
+    }
+    push_distinct_path(&mut roots, PathBuf::from("E:/earthmap"));
+    push_distinct_path(&mut roots, PathBuf::from("D:/earthmap"));
+    push_distinct_path(&mut roots, PathBuf::from("F:/earthmap"));
+    roots
+}
+
+fn push_distinct_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn is_fresh_wwf_cache(cache: &Path, sources: &[PathBuf]) -> bool {
+    let Ok(cache_modified) = std::fs::metadata(cache).and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    for source in sources {
+        let Ok(source_modified) =
+            std::fs::metadata(source).and_then(|metadata| metadata.modified())
+        else {
+            return false;
+        };
+        if source_modified > cache_modified {
+            return false;
+        }
+    }
+    true
+}
+
+fn read_nonnegative_usize(input: &mut impl Read, label: &str) -> Result<usize> {
+    let value = read_i32_be(input)?;
+    if value < 0 {
+        return Err(SurfaceError::invalid(format!("negative {label}")));
+    }
+    Ok(value as usize)
+}
+
+fn read_usize_array_be(input: &mut impl Read, label: &str) -> Result<Vec<usize>> {
+    let length = read_nonnegative_usize(input, label)?;
+    let mut values = Vec::with_capacity(length);
+    for _ in 0..length {
+        values.push(read_nonnegative_usize(input, label)?);
+    }
+    Ok(values)
+}
+
+fn read_f64_array_be(input: &mut impl Read, label: &str) -> Result<Vec<f64>> {
+    let length = read_nonnegative_usize(input, label)?;
+    let mut values = Vec::with_capacity(length);
+    for _ in 0..length {
+        values.push(read_f64_be(input)?);
+    }
+    Ok(values)
+}
+
+fn read_java_utf(input: &mut impl Read) -> Result<String> {
+    let length = usize::from(read_u16_be(input)?);
+    let mut bytes = vec![0u8; length];
+    input.read_exact(&mut bytes)?;
+    decode_modified_utf8(&bytes)
+}
+
+fn decode_modified_utf8(bytes: &[u8]) -> Result<String> {
+    let mut code_units = Vec::<u16>::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte >> 7 == 0 {
+            code_units.push(u16::from(byte));
+            index += 1;
+        } else if byte >> 5 == 0b110 {
+            if index + 1 >= bytes.len() {
+                return Err(SurfaceError::invalid("truncated modified UTF-8 sequence"));
+            }
+            let byte2 = bytes[index + 1];
+            if byte2 >> 6 != 0b10 {
+                return Err(SurfaceError::invalid("invalid modified UTF-8 continuation"));
+            }
+            code_units.push((u16::from(byte & 0x1f) << 6) | u16::from(byte2 & 0x3f));
+            index += 2;
+        } else if byte >> 4 == 0b1110 {
+            if index + 2 >= bytes.len() {
+                return Err(SurfaceError::invalid("truncated modified UTF-8 sequence"));
+            }
+            let byte2 = bytes[index + 1];
+            let byte3 = bytes[index + 2];
+            if byte2 >> 6 != 0b10 || byte3 >> 6 != 0b10 {
+                return Err(SurfaceError::invalid("invalid modified UTF-8 continuation"));
+            }
+            code_units.push(
+                (u16::from(byte & 0x0f) << 12)
+                    | (u16::from(byte2 & 0x3f) << 6)
+                    | u16::from(byte3 & 0x3f),
+            );
+            index += 3;
+        } else {
+            return Err(SurfaceError::invalid("invalid modified UTF-8 leading byte"));
+        }
+    }
+    String::from_utf16(&code_units)
+        .map_err(|error| SurfaceError::invalid(format!("invalid modified UTF-8 string: {error}")))
+}
+
+fn read_i32_be(input: &mut impl Read) -> Result<i32> {
+    let mut bytes = [0u8; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(i32::from_be_bytes(bytes))
+}
+
+fn read_u16_be(input: &mut impl Read) -> Result<u16> {
+    let mut bytes = [0u8; 2];
+    input.read_exact(&mut bytes)?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+fn read_f64_be(input: &mut impl Read) -> Result<f64> {
+    let mut bytes = [0u8; 8];
+    input.read_exact(&mut bytes)?;
+    Ok(f64::from_be_bytes(bytes))
 }
 
 fn open_surface_raster(
@@ -3303,9 +3637,20 @@ mod tests {
         let tif_root = root.join("TifFiles");
         let terrain = tif_root.join("terrain");
         let vegetation = tif_root.join("vegetation");
+        let shape_dir = root.join("ShapeFiles").join("ecoregionsOrig");
         std::fs::create_dir_all(&terrain).unwrap();
         std::fs::create_dir_all(&vegetation).unwrap();
+        std::fs::create_dir_all(&shape_dir).unwrap();
+        std::fs::create_dir_all(root.join(".earthmap-cache")).unwrap();
         std::fs::write(terrain.join("tiny.tif"), synthetic_classic_rgb_tiff()).unwrap();
+        std::fs::write(shape_dir.join("wwf_terr_ecos.shp"), b"shape placeholder").unwrap();
+        std::fs::write(shape_dir.join("wwf_terr_ecos.dbf"), b"dbf placeholder").unwrap();
+        std::fs::write(root.join("ecoregions.csv"), b"Cache Jungle,JUNGLE\n").unwrap();
+        std::fs::write(
+            root.join(".earthmap-cache").join("wwf-ecoregions-v2.bin"),
+            synthetic_wwf_ecoregion_cache(),
+        )
+        .unwrap();
         std::fs::write(
             terrain.join("TrueMarble.vrt"),
             r#"
@@ -3344,9 +3689,8 @@ mod tests {
         )
         .unwrap();
 
-        let sampler = EarthDataSurfaceMaterialSampler::open(terrain.join("TrueMarble.vrt"))
-            .unwrap()
-            .with_ecoregion_sampler_for_tests(FixtureEcoregionSampler);
+        let sampler =
+            EarthDataSurfaceMaterialSampler::open(terrain.join("TrueMarble.vrt")).unwrap();
         assert!(sampler.samples_open_water());
 
         let sample = sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap();
@@ -3371,9 +3715,9 @@ mod tests {
         assert_eq!(sample.ocean_temperature, 12);
         assert_eq!(sample.bathymetry_meters, -123);
         assert_eq!(sample.slope_permille, 500);
-        assert_eq!(sample.ecoregion_name, "Center Jungle");
+        assert_eq!(sample.ecoregion_name, "Cache Jungle");
         assert_eq!(sample.ecoregion_biome_id, "minecraft:jungle");
-        assert!((sample.ecoregion_confidence - (2.0 / 3.0)).abs() < 0.0001);
+        assert_eq!(sample.ecoregion_confidence, 1.0);
         assert_eq!(sampler.raster_stats().sample_averaged_requests, 1);
 
         assert_eq!(sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap(), sample);
@@ -3462,6 +3806,31 @@ mod tests {
 
         let unknown = sample_ecoregion_evidence(&UnknownEcoregionSampler, 0.0, 0.0, 0.012);
         assert_eq!(unknown, EcoregionEvidence::unknown());
+    }
+
+    #[test]
+    fn wwf_ecoregion_sampler_reads_java_cache_fixture() {
+        let root =
+            std::env::temp_dir().join(format!("earthmap-surface-wwf-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let cache = root.join("wwf-ecoregions-v2.bin");
+        std::fs::write(&cache, synthetic_wwf_ecoregion_cache()).unwrap();
+
+        let sampler = WwfEcoregionSampler::open_cache(&cache).unwrap();
+        assert_eq!(
+            sampler.sample(1.0, 1.0),
+            EcoregionSample::new("Cache Jungle", "minecraft:jungle")
+        );
+        assert_eq!(
+            sampler.sample(361.0, 1.0),
+            EcoregionSample::new("Cache Jungle", "minecraft:jungle")
+        );
+        assert_eq!(sampler.sample(3.0, 1.0), EcoregionSample::unknown());
+        assert_eq!(sampler.sample(f64::NAN, 1.0), EcoregionSample::unknown());
+        assert_eq!(sampler.sample(1.0, 91.0), EcoregionSample::unknown());
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -3772,6 +4141,82 @@ mod tests {
         fn sample(&self, _longitude: f64, _latitude: f64) -> EcoregionSample {
             EcoregionSample::unknown()
         }
+    }
+
+    fn synthetic_wwf_ecoregion_cache() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_i32_be(&mut out, WwfEcoregionSampler::CACHE_MAGIC);
+        push_i32_be(&mut out, WwfEcoregionSampler::CACHE_VERSION);
+        push_i32_be(&mut out, 1);
+        for value in [0.0, 0.0, 2.0, 2.0] {
+            push_f64_be(&mut out, value);
+        }
+        push_i32_array_be(&mut out, &[0, 5]);
+        push_f64_array_be(&mut out, &[0.0, 2.0, 2.0, 0.0, 0.0]);
+        push_f64_array_be(&mut out, &[0.0, 0.0, 2.0, 2.0, 0.0]);
+        push_java_utf(&mut out, "Cache Jungle");
+        push_java_utf(&mut out, "minecraft:jungle");
+
+        let grid_len = WwfEcoregionSampler::GRID_WIDTH * WwfEcoregionSampler::GRID_HEIGHT;
+        push_i32_be(&mut out, grid_len as i32);
+        for cell in 0..grid_len {
+            let x = cell % WwfEcoregionSampler::GRID_WIDTH;
+            let y = cell / WwfEcoregionSampler::GRID_WIDTH;
+            if (360..=364).contains(&x) && (180..=184).contains(&y) {
+                push_i32_array_be(&mut out, &[0]);
+            } else {
+                push_i32_be(&mut out, 0);
+            }
+        }
+        out
+    }
+
+    fn push_i32_array_be(out: &mut Vec<u8>, values: &[i32]) {
+        push_i32_be(out, values.len() as i32);
+        for &value in values {
+            push_i32_be(out, value);
+        }
+    }
+
+    fn push_f64_array_be(out: &mut Vec<u8>, values: &[f64]) {
+        push_i32_be(out, values.len() as i32);
+        for &value in values {
+            push_f64_be(out, value);
+        }
+    }
+
+    fn push_java_utf(out: &mut Vec<u8>, value: &str) {
+        let bytes = modified_utf8_bytes(value);
+        assert!(bytes.len() <= u16::MAX as usize);
+        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+
+    fn modified_utf8_bytes(value: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for code_unit in value.encode_utf16() {
+            match code_unit {
+                0x0001..=0x007f => bytes.push(code_unit as u8),
+                0x0000..=0x07ff => {
+                    bytes.push((0xc0 | ((code_unit >> 6) & 0x1f)) as u8);
+                    bytes.push((0x80 | (code_unit & 0x3f)) as u8);
+                }
+                _ => {
+                    bytes.push((0xe0 | ((code_unit >> 12) & 0x0f)) as u8);
+                    bytes.push((0x80 | ((code_unit >> 6) & 0x3f)) as u8);
+                    bytes.push((0x80 | (code_unit & 0x3f)) as u8);
+                }
+            }
+        }
+        bytes
+    }
+
+    fn push_i32_be(out: &mut Vec<u8>, value: i32) {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_f64_be(out: &mut Vec<u8>, value: f64) {
+        out.extend_from_slice(&value.to_be_bytes());
     }
 
     fn synthetic_classic_rgb_tiff() -> Vec<u8> {

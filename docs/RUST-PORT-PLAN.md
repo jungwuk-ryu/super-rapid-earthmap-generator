@@ -599,9 +599,12 @@ Bootstrap implementation status on 2026-06-03:
   open failures are tolerated like Java.
 - Rust EarthData ecoregion evidence bootstrap ports `EcoregionSample` normalization, ecoregion cell-degree clamps,
   Java biome-family grouping, and 3x3 family-confidence aggregation with bounded access-order cache fixture cases.
-- Remaining Phase 5 work: port WWF ecoregion source/cache loading, MET export terrain-token raster integration,
-  land-shallow-topographic/photo source selection, photo solver, smoothing/coastal policies, OSM overlay, surface biome
-  cell writing, and fixed-region `generate-surface-region` payload parity.
+- Rust `WwfEcoregionSampler` bootstrap reads Java-generated WWF ecoregion cache files, runs Java-compatible
+  point-in-polygon sampling, and lets `EarthDataSurfaceMaterialSampler` auto-load cache-backed ecoregion evidence when
+  present.
+- Remaining Phase 5 work: port WWF shapefile/DBF source parsing and cache freshness regeneration, MET export
+  terrain-token raster integration, land-shallow-topographic/photo source selection, photo solver, smoothing/coastal
+  policies, OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 
 ### Vanilla-Delegated Survival Scope
 
