@@ -672,6 +672,8 @@ Bootstrap implementation status on 2026-06-03:
   for warm dry evidence without stealing high-confidence savanna-like ecoregion cases that Java handles earlier.
 - Rust exposed highland rock intent now mirrors Java's `HIGHLAND_ROCK` compiler branch and highland rock surface/biome
   helper for rugged orange-rock terrain while preserving Java's earlier high-confidence savanna-like ecoregion ordering.
+- Rust savanna-like ecoregion intent now mirrors Java's high-confidence desert-edge, hot-desert sand-patch, and
+  temperate-grassland transition gates before JavaStandard and exposed-rock fallback intents.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
   remaining dry-savanna/desert-edge intent predicates, ecoregion transition, broader compiler-backed intent, and
   environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface
