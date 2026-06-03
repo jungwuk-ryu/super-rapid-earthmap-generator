@@ -2017,6 +2017,47 @@ fn classify_surface_material_by_semantic_intent(
         ));
     }
 
+    let savanna_like_ecoregion_precedes_java_standard = savanna_like
+        && sample.ecoregion_confidence >= 0.55
+        && !is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
+        && !is_tropical_rain_climate(climate);
+    if java_standard_terrain
+        && token_vegetated
+        && !green_like
+        && !is_tropical_rain_climate(climate)
+        && latitude.abs() <= 35.0
+        && (sahel_score >= 0.18 || dry_savanna_score >= 0.18 || mediterranean_score >= 0.32)
+        && metrics.value < 0.76
+        && !savanna_like_ecoregion_precedes_java_standard
+    {
+        let desert_edge = sahara_score >= 0.35 || is_desert_climate(climate);
+        let dry_score =
+            sahel_score
+                .max(dry_savanna_score)
+                .max(if desert_edge { 0.58 } else { 0.45 });
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
+            patch_noise,
+            fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
+        );
+        let biome = if desert_edge && dry_score >= 0.58 {
+            "minecraft:savanna".to_string()
+        } else {
+            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise)
+        };
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+
     if is_desert_climate(climate) {
         if (tree_cover >= 0.12 || herb_cover >= 0.35 || shrub_cover >= 0.35 || green_like)
             && (savanna_like || is_sahel_latitude(latitude) || sahel_score >= 0.18)
@@ -13147,6 +13188,72 @@ mod tests {
                 | "minecraft:sunflower_plains"
         ));
         assert_eq!(dry_score_savanna.decision_source, "intent");
+
+        let java_standard_vegetated_token = SurfaceMaterialSample::new(
+            RgbColor::of(167, 146, 103),
+            RgbColor::of(167, 146, 103),
+            TerrainTokenSource::JavaStandardPalette,
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            20,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Open shrubland",
+            "minecraft:plains",
+            0.40,
+        );
+        let java_standard_metrics = SurfaceColorMetrics::from(java_standard_vegetated_token.color);
+        let java_standard_terrain =
+            surface_material_met_terrain(&java_standard_vegetated_token, java_standard_metrics);
+        assert_eq!(java_standard_terrain.kind, MetTerrainKind::Vegetated);
+        assert!(java_standard_terrain.confident());
+        assert!(!is_green_like(java_standard_metrics));
+        let (java_standard_longitude, java_standard_latitude) = (-125..=147)
+            .flat_map(|longitude| (-39..=42).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let mediterranean = surface_material_mediterranean_score(longitude, latitude);
+                latitude.abs() <= 35.0
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.35
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && (0.32..0.40).contains(&mediterranean)
+            })
+            .expect("test fixture should find a JavaStandard vegetated-token intent coordinate");
+        let java_standard_token_dry = apply_test_surface_material_sample(
+            &base_land,
+            java_standard_vegetated_token,
+            280.0,
+            f64::from(java_standard_longitude),
+            f64::from(java_standard_latitude),
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            java_standard_token_dry.top_block_state_id,
+            block_state_ids::GRASS_BLOCK | block_state_ids::COARSE_DIRT
+        ));
+        assert_eq!(
+            java_standard_token_dry.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert!(matches!(
+            java_standard_token_dry.biome_id.as_str(),
+            "minecraft:savanna"
+                | "minecraft:savanna_plateau"
+                | "minecraft:windswept_savanna"
+                | "minecraft:plains"
+                | "minecraft:sunflower_plains"
+        ));
+        assert_eq!(java_standard_token_dry.decision_source, "intent");
 
         let temperate_steppe = SurfaceMaterialSample::land(
             RgbColor::of(134, 126, 82),
