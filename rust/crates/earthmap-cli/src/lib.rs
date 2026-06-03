@@ -7,7 +7,9 @@ use std::path::Path;
 use earthmap_core::build_info;
 use earthmap_core::commands::{self, CommandStatus};
 use earthmap_core::progress;
-use earthmap_geo::{EarthScaleMapping, GeoTiffHeightmapReader, GeoTiffMetadata};
+use earthmap_geo::{
+    EarthScaleMapping, GeoTiffHeightmapReader, GeoTiffMetadata, VrtRgbMosaicReader,
+};
 use earthmap_region::{ChunkLocalPos, RegionError};
 use earthmap_surface::{
     HeightOnlySettings, OutputFormat, DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
@@ -54,6 +56,9 @@ where
         "locate-heightmap-point" if args.len() == 5 => write_result(locate_heightmap_point(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4],
         )),
+        "sample-vrt-rgb" if args.len() == 4 => {
+            write_result(sample_vrt_rgb(stdout, stderr, &args[1], &args[2], &args[3]))
+        }
         "generate-height-region" if args.len() == 7 => write_result(generate_height_region(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
         )),
@@ -141,6 +146,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         out,
         "  locate-heightmap-point <heightmap> <scale> <longitude> <latitude>"
     )?;
+    writeln!(out, "  sample-vrt-rgb <terrainVrt> <longitude> <latitude>")?;
     for name in commands::INITIAL_COMMANDS
         .iter()
         .map(|command| command.name)
@@ -274,6 +280,14 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "DONE rust.phase4.vrtRgbMosaicReaderBootstrap - Synthetic single-source and split-source VRT RGB mosaic sampling, indexed source lookup, and aggregated tile stats match the Java fixture path."
+    )?;
+    writeln!(
+        out,
+        "DONE rust.phase4.vrtRgbDiagnosticCli - sample-vrt-rgb samples Java-compatible VRT RGB mosaics and reports color/source/cache stats for real-data smoke checks."
+    )?;
+    writeln!(
+        out,
+        "DONE rust.phase4.realVrtRgbSmoke - D:\\earthmap\\TifFiles\\terrain\\TrueMarble.vrt sample-vrt-rgb stdout matches the Java VrtRgbMosaicReader oracle for representative coordinates."
     )?;
     writeln!(
         out,
@@ -430,6 +444,60 @@ fn locate_heightmap_point_impl(
         format!("regionZ={region_z}"),
         format!("localBlockX={local_block_x}"),
         format!("localBlockZ={local_block_z}"),
+    ])
+}
+
+fn sample_vrt_rgb(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    vrt_path: &str,
+    longitude_text: &str,
+    latitude_text: &str,
+) -> io::Result<i32> {
+    match sample_vrt_rgb_impl(vrt_path, longitude_text, latitude_text) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "VRT RGB sampling failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn sample_vrt_rgb_impl(
+    vrt_path: &str,
+    longitude_text: &str,
+    latitude_text: &str,
+) -> earthmap_geo::Result<Vec<String>> {
+    let longitude = parse_f64(longitude_text)?;
+    let latitude = parse_f64(latitude_text)?;
+    let reader = VrtRgbMosaicReader::open(Path::new(vrt_path))?;
+    let color = reader.sample_nearest(longitude, latitude)?;
+    let stats = reader.stats();
+    Ok(vec![
+        "VRT RGB sampled".to_string(),
+        format!("path={}", Path::new(vrt_path).display()),
+        format!("longitude={}", java_double_string(longitude)),
+        format!("latitude={}", java_double_string(latitude)),
+        "mode=nearest".to_string(),
+        format!("available={}", color.available),
+        format!("red={}", color.red),
+        format!("green={}", color.green),
+        format!("blue={}", color.blue),
+        format!("sourceCount={}", stats.source_count),
+        format!("openReaders={}", stats.open_readers),
+        format!("residentTiles={}", stats.resident_tiles),
+        format!("tileHits={}", stats.tile_hits),
+        format!("tileMisses={}", stats.tile_misses),
+        format!("tileEvictions={}", stats.tile_evictions),
+        format!("sampleNearestRequests={}", stats.sample_nearest_requests),
+        format!("sampleAveragedRequests={}", stats.sample_averaged_requests),
+        format!("indexedSourceLookup={}", stats.indexed_source_lookup),
+        format!("sourceLookupCells={}", stats.source_lookup_cells),
     ])
 }
 
@@ -935,6 +1003,7 @@ mod tests {
         assert!(out.contains("write-region-writer-parity-fixtures <outputDir>"));
         assert!(out.contains("inspect-heightmap <path>"));
         assert!(out.contains("locate-heightmap-point <heightmap> <scale> <longitude> <latitude>"));
+        assert!(out.contains("sample-vrt-rgb <terrainVrt> <longitude> <latitude>"));
     }
 
     #[test]
@@ -1060,6 +1129,62 @@ localBlockZ=55\n"
     }
 
     #[test]
+    fn sample_vrt_rgb_matches_java_fixture_stdout_contract() {
+        let temp = tempdir().unwrap();
+        let tiff = temp.path().join("tiny.tif");
+        fs::write(&tiff, synthetic_classic_rgb_tiff()).unwrap();
+        let vrt = temp.path().join("tiny.vrt");
+        fs::write(
+            &vrt,
+            r#"
+<VRTDataset rasterXSize="2" rasterYSize="2">
+  <GeoTransform> 0, 1, 0, 2, 0, -1</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">tiny.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2" />
+      <DstRect xOff="0" yOff="0" xSize="2" ySize="2" />
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"#,
+        )
+        .unwrap();
+
+        let (code, out, err) =
+            run_capture(&["sample-vrt-rgb", vrt.to_str().unwrap(), "1.25", "0.75"]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert_eq!(
+            out,
+            format!(
+                "VRT RGB sampled\n\
+path={}\n\
+longitude=1.25\n\
+latitude=0.75\n\
+mode=nearest\n\
+available=true\n\
+red=100\n\
+green=110\n\
+blue=120\n\
+sourceCount=1\n\
+openReaders=1\n\
+residentTiles=1\n\
+tileHits=0\n\
+tileMisses=1\n\
+tileEvictions=0\n\
+sampleNearestRequests=1\n\
+sampleAveragedRequests=0\n\
+indexedSourceLookup=true\n\
+sourceLookupCells=1\n",
+                vrt.display()
+            )
+        );
+    }
+
+    #[test]
     fn generate_height_region_rejects_unknown_format_like_java() {
         let (code, out, err) = run_capture(&[
             "generate-height-region",
@@ -1157,6 +1282,47 @@ localBlockZ=55\n"
         out
     }
 
+    fn synthetic_classic_rgb_tiff() -> Vec<u8> {
+        let entry_count = 10usize;
+        let ifd_offset = 8usize;
+        let ifd_bytes = 2 + (entry_count * 12) + 4;
+        let bits_offset = ifd_offset + ifd_bytes;
+        let tile_offset = bits_offset + 6;
+        let pixels = [10u8, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let mut out = vec![0u8; tile_offset + pixels.len()];
+
+        out[0] = b'I';
+        out[1] = b'I';
+        put_u16(&mut out, 2, 42);
+        put_u32(&mut out, 4, ifd_offset as u32);
+
+        let mut cursor = ifd_offset;
+        put_u16(&mut out, cursor, entry_count as u16);
+        cursor += 2;
+        for (tag, field_type, count, value_or_offset) in [
+            (256, 4, 1, 2),
+            (257, 4, 1, 2),
+            (258, 3, 3, bits_offset as u32),
+            (259, 3, 1, 1),
+            (277, 3, 1, 3),
+            (284, 3, 1, 1),
+            (322, 4, 1, 2),
+            (323, 4, 1, 2),
+            (324, 4, 1, tile_offset as u32),
+            (325, 4, 1, pixels.len() as u32),
+        ] {
+            put_classic_entry(&mut out, cursor, tag, field_type, count, value_or_offset);
+            cursor += 12;
+        }
+        put_u32(&mut out, cursor, 0);
+
+        put_u16(&mut out, bits_offset, 8);
+        put_u16(&mut out, bits_offset + 2, 8);
+        put_u16(&mut out, bits_offset + 4, 8);
+        out[tile_offset..tile_offset + pixels.len()].copy_from_slice(&pixels);
+        out
+    }
+
     fn put_u16(out: &mut [u8], offset: usize, value: u16) {
         out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -1189,5 +1355,24 @@ localBlockZ=55\n"
         put_u16(out, offset + 2, field_type);
         put_u64(out, offset + 4, count);
         put_u64(out, offset + 12, value_or_offset);
+    }
+
+    fn put_classic_entry(
+        out: &mut [u8],
+        offset: usize,
+        tag: u16,
+        field_type: u16,
+        count: u32,
+        value_or_offset: u32,
+    ) {
+        put_u16(out, offset, tag);
+        put_u16(out, offset + 2, field_type);
+        put_u32(out, offset + 4, count);
+        if field_type == 3 && count == 1 {
+            put_u16(out, offset + 8, value_or_offset as u16);
+            put_u16(out, offset + 10, 0);
+        } else {
+            put_u32(out, offset + 8, value_or_offset);
+        }
     }
 }

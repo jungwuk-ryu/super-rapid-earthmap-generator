@@ -126,6 +126,11 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         status: CommandStatus::ImplementedShellOnly,
         note: "locate longitude/latitude in the Java-compatible Earth grid",
     },
+    CommandSpec {
+        name: "sample-vrt-rgb",
+        status: CommandStatus::ImplementedShellOnly,
+        note: "sample a Java-compatible VRT RGB mosaic",
+    },
 ];
 
 pub fn find_initial_command(name: &str) -> Option<CommandSpec> {
