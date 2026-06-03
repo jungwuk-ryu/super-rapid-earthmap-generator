@@ -326,6 +326,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.surfaceMaterialSampleBootstrap - SurfaceMaterialSample coverage, slope, ecoregion, terrain-token normalization, rounding, and SurfaceDataEvidence flag contracts match Java fixture cases."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.trueMarbleSurfaceSamplerBootstrap - TrueMarbleSurfaceMaterialSampler wraps VrtRgbMosaicReader.sample_averaged as Java-compatible color-only SurfaceMaterialSample output for synthetic VRT fixtures."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",

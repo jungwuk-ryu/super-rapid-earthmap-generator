@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use earthmap_core::build_info;
 use earthmap_geo::{
     EarthScaleMapping, GeoError, GeoTiffHeightmapReader, GeoTiffMetadata, GeoTiffRowCache,
-    GeoTiffRowCacheStats, HeightmapScalarSampler, RgbColor,
+    GeoTiffRowCacheStats, HeightmapScalarSampler, RgbColor, VrtRgbMosaicReader,
 };
 use earthmap_minecraft::block_state_ids;
 use earthmap_minecraft::chunk_model::{ChunkModel, CHUNK_WIDTH};
@@ -704,6 +704,86 @@ pub mod surface_data_evidence {
 
     fn positive(value: i32) -> bool {
         known(value) && value > 0
+    }
+}
+
+pub trait SurfaceMaterialSampler {
+    fn sample(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample>;
+
+    fn sample_photo(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
+
+    fn samples_open_water(&self) -> bool {
+        false
+    }
+
+    fn sample_water(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct TrueMarbleSurfaceMaterialSampler {
+    reader: VrtRgbMosaicReader,
+}
+
+impl TrueMarbleSurfaceMaterialSampler {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            reader: VrtRgbMosaicReader::open(path)?,
+        })
+    }
+
+    pub fn reader(&self) -> &VrtRgbMosaicReader {
+        &self.reader
+    }
+}
+
+impl SurfaceMaterialSampler for TrueMarbleSurfaceMaterialSampler {
+    fn sample(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        Ok(SurfaceMaterialSample::color_only(
+            self.reader.sample_averaged(
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            )?,
+        ))
     }
 }
 
@@ -1914,6 +1994,58 @@ mod tests {
     }
 
     #[test]
+    fn true_marble_surface_material_sampler_wraps_vrt_average_as_color_only_sample() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-surface-true-marble-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let tiff = root.join("tiny.tif");
+        std::fs::write(&tiff, synthetic_classic_rgb_tiff()).unwrap();
+        let vrt = root.join("tiny.vrt");
+        std::fs::write(
+            &vrt,
+            r#"
+<VRTDataset rasterXSize="2" rasterYSize="2">
+  <GeoTransform> 0, 1, 0, 2, 0, -1</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">tiny.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2" />
+      <DstRect xOff="0" yOff="0" xSize="2" ySize="2" />
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"#,
+        )
+        .unwrap();
+
+        let sampler = TrueMarbleSurfaceMaterialSampler::open(&vrt).unwrap();
+        assert!(!sampler.samples_open_water());
+
+        let sample = sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap();
+        assert_eq!(sample.color, RgbColor::of(70, 80, 90));
+        assert_eq!(sample.terrain_token_color, RgbColor::unavailable());
+        assert_eq!(sample.terrain_token_source, TerrainTokenSource::None);
+        assert_eq!(sample.climate_class, SurfaceMaterialSample::UNKNOWN);
+
+        assert_eq!(
+            sampler.sample_photo(1.25, 0.75, 0.0, 0.0).unwrap().color,
+            RgbColor::of(70, 80, 90)
+        );
+        assert_eq!(
+            sampler.sample_water(1.25, 0.75, 0.0, 0.0).unwrap().color,
+            RgbColor::of(70, 80, 90)
+        );
+        assert_eq!(sampler.reader().stats().sample_averaged_requests, 3);
+
+        drop(sampler);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn surface_y_matches_java_height_only_rounding_and_clamps() {
         assert_eq!(surface_y_for_elevation_meters(0.0), 63);
         assert_eq!(surface_y_for_elevation_meters(17.5), 64);
@@ -2004,4 +2136,88 @@ mod tests {
         assert_eq!(values["features.strongholdOrEquivalent"], "false");
         assert_eq!(values["generation.format"], "LINEAR_V2");
     }
+
+    fn synthetic_classic_rgb_tiff() -> Vec<u8> {
+        let pixel_bytes = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+        let entry_count = 10usize;
+        let ifd_offset = 8usize;
+        let ifd_bytes = 2 + (entry_count * CLASSIC_IFD_ENTRY_BYTES) + 4;
+        let bits_offset = ifd_offset + ifd_bytes;
+        let tile_offset = bits_offset + 6;
+        let file_size = tile_offset + pixel_bytes.len();
+        let mut out = vec![0u8; file_size];
+
+        out[0] = b'I';
+        out[1] = b'I';
+        put_u16(&mut out, 2, CLASSIC_TIFF_MAGIC);
+        put_u32(&mut out, 4, ifd_offset as u32);
+
+        let mut cursor = ifd_offset;
+        put_u16(&mut out, cursor, entry_count as u16);
+        cursor += 2;
+        for (tag, field_type, count, value_or_offset) in [
+            (TAG_IMAGE_WIDTH, TYPE_LONG, 1, 2),
+            (TAG_IMAGE_LENGTH, TYPE_LONG, 1, 2),
+            (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 3, bits_offset as u32),
+            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+            (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 3),
+            (TAG_PLANAR_CONFIGURATION, TYPE_SHORT, 1, 1),
+            (TAG_TILE_WIDTH, TYPE_LONG, 1, 2),
+            (TAG_TILE_LENGTH, TYPE_LONG, 1, 2),
+            (TAG_TILE_OFFSETS, TYPE_LONG, 1, tile_offset as u32),
+            (TAG_TILE_BYTE_COUNTS, TYPE_LONG, 1, pixel_bytes.len() as u32),
+        ] {
+            put_classic_entry(&mut out, cursor, tag, field_type, count, value_or_offset);
+            cursor += CLASSIC_IFD_ENTRY_BYTES;
+        }
+        put_u32(&mut out, cursor, 0);
+
+        put_u16(&mut out, bits_offset, 8);
+        put_u16(&mut out, bits_offset + 2, 8);
+        put_u16(&mut out, bits_offset + 4, 8);
+        out[tile_offset..tile_offset + pixel_bytes.len()].copy_from_slice(&pixel_bytes);
+        out
+    }
+
+    fn put_classic_entry(
+        out: &mut [u8],
+        offset: usize,
+        tag: u16,
+        field_type: u16,
+        count: u32,
+        value_or_offset: u32,
+    ) {
+        put_u16(out, offset, tag);
+        put_u16(out, offset + 2, field_type);
+        put_u32(out, offset + 4, count);
+        if field_type == TYPE_SHORT && count == 1 {
+            put_u16(out, offset + 8, value_or_offset as u16);
+            put_u16(out, offset + 10, 0);
+        } else {
+            put_u32(out, offset + 8, value_or_offset);
+        }
+    }
+
+    fn put_u16(out: &mut [u8], offset: usize, value: u16) {
+        out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(out: &mut [u8], offset: usize, value: u32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    const CLASSIC_TIFF_MAGIC: u16 = 42;
+    const CLASSIC_IFD_ENTRY_BYTES: usize = 12;
+    const TYPE_SHORT: u16 = 3;
+    const TYPE_LONG: u16 = 4;
+    const TAG_IMAGE_WIDTH: u16 = 256;
+    const TAG_IMAGE_LENGTH: u16 = 257;
+    const TAG_BITS_PER_SAMPLE: u16 = 258;
+    const TAG_COMPRESSION: u16 = 259;
+    const TAG_SAMPLES_PER_PIXEL: u16 = 277;
+    const TAG_PLANAR_CONFIGURATION: u16 = 284;
+    const TAG_TILE_WIDTH: u16 = 322;
+    const TAG_TILE_LENGTH: u16 = 323;
+    const TAG_TILE_OFFSETS: u16 = 324;
+    const TAG_TILE_BYTE_COUNTS: u16 = 325;
 }

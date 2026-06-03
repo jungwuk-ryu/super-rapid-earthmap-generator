@@ -583,8 +583,10 @@ Bootstrap implementation status on 2026-06-03:
 - Rust `SurfaceMaterialSample` and `SurfaceDataEvidence` bootstrap matches Java fixture cases for color-only samples,
   terrain-token source normalization, coverage/canopy/slope/ecoregion helpers, Java-style optional rounding, and
   evidence bit flags.
-- Remaining Phase 5 work: port surface material raster sampling, photo solver, smoothing/coastal policies, OSM overlay,
-  surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
+- Rust `SurfaceMaterialSampler` and `TrueMarbleSurfaceMaterialSampler` bootstrap wraps VRT RGB averaged samples as
+  Java-compatible color-only `SurfaceMaterialSample` output for synthetic VRT fixtures.
+- Remaining Phase 5 work: port EarthData surface material raster sampling, photo solver, smoothing/coastal policies,
+  OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 
 ### Vanilla-Delegated Survival Scope
 
