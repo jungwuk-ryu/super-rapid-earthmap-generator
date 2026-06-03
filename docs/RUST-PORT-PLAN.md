@@ -651,8 +651,12 @@ Bootstrap implementation status on 2026-06-03:
   Java color-only land/water classifier baseline for representative desert dry-grass, Sahel, Congo rainforest, Atlas
   rock, deep-ocean, shelf-water, bright-water, and missing-raster fixture cases. The full semantic intent/environment/
   ecoregion classifier remains intentionally tracked as follow-up work before classified material mode is enabled.
-- Remaining Phase 5 work: complete semantic `EarthSurfaceMaterialClassifier` parity, full photo solver parity, and
-  fixed-region Java/Rust payload parity for surface material/photo output.
+- Rust `EarthSurfaceMaterialClassifier` semantic fallback bootstrap ports Java's no-color climate/vegetation/ecoregion
+  fallback colors plus bounded climate intent cases for savanna, desert, Congo rainforest, temperate steppe, and
+  no-color forest/desert/savanna fixture coverage.
+- Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
+  authoritative terrain-token, ecoregion transition, compiler-backed intent, and environment edge cases; then finish
+  full photo solver parity and fixed-region Java/Rust payload parity for surface material/photo output.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

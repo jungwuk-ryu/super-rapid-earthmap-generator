@@ -1216,6 +1216,19 @@ pub fn apply_surface_material(
             sample,
             local_relief_meters,
         )
+    } else if let Some(metrics) =
+        surface_material_semantic_fallback_metrics(sample, longitude, latitude)
+    {
+        classify_surface_material_land(
+            base,
+            metrics,
+            elevation_meters,
+            longitude,
+            latitude,
+            coast_factor,
+            sample,
+            local_relief_meters,
+        )
     } else {
         base.with_decision_source("base")
     };
@@ -1346,6 +1359,79 @@ fn classify_surface_material_land(
                 "minecraft:snowy_plains",
             ),
             "snow",
+        );
+    }
+
+    if let Some(intent_column) = classify_surface_material_by_semantic_intent(
+        base,
+        sample,
+        metrics,
+        elevation_meters,
+        longitude,
+        latitude,
+        sahara_score,
+        sahel_score,
+        rainforest_score,
+        dry_savanna_score,
+        patch_noise,
+        fine_noise,
+        local_relief_meters,
+        terrain,
+        semantic_terrain,
+    ) {
+        let vegetation_evidence = has_vegetation_evidence(sample, metrics);
+        let decision_source =
+            if is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence) {
+                "intent-ecoregion"
+            } else {
+                "intent"
+            };
+        return mark_surface_material(intent_column, decision_source);
+    }
+
+    let java_standard_terrain = sample.terrain_token_source
+        == TerrainTokenSource::JavaStandardPalette
+        && terrain.confident();
+    let token_vegetated = is_trusted_vegetated_token(
+        sample,
+        metrics,
+        terrain,
+        semantic_terrain,
+        java_standard_terrain,
+    );
+    let sparse_dry_open_tropical = is_sparse_dry_open_tropical(
+        sample,
+        metrics,
+        sahel_score,
+        dry_savanna_score,
+        token_vegetated,
+    );
+    let sparse_dry_open_has_dry_intent =
+        is_sahel_latitude(latitude) || sahel_score >= 0.22 || dry_savanna_score >= 0.35;
+    if is_tropical_rain_climate(sample.climate_class)
+        && sparse_dry_open_tropical
+        && !sparse_dry_open_has_dry_intent
+        && !is_named_forest_savanna_mosaic(sample)
+    {
+        let biome = if sample.tree_cover() >= 0.15 || rainforest_score >= 0.45 || dark_vegetation {
+            rainforest_biome_with_sample(
+                sample,
+                rainforest_score.max(0.65),
+                dark_vegetation,
+                patch_noise,
+                fine_noise,
+            )
+        } else {
+            "minecraft:sparse_jungle".to_string()
+        };
+        return mark_surface_material(
+            surface_material_with_surface(
+                base,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                biome,
+            ),
+            "environment",
         );
     }
 
@@ -1597,6 +1683,443 @@ fn classify_surface_material_land(
         block_state_ids::DIRT,
         fallback_biome(base, latitude, patch_noise),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_surface_material_by_semantic_intent(
+    base: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    sahara_score: f64,
+    sahel_score: f64,
+    rainforest_score: f64,
+    dry_savanna_score: f64,
+    patch_noise: f64,
+    fine_noise: f64,
+    local_relief_meters: f64,
+    terrain: MetTerrainMatch,
+    semantic_terrain: bool,
+) -> Option<EarthSurfaceColumn> {
+    let climate = sample.climate_class;
+    let has_climate = sample.has_climate_class();
+    let tree_cover = sample.tree_cover();
+    let herb_cover = sample.herbaceous_cover();
+    let shrub_cover = sample.shrub_cover();
+    let green_like = is_green_like(metrics);
+    let dark_vegetation = green_like && metrics.value < 0.48;
+    let orange_rock_like = is_orange_rock_like(metrics);
+    let forest_like = is_forest_like_ecoregion(sample);
+    let savanna_like = is_savanna_like_ecoregion(sample);
+    let dry_tropical_woodland =
+        latitude.abs() <= 25.0 && dry_savanna_score >= 0.20 && !is_tropical_rain_climate(climate);
+    let java_standard_terrain = sample.terrain_token_source
+        == TerrainTokenSource::JavaStandardPalette
+        && terrain.confident();
+    let token_vegetated = is_trusted_vegetated_token(
+        sample,
+        metrics,
+        terrain,
+        semantic_terrain,
+        java_standard_terrain,
+    );
+
+    if sample.snow_cover_ratio() >= 0.35 || climate == 29 || climate == 30 {
+        return Some(surface_material_with_surface(
+            base,
+            block_state_ids::SNOW_BLOCK,
+            block_state_ids::DIRT,
+            if climate == 30 {
+                "minecraft:snowy_plains"
+            } else {
+                "minecraft:snowy_taiga"
+            },
+        ));
+    }
+
+    if sample.swamp_cover_ratio() >= 0.35 && latitude.abs() <= 45.0 {
+        return Some(surface_material_with_surface(
+            base,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:swamp",
+        ));
+    }
+
+    if is_forest_savanna_mosaic_intent(
+        sample,
+        metrics,
+        longitude,
+        latitude,
+        sahara_score,
+        rainforest_score,
+        dry_savanna_score,
+        token_vegetated,
+        patch_noise,
+        fine_noise,
+    ) {
+        let mut canopy_weight = clamp_unit(
+            0.10 + (sample.canopy_cover() * 0.48)
+                + (sample.vegetation_cover() * 0.12)
+                + (rainforest_score * 0.22)
+                - (sahel_score * 0.38)
+                - (dry_savanna_score * 0.34),
+        );
+        if is_humid_forest_core(sample, rainforest_score, sahel_score, dry_savanna_score) {
+            canopy_weight = canopy_weight.max(0.72);
+        } else if is_named_forest_savanna_mosaic(sample) {
+            canopy_weight = canopy_weight.max(clamp_unit(
+                0.52 + (rainforest_score * 0.08)
+                    - (sahel_score * 0.12)
+                    - (dry_savanna_score * 0.12),
+            ));
+        }
+        let local = (patch_noise * 0.68) + (fine_noise * 0.32);
+        let lush_patch = local < canopy_weight
+            || (sample.canopy_cover() >= 0.62 && sample.tree_cover() >= 0.28 && fine_noise < 0.80);
+        if lush_patch {
+            let humid_score = rainforest_score.max(0.48);
+            return Some(surface_material_with_surface(
+                base,
+                lush_vegetation_surface(
+                    sample,
+                    metrics,
+                    patch_noise,
+                    fine_noise,
+                    humid_score,
+                    terrain,
+                ),
+                block_state_ids::DIRT,
+                rainforest_biome_with_sample(
+                    sample,
+                    humid_score,
+                    metrics.value < 0.48,
+                    patch_noise,
+                    fine_noise,
+                ),
+            ));
+        }
+        let dry_score = sahel_score.max(dry_savanna_score).max(0.50);
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
+            patch_noise,
+            fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
+        );
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise),
+        ));
+    }
+
+    let sparse_dry_open_tropical = is_sparse_dry_open_tropical(
+        sample,
+        metrics,
+        sahel_score,
+        dry_savanna_score,
+        token_vegetated,
+    );
+    if is_tropical_rain_climate(climate) && !sparse_dry_open_tropical {
+        let biome = if tree_cover >= 0.15 || rainforest_score >= 0.45 || dark_vegetation {
+            rainforest_biome_with_sample(
+                sample,
+                rainforest_score.max(0.65),
+                dark_vegetation,
+                patch_noise,
+                fine_noise,
+            )
+        } else {
+            "minecraft:sparse_jungle".to_string()
+        };
+        return Some(surface_material_with_surface(
+            base,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+
+    if sparse_dry_open_tropical
+        && (is_sahel_latitude(latitude) || sahel_score >= 0.22 || dry_savanna_score >= 0.35)
+    {
+        let biome = dry_grass_biome(
+            sahel_score.max(dry_savanna_score).max(0.55),
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        );
+        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+
+    if is_tropical_savanna_climate(climate) {
+        let biome = dry_grass_biome(
+            sahel_score.max(dry_savanna_score).max(0.70),
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        );
+        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+
+    if is_steppe_climate(climate) {
+        if latitude.abs() >= 35.0 {
+            let biome = temperate_grassland_biome(latitude, patch_noise, fine_noise);
+            return Some(surface_material_with_surface(
+                base,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                biome,
+            ));
+        }
+        let biome = dry_grass_biome(
+            sahel_score.max(dry_savanna_score).max(0.58),
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        );
+        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+
+    if is_desert_climate(climate) {
+        if (tree_cover >= 0.12 || herb_cover >= 0.35 || shrub_cover >= 0.35 || green_like)
+            && (savanna_like || is_sahel_latitude(latitude) || sahel_score >= 0.18)
+        {
+            let biome = dry_grass_biome(
+                sahel_score.max(dry_savanna_score).max(0.50),
+                elevation_meters,
+                patch_noise,
+                fine_noise,
+            );
+            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                biome,
+            ));
+        }
+        if orange_rock_like
+            && is_exposed_dry_rock(
+                metrics,
+                elevation_meters,
+                longitude,
+                latitude,
+                sahara_score,
+                dry_savanna_score,
+                local_relief_meters,
+                sample.slope_ratio(),
+            )
+            && fine_noise >= 0.70
+        {
+            let top = if metrics.hue <= 35.0 {
+                block_state_ids::ORANGE_TERRACOTTA
+            } else {
+                block_state_ids::TERRACOTTA
+            };
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                top,
+                "minecraft:badlands",
+            ));
+        }
+        let top = desert_surface(
+            metrics,
+            patch_noise,
+            fine_noise,
+            sahara_score.max(0.65),
+            terrain,
+            semantic_terrain,
+        );
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            desert_filler(top),
+            desert_biome(elevation_meters, patch_noise, fine_noise),
+        ));
+    }
+
+    if is_temperate_climate(climate) {
+        if dry_tropical_woodland {
+            let biome = dry_grass_biome(
+                dry_savanna_score.max(0.55),
+                elevation_meters,
+                patch_noise,
+                fine_noise,
+            );
+            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                biome,
+            ));
+        }
+        if tree_cover >= 0.06 || dark_vegetation || forest_like {
+            return Some(surface_material_with_surface(
+                base,
+                temperate_forest_surface(sample, metrics, patch_noise, fine_noise),
+                block_state_ids::DIRT,
+                forest_biome_for_environment(
+                    latitude,
+                    climate,
+                    tree_cover,
+                    dark_vegetation,
+                    patch_noise,
+                ),
+            ));
+        }
+        if herb_cover >= 0.18 || shrub_cover >= 0.18 || green_like || metrics.value >= 0.42 {
+            let top = if fine_noise >= 0.86 && shrub_cover > herb_cover {
+                block_state_ids::COARSE_DIRT
+            } else {
+                block_state_ids::GRASS_BLOCK
+            };
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                "minecraft:plains",
+            ));
+        }
+    }
+
+    if is_cold_climate(climate) {
+        if elevation_meters >= 2_400.0 || base.ground_surface_y >= 165 {
+            return Some(surface_material_with_surface(
+                base,
+                block_state_ids::SNOW_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:snowy_plains",
+            ));
+        }
+        let biome = if tree_cover >= 0.12 || patch_noise >= 0.48 {
+            "minecraft:taiga"
+        } else {
+            "minecraft:plains"
+        };
+        return Some(surface_material_with_surface(
+            base,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+
+    if !has_climate {
+        if forest_like && (sample.vegetation_cover() >= 0.02 || tree_cover >= 0.06) {
+            return Some(surface_material_with_surface(
+                base,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                forest_biome_for_environment(
+                    latitude,
+                    climate,
+                    tree_cover,
+                    dark_vegetation,
+                    patch_noise,
+                ),
+            ));
+        }
+        if savanna_like && sample.vegetation_cover() > 0.0 {
+            let biome = dry_grass_biome(
+                sahel_score.max(dry_savanna_score).max(0.55),
+                elevation_meters,
+                patch_noise,
+                fine_noise,
+            );
+            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                biome,
+            ));
+        }
+    }
+
+    None
+}
+
+fn surface_material_semantic_fallback_metrics(
+    sample: &SurfaceMaterialSample,
+    longitude: f64,
+    latitude: f64,
+) -> Option<SurfaceColorMetrics> {
+    surface_material_semantic_fallback_color(sample, longitude, latitude)
+        .map(SurfaceColorMetrics::from)
+}
+
+fn surface_material_semantic_fallback_color(
+    sample: &SurfaceMaterialSample,
+    longitude: f64,
+    latitude: f64,
+) -> Option<RgbColor> {
+    let climate = sample.climate_class;
+    let vegetation = sample.vegetation_cover();
+    let forest_like = is_forest_like_ecoregion(sample);
+    let savanna_like = is_savanna_like_ecoregion(sample);
+    let dry_ecoregion = is_dry_ecoregion_biome(sample);
+
+    if sample.snow_cover_ratio() >= 0.18 || climate == 29 || climate == 30 {
+        return Some(RgbColor::of(230, 235, 235));
+    }
+    if sample.swamp_cover_ratio() >= 0.25 {
+        return Some(RgbColor::of(45, 85, 55));
+    }
+    if is_tropical_rain_climate(climate)
+        || (forest_like && vegetation >= 0.02)
+        || sample.tree_cover() >= 0.06
+    {
+        return Some(RgbColor::of(45, 96, 42));
+    }
+    if is_tropical_savanna_climate(climate) || is_steppe_climate(climate) || savanna_like {
+        return Some(RgbColor::of(126, 123, 70));
+    }
+    if is_desert_climate(climate) || dry_ecoregion {
+        if vegetation >= 0.04
+            && (savanna_like || surface_material_sahel_score(longitude, latitude) >= 0.18)
+        {
+            return Some(RgbColor::of(126, 123, 70));
+        }
+        return Some(RgbColor::of(230, 205, 160));
+    }
+    if is_temperate_climate(climate) || is_cold_climate(climate) || forest_like {
+        return Some(RgbColor::of(78, 118, 64));
+    }
+    if vegetation > 0.0 {
+        return Some(RgbColor::of(126, 123, 70));
+    }
+    if sample.has_ecoregion() || sample.has_ecoregion_biome() {
+        return Some(RgbColor::of(104, 128, 68));
+    }
+    None
 }
 
 fn surface_material_with_surface(
@@ -1917,6 +2440,169 @@ fn dry_grass_surface(
     block_state_ids::GRASS_BLOCK
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dry_grass_surface_conservative(
+    metrics: SurfaceColorMetrics,
+    sample: &SurfaceMaterialSample,
+    patch_noise: f64,
+    fine_noise: f64,
+    dry_score: f64,
+    terrain: MetTerrainMatch,
+    semantic_terrain: bool,
+    local_relief_meters: f64,
+) -> i32 {
+    let vegetation = sample
+        .tree_cover()
+        .max(sample.herbaceous_cover())
+        .max(sample.shrub_cover());
+    let green_like = is_green_like(metrics);
+    let sparse_vegetation = vegetation < 0.12 && !green_like;
+    let very_sparse_vegetation = vegetation < 0.06 && !green_like;
+    let very_dry_dark = metrics.value < 0.44 && metrics.saturation >= 0.28;
+    let muted_dry_grass = is_olive_dry_grass(metrics)
+        || ((38.0..=86.0).contains(&metrics.hue)
+            && metrics.saturation >= 0.14
+            && metrics.saturation <= 0.42
+            && metrics.value >= 0.34
+            && metrics.value <= 0.64);
+    let dryness = (metrics.saturation * 0.34)
+        + ((1.0 - metrics.value) * 0.28)
+        + (patch_noise * 0.24)
+        + (fine_noise * 0.14)
+        + (dry_score * 0.22);
+
+    if terrain.confident()
+        && terrain.kind == MetTerrainKind::CoarseDirt
+        && sparse_vegetation
+        && dry_score >= 0.52
+        && (semantic_terrain || fine_noise >= 0.42 || patch_noise >= 0.54)
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if terrain.confident()
+        && matches!(terrain.kind, MetTerrainKind::Gravel | MetTerrainKind::Rock)
+        && very_sparse_vegetation
+        && local_relief_meters >= 90.0
+        && dry_score >= 0.58
+        && fine_noise >= 0.68
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if terrain.confident()
+        && matches!(terrain.kind, MetTerrainKind::Sand | MetTerrainKind::RedSand)
+        && very_sparse_vegetation
+        && dry_score >= 0.72
+        && dryness >= 0.72
+        && patch_noise >= 0.58
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if sparse_vegetation
+        && dry_score >= 0.62
+        && dryness >= 0.70
+        && (fine_noise >= 0.58 || patch_noise >= 0.66)
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if sparse_vegetation
+        && is_savanna_like_ecoregion(sample)
+        && dry_score >= 0.55
+        && !green_like
+        && (muted_dry_grass || metrics.value < 0.76)
+        && dryness >= 0.54
+        && (fine_noise >= 0.76 || (patch_noise >= 0.62 && fine_noise >= 0.34))
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if sparse_vegetation
+        && muted_dry_grass
+        && dry_score >= 0.54
+        && dryness >= 0.61
+        && (fine_noise >= 0.84 || (patch_noise >= 0.72 && fine_noise >= 0.48))
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if !green_like
+        && muted_dry_grass
+        && vegetation < 0.22
+        && dry_score >= 0.52
+        && dryness >= 0.56
+        && fine_noise >= 0.70
+        && patch_noise >= 0.34
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if sparse_vegetation
+        && very_dry_dark
+        && dry_score >= 0.70
+        && fine_noise >= 0.88
+        && patch_noise >= 0.52
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn lush_vegetation_surface(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    patch_noise: f64,
+    fine_noise: f64,
+    rainforest_score: f64,
+    terrain: MetTerrainMatch,
+) -> i32 {
+    let dark_green = is_green_like(metrics) && metrics.value < 0.48;
+    let tree_cover = sample.tree_cover();
+    let vegetation = sample.vegetation_cover();
+    let strong_humid_evidence = rainforest_score >= 0.58
+        || is_tropical_rain_climate(sample.climate_class)
+        || tree_cover >= 0.18
+        || vegetation >= 0.28;
+    if sample.terrain_token_source == TerrainTokenSource::Export
+        && terrain.confident()
+        && terrain.distance_squared == 0
+        && matches!(
+            terrain.top_block_state_id,
+            block_state_ids::MOSS_BLOCK | block_state_ids::PODZOL
+        )
+        && strong_humid_evidence
+    {
+        return terrain.top_block_state_id;
+    }
+    if strong_humid_evidence && dark_green && tree_cover >= 0.28 {
+        let forest_floor_texture = (patch_noise * 0.60) + (fine_noise * 0.40);
+        if forest_floor_texture >= 0.42 {
+            return block_state_ids::MOSS_BLOCK;
+        }
+        if !is_tropical_rain_climate(sample.climate_class)
+            && !is_tropical_savanna_climate(sample.climate_class)
+            && fine_noise >= 0.58
+        {
+            return block_state_ids::PODZOL;
+        }
+        return block_state_ids::GRASS_BLOCK;
+    }
+    if strong_humid_evidence
+        && dark_green
+        && (patch_noise >= 0.54 || tree_cover >= 0.28)
+        && fine_noise >= 0.24
+    {
+        return block_state_ids::MOSS_BLOCK;
+    }
+    if strong_humid_evidence && tree_cover >= 0.22 && patch_noise >= 0.72 && fine_noise >= 0.46 {
+        return block_state_ids::MOSS_BLOCK;
+    }
+    if tree_cover >= 0.16
+        && !is_tropical_rain_climate(sample.climate_class)
+        && !is_tropical_savanna_climate(sample.climate_class)
+        && patch_noise <= 0.18
+        && fine_noise >= 0.62
+    {
+        return block_state_ids::PODZOL;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
 fn desert_surface(
     metrics: SurfaceColorMetrics,
     patch_noise: f64,
@@ -2014,6 +2700,37 @@ fn rainforest_biome(
     .to_string()
 }
 
+fn rainforest_biome_with_sample(
+    sample: &SurfaceMaterialSample,
+    rainforest_score: f64,
+    dark_vegetation: bool,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> String {
+    let tree_cover = sample.tree_cover();
+    let vegetation_cover = sample.vegetation_cover();
+    if tree_cover >= 0.35 && patch_noise >= 0.64 && fine_noise >= 0.44 {
+        return "minecraft:bamboo_jungle".to_string();
+    }
+    if dark_vegetation || tree_cover >= 0.16 {
+        return if fine_noise >= 0.30 {
+            "minecraft:jungle"
+        } else {
+            "minecraft:sparse_jungle"
+        }
+        .to_string();
+    }
+    if tree_cover >= 0.08 || vegetation_cover >= 0.24 || rainforest_score >= 0.58 {
+        return if patch_noise >= 0.38 {
+            "minecraft:sparse_jungle"
+        } else {
+            "minecraft:forest"
+        }
+        .to_string();
+    }
+    rainforest_biome(rainforest_score, dark_vegetation, patch_noise, fine_noise)
+}
+
 fn lush_biome(abs_lat: f64, dark_vegetation: bool, patch_noise: f64) -> String {
     if abs_lat <= 14.0 && dark_vegetation {
         return if patch_noise >= 0.68 {
@@ -2048,6 +2765,60 @@ fn lush_biome(abs_lat: f64, dark_vegetation: bool, patch_noise: f64) -> String {
     "minecraft:savanna".to_string()
 }
 
+fn forest_biome_for_environment(
+    latitude: f64,
+    climate: i32,
+    tree_cover: f64,
+    dark_vegetation: bool,
+    patch_noise: f64,
+) -> String {
+    let abs_lat = latitude.abs();
+    if climate == 1 || climate == 2 || abs_lat <= 12.0 {
+        if tree_cover >= 0.65 && patch_noise >= 0.58 {
+            return "minecraft:bamboo_jungle".to_string();
+        }
+        return if dark_vegetation || tree_cover >= 0.20 {
+            "minecraft:jungle"
+        } else {
+            "minecraft:sparse_jungle"
+        }
+        .to_string();
+    }
+    if abs_lat >= 56.0 || is_cold_climate(climate) {
+        return "minecraft:taiga".to_string();
+    }
+    if dark_vegetation && tree_cover >= 0.24 {
+        return "minecraft:dark_forest".to_string();
+    }
+    "minecraft:forest".to_string()
+}
+
+fn temperate_grassland_biome(latitude: f64, patch_noise: f64, fine_noise: f64) -> String {
+    let abs_lat = latitude.abs();
+    if abs_lat >= 54.0 && patch_noise >= 0.48 {
+        return "minecraft:taiga".to_string();
+    }
+    if abs_lat >= 40.0 && patch_noise >= 0.64 {
+        return "minecraft:forest".to_string();
+    }
+    if patch_noise <= 0.22 && fine_noise <= 0.36 {
+        return "minecraft:sunflower_plains".to_string();
+    }
+    "minecraft:plains".to_string()
+}
+
+fn temperate_forest_surface(
+    _sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    _patch_noise: f64,
+    fine_noise: f64,
+) -> i32 {
+    if !is_green_like(metrics) && fine_noise >= 0.90 && metrics.value < 0.50 {
+        return block_state_ids::COARSE_DIRT;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
 fn fallback_biome(base: &EarthSurfaceColumn, latitude: f64, patch_noise: f64) -> String {
     let biome = non_beach_biome(base, latitude);
     if biome != "minecraft:plains" {
@@ -2073,6 +2844,295 @@ fn non_beach_biome(base: &EarthSurfaceColumn, latitude: f64) -> String {
         "minecraft:plains"
     }
     .to_string()
+}
+
+fn is_forest_like_ecoregion(sample: &SurfaceMaterialSample) -> bool {
+    if !sample.has_ecoregion() {
+        return false;
+    }
+    let name = sample.ecoregion_name.to_ascii_lowercase();
+    let biome = sample.ecoregion_biome_id.to_ascii_lowercase();
+    biome.contains("forest")
+        || biome.contains("jungle")
+        || biome.contains("taiga")
+        || name.contains("forest")
+        || name.contains("woodland")
+        || name.contains("broadleaf")
+        || name.contains("conifer")
+}
+
+fn is_savanna_like_ecoregion(sample: &SurfaceMaterialSample) -> bool {
+    if !sample.has_ecoregion() {
+        return false;
+    }
+    let name = sample.ecoregion_name.to_ascii_lowercase();
+    let biome = sample.ecoregion_biome_id.to_ascii_lowercase();
+    biome.contains("savanna")
+        || biome.contains("plains")
+        || name.contains("savanna")
+        || name.contains("grassland")
+        || name.contains("steppe")
+        || name.contains("xeric")
+}
+
+fn is_named_forest_savanna_mosaic(sample: &SurfaceMaterialSample) -> bool {
+    if !sample.has_ecoregion() {
+        return false;
+    }
+    let name = sample.ecoregion_name.to_ascii_lowercase();
+    name.contains("forest-savanna")
+        || name.contains("forest savanna")
+        || (name.contains("mosaic")
+            && (name.contains("forest") || name.contains("woodland") || name.contains("savanna")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn is_forest_savanna_mosaic_intent(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    longitude: f64,
+    latitude: f64,
+    sahara_score: f64,
+    rainforest_score: f64,
+    dry_savanna_score: f64,
+    token_vegetated: bool,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> bool {
+    let biome_id = sample.ecoregion_biome_id.to_ascii_lowercase();
+    let sparse_jungle_savanna_edge = biome_id.contains("sparse_jungle")
+        && (is_tropical_savanna_climate(sample.climate_class) || dry_savanna_score >= 0.18);
+    let climate_ecotone = is_humid_dry_tropical_ecotone(
+        sample,
+        metrics,
+        longitude,
+        latitude,
+        rainforest_score,
+        dry_savanna_score,
+        patch_noise,
+        fine_noise,
+    );
+    if !is_named_forest_savanna_mosaic(sample) && !sparse_jungle_savanna_edge && !climate_ecotone {
+        return false;
+    }
+    let vegetation_evidence = has_vegetation_evidence(sample, metrics);
+    if is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
+        || is_desert_climate(sample.climate_class)
+        || sahara_score >= 0.35
+    {
+        return false;
+    }
+    let ecological_edge = is_tropical_savanna_climate(sample.climate_class)
+        || is_tropical_rain_climate(sample.climate_class)
+        || rainforest_score >= 0.15
+        || dry_savanna_score >= 0.15;
+    let evidence = sample.tree_cover() >= 0.10
+        || sample.vegetation_cover() >= 0.18
+        || is_green_like(metrics)
+        || is_olive_dry_grass(metrics)
+        || token_vegetated;
+    let strong_rainforest_core = is_tropical_rain_climate(sample.climate_class)
+        && sample.tree_cover() >= 0.60
+        && rainforest_score >= 0.65;
+    ecological_edge && evidence && !strong_rainforest_core
+}
+
+fn is_humid_forest_core(
+    sample: &SurfaceMaterialSample,
+    rainforest_score: f64,
+    sahel_score: f64,
+    dry_savanna_score: f64,
+) -> bool {
+    let biome = sample.ecoregion_biome_id.to_ascii_lowercase();
+    let name = sample.ecoregion_name.to_ascii_lowercase();
+    let forest_named = biome.contains("jungle")
+        || biome.contains("forest")
+        || name.contains("rainforest")
+        || name.contains("lowland forest");
+    let humid_climate = sample.climate_class == 1 || sample.climate_class == 2;
+    forest_named
+        && humid_climate
+        && sample.canopy_cover() >= 0.24
+        && rainforest_score >= 0.18
+        && sahel_score < 0.18
+        && dry_savanna_score < 0.30
+}
+
+#[allow(clippy::too_many_arguments)]
+fn is_humid_dry_tropical_ecotone(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    longitude: f64,
+    latitude: f64,
+    rainforest_score: f64,
+    dry_savanna_score: f64,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> bool {
+    let sahel_score = surface_material_sahel_score(longitude, latitude);
+    if latitude >= 3.0 && (-22.0..=45.0).contains(&longitude) && sahel_score >= 0.08 {
+        return false;
+    }
+    let humid_side = is_tropical_rain_climate(sample.climate_class)
+        || rainforest_score >= 0.22
+        || sample.tree_cover() >= 0.12
+        || is_forest_like_ecoregion(sample);
+    let dry_side = is_tropical_savanna_climate(sample.climate_class)
+        || sahel_score >= 0.10
+        || dry_savanna_score >= 0.10
+        || is_savanna_like_ecoregion(sample)
+        || is_olive_dry_grass(metrics);
+    if !humid_side || !dry_side {
+        return false;
+    }
+    if sample.tree_cover() >= 0.60 && rainforest_score >= 0.62 && patch_noise < 0.78 {
+        return false;
+    }
+    let transition_latitude = latitude.abs() <= 18.0 || dry_savanna_score >= 0.20;
+    let transition_texture =
+        patch_noise >= 0.18 || fine_noise >= 0.34 || sample.tree_cover() < 0.42;
+    transition_latitude
+        && transition_texture
+        && sample.vegetation_cover() >= 0.08
+        && !is_desert_sand_like(metrics)
+}
+
+fn is_dry_ecoregion_biome(sample: &SurfaceMaterialSample) -> bool {
+    if !sample.has_ecoregion_biome() {
+        return false;
+    }
+    let mut key = sample.ecoregion_biome_id.as_str();
+    if let Some(stripped) = key.strip_prefix("minecraft:") {
+        key = stripped;
+    }
+    let key = key.to_ascii_lowercase();
+    key.contains("desert") || key.contains("badlands")
+}
+
+fn has_vegetation_evidence(sample: &SurfaceMaterialSample, metrics: SurfaceColorMetrics) -> bool {
+    if sample.tree_cover() >= 0.08
+        || sample.herbaceous_cover() >= 0.16
+        || sample.shrub_cover() >= 0.16
+        || is_green_like(metrics)
+        || is_olive_dry_grass(metrics)
+    {
+        return true;
+    }
+    let vegetation = sample.vegetation_cover();
+    if vegetation <= 0.0 {
+        return false;
+    }
+    let climate_supports_vegetation = is_tropical_rain_climate(sample.climate_class)
+        || is_tropical_savanna_climate(sample.climate_class)
+        || is_steppe_climate(sample.climate_class)
+        || is_temperate_climate(sample.climate_class)
+        || is_cold_climate(sample.climate_class);
+    let ecoregion_supports_vegetation =
+        is_forest_like_ecoregion(sample) || is_savanna_like_ecoregion(sample);
+    if (climate_supports_vegetation || ecoregion_supports_vegetation) && vegetation >= 0.035 {
+        return true;
+    }
+    !is_desert_climate(sample.climate_class)
+        && !is_dry_ecoregion_biome(sample)
+        && vegetation >= 0.08
+}
+
+fn is_dry_core_ecoregion_evidence(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    vegetation_evidence: bool,
+) -> bool {
+    if !is_dry_ecoregion_biome(sample) {
+        return false;
+    }
+    let desert_like =
+        is_desert_sand_like(metrics) || is_orange_rock_like(metrics) || metrics.value >= 0.48;
+    if vegetation_evidence || is_green_like(metrics) || !desert_like {
+        return false;
+    }
+    if sample.ecoregion_confidence >= 0.70 {
+        return true;
+    }
+    sample.ecoregion_confidence >= 0.45
+        && sample.slope_ratio() >= 0.16
+        && (is_desert_sand_like(metrics) || is_orange_rock_like(metrics))
+}
+
+fn is_trusted_vegetated_token(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    terrain: MetTerrainMatch,
+    semantic_terrain: bool,
+    java_standard_terrain: bool,
+) -> bool {
+    if !terrain.confident() || terrain.kind != MetTerrainKind::Vegetated {
+        return false;
+    }
+    if semantic_terrain {
+        return true;
+    }
+    if !java_standard_terrain {
+        return false;
+    }
+    is_green_like(metrics)
+        || is_olive_dry_grass(metrics)
+        || sample.tree_cover() >= 0.08
+        || sample.herbaceous_cover() >= 0.16
+        || sample.shrub_cover() >= 0.16
+        || is_forest_like_ecoregion(sample)
+        || is_savanna_like_ecoregion(sample)
+        || is_temperate_climate(sample.climate_class)
+        || is_tropical_savanna_climate(sample.climate_class)
+}
+
+fn is_sparse_dry_open_tropical(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    sahel_score: f64,
+    dry_savanna_score: f64,
+    token_vegetated: bool,
+) -> bool {
+    if !is_tropical_rain_climate(sample.climate_class) {
+        return false;
+    }
+    let dry_open = is_savanna_like_ecoregion(sample)
+        || dry_savanna_score >= 0.15
+        || sahel_score >= 0.12
+        || is_tropical_savanna_climate(sample.climate_class);
+    if !dry_open {
+        return false;
+    }
+    sample.canopy_cover() < 0.22
+        && sample.tree_cover() < 0.14
+        && sample.vegetation_cover() < 0.42
+        && (is_olive_dry_grass(metrics)
+            || token_vegetated
+            || !is_green_like(metrics)
+            || metrics.value >= 0.40)
+}
+
+fn is_tropical_rain_climate(climate: i32) -> bool {
+    climate == 1 || climate == 2
+}
+
+fn is_tropical_savanna_climate(climate: i32) -> bool {
+    climate == 3
+}
+
+fn is_desert_climate(climate: i32) -> bool {
+    climate == 4 || climate == 5
+}
+
+fn is_steppe_climate(climate: i32) -> bool {
+    climate == 6 || climate == 7
+}
+
+fn is_temperate_climate(climate: i32) -> bool {
+    (8..=16).contains(&climate)
+}
+
+fn is_cold_climate(climate: i32) -> bool {
+    (17..=28).contains(&climate)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10971,6 +12031,599 @@ mod tests {
     }
 
     #[test]
+    fn surface_material_classifier_semantic_fallback_matches_java_bootstrap_cases() {
+        let base_land = surface_column(
+            false,
+            SEA_LEVEL_Y + 10,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+
+        let missing_land_raster = apply_surface_material(
+            &base_land,
+            &SurfaceMaterialSample::color_only(RgbColor::unavailable()),
+            250.0,
+            13.0,
+            24.0,
+            0.0,
+            0.0,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap();
+        assert_eq!(missing_land_raster.decision_source, "base");
+
+        let no_color_savanna = SurfaceMaterialSample::land(
+            RgbColor::unavailable(),
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            25,
+            12,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            40,
+            SurfaceMaterialSample::UNKNOWN,
+            "West Sudanian savanna",
+            "minecraft:savanna",
+            1.0,
+        );
+        let semantic_savanna = apply_test_surface_material_sample(
+            &base_land,
+            no_color_savanna,
+            260.0,
+            8.0,
+            13.0,
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            semantic_savanna.biome_id.as_str(),
+            "minecraft:savanna" | "minecraft:savanna_plateau" | "minecraft:windswept_savanna"
+        ));
+        assert_eq!(semantic_savanna.decision_source, "intent");
+
+        let no_color_desert = SurfaceMaterialSample::land(
+            RgbColor::unavailable(),
+            4,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            20,
+            SurfaceMaterialSample::UNKNOWN,
+            "Sahara desert",
+            "minecraft:desert",
+            1.0,
+        );
+        let semantic_desert = apply_test_surface_material_sample(
+            &base_land,
+            no_color_desert,
+            250.0,
+            13.0,
+            24.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(semantic_desert.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(semantic_desert.biome_id, "minecraft:desert");
+        assert_eq!(semantic_desert.decision_source, "intent-ecoregion");
+
+        let no_color_arabian_desert = SurfaceMaterialSample::land(
+            RgbColor::unavailable(),
+            4,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            4,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            25,
+            SurfaceMaterialSample::UNKNOWN,
+            "Arabian desert",
+            "minecraft:desert",
+            1.0,
+        );
+        let semantic_arabian_desert = apply_test_surface_material_sample(
+            &base_land,
+            no_color_arabian_desert,
+            250.0,
+            55.0,
+            15.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            semantic_arabian_desert.top_block_state_id,
+            block_state_ids::SAND
+        );
+        assert_eq!(semantic_arabian_desert.biome_id, "minecraft:desert");
+        assert_eq!(semantic_arabian_desert.decision_source, "intent-ecoregion");
+
+        let no_color_forest = SurfaceMaterialSample::land(
+            RgbColor::unavailable(),
+            15,
+            6,
+            2,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            12,
+            4,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            80,
+            SurfaceMaterialSample::UNKNOWN,
+            "Western European broadleaf forests",
+            "minecraft:forest",
+            1.0,
+        );
+        let semantic_forest = apply_test_surface_material_sample(
+            &base_land,
+            no_color_forest,
+            180.0,
+            10.0,
+            50.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            semantic_forest.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(matches!(
+            semantic_forest.biome_id.as_str(),
+            "minecraft:forest" | "minecraft:dark_forest"
+        ));
+    }
+
+    #[test]
+    fn surface_material_classifier_climate_intent_matches_java_bootstrap_cases() {
+        let base_land = surface_column(
+            false,
+            SEA_LEVEL_Y + 10,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+
+        let bright_congo_forest = SurfaceMaterialSample::land(
+            RgbColor::of(103, 126, 68),
+            2,
+            18,
+            10,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            22,
+            14,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            35,
+            SurfaceMaterialSample::UNKNOWN,
+            "Central Congolian lowland forests",
+            "minecraft:jungle",
+            1.0,
+        );
+        let semantic_congo = apply_test_surface_material_sample(
+            &base_land,
+            bright_congo_forest,
+            330.0,
+            20.0,
+            -2.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            semantic_congo.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(
+            semantic_congo.biome_id.contains("jungle")
+                || semantic_congo.biome_id.contains("forest")
+        );
+
+        let tropical_savanna = SurfaceMaterialSample::climate_only(
+            RgbColor::of(181, 96, 46),
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            35,
+            20,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+        );
+        let climate_sahel = apply_test_surface_material_sample(
+            &base_land,
+            tropical_savanna,
+            800.0,
+            8.0,
+            13.0,
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            climate_sahel.top_block_state_id,
+            block_state_ids::GRASS_BLOCK | block_state_ids::COARSE_DIRT
+        ));
+        assert!(matches!(
+            climate_sahel.biome_id.as_str(),
+            "minecraft:savanna" | "minecraft:savanna_plateau" | "minecraft:windswept_savanna"
+        ));
+        assert_eq!(climate_sahel.decision_source, "intent");
+
+        let sparse_dry_open_tropical = SurfaceMaterialSample::land(
+            RgbColor::of(126, 123, 70),
+            2,
+            4,
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            8,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Guinean forest-savanna mosaic",
+            "minecraft:savanna",
+            0.82,
+        );
+        let tropical_edge = apply_test_surface_material_sample(
+            &base_land,
+            sparse_dry_open_tropical,
+            280.0,
+            8.0,
+            8.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            tropical_edge.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(
+            !tropical_edge.biome_id.contains("jungle")
+                && !tropical_edge.biome_id.contains("forest")
+        );
+        assert_eq!(tropical_edge.decision_source, "intent");
+
+        let non_sahel_sparse_tropical_mosaic = SurfaceMaterialSample::land(
+            RgbColor::of(126, 123, 70),
+            2,
+            4,
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            8,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Tropical savanna edge",
+            "minecraft:savanna",
+            0.82,
+        );
+        let non_sahel_tropical_edge = apply_test_surface_material_sample(
+            &base_land,
+            non_sahel_sparse_tropical_mosaic,
+            280.0,
+            80.0,
+            3.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            non_sahel_tropical_edge.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(
+            non_sahel_tropical_edge.biome_id.contains("jungle")
+                || non_sahel_tropical_edge.biome_id.contains("forest")
+        );
+        assert_eq!(non_sahel_tropical_edge.decision_source, "environment");
+
+        let named_savanna_mosaic = SurfaceMaterialSample::land(
+            RgbColor::of(126, 123, 70),
+            2,
+            4,
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            8,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Tropical savanna mosaic",
+            "minecraft:savanna",
+            0.82,
+        );
+        let savanna_mosaic = apply_test_surface_material_sample(
+            &base_land,
+            named_savanna_mosaic,
+            280.0,
+            80.0,
+            3.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            savanna_mosaic.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(savanna_mosaic.decision_source, "intent");
+
+        let bare_named_mosaic = SurfaceMaterialSample::land(
+            RgbColor::of(166, 152, 126),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Tropical savanna mosaic",
+            "minecraft:savanna",
+            0.82,
+        );
+        let bare_metrics = SurfaceColorMetrics::from(bare_named_mosaic.color);
+        assert!(!is_forest_savanna_mosaic_intent(
+            &bare_named_mosaic,
+            bare_metrics,
+            80.0,
+            3.0,
+            surface_material_sahara_score(80.0, 3.0),
+            surface_material_rainforest_score(80.0, 3.0),
+            surface_material_dry_savanna_score(80.0, 3.0),
+            false,
+            0.0,
+            0.0,
+        ));
+        let bare_mosaic = apply_test_surface_material_sample(
+            &base_land,
+            bare_named_mosaic,
+            280.0,
+            80.0,
+            3.0,
+            0.0,
+            0.0,
+        );
+        assert_ne!(bare_mosaic.decision_source, "intent");
+
+        let sahara_named_mosaic = SurfaceMaterialSample::land(
+            RgbColor::of(126, 123, 70),
+            SurfaceMaterialSample::UNKNOWN,
+            4,
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            8,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Tropical savanna mosaic",
+            "minecraft:savanna",
+            0.82,
+        );
+        let sahara_metrics = SurfaceColorMetrics::from(sahara_named_mosaic.color);
+        assert!(surface_material_sahara_score(20.0, 25.0) >= 0.35);
+        assert!(!is_forest_savanna_mosaic_intent(
+            &sahara_named_mosaic,
+            sahara_metrics,
+            20.0,
+            25.0,
+            surface_material_sahara_score(20.0, 25.0),
+            surface_material_rainforest_score(20.0, 25.0),
+            surface_material_dry_savanna_score(20.0, 25.0),
+            false,
+            0.0,
+            0.0,
+        ));
+
+        let humid_named_mosaic = SurfaceMaterialSample::with_export_token(
+            RgbColor::of(35, 86, 34),
+            RgbColor::of(55, 70, 50),
+            2,
+            36,
+            30,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            24,
+            8,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Guinean forest-savanna mosaic",
+            "minecraft:sparse_jungle",
+            0.88,
+        );
+        let humid_mosaic = apply_test_surface_material_sample(
+            &base_land,
+            humid_named_mosaic,
+            280.0,
+            -8.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(humid_mosaic.top_block_state_id, block_state_ids::MOSS_BLOCK);
+        assert_eq!(humid_mosaic.decision_source, "intent");
+
+        let green_sparse_tropical_mosaic = SurfaceMaterialSample::land(
+            RgbColor::of(42, 95, 38),
+            2,
+            4,
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            8,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Guinean forest-savanna mosaic",
+            "minecraft:savanna",
+            0.82,
+        );
+        let green_tropical_edge = apply_test_surface_material_sample(
+            &base_land,
+            green_sparse_tropical_mosaic,
+            280.0,
+            8.0,
+            8.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            green_tropical_edge.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(
+            green_tropical_edge.biome_id.contains("jungle")
+                || green_tropical_edge.biome_id.contains("forest")
+        );
+        assert_eq!(green_tropical_edge.decision_source, "intent");
+
+        let no_color_sparse_tropical_mosaic = SurfaceMaterialSample::land(
+            RgbColor::unavailable(),
+            2,
+            4,
+            3,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            8,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Guinean forest-savanna mosaic",
+            "minecraft:savanna",
+            0.82,
+        );
+        let no_color_tropical_edge = apply_test_surface_material_sample(
+            &base_land,
+            no_color_sparse_tropical_mosaic,
+            280.0,
+            8.0,
+            8.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            no_color_tropical_edge.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(
+            no_color_tropical_edge.biome_id.contains("jungle")
+                || no_color_tropical_edge.biome_id.contains("forest")
+        );
+        assert_eq!(no_color_tropical_edge.decision_source, "intent");
+
+        let temperate_steppe = SurfaceMaterialSample::land(
+            RgbColor::of(134, 126, 82),
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            22,
+            10,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            55,
+            SurfaceMaterialSample::UNKNOWN,
+            "Eurasian steppe",
+            "minecraft:savanna",
+            1.0,
+        );
+        let climate_steppe = apply_test_surface_material_sample(
+            &base_land,
+            temperate_steppe,
+            300.0,
+            30.0,
+            48.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            climate_steppe.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(!climate_steppe.biome_id.contains("savanna"));
+        assert!(matches!(
+            climate_steppe.biome_id.as_str(),
+            "minecraft:plains"
+                | "minecraft:forest"
+                | "minecraft:taiga"
+                | "minecraft:sunflower_plains"
+                | "minecraft:meadow"
+        ));
+        assert_eq!(climate_steppe.decision_source, "intent");
+
+        let desert_climate = SurfaceMaterialSample::climate_only(
+            RgbColor::of(240, 213, 126),
+            4,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+        );
+        let climate_desert = apply_test_surface_material_sample(
+            &base_land,
+            desert_climate,
+            250.0,
+            13.0,
+            24.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(climate_desert.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(climate_desert.biome_id, "minecraft:desert");
+    }
+
+    #[test]
     fn surface_material_classifier_color_only_water_matches_java_bootstrap_cases() {
         let deep_ocean = surface_column(
             true,
@@ -14647,6 +16300,28 @@ mod tests {
         apply_surface_material(
             base,
             &SurfaceMaterialSample::color_only(color),
+            elevation_meters,
+            longitude,
+            latitude,
+            coast_factor,
+            local_relief_meters,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap()
+    }
+
+    fn apply_test_surface_material_sample(
+        base: &EarthSurfaceColumn,
+        sample: SurfaceMaterialSample,
+        elevation_meters: f64,
+        longitude: f64,
+        latitude: f64,
+        coast_factor: f64,
+        local_relief_meters: f64,
+    ) -> EarthSurfaceColumn {
+        apply_surface_material(
+            base,
+            &sample,
             elevation_meters,
             longitude,
             latitude,
