@@ -322,6 +322,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.earthSurfaceRulesBootstrap - EarthSurfaceRules classify/classifyShaped/normalizeForChunk contracts and classify-surface-point diagnostic match Java fixture cases and E:\\HQheightmap.tif smoke points."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.surfaceMaterialSampleBootstrap - SurfaceMaterialSample coverage, slope, ecoregion, terrain-token normalization, rounding, and SurfaceDataEvidence flag contracts match Java fixture cases."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",

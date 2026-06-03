@@ -580,7 +580,10 @@ Bootstrap implementation status on 2026-06-03:
   - Java/Rust stdout parity OK for `origin`, `sahara`, `amazon`, `korea`, and `everest` sample points
   - evidence folder:
     `D:\earthmap\rust-port-golden\phase5-classify-surface-point-smoke-20260603-0001`
-- Remaining Phase 5 work: port surface material sampling, photo solver, smoothing/coastal policies, OSM overlay,
+- Rust `SurfaceMaterialSample` and `SurfaceDataEvidence` bootstrap matches Java fixture cases for color-only samples,
+  terrain-token source normalization, coverage/canopy/slope/ecoregion helpers, Java-style optional rounding, and
+  evidence bit flags.
+- Remaining Phase 5 work: port surface material raster sampling, photo solver, smoothing/coastal policies, OSM overlay,
   surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 
 ### Vanilla-Delegated Survival Scope

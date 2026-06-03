@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use earthmap_core::build_info;
 use earthmap_geo::{
     EarthScaleMapping, GeoError, GeoTiffHeightmapReader, GeoTiffMetadata, GeoTiffRowCache,
-    GeoTiffRowCacheStats, HeightmapScalarSampler,
+    GeoTiffRowCacheStats, HeightmapScalarSampler, RgbColor,
 };
 use earthmap_minecraft::block_state_ids;
 use earthmap_minecraft::chunk_model::{ChunkModel, CHUNK_WIDTH};
 use earthmap_minecraft::{chunk_nbt_encoder, level_dat_template, MinecraftError};
 use earthmap_region::{ChunkLocalPos, RegionError};
 
-pub const MODULE_STATUS: &str = "phase4-height-only-region-bootstrap";
+pub const MODULE_STATUS: &str = "phase5-surface-bootstrap";
 
 pub const SEA_LEVEL_Y: i32 = 63;
 pub const ELEVATION_METERS_PER_BLOCK: f64 = 35.0;
@@ -248,6 +248,462 @@ impl EarthSurfaceColumn {
 
     pub fn terrain_token_available(&self) -> bool {
         self.terrain_token_source != TerrainTokenSource::None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceMaterialSample {
+    pub color: RgbColor,
+    pub terrain_token_color: RgbColor,
+    pub terrain_token_source: TerrainTokenSource,
+    pub climate_class: i32,
+    pub evergreen_broadleaf_trees: i32,
+    pub deciduous_broadleaf_trees: i32,
+    pub needleleaf_trees: i32,
+    pub mixed_trees: i32,
+    pub herbaceous_vegetation: i32,
+    pub shrubs: i32,
+    pub snow_cover: i32,
+    pub swamp_cover: i32,
+    pub ocean_temperature: i32,
+    pub bathymetry_meters: i32,
+    pub slope_permille: i32,
+    pub ecoregion_name: String,
+    pub ecoregion_biome_id: String,
+    pub ecoregion_confidence: f64,
+}
+
+impl SurfaceMaterialSample {
+    pub const UNKNOWN: i32 = -1;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        color: RgbColor,
+        terrain_token_color: RgbColor,
+        terrain_token_source: TerrainTokenSource,
+        climate_class: i32,
+        evergreen_broadleaf_trees: i32,
+        deciduous_broadleaf_trees: i32,
+        needleleaf_trees: i32,
+        mixed_trees: i32,
+        herbaceous_vegetation: i32,
+        shrubs: i32,
+        snow_cover: i32,
+        swamp_cover: i32,
+        ocean_temperature: i32,
+        bathymetry_meters: i32,
+        slope_permille: i32,
+        ecoregion_name: impl Into<String>,
+        ecoregion_biome_id: impl Into<String>,
+        ecoregion_confidence: f64,
+    ) -> Self {
+        let terrain_token_source = if terrain_token_color.available {
+            terrain_token_source
+        } else {
+            TerrainTokenSource::None
+        };
+        Self {
+            color,
+            terrain_token_color,
+            terrain_token_source,
+            climate_class,
+            evergreen_broadleaf_trees,
+            deciduous_broadleaf_trees,
+            needleleaf_trees,
+            mixed_trees,
+            herbaceous_vegetation,
+            shrubs,
+            snow_cover,
+            swamp_cover,
+            ocean_temperature,
+            bathymetry_meters,
+            slope_permille,
+            ecoregion_name: ecoregion_name.into().trim().to_string(),
+            ecoregion_biome_id: ecoregion_biome_id.into().trim().to_string(),
+            ecoregion_confidence: if ecoregion_confidence.is_finite() {
+                ecoregion_confidence.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_export_token(
+        color: RgbColor,
+        terrain_token_color: RgbColor,
+        climate_class: i32,
+        evergreen_broadleaf_trees: i32,
+        deciduous_broadleaf_trees: i32,
+        needleleaf_trees: i32,
+        mixed_trees: i32,
+        herbaceous_vegetation: i32,
+        shrubs: i32,
+        snow_cover: i32,
+        swamp_cover: i32,
+        ocean_temperature: i32,
+        bathymetry_meters: i32,
+        slope_permille: i32,
+        ecoregion_name: impl Into<String>,
+        ecoregion_biome_id: impl Into<String>,
+        ecoregion_confidence: f64,
+    ) -> Self {
+        Self::new(
+            color,
+            terrain_token_color,
+            TerrainTokenSource::Export,
+            climate_class,
+            evergreen_broadleaf_trees,
+            deciduous_broadleaf_trees,
+            needleleaf_trees,
+            mixed_trees,
+            herbaceous_vegetation,
+            shrubs,
+            snow_cover,
+            swamp_cover,
+            ocean_temperature,
+            bathymetry_meters,
+            slope_permille,
+            ecoregion_name,
+            ecoregion_biome_id,
+            ecoregion_confidence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn land(
+        color: RgbColor,
+        climate_class: i32,
+        evergreen_broadleaf_trees: i32,
+        deciduous_broadleaf_trees: i32,
+        needleleaf_trees: i32,
+        mixed_trees: i32,
+        herbaceous_vegetation: i32,
+        shrubs: i32,
+        snow_cover: i32,
+        swamp_cover: i32,
+        ocean_temperature: i32,
+        bathymetry_meters: i32,
+        slope_permille: i32,
+        ecoregion_name: impl Into<String>,
+        ecoregion_biome_id: impl Into<String>,
+        ecoregion_confidence: f64,
+    ) -> Self {
+        Self::new(
+            color,
+            RgbColor::unavailable(),
+            TerrainTokenSource::None,
+            climate_class,
+            evergreen_broadleaf_trees,
+            deciduous_broadleaf_trees,
+            needleleaf_trees,
+            mixed_trees,
+            herbaceous_vegetation,
+            shrubs,
+            snow_cover,
+            swamp_cover,
+            ocean_temperature,
+            bathymetry_meters,
+            slope_permille,
+            ecoregion_name,
+            ecoregion_biome_id,
+            ecoregion_confidence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn land_with_inferred_ecoregion_confidence(
+        color: RgbColor,
+        climate_class: i32,
+        evergreen_broadleaf_trees: i32,
+        deciduous_broadleaf_trees: i32,
+        needleleaf_trees: i32,
+        mixed_trees: i32,
+        herbaceous_vegetation: i32,
+        shrubs: i32,
+        snow_cover: i32,
+        swamp_cover: i32,
+        ocean_temperature: i32,
+        bathymetry_meters: i32,
+        slope_permille: i32,
+        ecoregion_name: impl Into<String>,
+        ecoregion_biome_id: impl Into<String>,
+    ) -> Self {
+        let ecoregion_biome_id = ecoregion_biome_id.into();
+        let ecoregion_confidence = if ecoregion_biome_id.trim().is_empty() {
+            0.0
+        } else {
+            1.0
+        };
+        Self::land(
+            color,
+            climate_class,
+            evergreen_broadleaf_trees,
+            deciduous_broadleaf_trees,
+            needleleaf_trees,
+            mixed_trees,
+            herbaceous_vegetation,
+            shrubs,
+            snow_cover,
+            swamp_cover,
+            ocean_temperature,
+            bathymetry_meters,
+            slope_permille,
+            ecoregion_name,
+            ecoregion_biome_id,
+            ecoregion_confidence,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn climate_only(
+        color: RgbColor,
+        climate_class: i32,
+        evergreen_broadleaf_trees: i32,
+        deciduous_broadleaf_trees: i32,
+        needleleaf_trees: i32,
+        mixed_trees: i32,
+        herbaceous_vegetation: i32,
+        shrubs: i32,
+        snow_cover: i32,
+        swamp_cover: i32,
+        ocean_temperature: i32,
+    ) -> Self {
+        Self::land(
+            color,
+            climate_class,
+            evergreen_broadleaf_trees,
+            deciduous_broadleaf_trees,
+            needleleaf_trees,
+            mixed_trees,
+            herbaceous_vegetation,
+            shrubs,
+            snow_cover,
+            swamp_cover,
+            ocean_temperature,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            "",
+            "",
+            0.0,
+        )
+    }
+
+    pub fn color_only(color: RgbColor) -> Self {
+        Self::land(
+            color,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            Self::UNKNOWN,
+            "",
+            "",
+            0.0,
+        )
+    }
+
+    pub fn with_color(&self, new_color: RgbColor) -> Self {
+        Self::new(
+            new_color,
+            self.terrain_token_color,
+            self.terrain_token_source,
+            self.climate_class,
+            self.evergreen_broadleaf_trees,
+            self.deciduous_broadleaf_trees,
+            self.needleleaf_trees,
+            self.mixed_trees,
+            self.herbaceous_vegetation,
+            self.shrubs,
+            self.snow_cover,
+            self.swamp_cover,
+            self.ocean_temperature,
+            self.bathymetry_meters,
+            self.slope_permille,
+            self.ecoregion_name.clone(),
+            self.ecoregion_biome_id.clone(),
+            self.ecoregion_confidence,
+        )
+    }
+
+    pub fn rounded(value: Option<f64>) -> i32 {
+        value.map_or(Self::UNKNOWN, java_math_round_double_to_narrowed_i32)
+    }
+
+    pub fn has_climate_class(&self) -> bool {
+        self.climate_class > 0
+    }
+
+    pub fn tree_cover(&self) -> f64 {
+        coverage(self.evergreen_broadleaf_trees)
+            .max(coverage(self.deciduous_broadleaf_trees))
+            .max(coverage(self.needleleaf_trees))
+            .max(coverage(self.mixed_trees))
+    }
+
+    pub fn canopy_cover(&self) -> f64 {
+        (coverage(self.evergreen_broadleaf_trees)
+            + coverage(self.deciduous_broadleaf_trees)
+            + coverage(self.needleleaf_trees)
+            + coverage(self.mixed_trees))
+        .min(1.0)
+    }
+
+    pub fn herbaceous_cover(&self) -> f64 {
+        coverage(self.herbaceous_vegetation)
+    }
+
+    pub fn shrub_cover(&self) -> f64 {
+        coverage(self.shrubs)
+    }
+
+    pub fn vegetation_cover(&self) -> f64 {
+        self.tree_cover()
+            .max(self.herbaceous_cover())
+            .max(self.shrub_cover())
+    }
+
+    pub fn has_vegetation_presence(&self) -> bool {
+        self.vegetation_cover() > 0.0
+    }
+
+    pub fn snow_cover_ratio(&self) -> f64 {
+        coverage(self.snow_cover)
+    }
+
+    pub fn swamp_cover_ratio(&self) -> f64 {
+        coverage(self.swamp_cover)
+    }
+
+    pub fn slope_ratio(&self) -> f64 {
+        if self.slope_permille == Self::UNKNOWN || self.slope_permille <= 0 {
+            return 0.0;
+        }
+        if self.slope_permille >= 1000 {
+            return 1.0;
+        }
+        f64::from(self.slope_permille) / 1000.0
+    }
+
+    pub fn has_ecoregion(&self) -> bool {
+        !self.ecoregion_name.is_empty()
+    }
+
+    pub fn has_ecoregion_biome(&self) -> bool {
+        !self.ecoregion_biome_id.is_empty()
+    }
+
+    pub fn has_bathymetry(&self) -> bool {
+        self.bathymetry_meters != Self::UNKNOWN
+    }
+}
+
+pub mod surface_data_evidence {
+    use super::SurfaceMaterialSample;
+
+    pub const CLIMATE: i32 = 1 << 0;
+    pub const TREE: i32 = 1 << 1;
+    pub const HERBACEOUS: i32 = 1 << 2;
+    pub const SHRUB: i32 = 1 << 3;
+    pub const SNOW: i32 = 1 << 4;
+    pub const SWAMP: i32 = 1 << 5;
+    pub const OCEAN_TEMPERATURE: i32 = 1 << 6;
+    pub const BATHYMETRY: i32 = 1 << 7;
+    pub const SLOPE: i32 = 1 << 8;
+    pub const ECOREGION: i32 = 1 << 9;
+    pub const TREE_PRESENT: i32 = 1 << 10;
+    pub const HERBACEOUS_PRESENT: i32 = 1 << 11;
+    pub const SHRUB_PRESENT: i32 = 1 << 12;
+    pub const SNOW_PRESENT: i32 = 1 << 13;
+    pub const SWAMP_PRESENT: i32 = 1 << 14;
+    pub const STEEP_SLOPE: i32 = 1 << 15;
+
+    pub fn from_sample(sample: &SurfaceMaterialSample) -> i32 {
+        let mut flags = 0;
+        if sample.has_climate_class() {
+            flags |= CLIMATE;
+        }
+        if known(sample.evergreen_broadleaf_trees)
+            || known(sample.deciduous_broadleaf_trees)
+            || known(sample.needleleaf_trees)
+            || known(sample.mixed_trees)
+        {
+            flags |= TREE;
+        }
+        if positive(sample.evergreen_broadleaf_trees)
+            || positive(sample.deciduous_broadleaf_trees)
+            || positive(sample.needleleaf_trees)
+            || positive(sample.mixed_trees)
+        {
+            flags |= TREE_PRESENT;
+        }
+        if known(sample.herbaceous_vegetation) {
+            flags |= HERBACEOUS;
+        }
+        if positive(sample.herbaceous_vegetation) {
+            flags |= HERBACEOUS_PRESENT;
+        }
+        if known(sample.shrubs) {
+            flags |= SHRUB;
+        }
+        if positive(sample.shrubs) {
+            flags |= SHRUB_PRESENT;
+        }
+        if known(sample.snow_cover) {
+            flags |= SNOW;
+        }
+        if positive(sample.snow_cover) {
+            flags |= SNOW_PRESENT;
+        }
+        if known(sample.swamp_cover) {
+            flags |= SWAMP;
+        }
+        if positive(sample.swamp_cover) {
+            flags |= SWAMP_PRESENT;
+        }
+        if known(sample.ocean_temperature) {
+            flags |= OCEAN_TEMPERATURE;
+        }
+        if sample.has_bathymetry() {
+            flags |= BATHYMETRY;
+        }
+        if known(sample.slope_permille) {
+            flags |= SLOPE;
+        }
+        if sample.slope_ratio() >= 0.20 {
+            flags |= STEEP_SLOPE;
+        }
+        if sample.has_ecoregion() || sample.has_ecoregion_biome() {
+            flags |= ECOREGION;
+        }
+        flags
+    }
+
+    pub fn has(flags: i32, mask: i32) -> bool {
+        (flags & mask) != 0
+    }
+
+    pub fn has_any_vegetation(flags: i32) -> bool {
+        has(flags, TREE) || has(flags, HERBACEOUS) || has(flags, SHRUB)
+    }
+
+    pub fn has_any_vegetation_present(flags: i32) -> bool {
+        has(flags, TREE_PRESENT) || has(flags, HERBACEOUS_PRESENT) || has(flags, SHRUB_PRESENT)
+    }
+
+    fn known(value: i32) -> bool {
+        value != SurfaceMaterialSample::UNKNOWN && value != 255
+    }
+
+    fn positive(value: i32) -> bool {
+        known(value) && value > 0
     }
 }
 
@@ -963,6 +1419,19 @@ fn normalize_text_default(value: String, default: &str) -> String {
     }
 }
 
+fn coverage(value: i32) -> f64 {
+    if value == SurfaceMaterialSample::UNKNOWN || value == 255 {
+        return 0.0;
+    }
+    if value <= 0 {
+        return 0.0;
+    }
+    if value >= 100 {
+        return 1.0;
+    }
+    f64::from(value) / 100.0
+}
+
 fn mapping_for(
     metadata: &GeoTiffMetadata,
     scale_denominator: i32,
@@ -1200,6 +1669,248 @@ mod tests {
         let edge = f64::from(i32::MAX);
         assert!(value_noise(edge, edge, 0x52dce729).is_finite());
         assert!(value_noise(edge + 0.25, edge + 0.25, 0x52dce729).is_finite());
+    }
+
+    #[test]
+    fn surface_material_sample_matches_java_cover_contract() {
+        let mixed_canopy = SurfaceMaterialSample::climate_only(
+            RgbColor::of(90, 120, 70),
+            2,
+            20,
+            15,
+            10,
+            8,
+            30,
+            5,
+            -1,
+            -1,
+            -1,
+        );
+        assert!((mixed_canopy.tree_cover() - 0.20).abs() < 0.0001);
+        assert!((mixed_canopy.canopy_cover() - 0.53).abs() < 0.0001);
+        assert_eq!(mixed_canopy.herbaceous_cover(), 0.30);
+        assert_eq!(mixed_canopy.shrub_cover(), 0.05);
+        assert_eq!(mixed_canopy.vegetation_cover(), 0.30);
+        assert!(mixed_canopy.has_vegetation_presence());
+
+        let capped_canopy = SurfaceMaterialSample::climate_only(
+            RgbColor::of(40, 85, 35),
+            2,
+            80,
+            50,
+            40,
+            30,
+            70,
+            10,
+            -1,
+            -1,
+            -1,
+        );
+        assert!((capped_canopy.canopy_cover() - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn surface_material_sample_normalizes_like_java_record_constructor() {
+        let sample = SurfaceMaterialSample::new(
+            RgbColor::of(1, 2, 3),
+            RgbColor::unavailable(),
+            TerrainTokenSource::JavaStandardPalette,
+            0,
+            255,
+            100,
+            101,
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            -5,
+            255,
+            100,
+            12,
+            0,
+            1250,
+            "  Ecoregion  ",
+            " minecraft:forest ",
+            f64::INFINITY,
+        );
+        assert_eq!(sample.terrain_token_source, TerrainTokenSource::None);
+        assert_eq!(sample.ecoregion_name, "Ecoregion");
+        assert_eq!(sample.ecoregion_biome_id, "minecraft:forest");
+        assert_eq!(sample.ecoregion_confidence, 0.0);
+        assert!(!sample.has_climate_class());
+        assert_eq!(sample.tree_cover(), 1.0);
+        assert_eq!(sample.snow_cover_ratio(), 0.0);
+        assert_eq!(sample.swamp_cover_ratio(), 1.0);
+        assert_eq!(sample.slope_ratio(), 1.0);
+        assert!(sample.has_ecoregion());
+        assert!(sample.has_ecoregion_biome());
+        assert!(sample.has_bathymetry());
+
+        let token_sample = SurfaceMaterialSample::with_export_token(
+            RgbColor::of(1, 2, 3),
+            RgbColor::of(4, 5, 6),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            2.0,
+        );
+        assert_eq!(
+            token_sample.terrain_token_source,
+            TerrainTokenSource::Export
+        );
+        assert_eq!(token_sample.ecoregion_confidence, 1.0);
+        assert!(token_sample.has_climate_class());
+        assert!(!token_sample.has_bathymetry());
+        assert_eq!(
+            token_sample.with_color(RgbColor::of(9, 8, 7)).color,
+            RgbColor::of(9, 8, 7)
+        );
+
+        assert_eq!(
+            SurfaceMaterialSample::rounded(None),
+            SurfaceMaterialSample::UNKNOWN
+        );
+        assert_eq!(SurfaceMaterialSample::rounded(Some(12.5)), 13);
+        assert_eq!(SurfaceMaterialSample::rounded(Some(-12.5)), -12);
+        assert_eq!(SurfaceMaterialSample::rounded(Some(f64::NAN)), 0);
+    }
+
+    #[test]
+    fn surface_material_sample_infers_ecoregion_confidence_like_java_overload() {
+        let with_biome = SurfaceMaterialSample::land_with_inferred_ecoregion_confidence(
+            RgbColor::of(42, 95, 38),
+            2,
+            20,
+            15,
+            10,
+            8,
+            30,
+            5,
+            -1,
+            -1,
+            -1,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Central Congolian lowland forests",
+            " minecraft:jungle ",
+        );
+        assert_eq!(with_biome.ecoregion_confidence, 1.0);
+        assert_eq!(with_biome.ecoregion_biome_id, "minecraft:jungle");
+
+        let without_biome = SurfaceMaterialSample::land_with_inferred_ecoregion_confidence(
+            RgbColor::of(42, 95, 38),
+            2,
+            20,
+            15,
+            10,
+            8,
+            30,
+            5,
+            -1,
+            -1,
+            -1,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Central Congolian lowland forests",
+            "   ",
+        );
+        assert_eq!(without_biome.ecoregion_confidence, 0.0);
+        assert_eq!(without_biome.ecoregion_biome_id, "");
+    }
+
+    #[test]
+    fn surface_data_evidence_flags_match_java_rules() {
+        let sample = SurfaceMaterialSample::land(
+            RgbColor::of(1, 2, 3),
+            2,
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            255,
+            12,
+            0,
+            7,
+            255,
+            5,
+            13,
+            42,
+            250,
+            " ecoregion ",
+            "",
+            0.75,
+        );
+
+        let flags = surface_data_evidence::from_sample(&sample);
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::CLIMATE
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::TREE
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::TREE_PRESENT
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::HERBACEOUS
+        ));
+        assert!(!surface_data_evidence::has(
+            flags,
+            surface_data_evidence::HERBACEOUS_PRESENT
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::SHRUB
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::SHRUB_PRESENT
+        ));
+        assert!(!surface_data_evidence::has(
+            flags,
+            surface_data_evidence::SNOW
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::SWAMP
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::SWAMP_PRESENT
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::OCEAN_TEMPERATURE
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::BATHYMETRY
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::SLOPE
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::STEEP_SLOPE
+        ));
+        assert!(surface_data_evidence::has(
+            flags,
+            surface_data_evidence::ECOREGION
+        ));
+        assert!(surface_data_evidence::has_any_vegetation(flags));
+        assert!(surface_data_evidence::has_any_vegetation_present(flags));
     }
 
     #[test]
