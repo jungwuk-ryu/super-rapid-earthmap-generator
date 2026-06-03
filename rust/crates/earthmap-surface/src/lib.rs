@@ -1451,6 +1451,28 @@ fn classify_surface_material_land(
         );
     }
 
+    if let Some(ecoregion_column) = classify_surface_material_by_ecoregion(
+        base,
+        sample,
+        metrics,
+        elevation_meters,
+        longitude,
+        latitude,
+        sahara_score,
+        sahel_score,
+        rainforest_score,
+        dry_savanna_score,
+        patch_noise,
+        fine_noise,
+        local_relief_meters,
+        sample.slope_ratio(),
+        coast_factor,
+        terrain,
+        semantic_terrain,
+    ) {
+        return mark_surface_material(ecoregion_column, "ecoregion");
+    }
+
     if is_sahel_latitude(latitude)
         && elevation_meters < 1_600.0
         && metrics.value < 0.74
@@ -2495,6 +2517,516 @@ fn classify_surface_material_by_semantic_intent(
     }
 
     None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_surface_material_by_ecoregion(
+    base: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    sahara_score: f64,
+    sahel_score: f64,
+    rainforest_score: f64,
+    dry_savanna_score: f64,
+    patch_noise: f64,
+    fine_noise: f64,
+    local_relief_meters: f64,
+    slope: f64,
+    coast_factor: f64,
+    terrain: MetTerrainMatch,
+    semantic_terrain: bool,
+) -> Option<EarthSurfaceColumn> {
+    if !sample.has_ecoregion_biome() {
+        return None;
+    }
+
+    let biome = sample.ecoregion_biome_id.as_str();
+    let key_source = biome.strip_prefix("minecraft:").unwrap_or(biome);
+    let key = key_source.to_ascii_lowercase();
+    let green_like = is_green_like(metrics);
+    let olive_dry_grass = is_olive_dry_grass(metrics);
+    let desert_sand_like = is_desert_sand_like(metrics);
+    let vegetation_evidence = has_vegetation_evidence(sample, metrics);
+    let vegetation_strength = sample.vegetation_cover();
+    let eco_name = sample.ecoregion_name.to_ascii_lowercase();
+
+    if should_defer_ecoregion_at_transition(
+        sample,
+        &key,
+        &eco_name,
+        metrics,
+        elevation_meters,
+        latitude,
+        sahara_score,
+        rainforest_score,
+        dry_savanna_score,
+        patch_noise,
+        fine_noise,
+        vegetation_evidence,
+    ) {
+        return None;
+    }
+
+    if key.contains("beach") {
+        if is_immediate_beach(base, coast_factor)
+            && should_use_beach_sand(metrics, longitude, latitude)
+        {
+            return Some(surface_material_with_surface(
+                base,
+                block_state_ids::SAND,
+                block_state_ids::SAND,
+                biome,
+            ));
+        }
+        return None;
+    }
+    if key.contains("snow") || key.contains("frozen") || key.contains("grove") {
+        let top = if base.ground_surface_y >= 145 || sample.snow_cover_ratio() >= 0.18 {
+            block_state_ids::SNOW_BLOCK
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+    if key.contains("peak")
+        || key.contains("stony")
+        || key.contains("jagged")
+        || key.contains("gravelly")
+    {
+        let top = if base.ground_surface_y >= 150 || local_relief_meters >= 180.0 {
+            block_state_ids::STONE
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
+        let filler = if top == block_state_ids::STONE {
+            block_state_ids::STONE
+        } else {
+            block_state_ids::DIRT
+        };
+        return Some(surface_material_with_surface(base, top, filler, biome));
+    }
+    if key.contains("swamp") || sample.swamp_cover_ratio() >= 0.35 {
+        if sample.swamp_cover_ratio() < 0.25
+            && !is_immediate_beach(base, coast_factor)
+            && base.ground_surface_y > SEA_LEVEL_Y + 3
+        {
+            return None;
+        }
+        let top = if fine_noise >= 0.72 || sample.swamp_cover_ratio() >= 0.55 {
+            block_state_ids::MUD
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
+        let filler = if top == block_state_ids::MUD {
+            block_state_ids::MUD
+        } else {
+            block_state_ids::DIRT
+        };
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            filler,
+            if key.contains("mangrove") {
+                "minecraft:mangrove_swamp"
+            } else {
+                "minecraft:swamp"
+            },
+        ));
+    }
+    if key.contains("jungle") {
+        if !vegetation_evidence
+            && rainforest_score < 0.25
+            && !is_tropical_rain_climate(sample.climate_class)
+        {
+            return None;
+        }
+        let mosaic = eco_name.contains("mosaic") || eco_name.contains("savanna");
+        if mosaic || rainforest_score < 0.42 || (vegetation_strength < 0.12 && !green_like) {
+            if (olive_dry_grass || dry_savanna_score >= 0.25) && patch_noise < 0.46 {
+                let top = dry_grass_surface_conservative(
+                    metrics,
+                    sample,
+                    patch_noise,
+                    fine_noise,
+                    dry_savanna_score.max(0.55),
+                    terrain,
+                    semantic_terrain,
+                    local_relief_meters,
+                );
+                return Some(surface_material_with_surface(
+                    base,
+                    top,
+                    block_state_ids::DIRT,
+                    "minecraft:savanna",
+                ));
+            }
+            let top = lush_vegetation_surface(
+                sample,
+                metrics,
+                patch_noise,
+                fine_noise,
+                rainforest_score.max(0.45),
+                terrain,
+            );
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                if patch_noise >= 0.58 {
+                    "minecraft:jungle"
+                } else {
+                    "minecraft:sparse_jungle"
+                },
+            ));
+        }
+        if rainforest_score < 0.58 || vegetation_strength < 0.16 || !green_like {
+            if olive_dry_grass && patch_noise < 0.34 {
+                let top = dry_grass_surface_conservative(
+                    metrics,
+                    sample,
+                    patch_noise,
+                    fine_noise,
+                    dry_savanna_score.max(0.48),
+                    terrain,
+                    semantic_terrain,
+                    local_relief_meters,
+                );
+                return Some(surface_material_with_surface(
+                    base,
+                    top,
+                    block_state_ids::DIRT,
+                    "minecraft:savanna",
+                ));
+            }
+            let top = lush_vegetation_surface(
+                sample,
+                metrics,
+                patch_noise,
+                fine_noise,
+                rainforest_score.max(0.45),
+                terrain,
+            );
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                if patch_noise >= 0.54 {
+                    "minecraft:jungle"
+                } else {
+                    "minecraft:sparse_jungle"
+                },
+            ));
+        }
+        let jungle_biome = if key.contains("sparse") {
+            "minecraft:sparse_jungle"
+        } else if sample.tree_cover() >= 0.55 && patch_noise >= 0.64 {
+            "minecraft:bamboo_jungle"
+        } else if patch_noise < 0.28 && fine_noise < 0.62 {
+            "minecraft:sparse_jungle"
+        } else {
+            "minecraft:jungle"
+        };
+        let top = lush_vegetation_surface(
+            sample,
+            metrics,
+            patch_noise,
+            fine_noise,
+            rainforest_score.max(0.58),
+            terrain,
+        );
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            jungle_biome,
+        ));
+    }
+    if key.contains("savanna") {
+        if !vegetation_evidence
+            && desert_sand_like
+            && sahara_score >= 0.35
+            && dry_savanna_score < 0.25
+        {
+            return None;
+        }
+        if desert_sand_like
+            && vegetation_strength < 0.10
+            && !green_like
+            && metrics.value >= 0.58
+            && (sahara_score >= 0.24 || sahel_score >= 0.20)
+            && patch_noise < 0.58
+        {
+            return None;
+        }
+        let dry_score = sahel_score.max(dry_savanna_score).max(0.62);
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
+            patch_noise,
+            fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
+        );
+        let savanna_biome = if key.contains("windswept") || elevation_meters >= 900.0 {
+            "minecraft:windswept_savanna"
+        } else {
+            "minecraft:savanna"
+        };
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            savanna_biome,
+        ));
+    }
+    if key.contains("desert") {
+        if vegetation_evidence
+            && (sahel_score >= 0.18 || dry_savanna_score >= 0.18)
+            && (!eco_name.contains("sahara desert")
+                || sahel_score >= 0.28
+                || dry_savanna_score >= 0.28
+                || is_sahel_latitude(latitude))
+        {
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
+                patch_noise,
+                fine_noise,
+                0.70,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
+            );
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ));
+        }
+        if eco_name.contains("sahara desert")
+            && (olive_dry_grass || green_like)
+            && (sahel_score >= 0.18 || latitude <= 20.0)
+            && patch_noise >= 0.42
+        {
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
+                patch_noise,
+                fine_noise,
+                0.62,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
+            );
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ));
+        }
+        let top = hot_desert_surface(
+            metrics,
+            patch_noise,
+            fine_noise,
+            local_relief_meters,
+            sahara_score,
+            terrain,
+            semantic_terrain,
+        );
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            desert_filler(top),
+            "minecraft:desert",
+        ));
+    }
+    if key.contains("badlands") {
+        let exposed = is_exposed_dry_rock(
+            metrics,
+            elevation_meters,
+            longitude,
+            latitude,
+            sahara_score,
+            dry_savanna_score,
+            local_relief_meters,
+            slope,
+        );
+        if exposed && (local_relief_meters >= 160.0 || elevation_meters >= 900.0) {
+            return Some(highland_rock_surface(
+                base,
+                metrics,
+                elevation_meters,
+                patch_noise,
+                fine_noise,
+            ));
+        }
+        if eco_name.contains("desert") && !has_vegetation_evidence(sample, metrics) {
+            let mut top = if metrics.red > metrics.green * 1.18 && metrics.hue <= 45.0 {
+                block_state_ids::RED_SAND
+            } else {
+                block_state_ids::SAND
+            };
+            if metrics.value < 0.42 && fine_noise >= 0.82 {
+                top = block_state_ids::COARSE_DIRT;
+            }
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                desert_filler(top),
+                biome,
+            ));
+        }
+        if vegetation_evidence || dry_savanna_score >= 0.20 || olive_dry_grass {
+            return None;
+        }
+        let top = if fine_noise >= 0.88 && !green_like {
+            block_state_ids::COARSE_DIRT
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+    if key.contains("forest") || key.contains("taiga") {
+        if !vegetation_evidence
+            && !is_temperate_climate(sample.climate_class)
+            && !is_cold_climate(sample.climate_class)
+        {
+            return None;
+        }
+        if eco_name.contains("mosaic")
+            && vegetation_strength < 0.16
+            && (olive_dry_grass || dry_savanna_score >= 0.25)
+            && patch_noise < 0.50
+        {
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
+                patch_noise,
+                fine_noise,
+                dry_savanna_score.max(0.52),
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
+            );
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ));
+        }
+        let forest_biome = if key.contains("forest")
+            && sample.tree_cover() < 0.08
+            && !green_like
+            && olive_dry_grass
+        {
+            "minecraft:plains"
+        } else {
+            biome
+        };
+        let top = temperate_forest_surface(sample, metrics, patch_noise, fine_noise);
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            forest_biome,
+        ));
+    }
+    if key.contains("meadow") || key.contains("plains") {
+        let top = if fine_noise >= 0.92 && !green_like && !olive_dry_grass {
+            block_state_ids::COARSE_DIRT
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
+        ));
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn should_defer_ecoregion_at_transition(
+    sample: &SurfaceMaterialSample,
+    key: &str,
+    eco_name: &str,
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    latitude: f64,
+    sahara_score: f64,
+    rainforest_score: f64,
+    dry_savanna_score: f64,
+    patch_noise: f64,
+    fine_noise: f64,
+    vegetation_evidence: bool,
+) -> bool {
+    if sample.ecoregion_confidence >= 0.84 {
+        return false;
+    }
+    if !(key.contains("desert")
+        || key.contains("savanna")
+        || key.contains("jungle")
+        || key.contains("forest")
+        || key.contains("badlands")
+        || key.contains("plains"))
+    {
+        return false;
+    }
+    let green_like = is_green_like(metrics);
+    let desert_sand_like = is_desert_sand_like(metrics);
+    if eco_name.contains("sahara desert")
+        && latitude >= 18.0
+        && !vegetation_evidence
+        && (desert_sand_like || sahara_score >= 0.55)
+    {
+        return false;
+    }
+    if key.contains("jungle")
+        && (sample.tree_cover() >= 0.22
+            || rainforest_score >= 0.62
+            || (is_tropical_rain_climate(sample.climate_class) && green_like))
+        && sample.ecoregion_confidence >= 0.56
+    {
+        return false;
+    }
+    if key.contains("savanna")
+        && (dry_savanna_score >= 0.55 || is_tropical_savanna_climate(sample.climate_class))
+        && sample.ecoregion_confidence >= 0.62
+    {
+        return false;
+    }
+    if (key.contains("badlands") || key.contains("desert"))
+        && elevation_meters >= 700.0
+        && sample.slope_ratio() >= 0.20
+        && !vegetation_evidence
+    {
+        return false;
+    }
+    let uncertainty = (0.84 - sample.ecoregion_confidence).max(0.0) / 0.84;
+    let defer_threshold = 0.58_f64.min(0.22 + (uncertainty * 0.48));
+    let transition_noise = (patch_noise * 0.65) + (fine_noise * 0.35);
+    transition_noise < defer_threshold
 }
 
 fn surface_material_semantic_fallback_metrics(
@@ -14559,6 +15091,103 @@ mod tests {
         );
         assert_eq!(desert_edge.biome_id, "minecraft:savanna");
         assert_eq!(desert_edge.decision_source, "intent");
+    }
+
+    #[test]
+    fn surface_material_classifier_ecoregion_fallback_matches_java_bootstrap_cases() {
+        let base_highland = surface_column(
+            false,
+            160,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let jagged_peaks = SurfaceMaterialSample::land(
+            RgbColor::of(96, 96, 92),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Alpine peaks",
+            "minecraft:jagged_peaks",
+            0.90,
+        );
+        let peaks = apply_test_surface_material_sample(
+            &base_highland,
+            jagged_peaks,
+            1_200.0,
+            78.0,
+            4.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(peaks.top_block_state_id, block_state_ids::STONE);
+        assert_eq!(peaks.filler_block_state_id, block_state_ids::STONE);
+        assert_eq!(peaks.biome_id, "minecraft:jagged_peaks");
+        assert_eq!(peaks.decision_source, "ecoregion");
+
+        let coastal_lowland = surface_column(
+            false,
+            SEA_LEVEL_Y + 2,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let weak_mangrove_swamp = SurfaceMaterialSample::land(
+            RgbColor::of(96, 82, 62),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            5,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Coastal mangrove swamp",
+            "minecraft:mangrove_swamp",
+            0.88,
+        );
+        let (swamp_longitude, swamp_latitude) = (-180..=180)
+            .flat_map(|longitude| (-45..=45).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                surface_material_sahara_score(longitude, latitude) < 0.45
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+            })
+            .expect("test fixture should find a low-intent swamp ecoregion coordinate");
+        let swamp = apply_test_surface_material_sample(
+            &coastal_lowland,
+            weak_mangrove_swamp,
+            20.0,
+            f64::from(swamp_longitude),
+            f64::from(swamp_latitude),
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            swamp.top_block_state_id,
+            block_state_ids::GRASS_BLOCK | block_state_ids::MUD
+        ));
+        assert_eq!(swamp.biome_id, "minecraft:mangrove_swamp");
+        assert_eq!(swamp.decision_source, "ecoregion");
     }
 
     #[test]
