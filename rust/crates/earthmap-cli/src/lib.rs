@@ -265,6 +265,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase4.geoTiffFloat32ReaderBootstrap - Synthetic BigTIFF Float32 metadata, nearest sampling, NoData handling, open-if-present behavior, and layout validation match the Java fixture path."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase4.heightmapScalarSamplerUncached - HeightmapScalarSampler nearest and bilinear math matches Java for the uncached synthetic fixture path."
     )?;
     writeln!(

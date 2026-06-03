@@ -458,6 +458,9 @@ Bootstrap implementation status on 2026-06-03:
     signed Int16 samples, no compression, `samplesPerPixel=1`, and `rowsPerStrip=1`
   - file-backed on-demand range reads for TIFF header, IFD/tag payloads, samples, and rows; the reader does not load
     the full heightmap into memory
+  - `GeoTiffFloat32Reader` bootstrap for the Java-supported synthetic path: little-endian BigTIFF magic 43, Float32
+    samples, no compression, `samplesPerPixel=1`, `rowsPerStrip=1`, `openIfPresent`, nearest sampling, raster-outside
+    empty samples, and `GDAL_NODATA` empty samples
   - `HeightmapScalarSampler` bootstrap for the Java `rowCache == null` path, including nearest sampling and bilinear
     interpolation with Java-compatible pixel-center offset, floor, clamp, and lerp math
   - `GeoTiffRowCache` bootstrap with Java-compatible sequential hit/miss/eviction statistics, synchronous read-ahead
@@ -472,7 +475,9 @@ Bootstrap implementation status on 2026-06-03:
   metadata parsing, pixel coordinate transforms, signed Int16 sample reads, row reads, reader edge validation, and the
   Java `HeightmapScalarSamplerTest` nearest/bilinear values. The row-cache tests cover the Java sequential
   hit/miss/eviction fixture, prefetch counters, repeated cached bilinear row reuse, and very large Rust-side
-  `prefetchRows` saturation. CLI tests cover Java-compatible diagnostic stdout for a synthetic BigTIFF fixture.
+  `prefetchRows` saturation. Float32 tests cover metadata, direct pixel reads, nearest sampling, NoData handling,
+  missing-file `openIfPresent`, and invalid layout rejection. CLI tests cover Java-compatible diagnostic stdout for a
+  synthetic BigTIFF fixture.
 - Verified locally with
   `cargo test --manifest-path rust/Cargo.toml -p earthmap-geo --locked`,
   `cargo test --manifest-path rust/Cargo.toml -p earthmap-cli --locked`, and
@@ -492,9 +497,9 @@ Bootstrap implementation status on 2026-06-03:
   - evidence folders:
     `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0001`
     and `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0002-mca`
-- Remaining Phase 4 work: port the non-height raster readers needed by later surface/photo work
-  (`GeoTiffFloat32Reader`, `GeoTiffRgbReader`, `VrtRgbMosaicReader`) and expand the height-only corpus beyond one
-  real region before promotion.
+- Remaining Phase 4 work: port the RGB/VRT raster readers needed by later surface/photo work
+  (`GeoTiffRgbReader`, `VrtRgbMosaicReader`) and expand the height-only corpus beyond one real region before
+  promotion.
 
 ## Phase 5: Surface Rules And Photo Solver
 

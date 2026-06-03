@@ -106,6 +106,14 @@ pub struct GeoTiffHeightmapReader {
     row_byte_count: usize,
 }
 
+#[derive(Debug)]
+pub struct GeoTiffFloat32Reader {
+    file: Mutex<File>,
+    metadata: GeoTiffMetadata,
+    strip_offsets: Vec<u64>,
+    strip_byte_counts: Vec<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GeoTiffRowCacheStats {
     pub max_rows: usize,
@@ -228,6 +236,88 @@ impl GeoTiffHeightmapReader {
             )));
         }
         Ok(y)
+    }
+
+    fn require_pixel(&self, x: i32, y: i32) -> Result<()> {
+        if x < 0 || x >= self.metadata.width {
+            return Err(GeoError::invalid(format!("x outside raster: {x}")));
+        }
+        if y < 0 || y >= self.metadata.height {
+            return Err(GeoError::invalid(format!("y outside raster: {y}")));
+        }
+        Ok(())
+    }
+}
+
+impl GeoTiffFloat32Reader {
+    pub fn open_if_present(path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let path = path.as_ref();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Self::open(path).map(Some)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = File::open(path).map_err(|error| GeoError::invalid(error.to_string()))?;
+        parse_bigtiff_float32(path, &mut file)
+    }
+
+    pub fn metadata(&self) -> &GeoTiffMetadata {
+        &self.metadata
+    }
+
+    pub fn sample_nearest(&self, longitude: f64, latitude: f64) -> Result<Option<f64>> {
+        let x = self.pixel_x(longitude);
+        let y = self.pixel_y(latitude);
+        if x < 0 || x >= self.metadata.width || y < 0 || y >= self.metadata.height {
+            return Ok(None);
+        }
+        let value = f64::from(self.sample_at_pixel(x, y)?);
+        if self
+            .metadata
+            .no_data_value
+            .is_some_and(|no_data| java_double_compare_equal(value, no_data))
+        {
+            return Ok(None);
+        }
+        Ok(Some(value))
+    }
+
+    pub fn sample_at_pixel(&self, x: i32, y: i32) -> Result<f32> {
+        self.require_pixel(x, y)?;
+        let expected_bytes = usize::try_from(self.metadata.width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or_else(|| GeoError::invalid("row byte count overflow"))?;
+        let byte_count = self.strip_byte_counts[y as usize];
+        if byte_count < expected_bytes {
+            return Err(GeoError::invalid(format!(
+                "strip byte count is too small for row {y}: {byte_count}"
+            )));
+        }
+        let offset = self.strip_offsets[y as usize]
+            .checked_add(u64::try_from(x).expect("validated x is non-negative") * 4)
+            .ok_or_else(|| GeoError::invalid("sample offset overflow"))?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| GeoError::invalid("Float32 GeoTIFF file lock poisoned"))?;
+        let bytes = read_exact_at(&mut file, offset, 4)?;
+        Ok(f32::from_le_bytes(
+            bytes.try_into().expect("sample read length is 4"),
+        ))
+    }
+
+    pub fn pixel_x(&self, longitude: f64) -> i32 {
+        ((longitude - self.metadata.top_left_longitude) / self.metadata.pixel_width_degrees).floor()
+            as i32
+    }
+
+    pub fn pixel_y(&self, latitude: f64) -> i32 {
+        ((self.metadata.top_left_latitude - latitude) / self.metadata.pixel_height_degrees).floor()
+            as i32
     }
 
     fn require_pixel(&self, x: i32, y: i32) -> Result<()> {
@@ -724,6 +814,111 @@ fn parse_bigtiff_heightmap(path: &Path, file: &mut File) -> Result<GeoTiffHeight
     })
 }
 
+fn parse_bigtiff_float32(path: &Path, file: &mut File) -> Result<GeoTiffFloat32Reader> {
+    let header = read_exact_at(file, 0, 16)?;
+    if header[0] != b'I' || header[1] != b'I' {
+        return Err(GeoError::invalid(
+            "only little-endian BigTIFF is supported for Float32 GeoTIFF input",
+        ));
+    }
+    let magic = read_u16_le(&header, 2)?;
+    if magic != 43 {
+        return Err(GeoError::invalid(format!(
+            "expected BigTIFF magic 43, found {magic}"
+        )));
+    }
+    let offset_size = read_u16_le(&header, 4)?;
+    let reserved = read_u16_le(&header, 6)?;
+    if offset_size != 8 || reserved != 0 {
+        return Err(GeoError::invalid(format!(
+            "unsupported BigTIFF header offsetSize={offset_size} reserved={reserved}"
+        )));
+    }
+    let ifd_offset = read_u64_le(&header, 8)?;
+    let entries = read_ifd(file, ifd_offset)?;
+
+    let width = i32_from_u64(required_unsigned(&entries, TAG_IMAGE_WIDTH)?, "width")?;
+    let height = i32_from_u64(required_unsigned(&entries, TAG_IMAGE_LENGTH)?, "height")?;
+    let bits_per_sample = i32_from_u64(
+        required_unsigned(&entries, TAG_BITS_PER_SAMPLE)?,
+        "bits per sample",
+    )?;
+    let compression = i32_from_u64(required_unsigned(&entries, TAG_COMPRESSION)?, "compression")?;
+    let samples_per_pixel = i32_from_u64(
+        required_unsigned(&entries, TAG_SAMPLES_PER_PIXEL)?,
+        "samples per pixel",
+    )?;
+    let rows_per_strip = i32_from_u64(
+        required_unsigned(&entries, TAG_ROWS_PER_STRIP)?,
+        "rows per strip",
+    )?;
+    let sample_format = i32_from_u64(
+        required_unsigned(&entries, TAG_SAMPLE_FORMAT)?,
+        "sample format",
+    )?;
+
+    if bits_per_sample != 32
+        || sample_format != 3
+        || compression != 1
+        || samples_per_pixel != 1
+        || rows_per_strip != 1
+    {
+        return Err(GeoError::invalid(format!(
+            "unsupported Float32 GeoTIFF layout: bits={bits_per_sample}, sampleFormat={sample_format}, compression={compression}, samplesPerPixel={samples_per_pixel}, rowsPerStrip={rows_per_strip}"
+        )));
+    }
+
+    let strip_offsets = read_unsigned_array(file, required(&entries, TAG_STRIP_OFFSETS)?)?;
+    let byte_counts = read_unsigned_array(file, required(&entries, TAG_STRIP_BYTE_COUNTS)?)?;
+    if strip_offsets.len() != height as usize || byte_counts.len() != height as usize {
+        return Err(GeoError::invalid(format!(
+            "one row strip layout expected: height={height} offsets={} byteCounts={}",
+            strip_offsets.len(),
+            byte_counts.len()
+        )));
+    }
+    let strip_byte_counts = byte_counts
+        .into_iter()
+        .map(|value| usize_from_i32_exact_u64(value, "strip byte count"))
+        .collect::<Result<Vec<_>>>()?;
+
+    let pixel_scale = read_double_array(file, required(&entries, TAG_MODEL_PIXEL_SCALE)?)?;
+    let tiepoint = read_double_array(file, required(&entries, TAG_MODEL_TIEPOINT)?)?;
+    if pixel_scale.len() < 2 || tiepoint.len() < 6 {
+        return Err(GeoError::invalid("GeoTIFF transform tags are incomplete"));
+    }
+    let top_left_longitude = tiepoint[3] - (tiepoint[0] * pixel_scale[0]);
+    let top_left_latitude = tiepoint[4] + (tiepoint[1] * pixel_scale[1]);
+
+    let epsg_code = parse_epsg(file, entries.get(&TAG_GEO_KEY_DIRECTORY))?;
+    let no_data_value = parse_no_data(file, entries.get(&TAG_GDAL_NODATA))?;
+    let metadata = GeoTiffMetadata {
+        path: path.to_path_buf(),
+        width,
+        height,
+        bits_per_sample,
+        sample_format,
+        compression,
+        rows_per_strip,
+        samples_per_pixel,
+        top_left_longitude,
+        top_left_latitude,
+        pixel_width_degrees: pixel_scale[0],
+        pixel_height_degrees: pixel_scale[1],
+        epsg_code,
+        no_data_value,
+    };
+    Ok(GeoTiffFloat32Reader {
+        file: Mutex::new(
+            file.try_clone()
+                .map_err(|error| GeoError::invalid(error.to_string()))?,
+        ),
+        metadata,
+        strip_offsets,
+        strip_byte_counts,
+    })
+}
+
 fn read_ifd(file: &mut File, offset: u64) -> Result<std::collections::BTreeMap<u16, TiffEntry>> {
     let entry_count_bytes = read_exact_at(file, offset, 8)?;
     let entry_count = read_u64_le(&entry_count_bytes, 0)?;
@@ -902,9 +1097,121 @@ fn parse_no_data(file: &mut File, entry: Option<&TiffEntry>) -> Result<Option<f6
     if text.is_empty() {
         return Ok(None);
     }
-    text.parse::<f64>()
+    parse_java_double(&text)
         .map(Some)
-        .map_err(|error| GeoError::invalid(error.to_string()))
+        .map_err(GeoError::invalid)
+}
+
+fn parse_java_double(text: &str) -> std::result::Result<f64, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(java_number_error(text));
+    }
+    let (negative, unsigned) = if let Some(rest) = trimmed.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, trimmed)
+    };
+    match unsigned {
+        "NaN" => return Ok(f64::NAN),
+        "Infinity" => {
+            return Ok(if negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+        }
+        _ => {}
+    }
+    if contains_case_insensitive(unsigned, "nan") || contains_case_insensitive(unsigned, "inf") {
+        return Err(java_number_error(text));
+    }
+    let without_suffix = strip_java_float_suffix(trimmed);
+    if is_java_hex_float(without_suffix) {
+        return parse_java_hex_double(without_suffix).ok_or_else(|| java_number_error(text));
+    }
+    without_suffix
+        .parse::<f64>()
+        .map_err(|_| java_number_error(text))
+}
+
+fn strip_java_float_suffix(text: &str) -> &str {
+    match text.as_bytes().last().copied() {
+        Some(b'd' | b'D' | b'f' | b'F') => &text[..text.len() - 1],
+        _ => text,
+    }
+}
+
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
+}
+
+fn is_java_hex_float(text: &str) -> bool {
+    let unsigned = text
+        .strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text);
+    unsigned.starts_with("0x") || unsigned.starts_with("0X")
+}
+
+fn parse_java_hex_double(text: &str) -> Option<f64> {
+    let (sign, unsigned) = if let Some(rest) = text.strip_prefix('-') {
+        (-1.0, rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        (1.0, rest)
+    } else {
+        (1.0, text)
+    };
+    let body = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))?;
+    let p_index = body.find('p').or_else(|| body.find('P'))?;
+    let (mantissa_text, exponent_text_with_p) = body.split_at(p_index);
+    let exponent_text = &exponent_text_with_p[1..];
+    if mantissa_text.is_empty() || exponent_text.is_empty() {
+        return None;
+    }
+    let exponent = exponent_text.parse::<i32>().ok()?;
+    let mut value = 0.0f64;
+    let mut saw_digit = false;
+    let mut after_dot = false;
+    let mut fraction_factor = 1.0 / 16.0;
+    for ch in mantissa_text.chars() {
+        if ch == '.' {
+            if after_dot {
+                return None;
+            }
+            after_dot = true;
+            continue;
+        }
+        let digit = ch.to_digit(16)? as f64;
+        saw_digit = true;
+        if after_dot {
+            value += digit * fraction_factor;
+            fraction_factor /= 16.0;
+        } else {
+            value = (value * 16.0) + digit;
+        }
+    }
+    if !saw_digit {
+        return None;
+    }
+    Some(sign * value * 2.0f64.powi(exponent))
+}
+
+fn java_number_error(text: &str) -> String {
+    format!("For input string: \"{text}\"")
+}
+
+fn java_double_compare_equal(left: f64, right: f64) -> bool {
+    if left.is_nan() && right.is_nan() {
+        return true;
+    }
+    left.to_bits() == right.to_bits()
 }
 
 fn entry_value_bytes_inline(entry: &TiffEntry) -> Result<Vec<u8>> {
@@ -1020,6 +1327,13 @@ fn usize_from_u64(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| GeoError::invalid(format!("{name} exceeds usize")))
 }
 
+fn usize_from_i32_exact_u64(value: u64, name: &str) -> Result<usize> {
+    if value > i32::MAX as u64 {
+        return Err(GeoError::invalid(format!("{name} exceeds i32")));
+    }
+    Ok(value as usize)
+}
+
 fn i32_from_u64(value: u64, name: &str) -> Result<i32> {
     i32::try_from(value).map_err(|_| GeoError::invalid(format!("{name} exceeds i32")))
 }
@@ -1088,6 +1402,110 @@ mod tests {
 
         metadata = metadata_with_sample_layout(8, 1);
         assert_eq!(metadata.sample_type_name(), "bits=8, sampleFormat=1");
+    }
+
+    #[test]
+    fn synthetic_bigtiff_float32_reader_matches_java_fixture_path() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-float32.tif");
+        fs::write(&path, synthetic_bigtiff_float32()).unwrap();
+
+        assert!(
+            GeoTiffFloat32Reader::open_if_present(temp.path().join("missing.tif"))
+                .unwrap()
+                .is_none()
+        );
+        let reader = GeoTiffFloat32Reader::open_if_present(&path)
+            .unwrap()
+            .expect("fixture exists");
+        let metadata = reader.metadata();
+        assert_eq!(metadata.width, 3);
+        assert_eq!(metadata.height, 2);
+        assert_eq!(metadata.bits_per_sample, 32);
+        assert_eq!(metadata.sample_format, 3);
+        assert_eq!(metadata.sample_type_name(), "Float32");
+        assert_eq!(metadata.no_data_value, Some(-9999.0));
+        assert_eq!(reader.pixel_x(10.75), 1);
+        assert_eq!(reader.pixel_y(19.75), 0);
+        assert_eq!(reader.sample_at_pixel(0, 0).unwrap(), 1.25);
+        assert_eq!(reader.sample_at_pixel(2, 1).unwrap(), 6.75);
+        assert_eq!(reader.sample_nearest(10.25, 19.75).unwrap(), Some(1.25));
+        assert_eq!(reader.sample_nearest(10.75, 19.75).unwrap(), None);
+        assert_eq!(reader.sample_nearest(9.99, 19.75).unwrap(), None);
+        assert_eq!(reader.sample_nearest(10.25, 18.9).unwrap(), None);
+    }
+
+    #[test]
+    fn synthetic_bigtiff_float32_reader_validation_matches_java_edges() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-float32.tif");
+        fs::write(&path, synthetic_bigtiff_float32()).unwrap();
+        let reader = GeoTiffFloat32Reader::open(&path).unwrap();
+
+        assert!(reader.sample_at_pixel(-1, 0).is_err());
+        assert!(reader.sample_at_pixel(0, -1).is_err());
+        assert!(reader.sample_at_pixel(3, 0).is_err());
+        assert!(reader.sample_at_pixel(0, 2).is_err());
+
+        let invalid_layout = temp.path().join("tiny-float32-invalid-layout.tif");
+        fs::write(
+            &invalid_layout,
+            synthetic_bigtiff_float32_with_layout(16, 3, 1, 1, 1),
+        )
+        .unwrap();
+        let error = GeoTiffFloat32Reader::open(&invalid_layout)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported Float32 GeoTIFF layout"));
+    }
+
+    #[test]
+    fn synthetic_bigtiff_float32_nodata_uses_java_double_rules() {
+        let temp = tempdir().unwrap();
+
+        let suffix_path = temp.path().join("tiny-float32-nodata-suffix.tif");
+        fs::write(
+            &suffix_path,
+            synthetic_bigtiff_float32_with_samples_and_no_data(
+                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                b"1.0d\0",
+            ),
+        )
+        .unwrap();
+        let suffix_reader = GeoTiffFloat32Reader::open(&suffix_path).unwrap();
+        assert_eq!(suffix_reader.metadata().no_data_value, Some(1.0));
+        assert_eq!(suffix_reader.sample_nearest(10.25, 19.75).unwrap(), None);
+        assert_eq!(
+            suffix_reader.sample_nearest(10.75, 19.75).unwrap(),
+            Some(2.0)
+        );
+
+        let nan_path = temp.path().join("tiny-float32-nodata-nan.tif");
+        fs::write(
+            &nan_path,
+            synthetic_bigtiff_float32_with_samples_and_no_data(
+                [f32::NAN, 2.0, 3.0, 4.0, 5.0, 6.0],
+                b"NaN\0",
+            ),
+        )
+        .unwrap();
+        let nan_reader = GeoTiffFloat32Reader::open(&nan_path).unwrap();
+        assert!(nan_reader.metadata().no_data_value.unwrap().is_nan());
+        assert_eq!(nan_reader.sample_nearest(10.25, 19.75).unwrap(), None);
+
+        let lowercase_nan_path = temp.path().join("tiny-float32-nodata-lowercase-nan.tif");
+        fs::write(
+            &lowercase_nan_path,
+            synthetic_bigtiff_float32_with_samples_and_no_data(
+                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                b"nan\0",
+            ),
+        )
+        .unwrap();
+        let error = GeoTiffFloat32Reader::open(&lowercase_nan_path)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "For input string: \"nan\"");
     }
 
     #[test]
@@ -1249,6 +1667,134 @@ mod tests {
             epsg_code: Some(4326),
             no_data_value: None,
         }
+    }
+
+    fn synthetic_bigtiff_float32() -> Vec<u8> {
+        synthetic_bigtiff_float32_with_layout(32, 3, 1, 1, 1)
+    }
+
+    fn synthetic_bigtiff_float32_with_samples_and_no_data(
+        samples: [f32; 6],
+        no_data_ascii: &'static [u8],
+    ) -> Vec<u8> {
+        synthetic_bigtiff_float32_with_layout_samples_and_no_data(
+            32,
+            3,
+            1,
+            1,
+            1,
+            samples,
+            no_data_ascii,
+        )
+    }
+
+    fn synthetic_bigtiff_float32_with_layout(
+        bits_per_sample: u64,
+        sample_format: u64,
+        compression: u64,
+        samples_per_pixel: u64,
+        rows_per_strip: u64,
+    ) -> Vec<u8> {
+        synthetic_bigtiff_float32_with_layout_samples_and_no_data(
+            bits_per_sample,
+            sample_format,
+            compression,
+            samples_per_pixel,
+            rows_per_strip,
+            [1.25, -9999.0, 3.5, 4.25, 5.5, 6.75],
+            b"-9999\0",
+        )
+    }
+
+    fn synthetic_bigtiff_float32_with_layout_samples_and_no_data(
+        bits_per_sample: u64,
+        sample_format: u64,
+        compression: u64,
+        samples_per_pixel: u64,
+        rows_per_strip: u64,
+        samples: [f32; 6],
+        no_data_ascii: &'static [u8],
+    ) -> Vec<u8> {
+        let width = 3usize;
+        let height = 2usize;
+        let pixel_bytes = width * height * 4;
+        let ifd_offset = 16 + pixel_bytes;
+        let entry_count = 14usize;
+        let ifd_bytes = 8 + (entry_count * 20) + 8;
+        let data_start = ifd_offset + ifd_bytes;
+        let strip_offsets_offset = data_start;
+        let strip_byte_counts_offset = strip_offsets_offset + (height * 8);
+        let pixel_scale_offset = strip_byte_counts_offset + (height * 4);
+        let tiepoint_offset = pixel_scale_offset + (3 * 8);
+        let file_size = tiepoint_offset + (6 * 8);
+        let mut out = vec![0u8; file_size];
+
+        out[0] = b'I';
+        out[1] = b'I';
+        put_u16(&mut out, 2, 43);
+        put_u16(&mut out, 4, 8);
+        put_u16(&mut out, 6, 0);
+        put_u64(&mut out, 8, ifd_offset as u64);
+
+        let mut cursor = 16;
+        for sample in samples {
+            put_f32(&mut out, cursor, sample);
+            cursor += 4;
+        }
+
+        cursor = ifd_offset;
+        put_u64(&mut out, cursor, entry_count as u64);
+        cursor += 8;
+        let no_data_inline = inline_ascii_u64(no_data_ascii);
+        let row_byte_count = (width * 4) as u32;
+        let strip_byte_counts_inline =
+            u64::from(row_byte_count) | (u64::from(row_byte_count) << 32);
+        for (tag, field_type, count, value_or_offset) in [
+            (256, 4, 1, width as u64),
+            (257, 4, 1, height as u64),
+            (258, 3, 1, bits_per_sample),
+            (259, 3, 1, compression),
+            (262, 3, 1, 1),
+            (273, 16, height as u64, strip_offsets_offset as u64),
+            (277, 3, 1, samples_per_pixel),
+            (278, 3, 1, rows_per_strip),
+            (279, 4, height as u64, strip_byte_counts_inline),
+            (284, 3, 1, 1),
+            (339, 3, 1, sample_format),
+            (33550, 12, 3, pixel_scale_offset as u64),
+            (33922, 12, 6, tiepoint_offset as u64),
+            (42113, 2, no_data_ascii.len() as u64, no_data_inline),
+        ] {
+            put_entry(&mut out, cursor, tag, field_type, count, value_or_offset);
+            cursor += 20;
+        }
+        put_u64(&mut out, cursor, 0);
+
+        cursor = strip_offsets_offset;
+        for y in 0..height {
+            put_u64(&mut out, cursor, 16 + ((y * width * 4) as u64));
+            cursor += 8;
+        }
+
+        cursor = strip_byte_counts_offset;
+        for _ in 0..height {
+            put_u32(&mut out, cursor, (width * 4) as u32);
+            cursor += 4;
+        }
+
+        cursor = pixel_scale_offset;
+        put_f64(&mut out, cursor, 0.5);
+        put_f64(&mut out, cursor + 8, 0.5);
+        put_f64(&mut out, cursor + 16, 0.0);
+
+        cursor = tiepoint_offset;
+        put_f64(&mut out, cursor, 0.0);
+        put_f64(&mut out, cursor + 8, 0.0);
+        put_f64(&mut out, cursor + 16, 0.0);
+        put_f64(&mut out, cursor + 24, 10.0);
+        put_f64(&mut out, cursor + 32, 20.0);
+        put_f64(&mut out, cursor + 40, 0.0);
+        out
     }
 
     fn synthetic_bigtiff_heightmap() -> Vec<u8> {
@@ -1502,6 +2048,13 @@ mod tests {
         put_u64(out, offset + 12, value_or_offset);
     }
 
+    fn inline_ascii_u64(bytes: &[u8]) -> u64 {
+        assert!(bytes.len() <= 8);
+        let mut inline = [0u8; 8];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        u64::from_le_bytes(inline)
+    }
+
     fn put_i16(out: &mut [u8], offset: usize, value: i16) {
         out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -1516,6 +2069,10 @@ mod tests {
 
     fn put_u64(out: &mut [u8], offset: usize, value: u64) {
         out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_f32(out: &mut [u8], offset: usize, value: f32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     fn put_f64(out: &mut [u8], offset: usize, value: f64) {
