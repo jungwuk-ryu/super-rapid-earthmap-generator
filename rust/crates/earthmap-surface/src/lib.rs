@@ -4378,6 +4378,15 @@ pub fn smooth_surface_classes(
     Ok(result)
 }
 
+pub fn smooth_photo_textures(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    require_surface_grid_width(columns, width)?;
+    let local_pass = smooth_photo_texture_local(columns, width);
+    Ok(smooth_photo_macro_vegetation(&local_pass, width))
+}
+
 pub fn stabilize_surface_biome_families(
     columns: &[EarthSurfaceColumn],
     width: usize,
@@ -6075,6 +6084,15 @@ fn surface_chunk_map_position_valid(mapping: &EarthScaleMapping, map_x: i32, map
 const SURFACE_SMOOTHER_NEIGHBOR_RADIUS: i32 = 1;
 const SURFACE_SMOOTHER_ISOLATED_COUNT_MAX: i32 = 2;
 const SURFACE_SMOOTHER_MAJORITY_COUNT_MIN: i32 = 5;
+const PHOTO_TEXTURE_NEIGHBOR_RADIUS: i32 = 2;
+const PHOTO_EXACT_ISOLATED_MAX: i32 = 4;
+const PHOTO_FAMILY_ISOLATED_MAX: i32 = 7;
+const PHOTO_EXACT_MAJORITY_MIN: i32 = 10;
+const PHOTO_FAMILY_MAJORITY_MIN: i32 = 15;
+const PHOTO_MACRO_NEIGHBOR_RADIUS: i32 = 4;
+const PHOTO_MACRO_LAND_MIN: i32 = 52;
+const PHOTO_LUSH_VEGETATION_RATIO_MIN: f64 = 0.58;
+const PHOTO_DRY_VEGETATION_RATIO_MIN: f64 = 0.82;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SurfaceNeighborhoodStats {
@@ -6095,6 +6113,143 @@ impl SurfaceNeighborhoodStats {
     fn count_biome(&self, biome: &str) -> i32 {
         self.biome_counts.get(biome).copied().unwrap_or(0)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PhotoTextureStats {
+    land_count: i32,
+    top_counts: BTreeMap<i32, i32>,
+    family_counts: BTreeMap<i32, i32>,
+    majority_top: i32,
+    majority_top_count: i32,
+    majority_family: i32,
+    majority_family_count: i32,
+}
+
+impl PhotoTextureStats {
+    fn count_top(&self, top: i32) -> i32 {
+        self.top_counts.get(&top).copied().unwrap_or(0)
+    }
+
+    fn count_family(&self, family: i32) -> i32 {
+        self.family_counts.get(&family).copied().unwrap_or(0)
+    }
+
+    fn majority_top_for_family(&self, family: i32) -> i32 {
+        let mut best_top = 0;
+        let mut best_count = 0;
+        for (&top, &count) in &self.top_counts {
+            if photo_texture_family(top) == family && count > best_count {
+                best_top = top;
+                best_count = count;
+            }
+        }
+        best_top
+    }
+}
+
+fn smooth_photo_texture_local(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Vec<EarthSurfaceColumn> {
+    let height = columns.len() / width;
+    let mut result = columns.to_vec();
+    for z in 0..height {
+        for x in 0..width {
+            let index = surface_class_index(x, z, width);
+            let column = &columns[index];
+            if column.water
+                || is_token_driven_photo_surface(column)
+                || is_protected_photo_surface(column.top_block_state_id, &column.biome_id)
+            {
+                continue;
+            }
+            let stats =
+                photo_texture_stats(columns, width, height, x, z, PHOTO_TEXTURE_NEIGHBOR_RADIUS);
+            if stats.land_count < PHOTO_FAMILY_MAJORITY_MIN {
+                continue;
+            }
+            let top = column.top_block_state_id;
+            let family = photo_texture_family(top);
+            let mut smoothed_top = top;
+            if stats.count_top(top) <= PHOTO_EXACT_ISOLATED_MAX
+                && stats.majority_top_count >= PHOTO_EXACT_MAJORITY_MIN
+                && can_photo_replace(top, stats.majority_top, &column.biome_id)
+            {
+                smoothed_top = stats.majority_top;
+            } else if can_absorb_dry_vegetation_sand_patch(top, &stats, &column.biome_id) {
+                smoothed_top = stats.majority_top_for_family(1);
+            } else if stats.count_family(family) <= PHOTO_FAMILY_ISOLATED_MAX
+                && stats.majority_family_count >= PHOTO_FAMILY_MAJORITY_MIN
+            {
+                let replacement_top = stats.majority_top_for_family(stats.majority_family);
+                if can_photo_replace(top, replacement_top, &column.biome_id) {
+                    smoothed_top = replacement_top;
+                }
+            }
+            if smoothed_top != top {
+                result[index] = photo_smoother_replacement(column, smoothed_top, "smoother-photo");
+            }
+        }
+    }
+    result
+}
+
+fn smooth_photo_macro_vegetation(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Vec<EarthSurfaceColumn> {
+    let height = columns.len() / width;
+    let mut result = columns.to_vec();
+    for z in 0..height {
+        for x in 0..width {
+            let index = surface_class_index(x, z, width);
+            let column = &columns[index];
+            let biome = &column.biome_id;
+            if column.water
+                || is_token_driven_photo_surface(column)
+                || is_protected_photo_surface(column.top_block_state_id, biome)
+                || !is_photo_vegetation_biome(biome)
+            {
+                continue;
+            }
+            let top = column.top_block_state_id;
+            let family = photo_texture_family(top);
+            if family == 1 || family == 5 || family == 6 {
+                continue;
+            }
+            let stats =
+                photo_texture_stats(columns, width, height, x, z, PHOTO_MACRO_NEIGHBOR_RADIUS);
+            if stats.land_count < PHOTO_MACRO_LAND_MIN {
+                continue;
+            }
+            let replacement_top = stats.majority_top_for_family(1);
+            if replacement_top == 0 || !can_photo_replace(top, replacement_top, biome) {
+                continue;
+            }
+            let vegetation_ratio = f64::from(stats.count_family(1)) / f64::from(stats.land_count);
+            let required_ratio = if is_lush_vegetation_biome(biome) {
+                PHOTO_LUSH_VEGETATION_RATIO_MIN
+            } else {
+                PHOTO_DRY_VEGETATION_RATIO_MIN
+            };
+            if vegetation_ratio < required_ratio {
+                continue;
+            }
+            let family_count = stats.count_family(family);
+            let compact_accent = if is_lush_vegetation_biome(biome) {
+                family_count <= 30
+            } else {
+                family_count <= 4
+            };
+            if !compact_accent {
+                continue;
+            }
+            result[index] =
+                photo_smoother_replacement(column, replacement_top, "smoother-photo-macro");
+        }
+    }
+    result
 }
 
 fn surface_neighborhood_stats(
@@ -6136,8 +6291,184 @@ fn surface_neighborhood_stats(
     }
 }
 
+fn photo_texture_stats(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+    height: usize,
+    center_x: usize,
+    center_z: usize,
+    radius: i32,
+) -> PhotoTextureStats {
+    let mut top_counts = BTreeMap::<i32, i32>::new();
+    let mut family_counts = BTreeMap::<i32, i32>::new();
+    let mut land_count = 0;
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            let x = center_x as i32 + dx;
+            let z = center_z as i32 + dz;
+            if x < 0 || x >= width as i32 || z < 0 || z >= height as i32 {
+                continue;
+            }
+            let column = &columns[surface_class_index(x as usize, z as usize, width)];
+            if column.water {
+                continue;
+            }
+            let top = column.top_block_state_id;
+            land_count += 1;
+            *top_counts.entry(top).or_insert(0) += 1;
+            *family_counts.entry(photo_texture_family(top)).or_insert(0) += 1;
+        }
+    }
+    let (majority_top, majority_top_count) = surface_majority_i32(&top_counts);
+    let (majority_family, majority_family_count) = surface_majority_i32(&family_counts);
+    PhotoTextureStats {
+        land_count,
+        top_counts,
+        family_counts,
+        majority_top,
+        majority_top_count,
+        majority_family,
+        majority_family_count,
+    }
+}
+
 fn is_protected_surface_for_smoothing(top: i32, biome: &str) -> bool {
     top == block_state_ids::SNOW_BLOCK || top == block_state_ids::MUD || biome == "minecraft:beach"
+}
+
+fn is_token_driven_photo_surface(column: &EarthSurfaceColumn) -> bool {
+    matches!(
+        column.terrain_token_source,
+        TerrainTokenSource::Export | TerrainTokenSource::JavaStandardPalette
+    )
+}
+
+fn is_protected_photo_surface(top: i32, biome: &str) -> bool {
+    if is_protected_surface_for_smoothing(top, biome) {
+        return true;
+    }
+    is_desert_like_biome(biome) && matches!(photo_texture_family(top), 2 | 3)
+}
+
+fn can_photo_replace(current_top: i32, replacement_top: i32, biome: &str) -> bool {
+    if current_top == replacement_top || replacement_top == 0 {
+        return false;
+    }
+    if is_protected_photo_surface(current_top, biome)
+        || is_protected_photo_surface(replacement_top, biome)
+    {
+        return false;
+    }
+    let current_family = photo_texture_family(current_top);
+    let replacement_family = photo_texture_family(replacement_top);
+    if current_family == replacement_family {
+        return true;
+    }
+    if current_family == 1 && matches!(replacement_family, 2 | 3) {
+        return false;
+    }
+    replacement_family != 6
+}
+
+fn can_absorb_dry_vegetation_sand_patch(
+    current_top: i32,
+    stats: &PhotoTextureStats,
+    biome: &str,
+) -> bool {
+    if !is_dry_vegetation_biome(biome)
+        || is_desert_like_biome(biome)
+        || is_protected_photo_surface(current_top, biome)
+    {
+        return false;
+    }
+    let current_family = photo_texture_family(current_top);
+    if !matches!(current_family, 2 | 3) {
+        return false;
+    }
+    let vegetation_family_count = stats.count_family(1);
+    let current_family_count = stats.count_family(current_family);
+    let replacement_top = stats.majority_top_for_family(1);
+    replacement_top != 0
+        && vegetation_family_count >= 18
+        && current_family_count <= 4
+        && can_photo_replace(current_top, replacement_top, biome)
+}
+
+fn is_dry_vegetation_biome(biome: &str) -> bool {
+    let lower = biome.to_ascii_lowercase();
+    lower.contains("savanna")
+        || lower.contains("plains")
+        || lower.contains("meadow")
+        || lower.contains("grassland")
+        || lower.contains("steppe")
+}
+
+fn is_photo_vegetation_biome(biome: &str) -> bool {
+    is_dry_vegetation_biome(biome) || is_lush_vegetation_biome(biome)
+}
+
+fn is_lush_vegetation_biome(biome: &str) -> bool {
+    let lower = biome.to_ascii_lowercase();
+    lower.contains("jungle") || lower.contains("forest") || lower.contains("taiga")
+}
+
+fn is_desert_like_biome(biome: &str) -> bool {
+    let lower = biome.to_ascii_lowercase();
+    lower.contains("desert") || lower.contains("badlands")
+}
+
+fn photo_texture_family(top: i32) -> i32 {
+    match top {
+        block_state_ids::GRASS_BLOCK
+        | block_state_ids::MOSS_BLOCK
+        | block_state_ids::PODZOL
+        | block_state_ids::COARSE_DIRT
+        | block_state_ids::DIRT
+        | block_state_ids::ROOTED_DIRT
+        | block_state_ids::PACKED_MUD
+        | block_state_ids::MYCELIUM
+        | block_state_ids::GREEN_TERRACOTTA
+        | block_state_ids::LIME_TERRACOTTA
+        | block_state_ids::OAK_LEAVES
+        | block_state_ids::JUNGLE_LEAVES
+        | block_state_ids::DARK_OAK_LEAVES
+        | block_state_ids::SPRUCE_LEAVES => 1,
+        block_state_ids::SAND
+        | block_state_ids::SANDSTONE
+        | block_state_ids::RED_SAND
+        | block_state_ids::YELLOW_TERRACOTTA
+        | block_state_ids::END_STONE
+        | block_state_ids::END_STONE_BRICKS
+        | block_state_ids::SMOOTH_SANDSTONE
+        | block_state_ids::CUT_SANDSTONE
+        | block_state_ids::CHISELED_SANDSTONE
+        | block_state_ids::SMOOTH_RED_SANDSTONE
+        | block_state_ids::CUT_RED_SANDSTONE
+        | block_state_ids::CHISELED_RED_SANDSTONE => 2,
+        block_state_ids::TERRACOTTA
+        | block_state_ids::ORANGE_TERRACOTTA
+        | block_state_ids::BROWN_TERRACOTTA
+        | block_state_ids::RED_TERRACOTTA
+        | block_state_ids::WHITE_TERRACOTTA
+        | block_state_ids::LIGHT_GRAY_TERRACOTTA
+        | block_state_ids::GRAY_TERRACOTTA
+        | block_state_ids::BLACK_TERRACOTTA
+        | block_state_ids::CYAN_TERRACOTTA
+        | block_state_ids::GRANITE
+        | block_state_ids::MUD_BRICKS
+        | block_state_ids::DRIPSTONE_BLOCK => 3,
+        block_state_ids::STONE
+        | block_state_ids::TUFF
+        | block_state_ids::GRAVEL
+        | block_state_ids::DEEPSLATE
+        | block_state_ids::CALCITE
+        | block_state_ids::ANDESITE
+        | block_state_ids::DIORITE
+        | block_state_ids::CLAY => 4,
+        block_state_ids::MUD => 5,
+        block_state_ids::SNOW_BLOCK => 6,
+        _ => 0,
+    }
 }
 
 fn compatible_top_for_smoother_biome(current_top: i32, biome: &str) -> i32 {
@@ -6169,6 +6500,25 @@ fn smoother_replacement(column: &EarthSurfaceColumn, top: i32, biome: &str) -> E
         smoother_filler_for(top),
         biome.to_string(),
         "smoother-isolated",
+    );
+    replacement.terrain_token_source = column.terrain_token_source;
+    replacement.data_evidence_flags = column.data_evidence_flags;
+    replacement
+}
+
+fn photo_smoother_replacement(
+    column: &EarthSurfaceColumn,
+    top: i32,
+    source: &str,
+) -> EarthSurfaceColumn {
+    let mut replacement = EarthSurfaceColumn::new(
+        false,
+        column.ground_surface_y,
+        column.water_surface_y,
+        top,
+        smoother_filler_for(top),
+        column.biome_id.clone(),
+        source.to_string(),
     );
     replacement.terrain_token_source = column.terrain_token_source;
     replacement.data_evidence_flags = column.data_evidence_flags;
@@ -8088,6 +8438,144 @@ mod tests {
     }
 
     #[test]
+    fn surface_class_photo_texture_smoother_matches_java_fixture_cases() {
+        let mut photo_speckles = filled_surface_columns(
+            5,
+            5,
+            photo_texture_surface_column(
+                block_state_ids::MOSS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:jungle",
+            ),
+        );
+        photo_speckles[surface_class_index(2, 2, 5)] = photo_texture_surface_column(
+            block_state_ids::ORANGE_TERRACOTTA,
+            block_state_ids::ORANGE_TERRACOTTA,
+            "minecraft:jungle",
+        );
+        photo_speckles[surface_class_index(2, 1, 5)] = photo_texture_surface_column(
+            block_state_ids::TERRACOTTA,
+            block_state_ids::TERRACOTTA,
+            "minecraft:jungle",
+        );
+        photo_speckles[surface_class_index(1, 2, 5)] = photo_texture_surface_column(
+            block_state_ids::GRANITE,
+            block_state_ids::STONE,
+            "minecraft:jungle",
+        );
+        let photo_smoothed = smooth_photo_textures(&photo_speckles, 5).unwrap();
+        assert_eq!(
+            photo_smoothed[surface_class_index(2, 2, 5)].top_block_state_id,
+            block_state_ids::MOSS_BLOCK
+        );
+        assert_eq!(
+            photo_smoothed[surface_class_index(2, 2, 5)].decision_source,
+            "smoother-photo"
+        );
+
+        let mut dry_savanna_sand_speckle = filled_surface_columns(
+            7,
+            7,
+            photo_texture_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+        );
+        dry_savanna_sand_speckle[surface_class_index(3, 3, 7)] = photo_texture_surface_column(
+            block_state_ids::SANDSTONE,
+            block_state_ids::SANDSTONE,
+            "minecraft:savanna",
+        );
+        let dry_savanna_sand_speckle_smoothed =
+            smooth_photo_textures(&dry_savanna_sand_speckle, 7).unwrap();
+        assert_eq!(
+            dry_savanna_sand_speckle_smoothed[surface_class_index(3, 3, 7)].top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+
+        let mut dry_savanna_sand_island = filled_surface_columns(
+            9,
+            9,
+            photo_texture_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+        );
+        for z in 3..=5 {
+            for x in 3..=5 {
+                dry_savanna_sand_island[surface_class_index(x, z, 9)] =
+                    photo_texture_surface_column(
+                        block_state_ids::SANDSTONE,
+                        block_state_ids::SANDSTONE,
+                        "minecraft:savanna",
+                    );
+            }
+        }
+        let dry_savanna_sand_smoothed = smooth_photo_textures(&dry_savanna_sand_island, 9).unwrap();
+        assert_eq!(
+            dry_savanna_sand_smoothed[surface_class_index(4, 4, 9)].top_block_state_id,
+            block_state_ids::SANDSTONE
+        );
+
+        let mut desert_sand_patch = filled_surface_columns(
+            9,
+            9,
+            photo_texture_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+        );
+        for z in 3..=5 {
+            for x in 3..=5 {
+                desert_sand_patch[surface_class_index(x, z, 9)] = photo_texture_surface_column(
+                    block_state_ids::SAND,
+                    block_state_ids::SAND,
+                    "minecraft:desert",
+                );
+            }
+        }
+        let desert_sand_smoothed = smooth_photo_textures(&desert_sand_patch, 9).unwrap();
+        assert_eq!(
+            desert_sand_smoothed[surface_class_index(4, 4, 9)].top_block_state_id,
+            block_state_ids::SAND
+        );
+
+        let mut jungle_hot_rock_noise = filled_surface_columns(
+            11,
+            11,
+            photo_texture_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:jungle",
+            ),
+        );
+        for z in 4..=6 {
+            for x in 4..=6 {
+                jungle_hot_rock_noise[surface_class_index(x, z, 11)] = photo_texture_surface_column(
+                    block_state_ids::ORANGE_TERRACOTTA,
+                    block_state_ids::ORANGE_TERRACOTTA,
+                    "minecraft:jungle",
+                );
+            }
+        }
+        let jungle_hot_rock_smoothed = smooth_photo_textures(&jungle_hot_rock_noise, 11).unwrap();
+        assert_eq!(
+            jungle_hot_rock_smoothed[surface_class_index(5, 5, 11)].top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            jungle_hot_rock_smoothed[surface_class_index(5, 5, 11)].decision_source,
+            "smoother-photo-macro"
+        );
+
+        assert!(smooth_photo_textures(&photo_speckles, 0).is_err());
+        assert!(smooth_photo_textures(&photo_speckles, 4).is_err());
+    }
+
+    #[test]
     fn surface_biome_family_intent_grid_matches_java_non_photo_fixture_cases() {
         let mut cell = filled_surface_columns(
             4,
@@ -9493,6 +9981,10 @@ mod tests {
 
     fn land_surface_column(top: i32, biome: &str, y: i32) -> EarthSurfaceColumn {
         surface_column(false, y, i32::MIN, top, top, biome)
+    }
+
+    fn photo_texture_surface_column(top: i32, filler: i32, biome: &str) -> EarthSurfaceColumn {
+        surface_column(false, 72, i32::MIN, top, filler, biome)
     }
 
     fn photo_palette_surface_column(top: i32, filler: i32, biome: &str) -> EarthSurfaceColumn {

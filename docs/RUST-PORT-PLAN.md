@@ -615,6 +615,8 @@ Bootstrap implementation status on 2026-06-03:
   water decisions, smoothing, coast factors, shaped classification, and coastal cleanup fixture cases.
 - Rust `SurfaceClassSmoother` non-photo bootstrap ports isolated-column smoothing, protected water surfaces, and
   snowy-biome top compatibility fixture cases.
+- Rust `SurfaceClassSmoother` photo texture bootstrap ports Java local speckle smoothing, dry-vegetation sand
+  absorption/preservation, desert-boundary preservation, and macro vegetation fixture cases.
 - Rust `SurfaceBiomeFamilyIntentGrid` non-photo bootstrap ports 4x4 cell stabilization, small biome-family component
   absorption, protected wetland/snow/beach handling, and arid-transition preservation fixture cases.
 - Rust `SurfaceBiomeFamilyIntentGrid` preserve-surface bootstrap ports Java photo-palette render locks, biome-only
@@ -627,8 +629,7 @@ Bootstrap implementation status on 2026-06-03:
 - Rust production surface cleanup bootstrap ports Java `NaturalSurfaceBlockPolicy` and `CoastalSurfaceCleaner` fixture
   cases for replacing artificial palette carrier blocks with natural top/filler blocks; full surface-region output wiring
   remains part of fixed-region `generate-surface-region` parity.
-- Remaining Phase 5 work: photo solver, photo texture smoothing,
-  region-level `generate-surface-region` command and payload parity.
+- Remaining Phase 5 work: photo solver and region-level `generate-surface-region` command and payload parity.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

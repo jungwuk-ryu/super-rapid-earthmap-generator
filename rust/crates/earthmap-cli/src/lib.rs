@@ -364,6 +364,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.surfaceClassPhotoTextureSmootherBootstrap - SurfaceClassSmoother photo texture local and macro vegetation smoothing match Java fixture cases."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.surfaceBiomeFamilyIntentGridBootstrap - SurfaceBiomeFamilyIntentGrid non-photo cell stabilization, small-component absorption, protected wetland/snow/beach handling, and arid-transition preservation match Java fixture cases."
     )?;
     writeln!(
