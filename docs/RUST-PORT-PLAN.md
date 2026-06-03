@@ -631,7 +631,11 @@ Bootstrap implementation status on 2026-06-03:
 - Rust production surface cleanup bootstrap ports Java `NaturalSurfaceBlockPolicy` and `CoastalSurfaceCleaner` fixture
   cases for replacing artificial palette carrier blocks with natural top/filler blocks; full surface-region output wiring
   remains part of fixed-region `generate-surface-region` parity.
-- Remaining Phase 5 work: full photo solver parity and region-level `generate-surface-region` command and payload parity.
+- Rust `generate-surface-region` command bootstrap wires Java-shaped region-wide no-material sampling with Java default
+  photo-mode post-processing, distance-transform coast-factor calculation, chunk building, level.dat writing,
+  exploration-only surface manifest metadata, region writing, and Java-shaped stdout for the default command path.
+- Remaining Phase 5 work: full photo solver parity and fixed-region Java/Rust payload parity for surface material/photo
+  output.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

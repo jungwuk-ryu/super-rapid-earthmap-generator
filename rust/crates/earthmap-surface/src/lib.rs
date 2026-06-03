@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use earthmap_core::build_info;
 use earthmap_geo::{
@@ -14,6 +15,7 @@ use earthmap_geo::{
     HeightmapScalarSampler, RgbColor, VrtRgbMosaicReader,
 };
 use earthmap_minecraft::block_state_ids;
+use earthmap_minecraft::chunk_generation_status::ChunkGenerationStatus;
 use earthmap_minecraft::chunk_model::{ChunkModel, BIOME_CELL_WIDTH, CHUNK_WIDTH};
 use earthmap_minecraft::{chunk_nbt_encoder, level_dat_template, MinecraftError};
 use earthmap_region::{ChunkLocalPos, RegionError};
@@ -171,6 +173,117 @@ pub struct HeightOnlyRegionReport {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceRegionSettings {
+    pub heightmap_path: PathBuf,
+    pub world_dir: PathBuf,
+    pub level_name: String,
+    pub seed: i64,
+    pub scale_denominator: i32,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub output_format: OutputFormat,
+    pub cache_rows: usize,
+    pub write_world_metadata: bool,
+    pub chunk_status: ChunkGenerationStatus,
+    pub vertical_scale: f64,
+}
+
+impl SurfaceRegionSettings {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        heightmap_path: impl Into<PathBuf>,
+        world_dir: impl Into<PathBuf>,
+        level_name: impl Into<String>,
+        seed: i64,
+        scale_denominator: i32,
+        region_x: i32,
+        region_z: i32,
+        output_format: OutputFormat,
+        cache_rows: usize,
+    ) -> Result<Self> {
+        Self::new_with_options(
+            heightmap_path,
+            world_dir,
+            level_name,
+            seed,
+            scale_denominator,
+            region_x,
+            region_z,
+            output_format,
+            cache_rows,
+            true,
+            ChunkGenerationStatus::Full,
+            DEFAULT_VERTICAL_SCALE,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        heightmap_path: impl Into<PathBuf>,
+        world_dir: impl Into<PathBuf>,
+        level_name: impl Into<String>,
+        seed: i64,
+        scale_denominator: i32,
+        region_x: i32,
+        region_z: i32,
+        output_format: OutputFormat,
+        cache_rows: usize,
+        write_world_metadata: bool,
+        chunk_status: ChunkGenerationStatus,
+        vertical_scale: f64,
+    ) -> Result<Self> {
+        let level_name = level_name.into();
+        if level_name.trim().is_empty() {
+            return Err(SurfaceError::invalid("levelName must not be blank"));
+        }
+        if scale_denominator <= 0 {
+            return Err(SurfaceError::invalid("scaleDenominator must be positive"));
+        }
+        if cache_rows == 0 {
+            return Err(SurfaceError::invalid("cacheRows must be positive"));
+        }
+        let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+        Ok(Self {
+            heightmap_path: heightmap_path.into(),
+            world_dir: world_dir.into(),
+            level_name,
+            seed,
+            scale_denominator,
+            region_x,
+            region_z,
+            output_format,
+            cache_rows,
+            write_world_metadata,
+            chunk_status,
+            vertical_scale,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceRegionReport {
+    pub region_x: i32,
+    pub region_z: i32,
+    pub output_format: OutputFormat,
+    pub scale_denominator: i32,
+    pub chunk_count: usize,
+    pub land_columns: i32,
+    pub water_columns: i32,
+    pub min_ground_y: i32,
+    pub max_ground_y: i32,
+    pub region_file: PathBuf,
+    pub preview_tile_file: Option<PathBuf>,
+    pub cache_stats: GeoTiffRowCacheStats,
+    pub surface_sample_nanos: u128,
+    pub chunk_build_nanos: u128,
+    pub nbt_encode_nanos: u128,
+    pub region_write_nanos: u128,
+    pub preview_nanos: u128,
+    pub metadata_nanos: u128,
+    pub total_nanos: u128,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceChunkBuild {
     pub chunk: ChunkModel,
     pub land_columns: i32,
@@ -212,6 +325,71 @@ impl SurfaceChunkSample {
             )));
         }
         Ok(&self.columns[(local_z as usize * CHUNK_WIDTH) + local_x as usize])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceRegionSample {
+    columns: Vec<EarthSurfaceColumn>,
+}
+
+impl SurfaceRegionSample {
+    pub fn new(columns: Vec<EarthSurfaceColumn>) -> Result<Self> {
+        if columns.len() != SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH {
+            return Err(SurfaceError::invalid(
+                "columns must contain one entry per region column",
+            ));
+        }
+        Ok(Self { columns })
+    }
+
+    pub fn width(&self) -> usize {
+        SURFACE_REGION_WIDTH
+    }
+
+    pub fn columns(&self) -> &[EarthSurfaceColumn] {
+        &self.columns
+    }
+
+    pub fn column(&self, local_x: i32, local_z: i32) -> Result<&EarthSurfaceColumn> {
+        if local_x < 0
+            || local_x >= SURFACE_REGION_WIDTH as i32
+            || local_z < 0
+            || local_z >= SURFACE_REGION_WIDTH as i32
+        {
+            return Err(SurfaceError::invalid(format!(
+                "local column outside region: {local_x},{local_z}"
+            )));
+        }
+        Ok(&self.columns
+            [surface_class_index(local_x as usize, local_z as usize, SURFACE_REGION_WIDTH)])
+    }
+
+    pub fn chunk_sample(
+        &self,
+        local_chunk_x: i32,
+        local_chunk_z: i32,
+    ) -> Result<SurfaceChunkSample> {
+        if local_chunk_x < 0
+            || local_chunk_x >= REGION_CHUNKS
+            || local_chunk_z < 0
+            || local_chunk_z >= REGION_CHUNKS
+        {
+            return Err(SurfaceError::invalid(format!(
+                "local chunk outside region: {local_chunk_x},{local_chunk_z}"
+            )));
+        }
+        let mut chunk_columns = Vec::with_capacity(CHUNK_WIDTH * CHUNK_WIDTH);
+        let block_x = local_chunk_x as usize * CHUNK_WIDTH;
+        let block_z = local_chunk_z as usize * CHUNK_WIDTH;
+        for local_z in 0..CHUNK_WIDTH {
+            for local_x in 0..CHUNK_WIDTH {
+                let index =
+                    surface_class_index(block_x + local_x, block_z + local_z, SURFACE_REGION_WIDTH);
+                chunk_columns.push(self.columns[index].clone());
+            }
+        }
+        SurfaceChunkSample::new(chunk_columns)
     }
 }
 
@@ -4307,6 +4485,143 @@ pub fn generate_height_only_region(
     })
 }
 
+pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<SurfaceRegionReport> {
+    fs::create_dir_all(&settings.world_dir)?;
+    fs::create_dir_all(settings.world_dir.join("region"))?;
+
+    let reader = GeoTiffHeightmapReader::open(&settings.heightmap_path)?;
+    let mapping = mapping_for(reader.metadata(), settings.scale_denominator)?;
+    let cache = GeoTiffRowCache::new(&reader, settings.cache_rows)?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let total_start = Instant::now();
+
+    let mut metadata_nanos = 0;
+    if settings.write_world_metadata {
+        let phase_start = Instant::now();
+        let spawn_x = settings
+            .region_x
+            .wrapping_mul(REGION_SIZE_BLOCKS)
+            .wrapping_add(REGION_SIZE_BLOCKS / 2);
+        let spawn_z = settings
+            .region_z
+            .wrapping_mul(REGION_SIZE_BLOCKS)
+            .wrapping_add(REGION_SIZE_BLOCKS / 2);
+        let level_settings = level_dat_template::Settings::new(
+            settings.level_name.clone(),
+            settings.seed,
+            spawn_x,
+            SEA_LEVEL_Y + 10,
+            spawn_z,
+        )?;
+        level_dat_template::write(settings.world_dir.join("level.dat"), &level_settings)?;
+        metadata_nanos += phase_start.elapsed().as_nanos();
+    }
+
+    let phase_start = Instant::now();
+    let region_surface = sample_surface_region_scaled(
+        settings.region_x,
+        settings.region_z,
+        &mapping,
+        &sampler,
+        settings.vertical_scale,
+    )?;
+    let surface_sample_nanos = phase_start.elapsed().as_nanos();
+
+    let mut chunks = BTreeMap::new();
+    let mut land_columns = 0;
+    let mut water_columns = 0;
+    let mut min_ground_y = i32::MAX;
+    let mut max_ground_y = i32::MIN;
+    let mut chunk_build_nanos = 0;
+    let mut nbt_encode_nanos = 0;
+    for local_chunk_z in 0..REGION_CHUNKS {
+        for local_chunk_x in 0..REGION_CHUNKS {
+            let chunk_x = settings
+                .region_x
+                .wrapping_mul(REGION_CHUNKS)
+                .wrapping_add(local_chunk_x);
+            let chunk_z = settings
+                .region_z
+                .wrapping_mul(REGION_CHUNKS)
+                .wrapping_add(local_chunk_z);
+            let sample = region_surface.chunk_sample(local_chunk_x, local_chunk_z)?;
+
+            let phase_start = Instant::now();
+            let build = build_surface_chunk(chunk_x, chunk_z, sample.columns())?;
+            chunk_build_nanos += phase_start.elapsed().as_nanos();
+
+            land_columns += build.land_columns;
+            water_columns += build.water_columns;
+            min_ground_y = min_ground_y.min(build.min_ground_y);
+            max_ground_y = max_ground_y.max(build.max_ground_y);
+
+            let phase_start = Instant::now();
+            let status = surface_chunk_status_for(&build, settings.chunk_status);
+            let payload = chunk_nbt_encoder::encode_to_bytes_with_status(&build.chunk, 0, status)?;
+            nbt_encode_nanos += phase_start.elapsed().as_nanos();
+
+            chunks.insert(
+                ChunkLocalPos::new(local_chunk_x as u8, local_chunk_z as u8)?,
+                payload,
+            );
+        }
+    }
+
+    let region_file = region_file(
+        &settings.world_dir,
+        settings.output_format,
+        settings.region_x,
+        settings.region_z,
+    );
+    let phase_start = Instant::now();
+    match settings.output_format {
+        OutputFormat::Mca => earthmap_region::write_mca_region(&region_file, &chunks, 0)?,
+        OutputFormat::LinearV2 => {
+            earthmap_region::write_linear_v2_region(&region_file, &chunks, 0)?
+        }
+    }
+    let region_write_nanos = phase_start.elapsed().as_nanos();
+
+    if settings.write_world_metadata {
+        let phase_start = Instant::now();
+        write_surface_region_manifest(settings)?;
+        metadata_nanos += phase_start.elapsed().as_nanos();
+    }
+
+    Ok(SurfaceRegionReport {
+        region_x: settings.region_x,
+        region_z: settings.region_z,
+        output_format: settings.output_format,
+        scale_denominator: settings.scale_denominator,
+        chunk_count: chunks.len(),
+        land_columns,
+        water_columns,
+        min_ground_y,
+        max_ground_y,
+        region_file,
+        preview_tile_file: None,
+        cache_stats: cache.stats(),
+        surface_sample_nanos,
+        chunk_build_nanos,
+        nbt_encode_nanos,
+        region_write_nanos,
+        preview_nanos: 0,
+        metadata_nanos,
+        total_nanos: total_start.elapsed().as_nanos(),
+    })
+}
+
+fn surface_chunk_status_for(
+    build: &SurfaceChunkBuild,
+    requested_status: ChunkGenerationStatus,
+) -> ChunkGenerationStatus {
+    if requested_status == ChunkGenerationStatus::Surface && build.water_columns > 0 {
+        ChunkGenerationStatus::Carvers
+    } else {
+        requested_status
+    }
+}
+
 pub fn surface_y_for_elevation_meters(elevation_meters: f64) -> i32 {
     let rounded =
         java_math_round_double_to_narrowed_i32(elevation_meters / ELEVATION_METERS_PER_BLOCK);
@@ -4581,6 +4896,113 @@ pub fn sample_surface_chunk_scaled(
                 .map_err(Into::into)
         },
     )
+}
+
+pub fn sample_surface_region_scaled(
+    region_x: i32,
+    region_z: i32,
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    vertical_scale: f64,
+) -> Result<SurfaceRegionSample> {
+    sample_surface_region_with_elevation_fn(
+        region_x,
+        region_z,
+        mapping,
+        vertical_scale,
+        |longitude, latitude| {
+            sampler
+                .bilinear_meters(longitude, latitude)
+                .map_err(Into::into)
+        },
+    )
+}
+
+fn sample_surface_region_with_elevation_fn<F>(
+    region_x: i32,
+    region_z: i32,
+    mapping: &EarthScaleMapping,
+    vertical_scale: f64,
+    mut elevation_fn: F,
+) -> Result<SurfaceRegionSample>
+where
+    F: FnMut(f64, f64) -> Result<f64>,
+{
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let mut elevations = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    let mut valid = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    let region_block_x = region_x.wrapping_mul(REGION_SIZE_BLOCKS);
+    let region_block_z = region_z.wrapping_mul(REGION_SIZE_BLOCKS);
+    for z in 0..SURFACE_REGION_EXTENT {
+        for x in 0..SURFACE_REGION_EXTENT {
+            let global_block_x = region_block_x
+                .wrapping_add(x as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+            let global_block_z = region_block_z
+                .wrapping_add(z as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let index = surface_region_extent_index(x, z);
+            if !surface_chunk_map_position_valid(mapping, map_x, map_z) {
+                elevations[index] = 0.0;
+                valid[index] = false;
+                continue;
+            }
+            let longitude = mapping.longitude_for_block_x(map_x)?;
+            let latitude = mapping.latitude_for_block_z(map_z)?;
+            elevations[index] = elevation_fn(longitude, latitude)?;
+            valid[index] = true;
+        }
+    }
+
+    let water_mask = surface_region_water_decision_mask(&elevations, &valid);
+    let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
+    let mut columns = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
+    let mut coast_factors = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
+    for local_z in 0..SURFACE_REGION_WIDTH {
+        for local_x in 0..SURFACE_REGION_WIDTH {
+            let center_x = local_x + SURFACE_REGION_COAST_RADIUS;
+            let center_z = local_z + SURFACE_REGION_COAST_RADIUS;
+            let global_block_x = region_block_x.wrapping_add(local_x as i32);
+            let global_block_z = region_block_z.wrapping_add(local_z as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
+                0.0
+            } else {
+                mapping.longitude_for_block_x(map_x)?
+            };
+            let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
+                0.0
+            } else {
+                mapping.latitude_for_block_z(map_z)?
+            };
+            let sample_index = surface_region_extent_index(center_x, center_z);
+            let smoothed_elevation =
+                surface_region_smoothed_elevation(&elevations, &valid, center_x, center_z);
+            let water = water_mask[sample_index];
+            let coast_factor = coast_factor_extent[sample_index];
+            columns.push(classify_shaped_surface_scaled(
+                smoothed_elevation,
+                longitude,
+                latitude,
+                water,
+                coast_factor,
+                vertical_scale,
+            )?);
+            coast_factors.push(coast_factor);
+        }
+    }
+
+    let stabilized =
+        stabilize_surface_biome_families_preserving_surfaces(&columns, SURFACE_REGION_WIDTH)?;
+    let smoothed = smooth_photo_textures(&stabilized, SURFACE_REGION_WIDTH)?;
+    let post_smoothed =
+        stabilize_small_surface_biome_family_components(&smoothed, SURFACE_REGION_WIDTH, true);
+    let cleaned =
+        clean_coastal_surface_columns(&post_smoothed, &coast_factors, SURFACE_REGION_WIDTH)?;
+    SurfaceRegionSample::new(cleaned)
 }
 
 pub fn smooth_surface_classes(
@@ -6138,6 +6560,9 @@ fn fill_surface_column(
 const SURFACE_CHUNK_COAST_RADIUS: usize = 64;
 const SURFACE_CHUNK_SMOOTH_RADIUS: i32 = 5;
 const SURFACE_CHUNK_EXTENT: usize = CHUNK_WIDTH + (SURFACE_CHUNK_COAST_RADIUS * 2);
+const SURFACE_REGION_WIDTH: usize = REGION_SIZE_BLOCKS as usize;
+const SURFACE_REGION_COAST_RADIUS: usize = 64;
+const SURFACE_REGION_EXTENT: usize = SURFACE_REGION_WIDTH + (SURFACE_REGION_COAST_RADIUS * 2);
 
 fn sample_surface_chunk_with_elevation_fn<F>(
     chunk_x: i32,
@@ -6329,6 +6754,207 @@ fn surface_chunk_extent_index(x: usize, z: usize) -> usize {
 
 fn surface_chunk_map_position_valid(mapping: &EarthScaleMapping, map_x: i32, map_z: i32) -> bool {
     map_x >= 0 && map_x < mapping.width_blocks && map_z >= 0 && map_z < mapping.height_blocks
+}
+
+fn surface_region_smoothed_elevation(
+    elevations: &[f64],
+    valid: &[bool],
+    center_x: usize,
+    center_z: usize,
+) -> f64 {
+    let mut weighted = 0.0;
+    let mut weights = 0.0;
+    for dz in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
+        for dx in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
+            let x = center_x as i32 + dx;
+            let z = center_z as i32 + dz;
+            if x < 0
+                || x >= SURFACE_REGION_EXTENT as i32
+                || z < 0
+                || z >= SURFACE_REGION_EXTENT as i32
+            {
+                continue;
+            }
+            let index = surface_region_extent_index(x as usize, z as usize);
+            if !valid[index] {
+                continue;
+            }
+            let distance_squared = f64::from((dx * dx) + (dz * dz));
+            let weight = 1.0 / (1.0 + distance_squared);
+            weighted += elevations[index] * weight;
+            weights += weight;
+        }
+    }
+    if weights == 0.0 {
+        0.0
+    } else {
+        weighted / weights
+    }
+}
+
+fn surface_region_water_decision_mask(elevations: &[f64], valid: &[bool]) -> Vec<bool> {
+    let mut water_mask = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    for z in 0..SURFACE_REGION_EXTENT {
+        for x in 0..SURFACE_REGION_EXTENT {
+            let index = surface_region_extent_index(x, z);
+            if !valid[index] {
+                continue;
+            }
+            let raw_elevation = elevations[index];
+            let smoothed_elevation =
+                if surface_chunk_requires_smoothed_water_decision(raw_elevation) {
+                    surface_region_smoothed_elevation(elevations, valid, x, z)
+                } else {
+                    0.0
+                };
+            water_mask[index] = surface_chunk_water_decision(raw_elevation, smoothed_elevation);
+        }
+    }
+    water_mask
+}
+
+const SURFACE_REGION_DISTANCE_INFINITY: i32 = 1_000_000_000;
+
+fn surface_region_coast_factors(valid: &[bool], water_mask: &[bool]) -> Vec<f64> {
+    let distance_to_water = surface_region_squared_distance_to_mask(valid, water_mask, true);
+    let distance_to_land = surface_region_squared_distance_to_mask(valid, water_mask, false);
+    let mut factors = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    for z in 0..SURFACE_REGION_EXTENT {
+        for x in 0..SURFACE_REGION_EXTENT {
+            let index = surface_region_extent_index(x, z);
+            let nearest_squared = if water_mask[index] {
+                distance_to_land[index]
+            } else {
+                distance_to_water[index]
+            };
+            factors[index] = surface_region_coast_factor_from_distance_squared(nearest_squared);
+        }
+    }
+    factors
+}
+
+fn surface_region_coast_factor_from_distance_squared(nearest_squared: i32) -> f64 {
+    let radius = SURFACE_REGION_COAST_RADIUS as i32;
+    if nearest_squared == i32::MAX
+        || nearest_squared >= SURFACE_REGION_DISTANCE_INFINITY
+        || nearest_squared > radius * radius
+    {
+        return 0.0;
+    }
+    let nearest = f64::from(nearest_squared).sqrt();
+    clamp_unit((f64::from(radius) + 1.0 - nearest) / f64::from(radius))
+}
+
+fn surface_region_squared_distance_to_mask(
+    valid: &[bool],
+    water_mask: &[bool],
+    target_water: bool,
+) -> Vec<i32> {
+    let mut row_distances = vec![0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    let mut distances = vec![0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    let mut input = vec![0; SURFACE_REGION_EXTENT];
+    let mut output = vec![0; SURFACE_REGION_EXTENT];
+    let mut parabolas = vec![0; SURFACE_REGION_EXTENT];
+    let mut boundaries = vec![0.0; SURFACE_REGION_EXTENT + 1];
+
+    for z in 0..SURFACE_REGION_EXTENT {
+        for x in 0..SURFACE_REGION_EXTENT {
+            let index = surface_region_extent_index(x, z);
+            input[x] = if valid[index] && water_mask[index] == target_water {
+                0
+            } else {
+                SURFACE_REGION_DISTANCE_INFINITY
+            };
+        }
+        surface_region_distance_transform_1d(&input, &mut output, &mut parabolas, &mut boundaries);
+        for x in 0..SURFACE_REGION_EXTENT {
+            row_distances[surface_region_extent_index(x, z)] = output[x];
+        }
+    }
+
+    for x in 0..SURFACE_REGION_EXTENT {
+        for z in 0..SURFACE_REGION_EXTENT {
+            input[z] = row_distances[surface_region_extent_index(x, z)];
+        }
+        surface_region_distance_transform_1d(&input, &mut output, &mut parabolas, &mut boundaries);
+        for z in 0..SURFACE_REGION_EXTENT {
+            distances[surface_region_extent_index(x, z)] = output[z];
+        }
+    }
+    distances
+}
+
+fn surface_region_distance_transform_1d(
+    input: &[i32],
+    output: &mut [i32],
+    parabolas: &mut [usize],
+    boundaries: &mut [f64],
+) {
+    let mut envelope_index: isize = -1;
+    for q in 0..SURFACE_REGION_EXTENT {
+        if input[q] >= SURFACE_REGION_DISTANCE_INFINITY {
+            continue;
+        }
+        if envelope_index < 0 {
+            envelope_index = 0;
+            parabolas[0] = q;
+            boundaries[0] = f64::NEG_INFINITY;
+            boundaries[1] = f64::INFINITY;
+            continue;
+        }
+
+        let mut intersection;
+        loop {
+            let previous = parabolas[envelope_index as usize];
+            intersection = surface_region_parabola_intersection(input, q, previous);
+            if intersection > boundaries[envelope_index as usize] {
+                break;
+            }
+            envelope_index -= 1;
+            if envelope_index < 0 {
+                break;
+            }
+        }
+        envelope_index += 1;
+        let active = envelope_index as usize;
+        parabolas[active] = q;
+        boundaries[active] = if active == 0 {
+            f64::NEG_INFINITY
+        } else {
+            intersection
+        };
+        boundaries[active + 1] = f64::INFINITY;
+    }
+
+    if envelope_index < 0 {
+        output.fill(SURFACE_REGION_DISTANCE_INFINITY);
+        return;
+    }
+
+    let mut active = 0usize;
+    for (q, out) in output.iter_mut().enumerate().take(SURFACE_REGION_EXTENT) {
+        while boundaries[active + 1] < q as f64 {
+            active += 1;
+        }
+        let nearest = parabolas[active];
+        let delta = q as i64 - nearest as i64;
+        let distance = (delta * delta) + i64::from(input[nearest]);
+        *out = if distance >= i64::from(SURFACE_REGION_DISTANCE_INFINITY) {
+            SURFACE_REGION_DISTANCE_INFINITY
+        } else {
+            distance as i32
+        };
+    }
+}
+
+fn surface_region_parabola_intersection(input: &[i32], q: usize, previous: usize) -> f64 {
+    ((f64::from(input[q]) + ((q * q) as f64))
+        - (f64::from(input[previous]) + ((previous * previous) as f64)))
+        / (2.0 * (q as f64 - previous as f64))
+}
+
+fn surface_region_extent_index(x: usize, z: usize) -> usize {
+    (z * SURFACE_REGION_EXTENT) + x
 }
 
 const SURFACE_SMOOTHER_NEIGHBOR_RADIUS: i32 = 1;
@@ -7852,6 +8478,84 @@ fn write_exploration_only_manifest(settings: &HeightOnlySettings) -> Result<Path
     Ok(manifest_path)
 }
 
+fn write_surface_region_manifest(settings: &SurfaceRegionSettings) -> Result<PathBuf> {
+    let mut values = base_exploration_only_manifest("surface-region");
+    values.insert("features.surfaceRules".to_string(), "true".to_string());
+    values.insert("features.waterSurface".to_string(), "true".to_string());
+    values.insert("features.biomes".to_string(), "heuristic".to_string());
+    values.insert(
+        "features.surfaceMaterialRaster".to_string(),
+        "false".to_string(),
+    );
+    values.insert(
+        "features.serverDelegation".to_string(),
+        settings.chunk_status.delegates_to_server().to_string(),
+    );
+    values.insert(
+        "generation.format".to_string(),
+        settings.output_format.java_name().to_string(),
+    );
+    values.insert(
+        "generation.scaleDenominator".to_string(),
+        settings.scale_denominator.to_string(),
+    );
+    values.insert(
+        "generation.regionX".to_string(),
+        settings.region_x.to_string(),
+    );
+    values.insert(
+        "generation.regionZ".to_string(),
+        settings.region_z.to_string(),
+    );
+    values.insert(
+        "generation.chunkStatus".to_string(),
+        settings.chunk_status.id().to_string(),
+    );
+    values.insert(
+        "generation.verticalScale".to_string(),
+        java_double_properties_string(settings.vertical_scale),
+    );
+    values.insert("generation.textureMode".to_string(), "photo".to_string());
+    values.insert(
+        "generation.progressionPlacementPolicy".to_string(),
+        "none".to_string(),
+    );
+    values.insert(
+        "generation.progressionStrategy".to_string(),
+        "none".to_string(),
+    );
+    values.insert(
+        "generation.progressionStructures".to_string(),
+        "0".to_string(),
+    );
+    values.insert("generation.progressionPortalX".to_string(), "0".to_string());
+    values.insert("generation.progressionPortalY".to_string(), "0".to_string());
+    values.insert("generation.progressionPortalZ".to_string(), "0".to_string());
+    values.insert(
+        "generation.directProgressionStructures".to_string(),
+        "false".to_string(),
+    );
+    values.insert("generation.directCaves".to_string(), "false".to_string());
+    values.insert("generation.directOres".to_string(), "false".to_string());
+    values.insert(
+        "generation.directVegetation".to_string(),
+        "false".to_string(),
+    );
+    values.insert(
+        "generation.directStructures".to_string(),
+        "false".to_string(),
+    );
+
+    fs::create_dir_all(&settings.world_dir)?;
+    let manifest_path = settings.world_dir.join(SURVIVAL_MANIFEST_FILE_NAME);
+    let mut file = File::create(&manifest_path)?;
+    writeln!(file, "# SR EarthMap survival manifest")?;
+    for (key, value) in values {
+        writeln!(file, "{key}={}", escape_properties_value(&value))?;
+    }
+    Ok(manifest_path)
+}
+
 fn base_exploration_only_manifest(generator: &str) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
     values.insert("manifest.version".to_string(), "1".to_string());
@@ -7878,6 +8582,22 @@ fn base_exploration_only_manifest(generator: &str) -> BTreeMap<String, String> {
         values.insert((*key).to_string(), "false".to_string());
     }
     values
+}
+
+fn java_double_properties_string(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value == f64::INFINITY {
+        return "Infinity".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Infinity".to_string();
+    }
+    if value.is_finite() && value.fract() == 0.0 {
+        return format!("{value:.1}");
+    }
+    value.to_string()
 }
 
 fn escape_properties_value(value: &str) -> String {

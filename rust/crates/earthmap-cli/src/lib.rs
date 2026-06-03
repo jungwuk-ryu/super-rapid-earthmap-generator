@@ -13,8 +13,8 @@ use earthmap_geo::{
 };
 use earthmap_region::{ChunkLocalPos, RegionError};
 use earthmap_surface::{
-    classify_surface, HeightOnlySettings, OutputFormat, DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
-    SURVIVAL_MANIFEST_FILE_NAME,
+    classify_surface, HeightOnlySettings, OutputFormat, SurfaceRegionReport, SurfaceRegionSettings,
+    DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
 };
 
 const EXIT_OK: i32 = 0;
@@ -65,6 +65,9 @@ where
             write_result(sample_vrt_rgb(stdout, stderr, &args[1], &args[2], &args[3]))
         }
         "generate-height-region" if args.len() == 7 => write_result(generate_height_region(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+        )),
+        "generate-surface-region" if args.len() == 7 => write_result(generate_surface_region(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
         )),
         "write-sha256-manifest" if args.len() == 3 => {
@@ -369,6 +372,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "DONE rust.phase5.photoSurfaceSolverContractBootstrap - PhotoSurfaceInput/Decision contract, water/no-photo preservation, and representative color-only nearest-palette photo solver cases are wired in Rust."
+    )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.surfaceRegionCommandBootstrap - generate-surface-region writes Java-shaped surface region files, level.dat, manifest metadata, and stdout reports for the no-surface-material default command path."
     )?;
     writeln!(
         out,
@@ -868,6 +875,113 @@ fn generate_height_region_impl(
                 .display()
         ),
     ])
+}
+
+fn generate_surface_region(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    match generate_surface_region_impl(
+        heightmap_path,
+        world_dir,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        format_text,
+    ) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Surface region generation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn generate_surface_region_impl(
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let scale = parse_i32_string(scale_text)?;
+    let region_x = parse_i32_string(region_x_text)?;
+    let region_z = parse_i32_string(region_z_text)?;
+    let settings = SurfaceRegionSettings::new(
+        heightmap_path,
+        world_dir,
+        "SR EarthMap Surface",
+        0,
+        scale,
+        region_x,
+        region_z,
+        format,
+        DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+    )
+    .map_err(|error| error.to_string())?;
+    let report =
+        earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
+    Ok(surface_region_report_lines(&report, world_dir))
+}
+
+fn surface_region_report_lines(report: &SurfaceRegionReport, world_dir: &str) -> Vec<String> {
+    vec![
+        "Surface region generated".to_string(),
+        format!("regionX={}", report.region_x),
+        format!("regionZ={}", report.region_z),
+        format!("format={}", report.output_format.java_name()),
+        format!("scale=1:{}", report.scale_denominator),
+        format!("chunkCount={}", report.chunk_count),
+        format!("landColumns={}", report.land_columns),
+        format!("waterColumns={}", report.water_columns),
+        format!("minGroundY={}", report.min_ground_y),
+        format!("maxGroundY={}", report.max_ground_y),
+        format!("regionFile={}", report.region_file.display()),
+        format!("cacheMaxRows={}", report.cache_stats.max_rows),
+        format!("cacheResidentRows={}", report.cache_stats.resident_rows),
+        format!("cacheHits={}", report.cache_stats.hits),
+        format!("cacheMisses={}", report.cache_stats.misses),
+        format!("cacheEvictions={}", report.cache_stats.evictions),
+        format!(
+            "phase.surfaceSampleMillis={}",
+            millis(report.surface_sample_nanos)
+        ),
+        format!(
+            "phase.chunkBuildMillis={}",
+            millis(report.chunk_build_nanos)
+        ),
+        format!("phase.nbtEncodeMillis={}", millis(report.nbt_encode_nanos)),
+        format!(
+            "phase.regionWriteMillis={}",
+            millis(report.region_write_nanos)
+        ),
+        format!("phase.previewMillis={}", millis(report.preview_nanos)),
+        format!("phase.metadataMillis={}", millis(report.metadata_nanos)),
+        format!("phase.totalInternalMillis={}", millis(report.total_nanos)),
+        format!(
+            "manifestFile={}",
+            Path::new(world_dir)
+                .join(SURVIVAL_MANIFEST_FILE_NAME)
+                .display()
+        ),
+    ]
+}
+
+fn millis(nanos: u128) -> u128 {
+    nanos / 1_000_000
 }
 
 fn parse_i32_string(text: &str) -> std::result::Result<i32, String> {
@@ -1406,6 +1520,157 @@ sourceLookupCells=1\n",
             err,
             "Height-only region generation failed: format must be mca or linear\n"
         );
+    }
+
+    #[test]
+    fn generate_surface_region_rejects_unknown_format_like_java() {
+        let (code, out, err) = run_capture(&[
+            "generate-surface-region",
+            "height.tif",
+            "world",
+            "5000",
+            "0",
+            "0",
+            "bogus",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert_eq!(
+            err,
+            "Surface region generation failed: format must be mca or linear\n"
+        );
+    }
+
+    #[test]
+    fn surface_region_report_lines_match_java_stdout_shape() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("surface-world");
+        let report = SurfaceRegionReport {
+            region_x: 0,
+            region_z: -1,
+            output_format: OutputFormat::LinearV2,
+            scale_denominator: 5000,
+            chunk_count: 1024,
+            land_columns: 200_000,
+            water_columns: 62_144,
+            min_ground_y: 54,
+            max_ground_y: 91,
+            region_file: world.join("region").join("r.0.-1.linear"),
+            preview_tile_file: None,
+            cache_stats: earthmap_geo::GeoTiffRowCacheStats {
+                max_rows: 64,
+                resident_rows: 12,
+                hits: 34,
+                misses: 56,
+                evictions: 7,
+                prefetch_rows: 0,
+                prefetch_requests: 0,
+                prefetch_loads: 0,
+            },
+            surface_sample_nanos: 2_900_000,
+            chunk_build_nanos: 3_100_000,
+            nbt_encode_nanos: 4_200_000,
+            region_write_nanos: 5_300_000,
+            preview_nanos: 0,
+            metadata_nanos: 6_400_000,
+            total_nanos: 21_900_000,
+        };
+
+        let out = surface_region_report_lines(&report, world.to_str().unwrap()).join("\n") + "\n";
+
+        assert_eq!(
+            out,
+            format!(
+                "Surface region generated\n\
+regionX=0\n\
+regionZ=-1\n\
+format=LINEAR_V2\n\
+scale=1:5000\n\
+chunkCount=1024\n\
+landColumns=200000\n\
+waterColumns=62144\n\
+minGroundY=54\n\
+maxGroundY=91\n\
+regionFile={}\n\
+cacheMaxRows=64\n\
+cacheResidentRows=12\n\
+cacheHits=34\n\
+cacheMisses=56\n\
+cacheEvictions=7\n\
+phase.surfaceSampleMillis=2\n\
+phase.chunkBuildMillis=3\n\
+phase.nbtEncodeMillis=4\n\
+phase.regionWriteMillis=5\n\
+phase.previewMillis=0\n\
+phase.metadataMillis=6\n\
+phase.totalInternalMillis=21\n\
+manifestFile={}\n",
+                world.join("region").join("r.0.-1.linear").display(),
+                world.join(SURVIVAL_MANIFEST_FILE_NAME).display()
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "slow full-region smoke; run explicitly when touching region generation"]
+    fn generate_surface_region_writes_stdout_manifest_and_region_file() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("tiny-cli-surface-region.tif");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+        let world = temp.path().join("surface-world");
+
+        let (code, out, err) = run_capture(&[
+            "generate-surface-region",
+            heightmap.to_str().unwrap(),
+            world.to_str().unwrap(),
+            "1000",
+            "0",
+            "0",
+            "linear",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Surface region generated\n"));
+        assert!(out.contains("regionX=0\n"));
+        assert!(out.contains("regionZ=0\n"));
+        assert!(out.contains("format=LINEAR_V2\n"));
+        assert!(out.contains("scale=1:1000\n"));
+        assert!(out.contains("chunkCount=1024\n"));
+        assert!(out.contains("landColumns="));
+        assert!(out.contains("waterColumns="));
+        assert!(out.contains("minGroundY="));
+        assert!(out.contains("maxGroundY="));
+        assert!(out.contains("phase.surfaceSampleMillis="));
+        assert!(out.contains("phase.chunkBuildMillis="));
+        assert!(out.contains("phase.nbtEncodeMillis="));
+        assert!(out.contains("phase.regionWriteMillis="));
+        assert!(out.contains("phase.previewMillis=0\n"));
+        assert!(out.contains("phase.metadataMillis="));
+        assert!(out.contains("phase.totalInternalMillis="));
+        assert!(out.contains(&format!(
+            "manifestFile={}\n",
+            world.join(SURVIVAL_MANIFEST_FILE_NAME).display()
+        )));
+        assert!(world.join("level.dat").is_file());
+        assert!(world.join("region").join("r.0.0.linear").is_file());
+
+        let manifest = fs::read_to_string(world.join(SURVIVAL_MANIFEST_FILE_NAME)).unwrap();
+        assert!(manifest.contains("generator.name=surface-region\n"));
+        assert!(manifest.contains("features.surfaceRules=true\n"));
+        assert!(manifest.contains("features.waterSurface=true\n"));
+        assert!(manifest.contains("features.biomes=heuristic\n"));
+        assert!(manifest.contains("features.surfaceMaterialRaster=false\n"));
+        assert!(manifest.contains("features.serverDelegation=false\n"));
+        assert!(manifest.contains("generation.chunkStatus=minecraft:full\n"));
+        assert!(manifest.contains("generation.textureMode=photo\n"));
+        assert!(manifest.contains("generation.verticalScale=1.0\n"));
+        assert!(manifest.contains("generation.directCaves=false\n"));
+        assert!(manifest.contains("generation.directOres=false\n"));
+        assert!(manifest.contains("generation.directVegetation=false\n"));
+        assert!(manifest.contains("generation.directStructures=false\n"));
+        assert!(manifest.contains("generation.directProgressionStructures=false\n"));
     }
 
     fn synthetic_bigtiff_heightmap() -> Vec<u8> {

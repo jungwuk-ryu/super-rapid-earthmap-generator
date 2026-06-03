@@ -25,8 +25,8 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "generate-surface-region",
-        status: CommandStatus::NotPortedYet,
-        note: "surface region generation",
+        status: CommandStatus::Implemented,
+        note: "surface region generation bootstrap",
     },
     CommandSpec {
         name: "generate-vanilla-delegated-region",
