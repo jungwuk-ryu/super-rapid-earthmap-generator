@@ -609,14 +609,16 @@ Bootstrap implementation status on 2026-06-03:
   and lets `EarthDataSurfaceMaterialSampler` prefer exported terrain tokens over Java standard-palette synthesis.
 - Rust `SurfaceBiomeCellWriter` bootstrap ports Java render-aware 4x4 biome cell selection, vertical surface-band
   coverage, and static carrier fallback fixture cases.
+- Rust surface chunk builder bootstrap wires normalized chunk columns through production natural-surface sanitization,
+  Java-style dominant default-biome selection, and `SurfaceBiomeCellWriter` application fixture cases.
 - Rust `LandShallowTopoPhotoSampler` bootstrap discovers Java's west/east `land_shallow_topo_*.tif` halves, samples
   topographic colors with Java half-world coordinate mapping, and lets `EarthDataSurfaceMaterialSampler.sample_photo`
   follow Java photo-source preference, coarse evidence caching, and terrain-token attachment rules.
 - Rust production surface cleanup bootstrap ports Java `NaturalSurfaceBlockPolicy` and `CoastalSurfaceCleaner` fixture
-  cases for replacing artificial palette carrier blocks with natural top/filler blocks; production chunk-output wiring
+  cases for replacing artificial palette carrier blocks with natural top/filler blocks; full surface-region output wiring
   remains part of fixed-region `generate-surface-region` parity.
 - Remaining Phase 5 work: photo solver, broader `SurfaceClassSmoother`/biome intent smoothing, OSM overlay,
-  production wiring of surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
+  region-level `generate-surface-region` command and payload parity.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

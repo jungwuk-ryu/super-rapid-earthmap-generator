@@ -170,6 +170,18 @@ pub struct HeightOnlyRegionReport {
     pub cache_stats: GeoTiffRowCacheStats,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceChunkBuild {
+    pub chunk: ChunkModel,
+    pub land_columns: i32,
+    pub water_columns: i32,
+    pub min_ground_y: i32,
+    pub max_ground_y: i32,
+    pub biome: String,
+    pub ground_surface_y_by_local_column: Vec<i32>,
+    pub water_by_local_column: Vec<bool>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerrainTokenSource {
     None,
@@ -4059,6 +4071,73 @@ pub fn sanitize_surface_column_for_production(column: &EarthSurfaceColumn) -> Ea
     replace_surface_blocks(column, top, filler, "natural-surface")
 }
 
+pub fn build_surface_chunk(
+    chunk_x: i32,
+    chunk_z: i32,
+    columns: &[EarthSurfaceColumn],
+) -> Result<SurfaceChunkBuild> {
+    let expected_columns = CHUNK_WIDTH * CHUNK_WIDTH;
+    if columns.len() != expected_columns {
+        return Err(SurfaceError::invalid(
+            "surface chunk sample must contain one entry per chunk column",
+        ));
+    }
+    let mut chunk = ChunkModel::overworld(chunk_x, chunk_z);
+    let mut land_columns = 0;
+    let mut water_columns = 0;
+    let mut min_ground_y = i32::MAX;
+    let mut max_ground_y = i32::MIN;
+    let mut biome_by_local_column = vec![String::new(); expected_columns];
+    let mut biome_min_y_by_local_column = vec![0; expected_columns];
+    let mut biome_max_y_by_local_column = vec![0; expected_columns];
+    let mut ground_surface_y_by_local_column = vec![0; expected_columns];
+    let mut water_by_local_column = vec![false; expected_columns];
+    let mut biome_counts = BTreeMap::<String, i32>::new();
+    for local_z in 0..CHUNK_WIDTH {
+        for local_x in 0..CHUNK_WIDTH {
+            let column_index = (local_z * CHUNK_WIDTH) + local_x;
+            let column = normalize_surface_column_for_chunk(&columns[column_index]);
+            if column.water {
+                water_columns += 1;
+            } else {
+                land_columns += 1;
+            }
+            min_ground_y = min_ground_y.min(column.ground_surface_y);
+            max_ground_y = max_ground_y.max(column.ground_surface_y);
+            biome_by_local_column[column_index] = column.biome_id.clone();
+            biome_min_y_by_local_column[column_index] = column.ground_surface_y;
+            biome_max_y_by_local_column[column_index] = if column.water {
+                column.water_surface_y
+            } else {
+                column.ground_surface_y
+            };
+            ground_surface_y_by_local_column[column_index] = column.ground_surface_y;
+            water_by_local_column[column_index] = column.water;
+            *biome_counts.entry(column.biome_id.clone()).or_insert(0) += 1;
+            fill_surface_column(&mut chunk, local_x as i32, local_z as i32, &column)?;
+        }
+    }
+    let biome = dominant_surface_biome(&biome_counts);
+    chunk.set_biome_id(biome.clone())?;
+    apply_surface_biome_cells(
+        &mut chunk,
+        &biome_by_local_column,
+        &biome_min_y_by_local_column,
+        &biome_max_y_by_local_column,
+        &biome,
+    )?;
+    Ok(SurfaceChunkBuild {
+        chunk,
+        land_columns,
+        water_columns,
+        min_ground_y,
+        max_ground_y,
+        biome,
+        ground_surface_y_by_local_column,
+        water_by_local_column,
+    })
+}
+
 pub fn is_allowed_production_top(block: i32, _biome: &str) -> bool {
     is_allowed_natural_surface_top(block)
 }
@@ -5350,6 +5429,47 @@ fn fill_height_only_column(
     Ok(())
 }
 
+fn fill_surface_column(
+    chunk: &mut ChunkModel,
+    local_x: i32,
+    local_z: i32,
+    column: &EarthSurfaceColumn,
+) -> Result<()> {
+    let column = normalize_surface_column_for_chunk(column);
+    let column = sanitize_surface_column_for_production(&column);
+    chunk.set_block_state_id(local_x, -64, local_z, block_state_ids::BEDROCK)?;
+    chunk.fill_column(
+        local_x,
+        local_z,
+        -63,
+        (-63).max(column.ground_surface_y - 4),
+        block_state_ids::STONE,
+    )?;
+    chunk.fill_column(
+        local_x,
+        local_z,
+        (-63).max(column.ground_surface_y - 3),
+        column.ground_surface_y - 1,
+        column.filler_block_state_id,
+    )?;
+    chunk.set_block_state_id(
+        local_x,
+        column.ground_surface_y,
+        local_z,
+        column.top_block_state_id,
+    )?;
+    if column.water {
+        chunk.fill_column(
+            local_x,
+            local_z,
+            column.ground_surface_y + 1,
+            column.water_surface_y,
+            block_state_ids::WATER,
+        )?;
+    }
+    Ok(())
+}
+
 fn top_block_state_id(
     _elevation_meters: f64,
     longitude: f64,
@@ -6294,6 +6414,78 @@ mod tests {
             0
         );
         assert_eq!(render_surface_color(i32::MAX, None), 0);
+    }
+
+    #[test]
+    fn surface_chunk_builder_wires_biome_cells_and_static_carriers_like_java_surface_chunk() {
+        let y = SEA_LEVEL_Y + 20;
+        let default_column = surface_column(
+            false,
+            y,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:dark_forest",
+        );
+        let mut columns = vec![default_column; CHUNK_WIDTH * CHUNK_WIDTH];
+        columns[local_column_index(0, 0)] = surface_column(
+            false,
+            y,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:windswept_savanna",
+        );
+        columns[local_column_index(1, 0)] = surface_column(
+            false,
+            y,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:windswept_savanna",
+        );
+
+        let build = build_surface_chunk(3, -2, &columns).unwrap();
+
+        assert_eq!(build.land_columns, 256);
+        assert_eq!(build.water_columns, 0);
+        assert_eq!(build.min_ground_y, y);
+        assert_eq!(build.max_ground_y, y);
+        assert_eq!(build.biome, "minecraft:dark_forest");
+        assert_eq!(build.chunk.chunk_x(), 3);
+        assert_eq!(build.chunk.chunk_z(), -2);
+        assert_eq!(build.ground_surface_y_by_local_column[0], y);
+        assert!(!build.water_by_local_column[0]);
+        assert_eq!(
+            build.chunk.get_block_state_id(0, y, 0).unwrap(),
+            block_state_ids::ANDESITE
+        );
+        assert_eq!(
+            build.chunk.get_block_state_id(1, y, 0).unwrap(),
+            block_state_ids::ANDESITE
+        );
+        assert_eq!(
+            build.chunk.get_block_state_id(2, y, 0).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            build.chunk.get_biome_id_at(0, y, 0).unwrap(),
+            "minecraft:dark_forest"
+        );
+    }
+
+    #[test]
+    fn surface_chunk_builder_validates_one_column_per_chunk_block() {
+        let columns = vec![
+            land_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                "minecraft:plains",
+                SEA_LEVEL_Y
+            );
+            (CHUNK_WIDTH * CHUNK_WIDTH) - 1
+        ];
+
+        assert!(build_surface_chunk(0, 0, &columns).is_err());
     }
 
     #[test]
