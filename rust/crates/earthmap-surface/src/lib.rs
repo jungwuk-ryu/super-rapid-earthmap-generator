@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use earthmap_core::build_info;
 use earthmap_geo::{
     EarthScaleMapping, GeoError, GeoTiffFloat32Reader, GeoTiffHeightmapReader, GeoTiffMetadata,
-    GeoTiffRowCache, GeoTiffRowCacheStats, GeoTiffSingleBandReader, HeightmapScalarSampler,
-    RgbColor, VrtRgbMosaicReader,
+    GeoTiffRgbReader, GeoTiffRowCache, GeoTiffRowCacheStats, GeoTiffSingleBandReader,
+    HeightmapScalarSampler, RgbColor, VrtRgbMosaicReader,
 };
 use earthmap_minecraft::block_state_ids;
 use earthmap_minecraft::chunk_model::{ChunkModel, CHUNK_WIDTH};
@@ -836,7 +836,10 @@ pub struct EarthDataSurfaceMaterialSampler {
     slope: Option<GeoTiffSingleBandReader>,
     ecoregions: Option<Box<dyn EcoregionSampler>>,
     terrain_tokens: Option<MetImageExportTerrainSampler>,
+    land_shallow_topo: Option<LandShallowTopoPhotoSampler>,
     material_cache: Mutex<BoundedAccessCache<SurfaceMaterialSample>>,
+    photo_color_cache: Mutex<BoundedAccessCache<RgbColor>>,
+    photo_evidence_cache: Mutex<BoundedAccessCache<SurfaceMaterialSample>>,
     ocean_cache: Mutex<BoundedAccessCache<SurfaceMaterialSample>>,
     ecoregion_cache: Mutex<BoundedAccessCache<EcoregionEvidence>>,
 }
@@ -846,6 +849,7 @@ impl EarthDataSurfaceMaterialSampler {
     const MATERIAL_CACHE_ENTRIES: usize = 262_144;
     const OCEAN_CACHE_ENTRIES: usize = 262_144;
     const ECOREGION_CACHE_ENTRIES: usize = 262_144;
+    const PHOTO_EVIDENCE_CACHE_ENTRIES: usize = Self::MATERIAL_CACHE_ENTRIES / 2;
 
     pub fn open(true_marble_path: impl AsRef<Path>) -> Result<Self> {
         let true_marble_path = true_marble_path.as_ref();
@@ -888,7 +892,12 @@ impl EarthDataSurfaceMaterialSampler {
             ecoregions: WwfEcoregionSampler::open_auto_cache(true_marble_path)?
                 .map(|sampler| Box::new(sampler) as Box<dyn EcoregionSampler>),
             terrain_tokens: MetImageExportTerrainSampler::open_auto(true_marble_path)?,
+            land_shallow_topo: LandShallowTopoPhotoSampler::open_near(true_marble_path)?,
             material_cache: Mutex::new(BoundedAccessCache::new(Self::MATERIAL_CACHE_ENTRIES)),
+            photo_color_cache: Mutex::new(BoundedAccessCache::new(Self::MATERIAL_CACHE_ENTRIES)),
+            photo_evidence_cache: Mutex::new(BoundedAccessCache::new(
+                Self::PHOTO_EVIDENCE_CACHE_ENTRIES,
+            )),
             ocean_cache: Mutex::new(BoundedAccessCache::new(Self::OCEAN_CACHE_ENTRIES)),
             ecoregion_cache: Mutex::new(BoundedAccessCache::new(Self::ECOREGION_CACHE_ENTRIES)),
         })
@@ -938,6 +947,188 @@ impl EarthDataSurfaceMaterialSampler {
             .map_err(|_| SurfaceError::invalid("surface material cache lock poisoned"))?;
         let sample = cache.insert_or_get(cell.key, sampled);
         Ok(self.with_terrain_token(&sample, longitude, latitude))
+    }
+
+    fn sample_photo_with_coarse_evidence(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        let color = self.sample_photo_color(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )?;
+        let evidence = self.sample_photo_evidence(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )?;
+        Ok(self.with_terrain_token(&evidence.with_color(color), longitude, latitude))
+    }
+
+    fn sample_photo_color(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<RgbColor> {
+        let cell_degrees = photo_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let cell = quantized_cell(longitude, latitude, cell_degrees);
+        {
+            let mut cache = self
+                .photo_color_cache
+                .lock()
+                .map_err(|_| SurfaceError::invalid("surface photo color cache lock poisoned"))?;
+            if let Some(cached) = cache.get(cell.key) {
+                return Ok(cached);
+            }
+        }
+        let sampled = self.sample_primary_photo_color(
+            cell.center_longitude,
+            cell.center_latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )?;
+        let mut cache = self
+            .photo_color_cache
+            .lock()
+            .map_err(|_| SurfaceError::invalid("surface photo color cache lock poisoned"))?;
+        Ok(cache.insert_or_get(cell.key, sampled))
+    }
+
+    fn sample_primary_photo_color(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<RgbColor> {
+        let prefer_topographic = prefers_topographic_photo_source();
+        if prefer_topographic {
+            let topographic = self.sample_topographic_photo_color(
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            )?;
+            if usable_photo_color(topographic) {
+                return Ok(topographic);
+            }
+        }
+        let satellite = self.true_marble.sample_averaged(
+            longitude,
+            latitude,
+            photo_average_span_degrees(longitude_span_degrees),
+            photo_average_span_degrees(latitude_span_degrees),
+        )?;
+        if usable_photo_color(satellite) {
+            return Ok(satellite);
+        }
+        if !prefer_topographic {
+            let topographic = self.sample_topographic_photo_color(
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            )?;
+            if usable_photo_color(topographic) {
+                return Ok(topographic);
+            }
+        }
+        self.true_marble
+            .sample_nearest(longitude, latitude)
+            .map_err(Into::into)
+    }
+
+    fn sample_topographic_photo_color(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<RgbColor> {
+        let Some(land_shallow_topo) = self.land_shallow_topo.as_ref() else {
+            return Ok(RgbColor::unavailable());
+        };
+        land_shallow_topo.sample_averaged(
+            longitude,
+            latitude,
+            photo_average_span_degrees(longitude_span_degrees),
+            photo_average_span_degrees(latitude_span_degrees),
+        )
+    }
+
+    fn sample_photo_evidence(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        let cell_degrees =
+            photo_evidence_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let cell = quantized_cell(longitude, latitude, cell_degrees);
+        {
+            let mut cache = self
+                .photo_evidence_cache
+                .lock()
+                .map_err(|_| SurfaceError::invalid("surface photo evidence cache lock poisoned"))?;
+            if let Some(cached) = cache.get(cell.key) {
+                return Ok(cached);
+            }
+        }
+        let sampled = self.sample_photo_evidence_uncached(
+            cell.center_longitude,
+            cell.center_latitude,
+            cell_degrees,
+            cell_degrees,
+        )?;
+        let mut cache = self
+            .photo_evidence_cache
+            .lock()
+            .map_err(|_| SurfaceError::invalid("surface photo evidence cache lock poisoned"))?;
+        Ok(cache.insert_or_get(cell.key, sampled))
+    }
+
+    fn sample_photo_evidence_uncached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        let ecoregion = self.sample_ecoregion(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )?;
+        Ok(SurfaceMaterialSample::new(
+            RgbColor::unavailable(),
+            RgbColor::unavailable(),
+            TerrainTokenSource::None,
+            sample_rounded(self.climate.as_ref(), longitude, latitude),
+            sample_rounded(self.evergreen_broadleaf_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.deciduous_broadleaf_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.needleleaf_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.mixed_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.herbaceous_vegetation.as_ref(), longitude, latitude),
+            sample_rounded(self.shrubs.as_ref(), longitude, latitude),
+            sample_rounded(self.snow.as_ref(), longitude, latitude),
+            sample_rounded(self.swamp.as_ref(), longitude, latitude),
+            sample_rounded(self.ocean_temperature.as_ref(), longitude, latitude),
+            sample_bathymetry_meters(self.bathymetry.as_ref(), longitude, latitude),
+            sample_slope_permille(self.slope.as_ref(), longitude, latitude),
+            ecoregion.sample.name,
+            ecoregion.sample.biome_id,
+            ecoregion.confidence,
+        ))
     }
 
     fn sample_land_uncached(
@@ -1129,6 +1320,21 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
         )
     }
 
+    fn sample_photo(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample_photo_with_coarse_evidence(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
+
     fn samples_open_water(&self) -> bool {
         self.bathymetry.is_some() || self.ocean_temperature.is_some()
     }
@@ -1222,6 +1428,131 @@ impl<T: Clone> BoundedAccessCache<T> {
 struct BoundedCacheEntry<T> {
     value: T,
     access_stamp: u64,
+}
+
+#[derive(Debug)]
+pub struct LandShallowTopoPhotoSampler {
+    west_path: PathBuf,
+    east_path: PathBuf,
+    readers: Mutex<HashMap<LandShallowReaderKey, Arc<GeoTiffRgbReader>>>,
+}
+
+impl LandShallowTopoPhotoSampler {
+    const WEST_FILE: &'static str = "land_shallow_topo_west.tif";
+    const EAST_FILE: &'static str = "land_shallow_topo_east.tif";
+    const HALF_WORLD_DEGREES: f64 = 180.0;
+    const DEFAULT_PIXEL_DEGREES: f64 = 1.0 / 120.0;
+    const ROW_CACHE_ENTRIES: usize = 1024;
+
+    pub fn open_near(true_marble_path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let normalized = absolute_normalized_path(true_marble_path.as_ref())?;
+        let Some(tif_root) = normalized.parent().and_then(Path::parent) else {
+            return Ok(None);
+        };
+        let west_path = absolute_normalized_path(&tif_root.join(Self::WEST_FILE))?;
+        let east_path = absolute_normalized_path(&tif_root.join(Self::EAST_FILE))?;
+        if !west_path.is_file() || !east_path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            west_path,
+            east_path,
+            readers: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    pub fn sample_nearest(&self, longitude: f64, latitude: f64) -> Result<RgbColor> {
+        let lon = normalize_longitude(longitude);
+        let lat = java_max(-90.0, java_min(90.0, latitude));
+        let (path, min_longitude) = if lon < 0.0 {
+            (&self.west_path, -Self::HALF_WORLD_DEGREES)
+        } else {
+            (&self.east_path, 0.0)
+        };
+        let reader = self.reader(path)?;
+        let x = (((lon - min_longitude) / Self::HALF_WORLD_DEGREES) * f64::from(reader.width()))
+            .floor() as i32;
+        let y =
+            (((90.0 - lat) / Self::HALF_WORLD_DEGREES) * f64::from(reader.height())).floor() as i32;
+        reader
+            .sample_pixel(
+                clamp_i32(x, 0, reader.width() - 1),
+                clamp_i32(y, 0, reader.height() - 1),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn sample_averaged(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<RgbColor> {
+        let lon_offset = java_max(longitude_span_degrees.abs(), Self::DEFAULT_PIXEL_DEGREES) / 2.0;
+        let lat_offset = java_max(latitude_span_degrees.abs(), Self::DEFAULT_PIXEL_DEGREES) / 2.0;
+        let mut red = 0u64;
+        let mut green = 0u64;
+        let mut blue = 0u64;
+        let mut samples = 0u64;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let color = self.sample_nearest(
+                    longitude + (f64::from(dx) * lon_offset),
+                    latitude + (f64::from(dz) * lat_offset),
+                )?;
+                if !color.available {
+                    continue;
+                }
+                red += u64::from(color.red);
+                green += u64::from(color.green);
+                blue += u64::from(color.blue);
+                samples += 1;
+            }
+        }
+        if samples == 0 {
+            return Ok(RgbColor::unavailable());
+        }
+        Ok(RgbColor::of(
+            java_math_round_double_to_narrowed_i32(red as f64 / samples as f64) as u8,
+            java_math_round_double_to_narrowed_i32(green as f64 / samples as f64) as u8,
+            java_math_round_double_to_narrowed_i32(blue as f64 / samples as f64) as u8,
+        ))
+    }
+
+    fn reader(&self, path: &Path) -> Result<Arc<GeoTiffRgbReader>> {
+        let key = LandShallowReaderKey {
+            path: path.to_path_buf(),
+            thread_id: std::thread::current().id(),
+        };
+        {
+            let readers = self.readers.lock().map_err(|_| {
+                SurfaceError::invalid("land-shallow topo reader cache lock poisoned")
+            })?;
+            if let Some(reader) = readers.get(&key) {
+                return Ok(reader.clone());
+            }
+        }
+        let loaded = Arc::new(GeoTiffRgbReader::open_with_tile_cache_entries(
+            path,
+            Self::ROW_CACHE_ENTRIES,
+        )?);
+        let mut readers = self
+            .readers
+            .lock()
+            .map_err(|_| SurfaceError::invalid("land-shallow topo reader cache lock poisoned"))?;
+        if let Some(existing) = readers.get(&key) {
+            return Ok(existing.clone());
+        }
+        readers.insert(key, loaded.clone());
+        Ok(loaded)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LandShallowReaderKey {
+    path: PathBuf,
+    thread_id: std::thread::ThreadId,
 }
 
 #[derive(Debug)]
@@ -2274,6 +2605,28 @@ pub fn photo_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f6
 
 pub fn photo_average_span_degrees(span_degrees: f64) -> f64 {
     java_max(0.0030, java_min(0.060, span_degrees.abs() * 2.75))
+}
+
+pub fn prefers_topographic_photo_source() -> bool {
+    let property = std::env::var("earthmap.photoSource").unwrap_or_default();
+    let environment = std::env::var("EARTHMAP_PHOTO_SOURCE").unwrap_or_default();
+    photo_source_prefers_topographic(&property, &environment)
+}
+
+pub fn photo_source_prefers_topographic(property: &str, environment: &str) -> bool {
+    let value = if property.trim().is_empty() {
+        environment
+    } else {
+        property
+    };
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "topo" | "topographic" | "land-shallow-topo" | "land_shallow_topo"
+    )
+}
+
+fn usable_photo_color(color: RgbColor) -> bool {
+    color.available && !color.is_near_black()
 }
 
 pub fn photo_evidence_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f64) -> f64 {
@@ -4243,6 +4596,61 @@ mod tests {
     }
 
     #[test]
+    fn photo_source_preference_matches_java_property_and_environment_rules() {
+        assert!(!photo_source_prefers_topographic("", ""));
+        assert!(!photo_source_prefers_topographic("   ", "satellite"));
+        assert!(photo_source_prefers_topographic("topo", ""));
+        assert!(photo_source_prefers_topographic(" topographic ", ""));
+        assert!(photo_source_prefers_topographic("", "land-shallow-topo"));
+        assert!(photo_source_prefers_topographic("", "land_shallow_topo"));
+        assert!(photo_source_prefers_topographic("topo", "satellite"));
+        assert!(!photo_source_prefers_topographic("satellite", "topo"));
+    }
+
+    #[test]
+    fn land_shallow_topo_photo_sampler_matches_java_half_world_mapping() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-surface-land-shallow-topo-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let tif_root = root.join("TifFiles");
+        let terrain = tif_root.join("terrain");
+        std::fs::create_dir_all(&terrain).unwrap();
+        let true_marble = terrain.join("TrueMarble.vrt");
+        std::fs::write(&true_marble, b"placeholder").unwrap();
+        std::fs::write(
+            tif_root.join("land_shallow_topo_west.tif"),
+            synthetic_classic_rgb_tiff(),
+        )
+        .unwrap();
+        std::fs::write(
+            tif_root.join("land_shallow_topo_east.tif"),
+            synthetic_classic_rgb_tiff(),
+        )
+        .unwrap();
+
+        let sampler = LandShallowTopoPhotoSampler::open_near(&true_marble)
+            .unwrap()
+            .expect("both land-shallow topo halves should be discovered");
+        assert_eq!(
+            sampler.sample_nearest(45.0, 45.0).unwrap(),
+            RgbColor::of(10, 20, 30)
+        );
+        assert_eq!(
+            sampler.sample_nearest(-45.0, -45.0).unwrap(),
+            RgbColor::of(100, 110, 120)
+        );
+        assert_eq!(
+            sampler.sample_averaged(45.0, 45.0, 0.0, 0.0).unwrap(),
+            RgbColor::of(10, 20, 30)
+        );
+
+        drop(sampler);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn met_image_export_terrain_sampler_matches_java_tile_discovery_and_sampling() {
         let root = std::env::temp_dir().join(format!(
             "earthmap-surface-met-terrain-sampler-{}",
@@ -4455,6 +4863,19 @@ mod tests {
 
         assert_eq!(sampler.sample_water(1.25, 0.75, 0.0, 0.0).unwrap(), water);
         assert_eq!(sampler.raster_stats().sample_averaged_requests, 2);
+
+        let photo = sampler.sample_photo(1.25, 0.75, 0.0, 0.0).unwrap();
+        assert_eq!(photo.color, RgbColor::of(70, 80, 90));
+        assert_eq!(photo.terrain_token_color, RgbColor::of(167, 146, 103));
+        assert_eq!(photo.terrain_token_source, TerrainTokenSource::Export);
+        assert_eq!(photo.climate_class, 2);
+        assert_eq!(photo.ecoregion_name, "Cache Jungle");
+        assert_eq!(photo.ecoregion_biome_id, "minecraft:jungle");
+        assert_eq!(photo.ecoregion_confidence, 1.0);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 3);
+
+        assert_eq!(sampler.sample_photo(1.25, 0.75, 0.0, 0.0).unwrap(), photo);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 3);
 
         drop(sampler);
         std::fs::remove_dir_all(&root).unwrap();

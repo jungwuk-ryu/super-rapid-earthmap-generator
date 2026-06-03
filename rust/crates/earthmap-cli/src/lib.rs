@@ -362,6 +362,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.metImageExportTerrainSamplerBootstrap - MetImageExportTerrainSampler discovers Java MET image_exports tiles, parses aux GeoTransform metadata, samples PNG terrain-token colors with a bounded image cache, and EarthDataSurfaceMaterialSampler prefers exported tokens when present."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.landShallowTopoPhotoSamplerBootstrap - LandShallowTopoPhotoSampler discovers west/east topographic GeoTIFF halves and EarthDataSurfaceMaterialSampler.sample_photo follows Java photo-source preference, coarse evidence, and terrain-token rules."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",
