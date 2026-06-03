@@ -379,6 +379,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.photoSurfaceSolverVegetationTokenBootstrap - Java Standard vegetation terrain-token handling has bounded fixture coverage for near-black shadow carriers and gray-olive static carrier selection."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.surfaceRegionCommandBootstrap - generate-surface-region writes Java-shaped surface region files, level.dat, manifest metadata, and stdout reports for the no-surface-material default command path."
     )?;
     writeln!(

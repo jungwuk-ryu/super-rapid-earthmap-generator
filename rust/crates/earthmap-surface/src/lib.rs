@@ -1092,6 +1092,9 @@ pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDeci
     if let Some(decision) = solve_authoritative_arid_token_surface(input, source) {
         return Ok(decision);
     }
+    if let Some(decision) = solve_java_standard_vegetation_token_surface(input, source) {
+        return Ok(decision);
+    }
     let entry = nearest_photo_palette_entry(source);
     let block_state_id = java_standard_tan_carrier_top(input, source, entry.block_state_id);
     let biome = photo_solver_biome(&input.semantic_column, &input.sample);
@@ -1173,6 +1176,76 @@ fn solve_authoritative_arid_token_surface(
         source,
         "authoritative arid terrain token",
     ))
+}
+
+fn solve_java_standard_vegetation_token_surface(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+) -> Option<PhotoSurfaceDecision> {
+    if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette {
+        return None;
+    }
+    let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+    if !token.confident() || !matches!(token.kind, MetTerrainKind::Vegetated | MetTerrainKind::Wet)
+    {
+        return None;
+    }
+    if photo_solver_dark_standard_shadow(input) {
+        let top = nearest_photo_static_carrier(
+            source,
+            &[
+                block_state_ids::BLACK_TERRACOTTA,
+                block_state_ids::GRAY_TERRACOTTA,
+                block_state_ids::DEEPSLATE,
+            ],
+        )
+        .unwrap_or(block_state_ids::BLACK_TERRACOTTA);
+        return Some(photo_surface_decision_for_top(
+            input,
+            top,
+            "photo-palette",
+            "palette-token-solver",
+            source,
+            "java standard dark vegetation token",
+        ));
+    }
+    if token.kind == MetTerrainKind::Vegetated
+        && token.top_block_state_id == block_state_ids::GRASS_BLOCK
+        && photo_solver_gray_olive_standard_target(source)
+    {
+        let baseline = nearest_photo_palette_entry(source);
+        if !is_tinted_vegetation_block(baseline.block_state_id) {
+            return None;
+        }
+        let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+        let tinted_distance =
+            photo_weighted_render_distance(source, baseline.block_state_id, &biome);
+        let top = nearest_photo_static_carrier(source, STATIC_CARRIER_BLOCKS)
+            .unwrap_or(block_state_ids::ANDESITE);
+        if is_tinted_vegetation_block(top) {
+            return None;
+        }
+        let carrier_distance = photo_weighted_render_distance(source, top, &biome);
+        if carrier_distance
+            + photo_solver_gray_olive_carrier_margin(
+                source,
+                input.global_block_x,
+                input.global_block_z,
+            )
+            >= tinted_distance
+        {
+            return None;
+        }
+        return Some(photo_surface_decision_for_top(
+            input,
+            top,
+            "photo-palette",
+            "palette-token-solver",
+            source,
+            "java standard gray olive static carrier",
+        ));
+    }
+    None
 }
 
 fn photo_surface_decision_for_top(
@@ -1349,6 +1422,103 @@ fn photo_solver_gray_rock_source_for_sand_token(
         && (input.local_relief_meters >= 80.0 || input.elevation_meters >= 700.0)
 }
 
+fn photo_solver_dark_standard_shadow(input: &PhotoSurfaceInput) -> bool {
+    if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette
+        || !input.sample.terrain_token_color.available
+        || !input.sample.color.available
+    {
+        return false;
+    }
+    let token = input.sample.terrain_token_color;
+    let source = input.sample.color;
+    token.red <= 24
+        && token.green <= 24
+        && token.blue <= 24
+        && photo_luma(source) <= 46.0
+        && photo_luma(token) <= 24.0
+}
+
+fn photo_solver_gray_olive_standard_target(color: RgbColor) -> bool {
+    color.red >= 120
+        && color.red <= 148
+        && color.green >= 128
+        && color.green <= 156
+        && color.blue >= 65
+        && color.blue <= 114
+        && (i32::from(color.red) - i32::from(color.green)).abs() <= 18
+        && color.green >= color.blue.saturating_add(28)
+}
+
+fn nearest_photo_static_carrier(source: RgbColor, candidates: &[i32]) -> Option<i32> {
+    let biome = "minecraft:plains";
+    candidates.iter().copied().min_by(|&left, &right| {
+        photo_weighted_render_distance(source, left, biome)
+            .partial_cmp(&photo_weighted_render_distance(source, right, biome))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.cmp(&right))
+    })
+}
+
+fn photo_solver_gray_olive_carrier_margin(
+    source: RgbColor,
+    global_block_x: i32,
+    global_block_z: i32,
+) -> f64 {
+    let luma_gap = (photo_luma(source) - 135.0).abs();
+    let noise = photo_solver_texture_cell_noise(
+        global_block_x,
+        global_block_z,
+        32,
+        block_state_ids::GRASS_BLOCK,
+        block_state_ids::ANDESITE,
+    );
+    0.35 + 1.10_f64.min(luma_gap * 0.025) + (noise * 0.25)
+}
+
+fn photo_solver_texture_cell_noise(
+    global_block_x: i32,
+    global_block_z: i32,
+    cell_width: i32,
+    salt_a: i32,
+    salt_b: i32,
+) -> f64 {
+    let cell_x = global_block_x.div_euclid(cell_width);
+    let cell_z = global_block_z.div_euclid(cell_width);
+    let tx = f64::from(global_block_x.rem_euclid(cell_width)) / f64::from(cell_width);
+    let tz = f64::from(global_block_z.rem_euclid(cell_width)) / f64::from(cell_width);
+    let sx = smooth_step(tx);
+    let sz = smooth_step(tz);
+    let h00 = photo_solver_texture_cell_hash(cell_x, cell_z, salt_a, salt_b);
+    let h10 = photo_solver_texture_cell_hash(cell_x.wrapping_add(1), cell_z, salt_a, salt_b);
+    let h01 = photo_solver_texture_cell_hash(cell_x, cell_z.wrapping_add(1), salt_a, salt_b);
+    let h11 = photo_solver_texture_cell_hash(
+        cell_x.wrapping_add(1),
+        cell_z.wrapping_add(1),
+        salt_a,
+        salt_b,
+    );
+    lerp(lerp(h00, h10, sx), lerp(h01, h11, sx), sz)
+}
+
+fn photo_solver_texture_cell_hash(cell_x: i32, cell_z: i32, salt_a: i32, salt_b: i32) -> f64 {
+    fine_photo_solver_hash(
+        cell_x ^ salt_a.wrapping_mul(31),
+        cell_z ^ salt_b.wrapping_mul(17),
+    )
+}
+
+fn fine_photo_solver_hash(x: i32, z: i32) -> f64 {
+    let mut hash = 0x9e3779b97f4a7c15_u64;
+    hash ^= (x as i64 as u64).wrapping_mul(0xbf58476d1ce4e5b9);
+    hash ^= (z as i64 as u64).wrapping_mul(0x94d049bb133111eb);
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58476d1ce4e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d049bb133111eb);
+    hash ^= hash >> 31;
+    ((hash >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
+}
+
 fn photo_solver_snow_evidence(input: &PhotoSurfaceInput, source: RgbColor) -> bool {
     if input.sample.snow_cover_ratio() >= 0.10 {
         return true;
@@ -1369,6 +1539,12 @@ fn photo_weighted_render_distance(source: RgbColor, top: i32, biome: &str) -> f6
     let green = f64::from(source.green) - f64::from((color >> 8) & 0xff);
     let blue = f64::from(source.blue) - f64::from(color & 0xff);
     ((red * red * 0.30) + (green * green * 0.45) + (blue * blue * 0.25)).sqrt()
+}
+
+fn photo_luma(color: RgbColor) -> f64 {
+    (f64::from(color.red) * 0.2126)
+        + (f64::from(color.green) * 0.7152)
+        + (f64::from(color.blue) * 0.0722)
 }
 
 fn arid_token_candidate_bias(source: RgbColor, top: i32, input: &PhotoSurfaceInput) -> f64 {
@@ -10879,6 +11055,225 @@ mod tests {
             }
         }
         assert!(saw_second_dither_top);
+    }
+
+    #[test]
+    fn photo_surface_solver_handles_java_standard_vegetation_token_cases() {
+        let savanna = surface_column(
+            false,
+            SEA_LEVEL_Y + 10,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:savanna",
+        );
+        let jungle = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:jungle",
+        );
+
+        let black_standard_shadow = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            jungle.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(0, 4, 14),
+                RgbColor::of(0, 0, 0),
+                TerrainTokenSource::JavaStandardPalette,
+                2,
+                18,
+                8,
+                0,
+                0,
+                24,
+                12,
+                -1,
+                -1,
+                28,
+                -1,
+                80,
+                "dark montane forest",
+                "minecraft:jungle",
+                0.90,
+            ),
+            900.0,
+            15.0,
+            -2.0,
+            0.0,
+            120.0,
+            300,
+            232,
+        ))
+        .unwrap();
+        assert!(matches!(
+            black_standard_shadow.top_block_state_id,
+            block_state_ids::BLACK_TERRACOTTA
+                | block_state_ids::DEEPSLATE
+                | block_state_ids::GRAY_TERRACOTTA
+        ));
+
+        let dry_savanna_dark_shadow = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(25, 35, 15),
+                RgbColor::of(20, 20, 20),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                0,
+                0,
+                0,
+                0,
+                9,
+                6,
+                -1,
+                -1,
+                28,
+                -1,
+                55,
+                "Guinean forest-savanna mosaic",
+                "minecraft:savanna",
+                0.88,
+            ),
+            240.0,
+            12.0,
+            8.0,
+            0.0,
+            28.0,
+            1006,
+            804,
+        ))
+        .unwrap();
+        assert!(matches!(
+            dry_savanna_dark_shadow.top_block_state_id,
+            block_state_ids::BLACK_TERRACOTTA
+                | block_state_ids::GRAY_TERRACOTTA
+                | block_state_ids::DEEPSLATE
+        ));
+
+        let dark_standard_natural_shadow = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            jungle,
+            SurfaceMaterialSample::new(
+                RgbColor::of(22, 34, 13),
+                RgbColor::of(20, 20, 20),
+                TerrainTokenSource::JavaStandardPalette,
+                2,
+                24,
+                12,
+                0,
+                0,
+                30,
+                12,
+                -1,
+                -1,
+                28,
+                -1,
+                64,
+                "dark montane forest",
+                "minecraft:forest",
+                0.90,
+            ),
+            720.0,
+            55.0,
+            9.0,
+            0.0,
+            90.0,
+            220,
+            -1160,
+        ))
+        .unwrap();
+        assert_eq!(
+            dark_standard_natural_shadow.top_block_state_id,
+            block_state_ids::BLACK_TERRACOTTA
+        );
+
+        let gray_olive_source = RgbColor::of(140, 150, 110);
+        let gray_olive_standard_carrier = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna,
+            SurfaceMaterialSample::new(
+                gray_olive_source,
+                RgbColor::of(140, 150, 110),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                0,
+                0,
+                0,
+                0,
+                14,
+                8,
+                -1,
+                -1,
+                28,
+                -1,
+                36,
+                "dry open woodland",
+                "minecraft:savanna",
+                0.95,
+            ),
+            260.0,
+            16.0,
+            10.0,
+            0.0,
+            30.0,
+            314,
+            236,
+        ))
+        .unwrap();
+        assert!(!is_tinted_vegetation_block(
+            gray_olive_standard_carrier.top_block_state_id
+        ));
+        assert!(
+            photo_weighted_render_distance(
+                gray_olive_source,
+                gray_olive_standard_carrier.top_block_state_id,
+                &gray_olive_standard_carrier.biome_id
+            ) < photo_weighted_render_distance(
+                gray_olive_source,
+                block_state_ids::GRASS_BLOCK,
+                "minecraft:savanna"
+            )
+        );
+
+        let marginal_gray_olive = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 10,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+            SurfaceMaterialSample::new(
+                RgbColor::of(120, 130, 77),
+                RgbColor::of(140, 150, 110),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                0,
+                0,
+                0,
+                0,
+                14,
+                8,
+                -1,
+                -1,
+                28,
+                -1,
+                36,
+                "dry open woodland",
+                "minecraft:savanna",
+                0.95,
+            ),
+            260.0,
+            16.0,
+            10.0,
+            0.0,
+            30.0,
+            314,
+            236,
+        ))
+        .unwrap();
+        assert_ne!(marginal_gray_olive.decision_source, "photo-palette");
     }
 
     #[test]
