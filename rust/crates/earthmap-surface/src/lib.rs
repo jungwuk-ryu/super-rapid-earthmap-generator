@@ -1710,9 +1710,12 @@ fn classify_surface_material_by_semantic_intent(
     let shrub_cover = sample.shrub_cover();
     let green_like = is_green_like(metrics);
     let dark_vegetation = green_like && metrics.value < 0.48;
+    let olive_dry_grass = is_olive_dry_grass(metrics);
+    let desert_sand_like = is_desert_sand_like(metrics);
     let orange_rock_like = is_orange_rock_like(metrics);
     let forest_like = is_forest_like_ecoregion(sample);
     let savanna_like = is_savanna_like_ecoregion(sample);
+    let vegetation_evidence = has_vegetation_evidence(sample, metrics);
     let dry_tropical_woodland =
         latitude.abs() <= 25.0 && dry_savanna_score >= 0.20 && !is_tropical_rain_climate(climate);
     let java_standard_terrain = sample.terrain_token_source
@@ -1863,6 +1866,42 @@ fn classify_surface_material_by_semantic_intent(
                 patch_noise,
                 fine_noise,
             ),
+        ));
+    }
+
+    if (is_sahel_latitude(latitude) || sahel_score >= 0.22)
+        && (vegetation_evidence
+            || olive_dry_grass
+            || dry_savanna_score >= 0.25
+            || token_vegetated
+            || (desert_sand_like && metrics.value < 0.72)
+            || (orange_rock_like && metrics.value < 0.74))
+    {
+        let desert_edge = is_desert_climate(climate) || sahara_score >= 0.35;
+        let dry_score =
+            sahel_score
+                .max(dry_savanna_score)
+                .max(if desert_edge { 0.58 } else { 0.45 });
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
+            patch_noise,
+            fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
+        );
+        let biome = if desert_edge && dry_score >= 0.58 {
+            "minecraft:savanna".to_string()
+        } else {
+            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise)
+        };
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            biome,
         ));
     }
 
@@ -12424,6 +12463,28 @@ mod tests {
                 | "minecraft:sunflower_plains"
         ));
         assert_eq!(climate_sahel.decision_source, "intent");
+
+        let sahel_band_olive = SurfaceMaterialSample::color_only(RgbColor::of(126, 123, 70));
+        let olive_sahel = apply_test_surface_material_sample(
+            &base_land,
+            sahel_band_olive,
+            220.0,
+            12.0,
+            12.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(olive_sahel.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(olive_sahel.filler_block_state_id, block_state_ids::DIRT);
+        assert!(matches!(
+            olive_sahel.biome_id.as_str(),
+            "minecraft:savanna"
+                | "minecraft:savanna_plateau"
+                | "minecraft:windswept_savanna"
+                | "minecraft:plains"
+                | "minecraft:sunflower_plains"
+        ));
+        assert_eq!(olive_sahel.decision_source, "intent");
 
         let coarse_token_savanna = SurfaceMaterialSample::new(
             RgbColor::of(140, 80, 50),

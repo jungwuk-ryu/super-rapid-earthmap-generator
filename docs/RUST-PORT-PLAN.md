@@ -660,6 +660,8 @@ Bootstrap implementation status on 2026-06-03:
 - Rust dry semantic intent material selection now uses Java-shaped conservative dry-grass top selection for existing
   dry-savanna/desert-edge bootstrap paths, preserving JavaStandard coarse terrain-token evidence instead of flattening
   those patches back to plain grass.
+- Rust semantic intent ordering now includes the Java `sahelBand` early dry-savanna/desert-edge compiler branch so
+  olive dry-grass, vegetation evidence, and dry Sahel coordinates resolve through intent before environment fallback.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
   remaining dry-savanna/desert-edge intent predicates, ecoregion transition, broader compiler-backed intent, and
   environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface
