@@ -593,8 +593,13 @@ Bootstrap implementation status on 2026-06-03:
   standard terrain-token synthesis fixture cases.
 - Rust surface terrain-token synthesis bootstrap matches Java `EarthDataSurfaceMaterialSampler.withTerrainToken`
   fixture cases for exported-token priority and Java standard palette fallback.
-- Remaining Phase 5 work: port EarthData surface material raster sampling, photo solver, smoothing/coastal policies,
-  OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
+- Rust `EarthDataSurfaceMaterialSampler` bootstrap opens TrueMarble plus optional climate, vegetation,
+  ocean-temperature, bathymetry, and slope rasters, then samples Java-compatible quantized land/water
+  `SurfaceMaterialSample` fixture cases with bounded cache reuse and terrain-token fallback. Optional auxiliary raster
+  open failures are tolerated like Java.
+- Remaining Phase 5 work: port EarthData ecoregion evidence, MET export terrain-token raster integration,
+  land-shallow-topographic/photo source selection, photo solver, smoothing/coastal policies, OSM overlay,
+  surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 
 ### Vanilla-Delegated Survival Scope
 

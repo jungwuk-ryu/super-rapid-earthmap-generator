@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use earthmap_core::build_info;
 use earthmap_geo::{
-    EarthScaleMapping, GeoError, GeoTiffHeightmapReader, GeoTiffMetadata, GeoTiffRowCache,
-    GeoTiffRowCacheStats, HeightmapScalarSampler, RgbColor, VrtRgbMosaicReader,
+    EarthScaleMapping, GeoError, GeoTiffFloat32Reader, GeoTiffHeightmapReader, GeoTiffMetadata,
+    GeoTiffRowCache, GeoTiffRowCacheStats, GeoTiffSingleBandReader, HeightmapScalarSampler,
+    RgbColor, VrtRgbMosaicReader,
 };
 use earthmap_minecraft::block_state_ids;
 use earthmap_minecraft::chunk_model::{ChunkModel, CHUNK_WIDTH};
@@ -787,6 +789,336 @@ impl SurfaceMaterialSampler for TrueMarbleSurfaceMaterialSampler {
     }
 }
 
+#[derive(Debug)]
+pub struct EarthDataSurfaceMaterialSampler {
+    true_marble: VrtRgbMosaicReader,
+    climate: Option<GeoTiffSingleBandReader>,
+    evergreen_broadleaf_trees: Option<GeoTiffSingleBandReader>,
+    deciduous_broadleaf_trees: Option<GeoTiffSingleBandReader>,
+    needleleaf_trees: Option<GeoTiffSingleBandReader>,
+    mixed_trees: Option<GeoTiffSingleBandReader>,
+    herbaceous_vegetation: Option<GeoTiffSingleBandReader>,
+    shrubs: Option<GeoTiffSingleBandReader>,
+    snow: Option<GeoTiffSingleBandReader>,
+    swamp: Option<GeoTiffSingleBandReader>,
+    ocean_temperature: Option<GeoTiffSingleBandReader>,
+    bathymetry: Option<GeoTiffFloat32Reader>,
+    slope: Option<GeoTiffSingleBandReader>,
+    material_cache: Mutex<BoundedSurfaceMaterialCache>,
+    ocean_cache: Mutex<BoundedSurfaceMaterialCache>,
+}
+
+impl EarthDataSurfaceMaterialSampler {
+    const DEFAULT_CACHE_BLOCKS: usize = 256;
+    const MATERIAL_CACHE_ENTRIES: usize = 262_144;
+    const OCEAN_CACHE_ENTRIES: usize = 262_144;
+
+    pub fn open(true_marble_path: impl AsRef<Path>) -> Result<Self> {
+        let true_marble_path = true_marble_path.as_ref();
+        let terrain_dir = true_marble_path
+            .canonicalize()
+            .unwrap_or_else(|_| true_marble_path.to_path_buf())
+            .parent()
+            .map(Path::to_path_buf);
+        let tif_root = terrain_dir
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf);
+        let vegetation = tif_root.as_ref().map(|root| root.join("vegetation"));
+        Ok(Self {
+            true_marble: VrtRgbMosaicReader::open(true_marble_path)?,
+            climate: open_surface_raster(tif_root.as_deref(), "climate.tif")?,
+            evergreen_broadleaf_trees: open_surface_raster(
+                vegetation.as_deref(),
+                "EvergreenBroadleafTrees.tif",
+            )?,
+            deciduous_broadleaf_trees: open_surface_raster(
+                vegetation.as_deref(),
+                "DeciduousBroadleafTrees.tif",
+            )?,
+            needleleaf_trees: open_surface_raster(
+                vegetation.as_deref(),
+                "EvergreenDeciduousNeedleleafTrees.tif",
+            )?,
+            mixed_trees: open_surface_raster(vegetation.as_deref(), "mixed.tif")?,
+            herbaceous_vegetation: open_surface_raster(
+                vegetation.as_deref(),
+                "HerbaceousVegetation.tif",
+            )?,
+            shrubs: open_surface_raster(vegetation.as_deref(), "Shrubs.tif")?,
+            snow: open_surface_raster(vegetation.as_deref(), "Snow.tif")?,
+            swamp: open_surface_raster(vegetation.as_deref(), "Swamp.tif")?,
+            ocean_temperature: open_surface_raster(tif_root.as_deref(), "ocean_temp_infill.tif")?,
+            bathymetry: open_surface_float_raster(tif_root.as_deref(), "bathymetry.tif")?,
+            slope: open_surface_raster(tif_root.as_deref(), "slope.tif")?,
+            material_cache: Mutex::new(BoundedSurfaceMaterialCache::new(
+                Self::MATERIAL_CACHE_ENTRIES,
+            )),
+            ocean_cache: Mutex::new(BoundedSurfaceMaterialCache::new(Self::OCEAN_CACHE_ENTRIES)),
+        })
+    }
+
+    pub fn raster_stats(&self) -> SurfaceMaterialRasterStats {
+        let stats = self.true_marble.stats();
+        SurfaceMaterialRasterStats {
+            source_count: stats.source_count,
+            open_readers: stats.open_readers,
+            resident_tiles: stats.resident_tiles,
+            tile_hits: stats.tile_hits,
+            tile_misses: stats.tile_misses,
+            tile_evictions: stats.tile_evictions,
+            sample_nearest_requests: stats.sample_nearest_requests,
+            sample_averaged_requests: stats.sample_averaged_requests,
+        }
+    }
+
+    fn sample_land(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let cell = quantized_cell(longitude, latitude, cell_degrees);
+        {
+            let mut cache = self
+                .material_cache
+                .lock()
+                .map_err(|_| SurfaceError::invalid("surface material cache lock poisoned"))?;
+            if let Some(cached) = cache.get(cell.key) {
+                return Ok(with_surface_terrain_token(&cached, RgbColor::unavailable()));
+            }
+        }
+        let sampled = self.sample_land_uncached(
+            cell.center_longitude,
+            cell.center_latitude,
+            cell_degrees,
+            cell_degrees,
+        )?;
+        let mut cache = self
+            .material_cache
+            .lock()
+            .map_err(|_| SurfaceError::invalid("surface material cache lock poisoned"))?;
+        let sample = cache.insert_or_get(cell.key, sampled);
+        Ok(with_surface_terrain_token(&sample, RgbColor::unavailable()))
+    }
+
+    fn sample_land_uncached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        let color = self.true_marble.sample_averaged(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )?;
+        Ok(SurfaceMaterialSample::land(
+            color,
+            sample_rounded(self.climate.as_ref(), longitude, latitude),
+            sample_rounded(self.evergreen_broadleaf_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.deciduous_broadleaf_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.needleleaf_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.mixed_trees.as_ref(), longitude, latitude),
+            sample_rounded(self.herbaceous_vegetation.as_ref(), longitude, latitude),
+            sample_rounded(self.shrubs.as_ref(), longitude, latitude),
+            sample_rounded(self.snow.as_ref(), longitude, latitude),
+            sample_rounded(self.swamp.as_ref(), longitude, latitude),
+            sample_rounded(self.ocean_temperature.as_ref(), longitude, latitude),
+            sample_bathymetry_meters(self.bathymetry.as_ref(), longitude, latitude),
+            sample_slope_permille(self.slope.as_ref(), longitude, latitude),
+            "",
+            "",
+            0.0,
+        ))
+    }
+
+    fn sample_water_cached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let cell = quantized_cell(longitude, latitude, cell_degrees);
+        {
+            let mut cache = self
+                .ocean_cache
+                .lock()
+                .map_err(|_| SurfaceError::invalid("surface ocean cache lock poisoned"))?;
+            if let Some(cached) = cache.get(cell.key) {
+                return Ok(with_surface_terrain_token(&cached, RgbColor::unavailable()));
+            }
+        }
+        let sampled = self.sample_ocean_uncached(
+            cell.center_longitude,
+            cell.center_latitude,
+            cell_degrees,
+            cell_degrees,
+        );
+        let mut cache = self
+            .ocean_cache
+            .lock()
+            .map_err(|_| SurfaceError::invalid("surface ocean cache lock poisoned"))?;
+        let sample = cache.insert_or_get(cell.key, sampled);
+        Ok(with_surface_terrain_token(&sample, RgbColor::unavailable()))
+    }
+
+    fn sample_ocean_uncached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> SurfaceMaterialSample {
+        let color = self
+            .true_marble
+            .sample_averaged(
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            )
+            .unwrap_or_else(|_| RgbColor::unavailable());
+        SurfaceMaterialSample::new(
+            color,
+            RgbColor::unavailable(),
+            TerrainTokenSource::None,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            sample_rounded(self.ocean_temperature.as_ref(), longitude, latitude),
+            sample_bathymetry_meters(self.bathymetry.as_ref(), longitude, latitude),
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        )
+    }
+}
+
+impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
+    fn sample(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample_land(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
+
+    fn samples_open_water(&self) -> bool {
+        self.bathymetry.is_some() || self.ocean_temperature.is_some()
+    }
+
+    fn sample_water(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample_water_cached(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct BoundedSurfaceMaterialCache {
+    entries: HashMap<i64, SurfaceMaterialCacheEntry>,
+    access_order: BTreeSet<(u64, i64)>,
+    max_entries: usize,
+    access_clock: u64,
+}
+
+impl BoundedSurfaceMaterialCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(max_entries.min(4096)),
+            access_order: BTreeSet::new(),
+            max_entries,
+            access_clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: i64) -> Option<SurfaceMaterialSample> {
+        let stamp = self.next_access_stamp();
+        let entry = self.entries.get_mut(&key)?;
+        let old_stamp = entry.access_stamp;
+        entry.access_stamp = stamp;
+        let sample = entry.sample.clone();
+        self.access_order.remove(&(old_stamp, key));
+        self.access_order.insert((stamp, key));
+        Some(sample)
+    }
+
+    fn insert_or_get(&mut self, key: i64, sample: SurfaceMaterialSample) -> SurfaceMaterialSample {
+        let stamp = self.next_access_stamp();
+        if let Some(entry) = self.entries.get_mut(&key) {
+            let old_stamp = entry.access_stamp;
+            entry.access_stamp = stamp;
+            let existing = entry.sample.clone();
+            self.access_order.remove(&(old_stamp, key));
+            self.access_order.insert((stamp, key));
+            return existing;
+        }
+        if self.max_entries == 0 {
+            return sample;
+        }
+        self.entries.insert(
+            key,
+            SurfaceMaterialCacheEntry {
+                sample: sample.clone(),
+                access_stamp: stamp,
+            },
+        );
+        self.access_order.insert((stamp, key));
+        self.trim_to_capacity();
+        sample
+    }
+
+    fn next_access_stamp(&mut self) -> u64 {
+        self.access_clock = self.access_clock.saturating_add(1);
+        self.access_clock
+    }
+
+    fn trim_to_capacity(&mut self) {
+        while self.entries.len() > self.max_entries {
+            let Some((_oldest_stamp, oldest_key)) = self.access_order.pop_first() else {
+                return;
+            };
+            self.entries.remove(&oldest_key);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SurfaceMaterialCacheEntry {
+    sample: SurfaceMaterialSample,
+    access_stamp: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SurfaceMaterialRasterStats {
     pub source_count: usize,
@@ -1404,6 +1736,95 @@ fn met_terrain_distance_squared(color: RgbColor, entry: MetTerrainEntry) -> i32 
     let green = i32::from(color.green) - i32::from(entry.green);
     let blue = i32::from(color.blue) - i32::from(entry.blue);
     (red * red) + (green * green) + (blue * blue)
+}
+
+fn open_surface_raster(
+    directory: Option<&Path>,
+    name: &str,
+) -> Result<Option<GeoTiffSingleBandReader>> {
+    for candidate_directory in surface_candidate_directories(directory) {
+        let candidate = candidate_directory.join(name);
+        match GeoTiffSingleBandReader::open_if_present(
+            &candidate,
+            EarthDataSurfaceMaterialSampler::DEFAULT_CACHE_BLOCKS,
+        ) {
+            Ok(Some(reader)) => return Ok(Some(reader)),
+            Ok(None) | Err(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+fn open_surface_float_raster(
+    directory: Option<&Path>,
+    name: &str,
+) -> Result<Option<GeoTiffFloat32Reader>> {
+    for candidate_directory in surface_candidate_directories(directory) {
+        let candidate = candidate_directory.join(name);
+        match GeoTiffFloat32Reader::open_if_present(&candidate) {
+            Ok(Some(reader)) => return Ok(Some(reader)),
+            Ok(None) | Err(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+fn surface_candidate_directories(directory: Option<&Path>) -> Vec<PathBuf> {
+    let vegetation = directory
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("vegetation"));
+    let relative = if vegetation {
+        PathBuf::from("TifFiles").join("vegetation")
+    } else {
+        PathBuf::from("TifFiles")
+    };
+    let mut candidates = Vec::with_capacity(4);
+    if let Some(directory) = directory {
+        candidates.push(directory.to_path_buf());
+    }
+    candidates.push(PathBuf::from("E:/earthmap").join(&relative));
+    candidates.push(PathBuf::from("D:/earthmap").join(&relative));
+    candidates.push(PathBuf::from("F:/earthmap").join(relative));
+    candidates
+}
+
+fn sample_rounded(reader: Option<&GeoTiffSingleBandReader>, longitude: f64, latitude: f64) -> i32 {
+    let Some(reader) = reader else {
+        return SurfaceMaterialSample::UNKNOWN;
+    };
+    match reader.sample_nearest(longitude, latitude) {
+        Ok(value) => SurfaceMaterialSample::rounded(value),
+        Err(_) => SurfaceMaterialSample::UNKNOWN,
+    }
+}
+
+fn sample_slope_permille(
+    reader: Option<&GeoTiffSingleBandReader>,
+    longitude: f64,
+    latitude: f64,
+) -> i32 {
+    let Some(reader) = reader else {
+        return SurfaceMaterialSample::UNKNOWN;
+    };
+    match reader.sample_nearest(longitude, latitude) {
+        Ok(Some(value)) => normalized_slope_permille(value),
+        Ok(None) | Err(_) => SurfaceMaterialSample::UNKNOWN,
+    }
+}
+
+fn sample_bathymetry_meters(
+    reader: Option<&GeoTiffFloat32Reader>,
+    longitude: f64,
+    latitude: f64,
+) -> i32 {
+    let Some(reader) = reader else {
+        return SurfaceMaterialSample::UNKNOWN;
+    };
+    match reader.sample_nearest(longitude, latitude) {
+        Ok(Some(value)) if value.is_finite() => SurfaceMaterialSample::rounded(Some(value)),
+        Ok(Some(_)) | Ok(None) | Err(_) => SurfaceMaterialSample::UNKNOWN,
+    }
 }
 
 pub fn generate_height_only_region(
@@ -2689,6 +3110,142 @@ mod tests {
     }
 
     #[test]
+    fn earth_data_surface_material_sampler_samples_optional_rasters_and_caches() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-surface-earth-data-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let tif_root = root.join("TifFiles");
+        let terrain = tif_root.join("terrain");
+        let vegetation = tif_root.join("vegetation");
+        std::fs::create_dir_all(&terrain).unwrap();
+        std::fs::create_dir_all(&vegetation).unwrap();
+        std::fs::write(terrain.join("tiny.tif"), synthetic_classic_rgb_tiff()).unwrap();
+        std::fs::write(
+            terrain.join("TrueMarble.vrt"),
+            r#"
+<VRTDataset rasterXSize="2" rasterYSize="2">
+  <GeoTransform> 0, 1, 0, 2, 0, -1</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">tiny.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2" />
+      <DstRect xOff="0" yOff="0" xSize="2" ySize="2" />
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"#,
+        )
+        .unwrap();
+        for (path, value) in [
+            (tif_root.join("climate.tif"), 2),
+            (vegetation.join("EvergreenBroadleafTrees.tif"), 10),
+            (vegetation.join("DeciduousBroadleafTrees.tif"), 20),
+            (vegetation.join("EvergreenDeciduousNeedleleafTrees.tif"), 30),
+            (vegetation.join("mixed.tif"), 40),
+            (vegetation.join("HerbaceousVegetation.tif"), 50),
+            (vegetation.join("Shrubs.tif"), 60),
+            (vegetation.join("Snow.tif"), 70),
+            (vegetation.join("Swamp.tif"), 80),
+            (tif_root.join("ocean_temp_infill.tif"), 12),
+            (tif_root.join("slope.tif"), 45),
+        ] {
+            std::fs::write(path, synthetic_classic_single_band_tiff(value)).unwrap();
+        }
+        std::fs::write(
+            tif_root.join("bathymetry.tif"),
+            synthetic_bigtiff_float32_tiff(-123.4),
+        )
+        .unwrap();
+
+        let sampler =
+            EarthDataSurfaceMaterialSampler::open(terrain.join("TrueMarble.vrt")).unwrap();
+        assert!(sampler.samples_open_water());
+
+        let sample = sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap();
+        assert_eq!(sample.color, RgbColor::of(70, 80, 90));
+        assert_eq!(
+            sample.terrain_token_color,
+            MetTerrainVocabulary::nearest(sample.color).color()
+        );
+        assert_eq!(
+            sample.terrain_token_source,
+            TerrainTokenSource::JavaStandardPalette
+        );
+        assert_eq!(sample.climate_class, 2);
+        assert_eq!(sample.evergreen_broadleaf_trees, 10);
+        assert_eq!(sample.deciduous_broadleaf_trees, 20);
+        assert_eq!(sample.needleleaf_trees, 30);
+        assert_eq!(sample.mixed_trees, 40);
+        assert_eq!(sample.herbaceous_vegetation, 50);
+        assert_eq!(sample.shrubs, 60);
+        assert_eq!(sample.snow_cover, 70);
+        assert_eq!(sample.swamp_cover, 80);
+        assert_eq!(sample.ocean_temperature, 12);
+        assert_eq!(sample.bathymetry_meters, -123);
+        assert_eq!(sample.slope_permille, 500);
+        assert_eq!(sample.ecoregion_name, "");
+        assert_eq!(sample.ecoregion_biome_id, "");
+        assert_eq!(sample.ecoregion_confidence, 0.0);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 1);
+
+        assert_eq!(sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap(), sample);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 1);
+
+        let water = sampler.sample_water(1.25, 0.75, 0.0, 0.0).unwrap();
+        assert_eq!(water.color, RgbColor::of(70, 80, 90));
+        assert_eq!(water.climate_class, SurfaceMaterialSample::UNKNOWN);
+        assert_eq!(water.ocean_temperature, 12);
+        assert_eq!(water.bathymetry_meters, -123);
+        assert_eq!(water.slope_permille, SurfaceMaterialSample::UNKNOWN);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 2);
+
+        assert_eq!(sampler.sample_water(1.25, 0.75, 0.0, 0.0).unwrap(), water);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 2);
+
+        drop(sampler);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn optional_surface_raster_open_failures_are_tolerated_like_java() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-surface-optional-raster-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let name = format!("malformed-optional-{}.tif", std::process::id());
+        std::fs::write(root.join(&name), b"not a tiff").unwrap();
+
+        assert!(open_surface_raster(Some(&root), &name).unwrap().is_none());
+        assert!(open_surface_float_raster(Some(&root), &name)
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn bounded_surface_material_cache_evicts_by_access_order_like_java_linked_hash_map() {
+        let mut cache = BoundedSurfaceMaterialCache::new(2);
+        let first = SurfaceMaterialSample::color_only(RgbColor::of(1, 1, 1));
+        let second = SurfaceMaterialSample::color_only(RgbColor::of(2, 2, 2));
+        let third = SurfaceMaterialSample::color_only(RgbColor::of(3, 3, 3));
+
+        assert_eq!(cache.insert_or_get(1, first.clone()), first);
+        assert_eq!(cache.insert_or_get(2, second.clone()), second);
+        assert_eq!(cache.get(1), Some(first.clone()));
+        assert_eq!(cache.insert_or_get(3, third.clone()), third);
+
+        assert_eq!(cache.get(2), None);
+        assert_eq!(cache.get(1), Some(first));
+        assert_eq!(cache.get(3), Some(third));
+    }
+
+    #[test]
     fn earth_data_sampler_helper_math_matches_java_contract() {
         assert_eq!(
             normalized_slope_permille(f64::NAN),
@@ -3018,6 +3575,216 @@ mod tests {
         out
     }
 
+    fn synthetic_classic_single_band_tiff(value: u8) -> Vec<u8> {
+        let width = 2usize;
+        let height = 2usize;
+        let samples = [value; 4];
+        let entry_count = 12usize;
+        let ifd_offset = 8usize;
+        let ifd_bytes = 2 + (entry_count * CLASSIC_IFD_ENTRY_BYTES) + 4;
+        let data_start = ifd_offset + ifd_bytes;
+        let strip_offsets_offset = data_start;
+        let strip_byte_counts_offset = strip_offsets_offset + (height * 4);
+        let pixel_scale_offset = strip_byte_counts_offset + (height * 4);
+        let tiepoint_offset = pixel_scale_offset + (3 * 8);
+        let sample_offset = tiepoint_offset + (6 * 8);
+        let row_byte_count = width;
+        let file_size = sample_offset + samples.len();
+        let mut out = vec![0u8; file_size];
+
+        out[0] = b'I';
+        out[1] = b'I';
+        put_u16(&mut out, 2, CLASSIC_TIFF_MAGIC);
+        put_u32(&mut out, 4, ifd_offset as u32);
+
+        let mut cursor = ifd_offset;
+        put_u16(&mut out, cursor, entry_count as u16);
+        cursor += 2;
+        for (tag, field_type, count, value_or_offset) in [
+            (TAG_IMAGE_WIDTH, TYPE_LONG, 1, width as u32),
+            (TAG_IMAGE_LENGTH, TYPE_LONG, 1, height as u32),
+            (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 1, 8),
+            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+            (
+                TAG_STRIP_OFFSETS,
+                TYPE_LONG,
+                height as u32,
+                strip_offsets_offset as u32,
+            ),
+            (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 1),
+            (TAG_ROWS_PER_STRIP, TYPE_LONG, 1, 1),
+            (
+                TAG_STRIP_BYTE_COUNTS,
+                TYPE_LONG,
+                height as u32,
+                strip_byte_counts_offset as u32,
+            ),
+            (TAG_PLANAR_CONFIGURATION, TYPE_SHORT, 1, 1),
+            (TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 1),
+            (
+                TAG_MODEL_PIXEL_SCALE,
+                TYPE_DOUBLE,
+                3,
+                pixel_scale_offset as u32,
+            ),
+            (TAG_MODEL_TIEPOINT, TYPE_DOUBLE, 6, tiepoint_offset as u32),
+        ] {
+            put_classic_entry(&mut out, cursor, tag, field_type, count, value_or_offset);
+            cursor += CLASSIC_IFD_ENTRY_BYTES;
+        }
+        put_u32(&mut out, cursor, 0);
+
+        cursor = strip_offsets_offset;
+        for y in 0..height {
+            put_u32(
+                &mut out,
+                cursor,
+                (sample_offset + (y * row_byte_count)) as u32,
+            );
+            cursor += 4;
+        }
+
+        cursor = strip_byte_counts_offset;
+        for _ in 0..height {
+            put_u32(&mut out, cursor, row_byte_count as u32);
+            cursor += 4;
+        }
+
+        cursor = pixel_scale_offset;
+        put_f64(&mut out, cursor, 1.0);
+        put_f64(&mut out, cursor + 8, 1.0);
+        put_f64(&mut out, cursor + 16, 0.0);
+
+        cursor = tiepoint_offset;
+        put_f64(&mut out, cursor, 0.0);
+        put_f64(&mut out, cursor + 8, 0.0);
+        put_f64(&mut out, cursor + 16, 0.0);
+        put_f64(&mut out, cursor + 24, 0.0);
+        put_f64(&mut out, cursor + 32, 2.0);
+        put_f64(&mut out, cursor + 40, 0.0);
+
+        out[sample_offset..sample_offset + samples.len()].copy_from_slice(&samples);
+        out
+    }
+
+    fn synthetic_bigtiff_float32_tiff(value: f32) -> Vec<u8> {
+        let width = 2usize;
+        let height = 2usize;
+        let pixel_bytes = width * height * 4;
+        let ifd_offset = 16 + pixel_bytes;
+        let entry_count = 14usize;
+        let ifd_bytes = 8 + (entry_count * BIG_IFD_ENTRY_BYTES) + 8;
+        let data_start = ifd_offset + ifd_bytes;
+        let strip_offsets_offset = data_start;
+        let strip_byte_counts_offset = strip_offsets_offset + (height * 8);
+        let pixel_scale_offset = strip_byte_counts_offset + (height * 4);
+        let tiepoint_offset = pixel_scale_offset + (3 * 8);
+        let file_size = tiepoint_offset + (6 * 8);
+        let mut out = vec![0u8; file_size];
+
+        out[0] = b'I';
+        out[1] = b'I';
+        put_u16(&mut out, 2, BIG_TIFF_MAGIC);
+        put_u16(&mut out, 4, 8);
+        put_u16(&mut out, 6, 0);
+        put_u64(&mut out, 8, ifd_offset as u64);
+
+        let mut cursor = 16;
+        for _ in 0..(width * height) {
+            put_f32(&mut out, cursor, value);
+            cursor += 4;
+        }
+
+        cursor = ifd_offset;
+        put_u64(&mut out, cursor, entry_count as u64);
+        cursor += 8;
+        let no_data_ascii = b"-9999\0";
+        let no_data_inline = inline_ascii_u64(no_data_ascii);
+        let row_byte_count = (width * 4) as u32;
+        let strip_byte_counts_inline =
+            u64::from(row_byte_count) | (u64::from(row_byte_count) << 32);
+        for (tag, field_type, count, value_or_offset) in [
+            (TAG_IMAGE_WIDTH, TYPE_LONG, 1, width as u64),
+            (TAG_IMAGE_LENGTH, TYPE_LONG, 1, height as u64),
+            (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 1, 32),
+            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+            (TAG_PHOTOMETRIC_INTERPRETATION, TYPE_SHORT, 1, 1),
+            (
+                TAG_STRIP_OFFSETS,
+                TYPE_LONG8,
+                height as u64,
+                strip_offsets_offset as u64,
+            ),
+            (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 1),
+            (TAG_ROWS_PER_STRIP, TYPE_SHORT, 1, 1),
+            (
+                TAG_STRIP_BYTE_COUNTS,
+                TYPE_LONG,
+                height as u64,
+                strip_byte_counts_inline,
+            ),
+            (TAG_PLANAR_CONFIGURATION, TYPE_SHORT, 1, 1),
+            (TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 3),
+            (
+                TAG_MODEL_PIXEL_SCALE,
+                TYPE_DOUBLE,
+                3,
+                pixel_scale_offset as u64,
+            ),
+            (TAG_MODEL_TIEPOINT, TYPE_DOUBLE, 6, tiepoint_offset as u64),
+            (
+                TAG_GDAL_NODATA,
+                TYPE_ASCII,
+                no_data_ascii.len() as u64,
+                no_data_inline,
+            ),
+        ] {
+            put_entry(&mut out, cursor, tag, field_type, count, value_or_offset);
+            cursor += BIG_IFD_ENTRY_BYTES;
+        }
+        put_u64(&mut out, cursor, 0);
+
+        cursor = strip_offsets_offset;
+        for y in 0..height {
+            put_u64(&mut out, cursor, 16 + ((y * width * 4) as u64));
+            cursor += 8;
+        }
+
+        cursor = strip_byte_counts_offset;
+        for _ in 0..height {
+            put_u32(&mut out, cursor, row_byte_count);
+            cursor += 4;
+        }
+
+        cursor = pixel_scale_offset;
+        put_f64(&mut out, cursor, 1.0);
+        put_f64(&mut out, cursor + 8, 1.0);
+        put_f64(&mut out, cursor + 16, 0.0);
+
+        cursor = tiepoint_offset;
+        put_f64(&mut out, cursor, 0.0);
+        put_f64(&mut out, cursor + 8, 0.0);
+        put_f64(&mut out, cursor + 16, 0.0);
+        put_f64(&mut out, cursor + 24, 0.0);
+        put_f64(&mut out, cursor + 32, 2.0);
+        put_f64(&mut out, cursor + 40, 0.0);
+        out
+    }
+
+    fn put_entry(
+        out: &mut [u8],
+        offset: usize,
+        tag: u16,
+        field_type: u16,
+        count: u64,
+        value_or_offset: u64,
+    ) {
+        put_u16(out, offset, tag);
+        put_u16(out, offset + 2, field_type);
+        put_u64(out, offset + 4, count);
+        put_u64(out, offset + 12, value_or_offset);
+    }
+
     fn put_classic_entry(
         out: &mut [u8],
         offset: usize,
@@ -3045,18 +3812,50 @@ mod tests {
         out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
+    fn put_u64(out: &mut [u8], offset: usize, value: u64) {
+        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_f32(out: &mut [u8], offset: usize, value: f32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_f64(out: &mut [u8], offset: usize, value: f64) {
+        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn inline_ascii_u64(bytes: &[u8]) -> u64 {
+        assert!(bytes.len() <= 8);
+        let mut inline = [0u8; 8];
+        inline[..bytes.len()].copy_from_slice(bytes);
+        u64::from_le_bytes(inline)
+    }
+
     const CLASSIC_TIFF_MAGIC: u16 = 42;
+    const BIG_TIFF_MAGIC: u16 = 43;
     const CLASSIC_IFD_ENTRY_BYTES: usize = 12;
+    const BIG_IFD_ENTRY_BYTES: usize = 20;
+    const TYPE_ASCII: u16 = 2;
     const TYPE_SHORT: u16 = 3;
     const TYPE_LONG: u16 = 4;
+    const TYPE_DOUBLE: u16 = 12;
+    const TYPE_LONG8: u16 = 16;
     const TAG_IMAGE_WIDTH: u16 = 256;
     const TAG_IMAGE_LENGTH: u16 = 257;
     const TAG_BITS_PER_SAMPLE: u16 = 258;
     const TAG_COMPRESSION: u16 = 259;
+    const TAG_PHOTOMETRIC_INTERPRETATION: u16 = 262;
+    const TAG_STRIP_OFFSETS: u16 = 273;
     const TAG_SAMPLES_PER_PIXEL: u16 = 277;
+    const TAG_ROWS_PER_STRIP: u16 = 278;
+    const TAG_STRIP_BYTE_COUNTS: u16 = 279;
     const TAG_PLANAR_CONFIGURATION: u16 = 284;
+    const TAG_SAMPLE_FORMAT: u16 = 339;
     const TAG_TILE_WIDTH: u16 = 322;
     const TAG_TILE_LENGTH: u16 = 323;
     const TAG_TILE_OFFSETS: u16 = 324;
     const TAG_TILE_BYTE_COUNTS: u16 = 325;
+    const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
+    const TAG_MODEL_TIEPOINT: u16 = 33922;
+    const TAG_GDAL_NODATA: u16 = 42113;
 }

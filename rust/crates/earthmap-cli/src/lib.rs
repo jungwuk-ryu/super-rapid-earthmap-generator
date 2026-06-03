@@ -346,6 +346,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.surfaceTerrainTokenSynthesisBootstrap - Surface terrain-token synthesis now prefers exported tokens and falls back to Java standard palette matches like EarthDataSurfaceMaterialSampler.withTerrainToken fixture cases."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.earthDataSurfaceMaterialSamplerBootstrap - EarthDataSurfaceMaterialSampler opens TrueMarble plus optional climate, vegetation, ocean-temperature, bathymetry, and slope rasters, then samples Java-compatible quantized land/water SurfaceMaterialSample fixture cases with bounded cache reuse and terrain-token fallback."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",
