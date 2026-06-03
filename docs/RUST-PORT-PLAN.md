@@ -619,6 +619,8 @@ Bootstrap implementation status on 2026-06-03:
   absorption/preservation, desert-boundary preservation, and macro vegetation fixture cases.
 - Rust `PhotoSurfaceSolver` contract bootstrap adds Rust `PhotoSurfaceInput`/`PhotoSurfaceDecision`, decision-to-column
   conversion, water/no-photo preservation, and representative color-only nearest-palette lush/arid fixture cases.
+- Rust `PhotoSurfaceSolver` Java Standard arid-token bootstrap adds bounded fixture coverage for exact MET sand/snow
+  token handling, dry false-snow avoidance, coastal tan carrier reduction, and 4x4 ordered arid carrier variation.
 - Rust `SurfaceBiomeFamilyIntentGrid` non-photo bootstrap ports 4x4 cell stabilization, small biome-family component
   absorption, protected wetland/snow/beach handling, and arid-transition preservation fixture cases.
 - Rust `SurfaceBiomeFamilyIntentGrid` preserve-surface bootstrap ports Java photo-palette render locks, biome-only

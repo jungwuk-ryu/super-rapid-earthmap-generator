@@ -375,6 +375,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.photoSurfaceSolverAridTokenBootstrap - Java Standard arid terrain-token handling has bounded fixture coverage for dry false-snow avoidance, coastal tan carrier reduction, and ordered arid carrier variation."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.surfaceRegionCommandBootstrap - generate-surface-region writes Java-shaped surface region files, level.dat, manifest metadata, and stdout reports for the no-surface-material default command path."
     )?;
     writeln!(

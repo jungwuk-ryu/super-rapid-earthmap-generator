@@ -1089,23 +1089,27 @@ pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDeci
             "photo source unavailable or near black",
         ));
     }
+    if let Some(decision) = solve_authoritative_arid_token_surface(input, source) {
+        return Ok(decision);
+    }
     let entry = nearest_photo_palette_entry(source);
+    let block_state_id = java_standard_tan_carrier_top(input, source, entry.block_state_id);
     let biome = photo_solver_biome(&input.semantic_column, &input.sample);
-    let filler = if entry.block_state_id == input.semantic_column.top_block_state_id {
+    let filler = if block_state_id == input.semantic_column.top_block_state_id {
         input.semantic_column.filler_block_state_id
     } else {
-        smoother_filler_for(entry.block_state_id)
+        smoother_filler_for(block_state_id)
     };
     Ok(PhotoSurfaceDecision::new(
-        entry.block_state_id,
+        block_state_id,
         filler,
         biome.clone(),
-        render_surface_color(entry.block_state_id, Some(&biome)),
+        render_surface_color(block_state_id, Some(&biome)),
         "photo-texture",
         "palette-nearest",
         format!(
             "nearest photo palette block {} for rgb #{:02X}{:02X}{:02X}",
-            entry.block_state_id, source.red, source.green, source.blue
+            block_state_id, source.red, source.green, source.blue
         ),
     ))
 }
@@ -1123,6 +1127,394 @@ fn photo_solver_biome(
     }
     semantic_column.biome_id.clone()
 }
+
+fn solve_authoritative_arid_token_surface(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+) -> Option<PhotoSurfaceDecision> {
+    if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette {
+        return None;
+    }
+    let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+    if !token.confident() {
+        return None;
+    }
+    if !matches!(
+        token.kind,
+        MetTerrainKind::Sand | MetTerrainKind::RedSand | MetTerrainKind::Snow
+    ) {
+        return None;
+    }
+    let snow_evidence = photo_solver_snow_evidence(input, source);
+    if token.kind == MetTerrainKind::Snow && snow_evidence {
+        return Some(photo_surface_decision_for_top(
+            input,
+            token.top_block_state_id,
+            "photo-palette",
+            "palette-token-solver",
+            source,
+            "authoritative snow terrain token",
+        ));
+    }
+    if input.sample.terrain_token_source == TerrainTokenSource::JavaStandardPalette
+        && photo_solver_clear_green_source(source)
+    {
+        return None;
+    }
+    if token.kind == MetTerrainKind::Snow && !photo_solver_dry_context(input, source) {
+        return None;
+    }
+    let top = ordered_arid_token_top(input, source, token.kind);
+    Some(photo_surface_decision_for_top(
+        input,
+        top,
+        "photo-palette",
+        "palette-token-solver",
+        source,
+        "authoritative arid terrain token",
+    ))
+}
+
+fn photo_surface_decision_for_top(
+    input: &PhotoSurfaceInput,
+    top: i32,
+    recipe_id: &str,
+    stage_id: &str,
+    source: RgbColor,
+    reason: &str,
+) -> PhotoSurfaceDecision {
+    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    let filler = if top == input.semantic_column.top_block_state_id {
+        input.semantic_column.filler_block_state_id
+    } else {
+        smoother_filler_for(top)
+    };
+    PhotoSurfaceDecision::new(
+        top,
+        filler,
+        biome.clone(),
+        render_surface_color(top, Some(&biome)),
+        recipe_id,
+        stage_id,
+        format!(
+            "sourceRgb={},{},{};{};top={};biome={}",
+            source.red, source.green, source.blue, reason, top, biome
+        ),
+    )
+}
+
+fn ordered_arid_token_top(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    token_kind: MetTerrainKind,
+) -> i32 {
+    let candidates = if input.sample.terrain_token_source == TerrainTokenSource::JavaStandardPalette
+        && matches!(token_kind, MetTerrainKind::Sand | MetTerrainKind::RedSand)
+        && photo_solver_gray_rock_source_for_sand_token(input, source)
+    {
+        &PALETTE_ROCK_CANDIDATES[..]
+    } else if token_kind == MetTerrainKind::RedSand {
+        &PALETTE_RED_SAND_CANDIDATES[..]
+    } else {
+        &PALETTE_SAND_CANDIDATES[..]
+    };
+    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    let mut scored = candidates
+        .iter()
+        .copied()
+        .filter(|&top| top != block_state_ids::SNOW_BLOCK)
+        .filter(|&top| !is_capped_bright_arid_carrier(top) || photo_color_value(source) >= 225)
+        .map(|top| {
+            (
+                top,
+                photo_weighted_render_distance(source, top, &biome)
+                    + arid_token_candidate_bias(source, top, input),
+            )
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    let first = scored
+        .first()
+        .map(|&(top, _)| top)
+        .unwrap_or(block_state_ids::SANDSTONE);
+    let second = scored
+        .iter()
+        .map(|&(top, _)| top)
+        .find(|&top| top != first && same_surface_family(top, first))
+        .or_else(|| scored.get(1).map(|&(top, _)| top))
+        .unwrap_or(first);
+    if second == first {
+        return first;
+    }
+    if ordered_dither_threshold(input.global_block_x, input.global_block_z) < 5 {
+        second
+    } else {
+        first
+    }
+}
+
+fn java_standard_tan_carrier_top(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    palette_top: i32,
+) -> i32 {
+    if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette {
+        return palette_top;
+    }
+    if palette_top != block_state_ids::SAND || !photo_solver_dry_context(input, source) {
+        return palette_top;
+    }
+    if input.coast_factor < 0.70 || photo_color_value(source) < 190 {
+        return palette_top;
+    }
+    let candidates = [
+        block_state_ids::SANDSTONE,
+        block_state_ids::SMOOTH_SANDSTONE,
+        block_state_ids::CUT_SANDSTONE,
+        block_state_ids::END_STONE,
+        block_state_ids::BONE_BLOCK,
+        block_state_ids::CALCITE,
+        block_state_ids::WHITE_TERRACOTTA,
+    ];
+    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    candidates
+        .iter()
+        .copied()
+        .min_by(|&left, &right| {
+            photo_weighted_render_distance(source, left, &biome)
+                .partial_cmp(&photo_weighted_render_distance(source, right, &biome))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.cmp(&right))
+        })
+        .unwrap_or(block_state_ids::SANDSTONE)
+}
+
+fn photo_solver_dry_context(input: &PhotoSurfaceInput, source: RgbColor) -> bool {
+    let biome = input.semantic_column.biome_id.to_ascii_lowercase();
+    let eco_biome = input.sample.ecoregion_biome_id.to_ascii_lowercase();
+    let eco_name = input.sample.ecoregion_name.to_ascii_lowercase();
+    biome.contains("desert")
+        || biome.contains("savanna")
+        || biome.contains("badlands")
+        || eco_biome.contains("desert")
+        || eco_biome.contains("savanna")
+        || eco_name.contains("desert")
+        || eco_name.contains("savanna")
+        || eco_name.contains("sahel")
+        || photo_color_saturation(source) >= 0.16
+            && (28.0..=66.0).contains(&photo_color_hue_degrees(source))
+}
+
+fn photo_solver_clear_green_source(source: RgbColor) -> bool {
+    let value = f64::from(photo_color_value(source)) / 255.0;
+    let saturation = photo_color_saturation(source);
+    value >= 0.18
+        && saturation >= 0.22
+        && (photo_solver_green_like(source) || photo_solver_olive_vegetation_like(source))
+}
+
+fn photo_solver_green_like(source: RgbColor) -> bool {
+    let red = f64::from(source.red) / 255.0;
+    let green = f64::from(source.green) / 255.0;
+    let blue = f64::from(source.blue) / 255.0;
+    let hue = photo_color_hue_degrees(source);
+    (58.0..=170.0).contains(&hue) && green >= red * 0.88 && green >= blue * 1.02
+}
+
+fn photo_solver_olive_vegetation_like(source: RgbColor) -> bool {
+    let red = f64::from(source.red) / 255.0;
+    let green = f64::from(source.green) / 255.0;
+    let blue = f64::from(source.blue) / 255.0;
+    let hue = photo_color_hue_degrees(source);
+    let value = f64::from(photo_color_value(source)) / 255.0;
+    (42.0..=105.0).contains(&hue)
+        && photo_color_saturation(source) >= 0.12
+        && (0.24..=0.64).contains(&value)
+        && green >= red * 0.72
+        && green >= blue * 0.82
+}
+
+fn photo_solver_gray_rock_source_for_sand_token(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+) -> bool {
+    let value = f64::from(photo_color_value(source)) / 255.0;
+    photo_color_saturation(source) <= 0.16
+        && (0.42..=0.72).contains(&value)
+        && (input.local_relief_meters >= 80.0 || input.elevation_meters >= 700.0)
+}
+
+fn photo_solver_snow_evidence(input: &PhotoSurfaceInput, source: RgbColor) -> bool {
+    if input.sample.snow_cover_ratio() >= 0.10 {
+        return true;
+    }
+    let biome = input.semantic_column.biome_id.to_ascii_lowercase();
+    if biome.contains("snow") || biome.contains("frozen") {
+        return true;
+    }
+    let value = f64::from(photo_color_value(source)) / 255.0;
+    value >= 0.78
+        && photo_color_saturation(source) <= 0.22
+        && (input.latitude.abs() >= 45.0 || input.elevation_meters >= 2_000.0)
+}
+
+fn photo_weighted_render_distance(source: RgbColor, top: i32, biome: &str) -> f64 {
+    let color = render_surface_color(top, Some(biome));
+    let red = f64::from(source.red) - f64::from((color >> 16) & 0xff);
+    let green = f64::from(source.green) - f64::from((color >> 8) & 0xff);
+    let blue = f64::from(source.blue) - f64::from(color & 0xff);
+    ((red * red * 0.30) + (green * green * 0.45) + (blue * blue * 0.25)).sqrt()
+}
+
+fn arid_token_candidate_bias(source: RgbColor, top: i32, input: &PhotoSurfaceInput) -> f64 {
+    let mut bias = 0.0;
+    if top == block_state_ids::SAND && input.coast_factor >= 0.70 {
+        bias += 9.0;
+    }
+    if top == block_state_ids::SAND && input.coast_factor >= 0.985 {
+        bias += 12.0;
+    }
+    if matches!(
+        top,
+        block_state_ids::BONE_BLOCK
+            | block_state_ids::CALCITE
+            | block_state_ids::QUARTZ_BLOCK
+            | block_state_ids::WHITE_TERRACOTTA
+    ) && photo_color_value(source) < 215
+    {
+        bias += 7.0;
+    }
+    if matches!(
+        top,
+        block_state_ids::GRAVEL
+            | block_state_ids::TERRACOTTA
+            | block_state_ids::PACKED_MUD
+            | block_state_ids::YELLOW_TERRACOTTA
+    ) && photo_color_value(source) >= 225
+    {
+        bias += 6.0;
+    }
+    bias
+}
+
+fn is_capped_bright_arid_carrier(top: i32) -> bool {
+    matches!(
+        top,
+        block_state_ids::QUARTZ_BLOCK
+            | block_state_ids::CALCITE
+            | block_state_ids::BONE_BLOCK
+            | block_state_ids::WHITE_TERRACOTTA
+    )
+}
+
+fn same_surface_family(left: i32, right: i32) -> bool {
+    photo_texture_family(left) == photo_texture_family(right)
+}
+
+fn ordered_dither_threshold(global_block_x: i32, global_block_z: i32) -> i32 {
+    const BAYER_4X4: [i32; 16] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+    let x = global_block_x & 3;
+    let z = global_block_z & 3;
+    BAYER_4X4[(z * 4 + x) as usize]
+}
+
+fn photo_color_value(color: RgbColor) -> u8 {
+    color.red.max(color.green).max(color.blue)
+}
+
+fn photo_color_saturation(color: RgbColor) -> f64 {
+    let max = f64::from(photo_color_value(color)) / 255.0;
+    if max == 0.0 {
+        return 0.0;
+    }
+    let min = f64::from(color.red.min(color.green).min(color.blue)) / 255.0;
+    (max - min) / max
+}
+
+fn photo_color_hue_degrees(color: RgbColor) -> f64 {
+    let red = f64::from(color.red) / 255.0;
+    let green = f64::from(color.green) / 255.0;
+    let blue = f64::from(color.blue) / 255.0;
+    let max = red.max(green).max(blue);
+    let min = red.min(green).min(blue);
+    let delta = max - min;
+    if delta == 0.0 {
+        return 0.0;
+    }
+    let hue = if max == red {
+        60.0 * ((green - blue) / delta).rem_euclid(6.0)
+    } else if max == green {
+        60.0 * (((blue - red) / delta) + 2.0)
+    } else {
+        60.0 * (((red - green) / delta) + 4.0)
+    };
+    if hue < 0.0 {
+        hue + 360.0
+    } else {
+        hue
+    }
+}
+
+const PALETTE_SAND_CANDIDATES: [i32; 16] = [
+    block_state_ids::SAND,
+    block_state_ids::SANDSTONE,
+    block_state_ids::YELLOW_TERRACOTTA,
+    block_state_ids::END_STONE,
+    block_state_ids::END_STONE_BRICKS,
+    block_state_ids::SMOOTH_SANDSTONE,
+    block_state_ids::CUT_SANDSTONE,
+    block_state_ids::CHISELED_SANDSTONE,
+    block_state_ids::WHITE_TERRACOTTA,
+    block_state_ids::LIGHT_GRAY_TERRACOTTA,
+    block_state_ids::BONE_BLOCK,
+    block_state_ids::CALCITE,
+    block_state_ids::QUARTZ_BLOCK,
+    block_state_ids::GRAVEL,
+    block_state_ids::TERRACOTTA,
+    block_state_ids::PACKED_MUD,
+];
+
+const PALETTE_RED_SAND_CANDIDATES: [i32; 13] = [
+    block_state_ids::RED_SAND,
+    block_state_ids::ORANGE_TERRACOTTA,
+    block_state_ids::TERRACOTTA,
+    block_state_ids::SMOOTH_RED_SANDSTONE,
+    block_state_ids::CUT_RED_SANDSTONE,
+    block_state_ids::CHISELED_RED_SANDSTONE,
+    block_state_ids::MUD_BRICKS,
+    block_state_ids::RED_TERRACOTTA,
+    block_state_ids::BROWN_TERRACOTTA,
+    block_state_ids::GRANITE,
+    block_state_ids::PACKED_MUD,
+    block_state_ids::WHITE_TERRACOTTA,
+    block_state_ids::BONE_BLOCK,
+];
+
+const PALETTE_ROCK_CANDIDATES: [i32; 18] = [
+    block_state_ids::STONE,
+    block_state_ids::TUFF,
+    block_state_ids::GRAVEL,
+    block_state_ids::DEEPSLATE,
+    block_state_ids::ANDESITE,
+    block_state_ids::DIORITE,
+    block_state_ids::CYAN_TERRACOTTA,
+    block_state_ids::GRAY_TERRACOTTA,
+    block_state_ids::BLACK_TERRACOTTA,
+    block_state_ids::CALCITE,
+    block_state_ids::TERRACOTTA,
+    block_state_ids::QUARTZ_BLOCK,
+    block_state_ids::BONE_BLOCK,
+    block_state_ids::END_STONE,
+    block_state_ids::END_STONE_BRICKS,
+    block_state_ids::SMOOTH_RED_SANDSTONE,
+    block_state_ids::CUT_RED_SANDSTONE,
+    block_state_ids::CHISELED_RED_SANDSTONE,
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EcoregionSample {
@@ -10094,6 +10486,399 @@ mod tests {
                 .to_column(&semantic),
             semantic
         );
+    }
+
+    #[test]
+    fn photo_surface_solver_handles_java_standard_arid_token_cases() {
+        let plains = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let savanna = surface_column(
+            false,
+            SEA_LEVEL_Y + 10,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:savanna",
+        );
+
+        let dry_coastal_palette = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(218, 202, 142),
+                RgbColor::of(218, 202, 142),
+                TerrainTokenSource::JavaStandardPalette,
+                13,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                -1,
+                -1,
+                28,
+                -1,
+                15,
+                "dry coastal scrub",
+                "minecraft:savanna",
+                1.0,
+            ),
+            8.0,
+            58.0,
+            19.0,
+            0.80,
+            8.0,
+            128,
+            96,
+        ))
+        .unwrap();
+        assert_ne!(
+            dry_coastal_palette.top_block_state_id,
+            block_state_ids::SAND
+        );
+
+        let export_sand_token_over_green = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(42, 95, 38),
+                RgbColor::of(230, 205, 160),
+                TerrainTokenSource::Export,
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                -1,
+                -1,
+                -1,
+                -1,
+                12,
+                "desert",
+                "minecraft:desert",
+                0.80,
+            ),
+            220.0,
+            50.0,
+            15.0,
+            0.0,
+            15.0,
+            280,
+            216,
+        ))
+        .unwrap();
+        assert!(matches!(
+            export_sand_token_over_green.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+                | block_state_ids::OAK_LEAVES
+                | block_state_ids::JUNGLE_LEAVES
+                | block_state_ids::DARK_OAK_LEAVES
+                | block_state_ids::SPRUCE_LEAVES
+                | block_state_ids::MOSS_BLOCK
+                | block_state_ids::GREEN_TERRACOTTA
+                | block_state_ids::LIME_TERRACOTTA
+        ));
+
+        let standard_sand_token_over_green = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(54, 118, 46),
+                RgbColor::of(230, 205, 160),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                0,
+                0,
+                0,
+                0,
+                30,
+                12,
+                -1,
+                -1,
+                28,
+                -1,
+                45,
+                "West Sudanian savanna",
+                "minecraft:savanna",
+                0.95,
+            ),
+            260.0,
+            16.0,
+            10.0,
+            0.0,
+            30.0,
+            316,
+            236,
+        ))
+        .unwrap();
+        assert!(matches!(
+            standard_sand_token_over_green.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+                | block_state_ids::OAK_LEAVES
+                | block_state_ids::JUNGLE_LEAVES
+                | block_state_ids::DARK_OAK_LEAVES
+                | block_state_ids::SPRUCE_LEAVES
+                | block_state_ids::MOSS_BLOCK
+                | block_state_ids::GREEN_TERRACOTTA
+                | block_state_ids::LIME_TERRACOTTA
+        ));
+
+        let olive_standard_sand_token = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(126, 123, 70),
+                RgbColor::of(230, 205, 160),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                0,
+                0,
+                0,
+                0,
+                24,
+                18,
+                -1,
+                -1,
+                28,
+                -1,
+                36,
+                "West Sudanian savanna",
+                "minecraft:savanna",
+                0.95,
+            ),
+            260.0,
+            16.0,
+            10.0,
+            0.0,
+            30.0,
+            317,
+            236,
+        ))
+        .unwrap();
+        assert_ne!(olive_standard_sand_token.decision_source, "photo-palette");
+
+        let false_snow_desert = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            plains.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(238, 226, 190),
+                RgbColor::of(250, 255, 250),
+                TerrainTokenSource::JavaStandardPalette,
+                13,
+                0,
+                0,
+                0,
+                0,
+                4,
+                2,
+                0,
+                0,
+                30,
+                -1,
+                12,
+                "Saharan desert",
+                "minecraft:desert",
+                1.0,
+            ),
+            350.0,
+            13.0,
+            24.0,
+            0.0,
+            20.0,
+            140,
+            112,
+        ))
+        .unwrap();
+        assert_ne!(
+            false_snow_desert.top_block_state_id,
+            block_state_ids::SNOW_BLOCK
+        );
+
+        let snow_cover_boundary = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            plains.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(138, 122, 86),
+                RgbColor::of(250, 255, 250),
+                TerrainTokenSource::JavaStandardPalette,
+                13,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                10,
+                0,
+                5,
+                -1,
+                30,
+                "snowy upland scrub",
+                "minecraft:plains",
+                0.80,
+            ),
+            450.0,
+            38.0,
+            6.0,
+            0.0,
+            15.0,
+            164,
+            164,
+        ))
+        .unwrap();
+        assert_eq!(
+            snow_cover_boundary.top_block_state_id,
+            block_state_ids::SNOW_BLOCK
+        );
+
+        let high_elevation_dry_false_snow = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            plains.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(143, 128, 82),
+                RgbColor::of(250, 255, 250),
+                TerrainTokenSource::JavaStandardPalette,
+                13,
+                0,
+                0,
+                0,
+                0,
+                4,
+                2,
+                0,
+                0,
+                12,
+                -1,
+                120,
+                "high desert plateau",
+                "minecraft:desert",
+                0.90,
+            ),
+            2_500.0,
+            34.0,
+            14.0,
+            0.0,
+            110.0,
+            188,
+            188,
+        ))
+        .unwrap();
+        assert_ne!(
+            high_elevation_dry_false_snow.top_block_state_id,
+            block_state_ids::SNOW_BLOCK
+        );
+
+        let gray_rock_standard_token = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            plains.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(156, 149, 137),
+                RgbColor::of(230, 205, 160),
+                TerrainTokenSource::JavaStandardPalette,
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                -1,
+                -1,
+                28,
+                -1,
+                150,
+                "rocky desert plateau",
+                "minecraft:desert",
+                0.95,
+            ),
+            900.0,
+            34.0,
+            22.0,
+            0.0,
+            130.0,
+            512,
+            512,
+        ))
+        .unwrap();
+        assert_ne!(
+            gray_rock_standard_token.top_block_state_id,
+            block_state_ids::SAND
+        );
+        assert_ne!(
+            gray_rock_standard_token.top_block_state_id,
+            block_state_ids::SANDSTONE
+        );
+        let gray_source = RgbColor::of(156, 149, 137);
+        let gray_biome = "minecraft:desert";
+        assert!(
+            photo_weighted_render_distance(
+                gray_source,
+                gray_rock_standard_token.top_block_state_id,
+                gray_biome
+            ) < photo_weighted_render_distance(gray_source, block_state_ids::SAND, gray_biome).min(
+                photo_weighted_render_distance(gray_source, block_state_ids::SANDSTONE, gray_biome)
+            )
+        );
+
+        let mut first_dither_top = -1;
+        let mut saw_second_dither_top = false;
+        for z in 0..4 {
+            for x in 0..4 {
+                let dithered = apply_photo_surface_material(&PhotoSurfaceInput::new(
+                    plains.clone(),
+                    SurfaceMaterialSample::new(
+                        RgbColor::of(242, 216, 160),
+                        RgbColor::of(230, 205, 160),
+                        TerrainTokenSource::JavaStandardPalette,
+                        13,
+                        0,
+                        0,
+                        0,
+                        0,
+                        4,
+                        2,
+                        0,
+                        0,
+                        30,
+                        -1,
+                        12,
+                        "Saharan desert",
+                        "minecraft:desert",
+                        1.0,
+                    ),
+                    350.0,
+                    13.0,
+                    24.0,
+                    0.0,
+                    20.0,
+                    x,
+                    z,
+                ))
+                .unwrap();
+                assert!(matches!(
+                    dithered.top_block_state_id,
+                    block_state_ids::SAND
+                        | block_state_ids::SANDSTONE
+                        | block_state_ids::SMOOTH_SANDSTONE
+                        | block_state_ids::CUT_SANDSTONE
+                        | block_state_ids::CHISELED_SANDSTONE
+                        | block_state_ids::END_STONE
+                        | block_state_ids::END_STONE_BRICKS
+                        | block_state_ids::WHITE_TERRACOTTA
+                        | block_state_ids::LIGHT_GRAY_TERRACOTTA
+                        | block_state_ids::CALCITE
+                        | block_state_ids::BONE_BLOCK
+                ));
+                assert_ne!(dithered.top_block_state_id, block_state_ids::SNOW_BLOCK);
+                if first_dither_top < 0 {
+                    first_dither_top = dithered.top_block_state_id;
+                } else if dithered.top_block_state_id != first_dither_top {
+                    saw_second_dither_top = true;
+                }
+            }
+        }
+        assert!(saw_second_dither_top);
     }
 
     #[test]
