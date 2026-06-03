@@ -654,9 +654,13 @@ Bootstrap implementation status on 2026-06-03:
 - Rust `EarthSurfaceMaterialClassifier` semantic fallback bootstrap ports Java's no-color climate/vegetation/ecoregion
   fallback colors plus bounded climate intent cases for savanna, desert, Congo rainforest, temperate steppe, and
   no-color forest/desert/savanna fixture coverage.
+- Rust semantic intent material selection now mirrors Java compiler behavior for rainforest, wetland, and snow bootstrap
+  cases, including lush rainforest `MOSS_BLOCK` terrain-token evidence, muddy wetland fine-noise patches, and
+  latitude-based snowy biome selection.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
-  authoritative terrain-token, ecoregion transition, compiler-backed intent, and environment edge cases; then finish
-  full photo solver parity and fixed-region Java/Rust payload parity for surface material/photo output.
+  dry-savanna/desert-edge authoritative terrain-token, ecoregion transition, broader compiler-backed intent, and
+  environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface
+  material/photo output.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

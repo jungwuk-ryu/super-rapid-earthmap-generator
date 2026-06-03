@@ -1731,19 +1731,28 @@ fn classify_surface_material_by_semantic_intent(
             base,
             block_state_ids::SNOW_BLOCK,
             block_state_ids::DIRT,
-            if climate == 30 {
-                "minecraft:snowy_plains"
-            } else {
+            if latitude.abs() >= 58.0 {
                 "minecraft:snowy_taiga"
+            } else {
+                "minecraft:snowy_plains"
             },
         ));
     }
 
     if sample.swamp_cover_ratio() >= 0.35 && latitude.abs() <= 45.0 {
+        let top = if fine_noise >= 0.82 {
+            block_state_ids::MUD
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
         return Some(surface_material_with_surface(
             base,
-            block_state_ids::GRASS_BLOCK,
-            block_state_ids::DIRT,
+            top,
+            if top == block_state_ids::MUD {
+                block_state_ids::MUD
+            } else {
+                block_state_ids::DIRT
+            },
             "minecraft:swamp",
         ));
     }
@@ -1827,23 +1836,33 @@ fn classify_surface_material_by_semantic_intent(
         dry_savanna_score,
         token_vegetated,
     );
-    if is_tropical_rain_climate(climate) && !sparse_dry_open_tropical {
-        let biome = if tree_cover >= 0.15 || rainforest_score >= 0.45 || dark_vegetation {
-            rainforest_biome_with_sample(
-                sample,
-                rainforest_score.max(0.65),
-                dark_vegetation,
-                patch_noise,
-                fine_noise,
-            )
-        } else {
-            "minecraft:sparse_jungle".to_string()
-        };
+    let rainforest_intent =
+        (has_climate && is_tropical_rain_climate(climate) && !sparse_dry_open_tropical)
+            || (rainforest_score >= 0.35 && tree_cover >= 0.12)
+            || (rainforest_score >= 0.45
+                && (sample.vegetation_cover() >= 0.18
+                    || tree_cover >= 0.08
+                    || green_like
+                    || metrics.value < 0.44));
+    if rainforest_intent {
         return Some(surface_material_with_surface(
             base,
-            block_state_ids::GRASS_BLOCK,
+            lush_vegetation_surface(
+                sample,
+                metrics,
+                patch_noise,
+                fine_noise,
+                rainforest_score,
+                terrain,
+            ),
             block_state_ids::DIRT,
-            biome,
+            rainforest_biome_with_sample(
+                sample,
+                rainforest_score.max(0.60),
+                metrics.value < 0.48,
+                patch_noise,
+                fine_noise,
+            ),
         ));
     }
 
@@ -12235,6 +12254,107 @@ mod tests {
             semantic_congo.biome_id.contains("jungle")
                 || semantic_congo.biome_id.contains("forest")
         );
+
+        let moss_congo_forest = SurfaceMaterialSample::with_export_token(
+            RgbColor::of(0, 50, 0),
+            RgbColor::of(0, 50, 0),
+            2,
+            35,
+            10,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            22,
+            14,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            35,
+            "Central Congolian lowland forests",
+            "minecraft:jungle",
+            1.0,
+        );
+        let moss_congo = apply_test_surface_material_sample(
+            &base_land,
+            moss_congo_forest,
+            330.0,
+            20.0,
+            -2.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(moss_congo.top_block_state_id, block_state_ids::MOSS_BLOCK);
+        assert!(moss_congo.biome_id.contains("jungle") || moss_congo.biome_id.contains("forest"));
+        assert_eq!(moss_congo.decision_source, "intent");
+
+        let equatorial_snow = SurfaceMaterialSample::climate_only(
+            RgbColor::of(232, 238, 236),
+            29,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            45,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+        );
+        let snow = apply_test_surface_material_sample(
+            &base_land,
+            equatorial_snow,
+            50.0,
+            20.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(snow.top_block_state_id, block_state_ids::SNOW_BLOCK);
+        assert_eq!(snow.biome_id, "minecraft:snowy_plains");
+        assert_eq!(snow.decision_source, "intent");
+
+        let muddy_wetland = SurfaceMaterialSample::land(
+            RgbColor::of(45, 75, 48),
+            12,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            20,
+            10,
+            SurfaceMaterialSample::UNKNOWN,
+            80,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Coastal swamp mosaic",
+            "minecraft:swamp",
+            0.90,
+        );
+        let (swamp_longitude, swamp_latitude) = (-180..=180)
+            .flat_map(|longitude| (-45..=45).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                surface_material_ecology_noise(
+                    f64::from(longitude),
+                    f64::from(latitude),
+                    7.5,
+                    0x9d6c63b5a8e33f21_u64 as i64,
+                ) >= 0.82
+            })
+            .expect("test fixture should find a muddy wetland fine-noise coordinate");
+        let swamp = apply_test_surface_material_sample(
+            &base_land,
+            muddy_wetland,
+            20.0,
+            f64::from(swamp_longitude),
+            f64::from(swamp_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(swamp.top_block_state_id, block_state_ids::MUD);
+        assert_eq!(swamp.filler_block_state_id, block_state_ids::MUD);
+        assert_eq!(swamp.biome_id, "minecraft:swamp");
+        assert_eq!(swamp.decision_source, "intent");
 
         let tropical_savanna = SurfaceMaterialSample::climate_only(
             RgbColor::of(181, 96, 46),
