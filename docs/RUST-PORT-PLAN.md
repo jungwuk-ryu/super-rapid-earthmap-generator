@@ -689,6 +689,9 @@ Bootstrap implementation status on 2026-06-03:
   intent/environment fallbacks.
 - Rust no-climate herbaceous/shrub orange-texture environment fallback now mirrors Java's `classifyByEnvironment`
   dry-grass promotion instead of falling through to broad badlands/rock color rules.
+- Rust photo solver snow-evidence handling now mirrors Java's non-token ecology constraint, preserving calcite nearest
+  matches and otherwise forcing snow evidence to `SNOW_BLOCK` while retaining dry false-snow guards and Java
+  decision-source/stage metadata.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
   remaining dry-savanna/desert-edge intent predicates and broader compiler-backed intent; then finish full photo
   solver parity and fixed-region Java/Rust payload parity for surface material/photo output.

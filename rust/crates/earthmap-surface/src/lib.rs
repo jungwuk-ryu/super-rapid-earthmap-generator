@@ -4860,6 +4860,39 @@ pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDeci
         return Ok(decision);
     }
     let entry = nearest_photo_palette_entry(source);
+    if photo_solver_snow_evidence(input, source) {
+        let block_state_id = if entry.block_state_id == block_state_ids::CALCITE {
+            block_state_ids::CALCITE
+        } else {
+            block_state_ids::SNOW_BLOCK
+        };
+        let biome = if block_state_id == block_state_ids::SNOW_BLOCK {
+            "minecraft:snowy_plains".to_string()
+        } else {
+            photo_solver_biome(&input.semantic_column, &input.sample)
+        };
+        let filler = if block_state_id == input.semantic_column.top_block_state_id {
+            input.semantic_column.filler_block_state_id
+        } else {
+            smoother_filler_for(block_state_id)
+        };
+        return Ok(PhotoSurfaceDecision::new(
+            block_state_id,
+            filler,
+            biome.clone(),
+            render_surface_color(block_state_id, Some(&biome)),
+            if block_state_id == entry.block_state_id {
+                "photo-texture"
+            } else {
+                "photo-ecology"
+            },
+            "source-render-solver",
+            format!(
+                "snow evidence photo palette block {} for rgb #{:02X}{:02X}{:02X}",
+                block_state_id, source.red, source.green, source.blue
+            ),
+        ));
+    }
     let block_state_id = java_standard_tan_carrier_top(input, source, entry.block_state_id);
     let biome = photo_solver_biome(&input.semantic_column, &input.sample);
     let filler = if block_state_id == input.semantic_column.top_block_state_id {
@@ -17218,6 +17251,118 @@ mod tests {
                 .to_column(&semantic),
             semantic
         );
+    }
+
+    #[test]
+    fn photo_surface_solver_handles_color_only_edge_cases() {
+        let plains = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+
+        let vegetated_coast = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 1,
+                i32::MIN,
+                block_state_ids::SAND,
+                block_state_ids::SAND,
+                "minecraft:beach",
+            ),
+            SurfaceMaterialSample::land(
+                RgbColor::of(62, 122, 58),
+                8,
+                8,
+                12,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                26,
+                10,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                16,
+                SurfaceMaterialSample::UNKNOWN,
+                18,
+                "temperate coastal grassland",
+                "minecraft:plains",
+                1.0,
+            ),
+            8.0,
+            -5.0,
+            43.0,
+            1.0,
+            12.0,
+            96,
+            64,
+        ))
+        .unwrap();
+        assert!(!matches!(
+            vegetated_coast.top_block_state_id,
+            block_state_ids::SAND | block_state_ids::SANDSTONE | block_state_ids::RED_SAND
+        ));
+
+        let dark_rock = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            plains.clone(),
+            SurfaceMaterialSample::color_only(RgbColor::of(62, 58, 55)),
+            1_600.0,
+            -70.0,
+            -20.0,
+            0.0,
+            260.0,
+            102,
+            100,
+        ))
+        .unwrap();
+        assert!(matches!(
+            dark_rock.top_block_state_id,
+            block_state_ids::DEEPSLATE
+                | block_state_ids::STONE
+                | block_state_ids::TUFF
+                | block_state_ids::ANDESITE
+                | block_state_ids::GRANITE
+                | block_state_ids::DIORITE
+                | block_state_ids::GRAY_TERRACOTTA
+                | block_state_ids::BLACK_TERRACOTTA
+                | block_state_ids::CYAN_TERRACOTTA
+                | block_state_ids::MUD
+                | block_state_ids::ROOTED_DIRT
+                | block_state_ids::MYCELIUM
+        ));
+
+        let snow_input = PhotoSurfaceInput::new(
+            plains,
+            SurfaceMaterialSample::climate_only(
+                RgbColor::of(230, 232, 224),
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                40,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+            ),
+            2_300.0,
+            86.9,
+            28.0,
+            0.0,
+            80.0,
+            103,
+            100,
+        );
+        let snow_decision = solve_photo_surface(&snow_input).unwrap();
+        let snow = snow_decision.to_column(&snow_input.semantic_column);
+        assert_eq!(block_state_ids::SNOW_BLOCK, snow.top_block_state_id);
+        assert_eq!("minecraft:snowy_plains", snow.biome_id);
+        assert_eq!("photo-ecology", snow.decision_source);
+        assert_eq!("photo-ecology", snow_decision.recipe_id);
+        assert_eq!("source-render-solver", snow_decision.stage_id);
     }
 
     #[test]
