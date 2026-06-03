@@ -461,6 +461,9 @@ Bootstrap implementation status on 2026-06-03:
   - `GeoTiffFloat32Reader` bootstrap for the Java-supported synthetic path: little-endian BigTIFF magic 43, Float32
     samples, no compression, `samplesPerPixel=1`, `rowsPerStrip=1`, `openIfPresent`, nearest sampling, raster-outside
     empty samples, and `GDAL_NODATA` empty samples
+  - `GeoTiffRgbReader` bootstrap for the Java-supported synthetic path: Classic/BigTIFF byte order parsing,
+    non-compressed interleaved RGB samples, tiled or stripped layouts, `RgbColor` availability semantics, out-of-range
+    unavailable samples, and Java-compatible tile cache hit/miss/eviction counters
   - `HeightmapScalarSampler` bootstrap for the Java `rowCache == null` path, including nearest sampling and bilinear
     interpolation with Java-compatible pixel-center offset, floor, clamp, and lerp math
   - `GeoTiffRowCache` bootstrap with Java-compatible sequential hit/miss/eviction statistics, synchronous read-ahead
@@ -476,8 +479,9 @@ Bootstrap implementation status on 2026-06-03:
   Java `HeightmapScalarSamplerTest` nearest/bilinear values. The row-cache tests cover the Java sequential
   hit/miss/eviction fixture, prefetch counters, repeated cached bilinear row reuse, and very large Rust-side
   `prefetchRows` saturation. Float32 tests cover metadata, direct pixel reads, nearest sampling, NoData handling,
-  missing-file `openIfPresent`, and invalid layout rejection. CLI tests cover Java-compatible diagnostic stdout for a
-  synthetic BigTIFF fixture.
+  missing-file `openIfPresent`, and invalid layout rejection. RGB tests cover the Java `GeoTiffRgbReaderTest`
+  Classic TIFF fixture path, pixel values, unavailable out-of-range samples, near-black color semantics, and tile cache
+  statistics. CLI tests cover Java-compatible diagnostic stdout for a synthetic BigTIFF fixture.
 - Verified locally with
   `cargo test --manifest-path rust/Cargo.toml -p earthmap-geo --locked`,
   `cargo test --manifest-path rust/Cargo.toml -p earthmap-cli --locked`, and
@@ -497,9 +501,8 @@ Bootstrap implementation status on 2026-06-03:
   - evidence folders:
     `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0001`
     and `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0002-mca`
-- Remaining Phase 4 work: port the RGB/VRT raster readers needed by later surface/photo work
-  (`GeoTiffRgbReader`, `VrtRgbMosaicReader`) and expand the height-only corpus beyond one real region before
-  promotion.
+- Remaining Phase 4 work: port `VrtRgbMosaicReader`, exercise real RGB/VRT inputs, and expand the height-only corpus
+  beyond one real region before promotion.
 
 ## Phase 5: Surface Rules And Photo Solver
 

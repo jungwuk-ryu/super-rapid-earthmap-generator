@@ -26,11 +26,23 @@ const TAG_MODEL_TIEPOINT: u16 = 33922;
 const TAG_GEO_KEY_DIRECTORY: u16 = 34735;
 const TAG_GDAL_NODATA: u16 = 42113;
 
+const TYPE_BYTE: u16 = 1;
 const TYPE_ASCII: u16 = 2;
 const TYPE_SHORT: u16 = 3;
 const TYPE_LONG: u16 = 4;
+const TYPE_RATIONAL: u16 = 5;
 const TYPE_DOUBLE: u16 = 12;
 const TYPE_LONG8: u16 = 16;
+
+const CLASSIC_TIFF_MAGIC: u16 = 42;
+const BIG_TIFF_MAGIC: u16 = 43;
+const CLASSIC_IFD_ENTRY_BYTES: usize = 12;
+const BIG_IFD_ENTRY_BYTES: usize = 20;
+const TAG_PLANAR_CONFIGURATION: u16 = 284;
+const TAG_TILE_WIDTH: u16 = 322;
+const TAG_TILE_LENGTH: u16 = 323;
+const TAG_TILE_OFFSETS: u16 = 324;
+const TAG_TILE_BYTE_COUNTS: u16 = 325;
 
 pub type Result<T> = std::result::Result<T, GeoError>;
 
@@ -112,6 +124,77 @@ pub struct GeoTiffFloat32Reader {
     metadata: GeoTiffMetadata,
     strip_offsets: Vec<u64>,
     strip_byte_counts: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RgbColor {
+    pub available: bool,
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl RgbColor {
+    pub const fn of(red: u8, green: u8, blue: u8) -> Self {
+        Self {
+            available: true,
+            red,
+            green,
+            blue,
+        }
+    }
+
+    pub const fn unavailable() -> Self {
+        Self {
+            available: false,
+            red: 0,
+            green: 0,
+            blue: 0,
+        }
+    }
+
+    pub fn is_near_black(self) -> bool {
+        self.available && self.red <= 4 && self.green <= 4 && self.blue <= 4
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GeoTiffRgbReaderStats {
+    pub max_tile_cache_entries: usize,
+    pub resident_tiles: usize,
+    pub tile_hits: u64,
+    pub tile_misses: u64,
+    pub tile_evictions: u64,
+}
+
+#[derive(Debug)]
+pub struct GeoTiffRgbReader {
+    file: Mutex<File>,
+    width: i32,
+    height: i32,
+    samples_per_pixel: usize,
+    tile_width: i32,
+    tile_length: i32,
+    tiles_across: i32,
+    tile_offsets: Vec<u64>,
+    tile_byte_counts: Vec<usize>,
+    tile_cache_entries: usize,
+    tile_state: Mutex<RgbTileState>,
+}
+
+#[derive(Debug, Default)]
+struct RgbTileState {
+    tiles: BTreeMap<usize, CachedTile>,
+    access_clock: u64,
+    tile_hits: u64,
+    tile_misses: u64,
+    tile_evictions: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedTile {
+    bytes: Vec<u8>,
+    access_stamp: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -328,6 +411,140 @@ impl GeoTiffFloat32Reader {
             return Err(GeoError::invalid(format!("y outside raster: {y}")));
         }
         Ok(())
+    }
+}
+
+impl GeoTiffRgbReader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_tile_cache_entries(path, 256)
+    }
+
+    pub fn open_with_tile_cache_entries(
+        path: impl AsRef<Path>,
+        tile_cache_entries: usize,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        let mut file = File::open(path).map_err(|error| GeoError::invalid(error.to_string()))?;
+        parse_rgb_tiff(&mut file, tile_cache_entries.max(1))
+    }
+
+    pub fn width(&self) -> i32 {
+        self.width
+    }
+
+    pub fn height(&self) -> i32 {
+        self.height
+    }
+
+    pub fn sample_pixel(&self, x: i32, y: i32) -> Result<RgbColor> {
+        let packed = self.sample_pixel_packed(x, y)?;
+        if packed < 0 {
+            return Ok(RgbColor::unavailable());
+        }
+        Ok(RgbColor::of(
+            ((packed >> 16) & 0xff) as u8,
+            ((packed >> 8) & 0xff) as u8,
+            (packed & 0xff) as u8,
+        ))
+    }
+
+    pub fn sample_pixel_packed(&self, x: i32, y: i32) -> Result<i32> {
+        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+            return Ok(-1);
+        }
+        let tile_x = x / self.tile_width;
+        let tile_y = y / self.tile_length;
+        let tile_index = tile_y
+            .checked_mul(self.tiles_across)
+            .and_then(|value| value.checked_add(tile_x))
+            .ok_or_else(|| GeoError::invalid("RGB tile index overflow"))?;
+        if tile_index < 0 || tile_index as usize >= self.tile_offsets.len() {
+            return Ok(-1);
+        }
+        let tile = self.tile(tile_index as usize)?;
+        let actual_width = self.tile_width.min(self.width - (tile_x * self.tile_width));
+        let actual_height = self
+            .tile_length
+            .min(self.height - (tile_y * self.tile_length));
+        let full_stride = usize::try_from(self.tile_width)
+            .ok()
+            .and_then(|width| width.checked_mul(self.samples_per_pixel))
+            .ok_or_else(|| GeoError::invalid("RGB full stride overflow"))?;
+        let cropped_stride = usize::try_from(actual_width)
+            .ok()
+            .and_then(|width| width.checked_mul(self.samples_per_pixel))
+            .ok_or_else(|| GeoError::invalid("RGB cropped stride overflow"))?;
+        let cropped_size = cropped_stride
+            .checked_mul(usize::try_from(actual_height).unwrap_or(0))
+            .ok_or_else(|| GeoError::invalid("RGB cropped tile size overflow"))?;
+        let row_stride = if tile.len() == cropped_size {
+            cropped_stride
+        } else {
+            full_stride
+        };
+        let local_x = usize::try_from(x - (tile_x * self.tile_width))
+            .map_err(|_| GeoError::invalid("RGB local x outside tile"))?;
+        let local_y = usize::try_from(y - (tile_y * self.tile_length))
+            .map_err(|_| GeoError::invalid("RGB local y outside tile"))?;
+        let offset = local_y
+            .checked_mul(row_stride)
+            .and_then(|value| value.checked_add(local_x.checked_mul(self.samples_per_pixel)?))
+            .ok_or_else(|| GeoError::invalid("RGB tile sample offset overflow"))?;
+        if offset.checked_add(2).is_none_or(|end| end >= tile.len()) {
+            return Ok(-1);
+        }
+        Ok(((i32::from(tile[offset])) << 16)
+            | ((i32::from(tile[offset + 1])) << 8)
+            | i32::from(tile[offset + 2]))
+    }
+
+    pub fn stats(&self) -> GeoTiffRgbReaderStats {
+        let state = self
+            .tile_state
+            .lock()
+            .expect("RGB tile cache lock not poisoned");
+        GeoTiffRgbReaderStats {
+            max_tile_cache_entries: self.tile_cache_entries,
+            resident_tiles: state.tiles.len(),
+            tile_hits: state.tile_hits,
+            tile_misses: state.tile_misses,
+            tile_evictions: state.tile_evictions,
+        }
+    }
+
+    fn tile(&self, tile_index: usize) -> Result<Vec<u8>> {
+        let mut state = self
+            .tile_state
+            .lock()
+            .map_err(|_| GeoError::invalid("RGB tile cache lock poisoned"))?;
+        if state.tiles.contains_key(&tile_index) {
+            state.tile_hits += 1;
+            let stamp = touch_rgb_tile_state(&mut state);
+            let tile = state
+                .tiles
+                .get_mut(&tile_index)
+                .expect("tile was just checked");
+            tile.access_stamp = stamp;
+            return Ok(tile.bytes.clone());
+        }
+        state.tile_misses += 1;
+        let offset = self.tile_offsets[tile_index];
+        let byte_count = self.tile_byte_counts[tile_index];
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| GeoError::invalid("RGB TIFF file lock poisoned"))?;
+        let bytes = read_exact_at(&mut file, offset, byte_count)?;
+        let stamp = touch_rgb_tile_state(&mut state);
+        state.tiles.insert(
+            tile_index,
+            CachedTile {
+                bytes: bytes.clone(),
+                access_stamp: stamp,
+            },
+        );
+        trim_rgb_tile_cache_locked(&mut state, self.tile_cache_entries);
+        Ok(bytes)
     }
 }
 
@@ -699,6 +916,369 @@ fn trim_cache_locked(state: &mut RowCacheState, max_rows: usize) {
             state.evictions += 1;
         }
     }
+}
+
+fn touch_rgb_tile_state(state: &mut RgbTileState) -> u64 {
+    state.access_clock += 1;
+    state.access_clock
+}
+
+fn trim_rgb_tile_cache_locked(state: &mut RgbTileState, max_tiles: usize) {
+    while state.tiles.len() > max_tiles {
+        let Some((&oldest_tile, _)) = state
+            .tiles
+            .iter()
+            .min_by_key(|(_tile_index, tile)| tile.access_stamp)
+        else {
+            return;
+        };
+        if state.tiles.remove(&oldest_tile).is_some() {
+            state.tile_evictions += 1;
+        }
+    }
+}
+
+fn parse_rgb_tiff(file: &mut File, tile_cache_entries: usize) -> Result<GeoTiffRgbReader> {
+    let header = read_exact_at(file, 0, 16)?;
+    let order = tiff_byte_order(&header)?;
+    let magic = read_u16_order(&header, 2, order)?;
+    let entries = if magic == CLASSIC_TIFF_MAGIC {
+        let ifd_offset = u64::from(read_u32_order(&header, 4, order)?);
+        read_classic_rgb_ifd(file, order, ifd_offset)?
+    } else if magic == BIG_TIFF_MAGIC {
+        let offset_size = read_u16_order(&header, 4, order)?;
+        let reserved = read_u16_order(&header, 6, order)?;
+        if offset_size != 8 || reserved != 0 {
+            return Err(GeoError::invalid("unsupported BigTIFF header"));
+        }
+        let ifd_offset = read_u64_order(&header, 8, order)?;
+        read_big_rgb_ifd(file, order, ifd_offset)?
+    } else {
+        return Err(GeoError::invalid(format!(
+            "not a TIFF file or unsupported TIFF magic: {magic}"
+        )));
+    };
+
+    let width = i32_from_u64(
+        required_rgb_first_unsigned(file, &entries, TAG_IMAGE_WIDTH, "ImageWidth")?,
+        "width",
+    )?;
+    let height = i32_from_u64(
+        required_rgb_first_unsigned(file, &entries, TAG_IMAGE_LENGTH, "ImageLength")?,
+        "height",
+    )?;
+    let bits = required_rgb_unsigned_array(file, &entries, TAG_BITS_PER_SAMPLE, "BitsPerSample")?;
+    let samples_per_pixel = i32_from_u64(
+        optional_rgb_first_unsigned(file, &entries, TAG_SAMPLES_PER_PIXEL, 3)?,
+        "samples per pixel",
+    )?;
+    let compression = i32_from_u64(
+        optional_rgb_first_unsigned(file, &entries, TAG_COMPRESSION, 1)?,
+        "compression",
+    )?;
+    let planar_configuration = i32_from_u64(
+        optional_rgb_first_unsigned(file, &entries, TAG_PLANAR_CONFIGURATION, 1)?,
+        "planar configuration",
+    )?;
+    let tiled = entries.contains_key(&TAG_TILE_WIDTH)
+        && entries.contains_key(&TAG_TILE_LENGTH)
+        && entries.contains_key(&TAG_TILE_OFFSETS)
+        && entries.contains_key(&TAG_TILE_BYTE_COUNTS);
+    let (tile_width, tile_length, tile_offsets, tile_byte_counts) = if tiled {
+        (
+            i32_from_u64(
+                required_rgb_first_unsigned(file, &entries, TAG_TILE_WIDTH, "TileWidth")?,
+                "tile width",
+            )?,
+            i32_from_u64(
+                required_rgb_first_unsigned(file, &entries, TAG_TILE_LENGTH, "TileLength")?,
+                "tile length",
+            )?,
+            required_rgb_unsigned_array(file, &entries, TAG_TILE_OFFSETS, "TileOffsets")?,
+            required_rgb_unsigned_array(file, &entries, TAG_TILE_BYTE_COUNTS, "TileByteCounts")?,
+        )
+    } else {
+        (
+            width,
+            i32_from_u64(
+                optional_rgb_first_unsigned(file, &entries, TAG_ROWS_PER_STRIP, height as u64)?,
+                "rows per strip",
+            )?,
+            required_rgb_unsigned_array(file, &entries, TAG_STRIP_OFFSETS, "StripOffsets")?,
+            required_rgb_unsigned_array(file, &entries, TAG_STRIP_BYTE_COUNTS, "StripByteCounts")?,
+        )
+    };
+
+    if width <= 0 || height <= 0 || tile_width <= 0 || tile_length <= 0 {
+        return Err(GeoError::invalid("invalid TIFF dimensions"));
+    }
+    if samples_per_pixel < 3 {
+        return Err(GeoError::invalid(format!(
+            "RGB TIFF must have at least 3 samples per pixel: {samples_per_pixel}"
+        )));
+    }
+    for bit in bits.iter().take(3) {
+        if *bit != 8 {
+            return Err(GeoError::invalid("RGB TIFF must use 8-bit samples"));
+        }
+    }
+    if compression != 1 {
+        return Err(GeoError::invalid(format!(
+            "compressed RGB TIFF is not supported: compression={compression}"
+        )));
+    }
+    if planar_configuration != 1 {
+        return Err(GeoError::invalid("planar RGB TIFF is not supported"));
+    }
+
+    let tiles_across = ceil_div_i32(width, tile_width)?;
+    let tiles_down = ceil_div_i32(height, tile_length)?;
+    let expected_tile_count = usize::try_from(
+        i64::from(tiles_across)
+            .checked_mul(i64::from(tiles_down))
+            .ok_or_else(|| GeoError::invalid("RGB tile count overflow"))?,
+    )
+    .map_err(|_| GeoError::invalid("RGB tile count exceeds usize"))?;
+    if tile_offsets.len() < expected_tile_count || tile_byte_counts.len() < expected_tile_count {
+        return Err(GeoError::invalid(
+            "TIFF tile arrays are shorter than expected",
+        ));
+    }
+    let tile_byte_counts = tile_byte_counts
+        .into_iter()
+        .map(|value| usize_from_i32_exact_u64(value, "tile byte count"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GeoTiffRgbReader {
+        file: Mutex::new(
+            file.try_clone()
+                .map_err(|error| GeoError::invalid(error.to_string()))?,
+        ),
+        width,
+        height,
+        samples_per_pixel: usize::try_from(samples_per_pixel)
+            .expect("validated positive samples per pixel fits usize"),
+        tile_width,
+        tile_length,
+        tiles_across,
+        tile_offsets,
+        tile_byte_counts,
+        tile_cache_entries,
+        tile_state: Mutex::new(RgbTileState::default()),
+    })
+}
+
+fn ceil_div_i32(dividend: i32, divisor: i32) -> Result<i32> {
+    if dividend <= 0 || divisor <= 0 {
+        return Err(GeoError::invalid("ceilDiv requires positive inputs"));
+    }
+    Ok(((i64::from(dividend) + i64::from(divisor) - 1) / i64::from(divisor)) as i32)
+}
+
+fn required_rgb_first_unsigned(
+    file: &mut File,
+    entries: &BTreeMap<u16, RgbTiffEntry>,
+    tag: u16,
+    name: &str,
+) -> Result<u64> {
+    let values = required_rgb_unsigned_array(file, entries, tag, name)?;
+    values
+        .first()
+        .copied()
+        .ok_or_else(|| GeoError::invalid(format!("missing TIFF tag value: {name}")))
+}
+
+fn optional_rgb_first_unsigned(
+    file: &mut File,
+    entries: &BTreeMap<u16, RgbTiffEntry>,
+    tag: u16,
+    default_value: u64,
+) -> Result<u64> {
+    let Some(entry) = entries.get(&tag) else {
+        return Ok(default_value);
+    };
+    let values = rgb_unsigned_array(file, entry)?;
+    Ok(values.first().copied().unwrap_or(default_value))
+}
+
+fn required_rgb_unsigned_array(
+    file: &mut File,
+    entries: &BTreeMap<u16, RgbTiffEntry>,
+    tag: u16,
+    name: &str,
+) -> Result<Vec<u64>> {
+    let entry = entries
+        .get(&tag)
+        .ok_or_else(|| GeoError::invalid(format!("missing TIFF tag: {name}")))?;
+    rgb_unsigned_array(file, entry)
+}
+
+fn rgb_unsigned_array(file: &mut File, entry: &RgbTiffEntry) -> Result<Vec<u64>> {
+    let value_count = usize_from_i32_exact_u64(entry.count, "TIFF value count")?;
+    let bytes = rgb_entry_value_bytes(file, entry)?;
+    let mut values = Vec::with_capacity(value_count);
+    for index in 0..entry.count {
+        let offset = usize_from_u64(
+            index
+                .checked_mul(rgb_type_size(entry.field_type)?)
+                .ok_or_else(|| GeoError::invalid("TIFF array offset overflow"))?,
+            "TIFF array offset",
+        )?;
+        values.push(match entry.field_type {
+            TYPE_BYTE | TYPE_ASCII => {
+                u64::from(*checked_slice(&bytes, offset, 1)?.first().expect("one byte"))
+            }
+            TYPE_SHORT => u64::from(read_u16_order(&bytes, offset, entry.order)?),
+            TYPE_LONG => u64::from(read_u32_order(&bytes, offset, entry.order)?),
+            TYPE_LONG8 => read_u64_order(&bytes, offset, entry.order)?,
+            _ => {
+                return Err(GeoError::invalid(format!(
+                    "TIFF value cannot be represented as integer array: {}",
+                    entry.field_type
+                )))
+            }
+        });
+    }
+    Ok(values)
+}
+
+fn rgb_entry_value_bytes(file: &mut File, entry: &RgbTiffEntry) -> Result<Vec<u8>> {
+    let byte_size = entry
+        .count
+        .checked_mul(rgb_type_size(entry.field_type)?)
+        .ok_or_else(|| GeoError::invalid(format!("TIFF tag too large to read: {}", entry.tag)))?;
+    if byte_size > i32::MAX as u64 {
+        return Err(GeoError::invalid(format!(
+            "unsupported TIFF value byte length: {byte_size}"
+        )));
+    }
+    let size = byte_size as usize;
+    if size <= entry.inline_bytes.len() {
+        return Ok(entry.inline_bytes[..size].to_vec());
+    }
+    read_exact_at(file, entry.value_or_offset, size)
+}
+
+fn rgb_type_size(field_type: u16) -> Result<u64> {
+    match field_type {
+        TYPE_BYTE | TYPE_ASCII => Ok(1),
+        TYPE_SHORT => Ok(2),
+        TYPE_LONG => Ok(4),
+        TYPE_RATIONAL | TYPE_DOUBLE | TYPE_LONG8 => Ok(8),
+        _ => Err(GeoError::invalid(format!(
+            "unsupported TIFF field type: {field_type}"
+        ))),
+    }
+}
+
+fn read_classic_rgb_ifd(
+    file: &mut File,
+    order: TiffByteOrder,
+    offset: u64,
+) -> Result<BTreeMap<u16, RgbTiffEntry>> {
+    let count_bytes = read_exact_at(file, offset, 2)?;
+    let entry_count = u64::from(read_u16_order(&count_bytes, 0, order)?);
+    let entry_bytes_len = usize_from_u64(
+        entry_count
+            .checked_mul(CLASSIC_IFD_ENTRY_BYTES as u64)
+            .ok_or_else(|| GeoError::invalid("Classic TIFF IFD byte count overflow"))?,
+        "Classic TIFF IFD byte count",
+    )?;
+    let entry_bytes = read_exact_at(file, offset + 2, entry_bytes_len)?;
+    let mut entries = BTreeMap::new();
+    let mut cursor = 0usize;
+    for _ in 0..entry_count {
+        let tag = read_u16_order(&entry_bytes, cursor, order)?;
+        let field_type = read_u16_order(&entry_bytes, cursor + 2, order)?;
+        let count = u64::from(read_u32_order(&entry_bytes, cursor + 4, order)?);
+        let inline_bytes = checked_slice(&entry_bytes, cursor + 8, 4)?.to_vec();
+        let value_or_offset = u64::from(read_u32_order(&entry_bytes, cursor + 8, order)?);
+        entries.insert(
+            tag,
+            RgbTiffEntry {
+                tag,
+                field_type,
+                count,
+                value_or_offset,
+                inline_bytes,
+                order,
+            },
+        );
+        cursor = cursor
+            .checked_add(CLASSIC_IFD_ENTRY_BYTES)
+            .ok_or_else(|| GeoError::invalid("Classic TIFF IFD cursor overflow"))?;
+    }
+    Ok(entries)
+}
+
+fn read_big_rgb_ifd(
+    file: &mut File,
+    order: TiffByteOrder,
+    offset: u64,
+) -> Result<BTreeMap<u16, RgbTiffEntry>> {
+    let count_bytes = read_exact_at(file, offset, 8)?;
+    let entry_count = read_u64_order(&count_bytes, 0, order)?;
+    if entry_count > 1_000_000 {
+        return Err(GeoError::invalid(format!(
+            "unreasonable BigTIFF IFD entry count: {entry_count}"
+        )));
+    }
+    let entry_bytes_len = usize_from_u64(
+        entry_count
+            .checked_mul(BIG_IFD_ENTRY_BYTES as u64)
+            .ok_or_else(|| GeoError::invalid("BigTIFF IFD byte count overflow"))?,
+        "BigTIFF IFD byte count",
+    )?;
+    let entry_bytes = read_exact_at(file, offset + 8, entry_bytes_len)?;
+    let mut entries = BTreeMap::new();
+    let mut cursor = 0usize;
+    for _ in 0..entry_count {
+        let tag = read_u16_order(&entry_bytes, cursor, order)?;
+        let field_type = read_u16_order(&entry_bytes, cursor + 2, order)?;
+        let count = read_u64_order(&entry_bytes, cursor + 4, order)?;
+        let inline_bytes = checked_slice(&entry_bytes, cursor + 12, 8)?.to_vec();
+        let value_or_offset = read_u64_order(&entry_bytes, cursor + 12, order)?;
+        entries.insert(
+            tag,
+            RgbTiffEntry {
+                tag,
+                field_type,
+                count,
+                value_or_offset,
+                inline_bytes,
+                order,
+            },
+        );
+        cursor = cursor
+            .checked_add(BIG_IFD_ENTRY_BYTES)
+            .ok_or_else(|| GeoError::invalid("BigTIFF IFD cursor overflow"))?;
+    }
+    Ok(entries)
+}
+
+fn tiff_byte_order(header: &[u8]) -> Result<TiffByteOrder> {
+    if header[0] == b'I' && header[1] == b'I' {
+        return Ok(TiffByteOrder::Little);
+    }
+    if header[0] == b'M' && header[1] == b'M' {
+        return Ok(TiffByteOrder::Big);
+    }
+    Err(GeoError::invalid("unsupported TIFF byte order"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TiffByteOrder {
+    Little,
+    Big,
+}
+
+#[derive(Clone, Debug)]
+struct RgbTiffEntry {
+    tag: u16,
+    field_type: u16,
+    count: u64,
+    value_or_offset: u64,
+    inline_bytes: Vec<u8>,
+    order: TiffByteOrder,
 }
 
 fn parse_bigtiff_heightmap(path: &Path, file: &mut File) -> Result<GeoTiffHeightmapReader> {
@@ -1307,6 +1887,16 @@ fn read_u16_le(data: &[u8], offset: usize) -> Result<u16> {
     ))
 }
 
+fn read_u16_order(data: &[u8], offset: usize, order: TiffByteOrder) -> Result<u16> {
+    let bytes: [u8; 2] = checked_slice(data, offset, 2)?
+        .try_into()
+        .expect("slice length is 2");
+    Ok(match order {
+        TiffByteOrder::Little => u16::from_le_bytes(bytes),
+        TiffByteOrder::Big => u16::from_be_bytes(bytes),
+    })
+}
+
 fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
         checked_slice(data, offset, 4)?
@@ -1315,12 +1905,32 @@ fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
     ))
 }
 
+fn read_u32_order(data: &[u8], offset: usize, order: TiffByteOrder) -> Result<u32> {
+    let bytes: [u8; 4] = checked_slice(data, offset, 4)?
+        .try_into()
+        .expect("slice length is 4");
+    Ok(match order {
+        TiffByteOrder::Little => u32::from_le_bytes(bytes),
+        TiffByteOrder::Big => u32::from_be_bytes(bytes),
+    })
+}
+
 fn read_u64_le(data: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(
         checked_slice(data, offset, 8)?
             .try_into()
             .expect("slice length is 8"),
     ))
+}
+
+fn read_u64_order(data: &[u8], offset: usize, order: TiffByteOrder) -> Result<u64> {
+    let bytes: [u8; 8] = checked_slice(data, offset, 8)?
+        .try_into()
+        .expect("slice length is 8");
+    Ok(match order {
+        TiffByteOrder::Little => u64::from_le_bytes(bytes),
+        TiffByteOrder::Big => u64::from_be_bytes(bytes),
+    })
 }
 
 fn usize_from_u64(value: u64, name: &str) -> Result<usize> {
@@ -1509,6 +2119,32 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_classic_rgb_reader_matches_java_fixture_path() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-rgb.tif");
+        fs::write(&path, synthetic_classic_rgb_tiff()).unwrap();
+
+        let reader = GeoTiffRgbReader::open(&path).unwrap();
+        assert_eq!(reader.width(), 2);
+        assert_eq!(reader.height(), 2);
+        assert_eq!(reader.sample_pixel(0, 0).unwrap(), RgbColor::of(10, 20, 30));
+        assert_eq!(
+            reader.sample_pixel(1, 1).unwrap(),
+            RgbColor::of(100, 110, 120)
+        );
+        assert_eq!(reader.sample_pixel(2, 0).unwrap(), RgbColor::unavailable());
+        assert!(RgbColor::of(4, 4, 4).is_near_black());
+        assert!(!RgbColor::of(5, 4, 4).is_near_black());
+
+        let stats = reader.stats();
+        assert_eq!(stats.max_tile_cache_entries, 256);
+        assert_eq!(stats.resident_tiles, 1);
+        assert_eq!(stats.tile_misses, 1);
+        assert_eq!(stats.tile_hits, 1);
+        assert_eq!(stats.tile_evictions, 0);
+    }
+
+    #[test]
     fn synthetic_bigtiff_heightmap_reader_matches_java_test_fixture() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("tiny-bigtiff.tif");
@@ -1667,6 +2303,51 @@ mod tests {
             epsg_code: Some(4326),
             no_data_value: None,
         }
+    }
+
+    fn synthetic_classic_rgb_tiff() -> Vec<u8> {
+        synthetic_classic_rgb_tiff_with_pixels([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120])
+    }
+
+    fn synthetic_classic_rgb_tiff_with_pixels(pixel_bytes: [u8; 12]) -> Vec<u8> {
+        let entry_count = 10usize;
+        let ifd_offset = 8usize;
+        let ifd_bytes = 2 + (entry_count * CLASSIC_IFD_ENTRY_BYTES) + 4;
+        let bits_offset = ifd_offset + ifd_bytes;
+        let tile_offset = bits_offset + 6;
+        let file_size = tile_offset + pixel_bytes.len();
+        let mut out = vec![0u8; file_size];
+
+        out[0] = b'I';
+        out[1] = b'I';
+        put_u16(&mut out, 2, CLASSIC_TIFF_MAGIC);
+        put_u32(&mut out, 4, ifd_offset as u32);
+
+        let mut cursor = ifd_offset;
+        put_u16(&mut out, cursor, entry_count as u16);
+        cursor += 2;
+        for (tag, field_type, count, value_or_offset) in [
+            (TAG_IMAGE_WIDTH, TYPE_LONG, 1, 2),
+            (TAG_IMAGE_LENGTH, TYPE_LONG, 1, 2),
+            (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 3, bits_offset as u32),
+            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+            (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 3),
+            (TAG_PLANAR_CONFIGURATION, TYPE_SHORT, 1, 1),
+            (TAG_TILE_WIDTH, TYPE_LONG, 1, 2),
+            (TAG_TILE_LENGTH, TYPE_LONG, 1, 2),
+            (TAG_TILE_OFFSETS, TYPE_LONG, 1, tile_offset as u32),
+            (TAG_TILE_BYTE_COUNTS, TYPE_LONG, 1, pixel_bytes.len() as u32),
+        ] {
+            put_classic_entry(&mut out, cursor, tag, field_type, count, value_or_offset);
+            cursor += CLASSIC_IFD_ENTRY_BYTES;
+        }
+        put_u32(&mut out, cursor, 0);
+
+        put_u16(&mut out, bits_offset, 8);
+        put_u16(&mut out, bits_offset + 2, 8);
+        put_u16(&mut out, bits_offset + 4, 8);
+        out[tile_offset..tile_offset + pixel_bytes.len()].copy_from_slice(&pixel_bytes);
+        out
     }
 
     fn synthetic_bigtiff_float32() -> Vec<u8> {
@@ -2046,6 +2727,25 @@ mod tests {
         put_u16(out, offset + 2, field_type);
         put_u64(out, offset + 4, count);
         put_u64(out, offset + 12, value_or_offset);
+    }
+
+    fn put_classic_entry(
+        out: &mut [u8],
+        offset: usize,
+        tag: u16,
+        field_type: u16,
+        count: u32,
+        value_or_offset: u32,
+    ) {
+        put_u16(out, offset, tag);
+        put_u16(out, offset + 2, field_type);
+        put_u32(out, offset + 4, count);
+        if field_type == TYPE_SHORT && count == 1 {
+            put_u16(out, offset + 8, value_or_offset as u16);
+            put_u16(out, offset + 10, 0);
+        } else {
+            put_u32(out, offset + 8, value_or_offset);
+        }
     }
 
     fn inline_ascii_u64(bytes: &[u8]) -> u64 {

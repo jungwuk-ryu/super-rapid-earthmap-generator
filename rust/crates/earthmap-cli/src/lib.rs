@@ -269,6 +269,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase4.geoTiffRgbReaderBootstrap - Synthetic Classic TIFF RGB metadata, interleaved pixel sampling, unavailable out-of-range pixels, and tile cache statistics match the Java fixture path."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase4.heightmapScalarSamplerUncached - HeightmapScalarSampler nearest and bilinear math matches Java for the uncached synthetic fixture path."
     )?;
     writeln!(
