@@ -9,6 +9,8 @@ earthmap-core = { path = "../earthmap-core" }
 earthmap-geo = { path = "../earthmap-geo" }
 earthmap-minecraft = { path = "../earthmap-minecraft" }
 earthmap-region = { path = "../earthmap-region" }
+png.workspace = true
+quick-xml.workspace = true
 
 [lib]
 path = "src/lib.rs"

@@ -358,6 +358,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.wwfEcoregionCacheBootstrap - WwfEcoregionSampler reads Java-generated ecoregion cache files and EarthDataSurfaceMaterialSampler auto-loads cache-backed ecoregion evidence when present."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.metImageExportTerrainSamplerBootstrap - MetImageExportTerrainSampler discovers Java MET image_exports tiles, parses aux GeoTransform metadata, samples PNG terrain-token colors with a bounded image cache, and EarthDataSurfaceMaterialSampler prefers exported tokens when present."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",

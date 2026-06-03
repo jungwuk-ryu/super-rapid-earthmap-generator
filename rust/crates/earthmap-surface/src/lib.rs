@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use earthmap_core::build_info;
 use earthmap_geo::{
@@ -17,6 +17,8 @@ use earthmap_minecraft::block_state_ids;
 use earthmap_minecraft::chunk_model::{ChunkModel, CHUNK_WIDTH};
 use earthmap_minecraft::{chunk_nbt_encoder, level_dat_template, MinecraftError};
 use earthmap_region::{ChunkLocalPos, RegionError};
+use quick_xml::events::Event;
+use quick_xml::Reader;
 
 pub const MODULE_STATUS: &str = "phase5-surface-bootstrap";
 
@@ -833,6 +835,7 @@ pub struct EarthDataSurfaceMaterialSampler {
     bathymetry: Option<GeoTiffFloat32Reader>,
     slope: Option<GeoTiffSingleBandReader>,
     ecoregions: Option<Box<dyn EcoregionSampler>>,
+    terrain_tokens: Option<MetImageExportTerrainSampler>,
     material_cache: Mutex<BoundedAccessCache<SurfaceMaterialSample>>,
     ocean_cache: Mutex<BoundedAccessCache<SurfaceMaterialSample>>,
     ecoregion_cache: Mutex<BoundedAccessCache<EcoregionEvidence>>,
@@ -884,6 +887,7 @@ impl EarthDataSurfaceMaterialSampler {
             slope: open_surface_raster(tif_root.as_deref(), "slope.tif")?,
             ecoregions: WwfEcoregionSampler::open_auto_cache(true_marble_path)?
                 .map(|sampler| Box::new(sampler) as Box<dyn EcoregionSampler>),
+            terrain_tokens: MetImageExportTerrainSampler::open_auto(true_marble_path)?,
             material_cache: Mutex::new(BoundedAccessCache::new(Self::MATERIAL_CACHE_ENTRIES)),
             ocean_cache: Mutex::new(BoundedAccessCache::new(Self::OCEAN_CACHE_ENTRIES)),
             ecoregion_cache: Mutex::new(BoundedAccessCache::new(Self::ECOREGION_CACHE_ENTRIES)),
@@ -919,7 +923,7 @@ impl EarthDataSurfaceMaterialSampler {
                 .lock()
                 .map_err(|_| SurfaceError::invalid("surface material cache lock poisoned"))?;
             if let Some(cached) = cache.get(cell.key) {
-                return Ok(with_surface_terrain_token(&cached, RgbColor::unavailable()));
+                return Ok(self.with_terrain_token(&cached, longitude, latitude));
             }
         }
         let sampled = self.sample_land_uncached(
@@ -933,7 +937,7 @@ impl EarthDataSurfaceMaterialSampler {
             .lock()
             .map_err(|_| SurfaceError::invalid("surface material cache lock poisoned"))?;
         let sample = cache.insert_or_get(cell.key, sampled);
-        Ok(with_surface_terrain_token(&sample, RgbColor::unavailable()))
+        Ok(self.with_terrain_token(&sample, longitude, latitude))
     }
 
     fn sample_land_uncached(
@@ -1035,7 +1039,7 @@ impl EarthDataSurfaceMaterialSampler {
                 .lock()
                 .map_err(|_| SurfaceError::invalid("surface ocean cache lock poisoned"))?;
             if let Some(cached) = cache.get(cell.key) {
-                return Ok(with_surface_terrain_token(&cached, RgbColor::unavailable()));
+                return Ok(self.with_terrain_token(&cached, longitude, latitude));
             }
         }
         let sampled = self.sample_ocean_uncached(
@@ -1049,7 +1053,7 @@ impl EarthDataSurfaceMaterialSampler {
             .lock()
             .map_err(|_| SurfaceError::invalid("surface ocean cache lock poisoned"))?;
         let sample = cache.insert_or_get(cell.key, sampled);
-        Ok(with_surface_terrain_token(&sample, RgbColor::unavailable()))
+        Ok(self.with_terrain_token(&sample, longitude, latitude))
     }
 
     fn sample_ocean_uncached(
@@ -1088,6 +1092,24 @@ impl EarthDataSurfaceMaterialSampler {
             "",
             0.0,
         )
+    }
+
+    fn sample_terrain_token_color(&self, longitude: f64, latitude: f64) -> RgbColor {
+        let Some(terrain_tokens) = self.terrain_tokens.as_ref() else {
+            return RgbColor::unavailable();
+        };
+        terrain_tokens
+            .sample(longitude, latitude)
+            .unwrap_or_else(|_| RgbColor::unavailable())
+    }
+
+    fn with_terrain_token(
+        &self,
+        sample: &SurfaceMaterialSample,
+        longitude: f64,
+        latitude: f64,
+    ) -> SurfaceMaterialSample {
+        with_surface_terrain_token(sample, self.sample_terrain_token_color(longitude, latitude))
     }
 }
 
@@ -1200,6 +1222,599 @@ impl<T: Clone> BoundedAccessCache<T> {
 struct BoundedCacheEntry<T> {
     value: T,
     access_stamp: u64,
+}
+
+#[derive(Debug)]
+pub struct MetImageExportTerrainSampler {
+    tiles: Vec<MetTerrainTile>,
+    tile_index: HashMap<i64, Vec<usize>>,
+    images: Mutex<BoundedAccessCache<Arc<MetTerrainImage>>>,
+}
+
+impl MetImageExportTerrainSampler {
+    const IMAGE_CACHE_ENTRIES: usize = 64;
+
+    pub fn open_auto(true_marble_path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let mut tiles = Vec::new();
+        for root in met_candidate_roots(true_marble_path.as_ref())? {
+            add_met_image_export_root(&root.join("image_exports"), &mut tiles)?;
+            add_met_image_export_root(&root.join("met_work").join("image_exports"), &mut tiles)?;
+            add_nested_met_image_export_roots(&root.join("met_shards"), &mut tiles)?;
+            add_nested_met_image_export_roots(&root.join("met_turbo_temp"), &mut tiles)?;
+        }
+        if tiles.is_empty() {
+            return Ok(None);
+        }
+        tiles.sort_by(|left, right| {
+            left.area_degrees()
+                .partial_cmp(&right.area_degrees())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.path
+                        .to_string_lossy()
+                        .cmp(&right.path.to_string_lossy())
+                })
+        });
+        let tile_index = build_met_tile_index(&tiles);
+        Ok(Some(Self {
+            tiles,
+            tile_index,
+            images: Mutex::new(BoundedAccessCache::new(Self::IMAGE_CACHE_ENTRIES)),
+        }))
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.tiles.len()
+    }
+
+    pub fn sample(&self, longitude: f64, latitude: f64) -> Result<RgbColor> {
+        let Some(tile_index) = self.tile_for(longitude, latitude) else {
+            return Ok(RgbColor::unavailable());
+        };
+        let tile = &self.tiles[tile_index];
+        let image = self.image(tile_index)?;
+        let pixel_x = clamp_i32(
+            ((normalize_longitude(longitude) - tile.origin_longitude) / tile.pixel_longitude)
+                .floor() as i32,
+            0,
+            image.width.saturating_sub(1) as i32,
+        ) as usize;
+        let pixel_y = clamp_i32(
+            ((latitude - tile.origin_latitude) / tile.pixel_latitude).floor() as i32,
+            0,
+            image.height.saturating_sub(1) as i32,
+        ) as usize;
+        Ok(image.pixel(pixel_x, pixel_y))
+    }
+
+    fn tile_for(&self, longitude: f64, latitude: f64) -> Option<usize> {
+        let lon = normalize_longitude(longitude);
+        let candidates = self
+            .tile_index
+            .get(&met_index_key(lon.floor() as i32, latitude.floor() as i32))?;
+        candidates
+            .iter()
+            .copied()
+            .find(|index| self.tiles[*index].contains(lon, latitude))
+    }
+
+    fn image(&self, tile_index: usize) -> Result<Arc<MetTerrainImage>> {
+        let key = tile_index as i64;
+        {
+            let mut cache = self
+                .images
+                .lock()
+                .map_err(|_| SurfaceError::invalid("MET terrain image cache lock poisoned"))?;
+            if let Some(cached) = cache.get(key) {
+                return Ok(cached);
+            }
+        }
+        let loaded = Arc::new(load_met_png_rgb(&self.tiles[tile_index].path)?);
+        let mut cache = self
+            .images
+            .lock()
+            .map_err(|_| SurfaceError::invalid("MET terrain image cache lock poisoned"))?;
+        Ok(cache.insert_or_get(key, loaded))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MetTerrainTile {
+    path: PathBuf,
+    origin_longitude: f64,
+    pixel_longitude: f64,
+    origin_latitude: f64,
+    pixel_latitude: f64,
+    min_longitude: f64,
+    max_longitude: f64,
+    min_latitude: f64,
+    max_latitude: f64,
+}
+
+impl MetTerrainTile {
+    fn from_geo_transform(path: PathBuf, size: MetImageSize, transform: MetGeoTransform) -> Self {
+        let other_longitude =
+            transform.origin_longitude + (transform.pixel_longitude * size.width as f64);
+        let other_latitude =
+            transform.origin_latitude + (transform.pixel_latitude * size.height as f64);
+        Self {
+            path,
+            origin_longitude: transform.origin_longitude,
+            pixel_longitude: transform.pixel_longitude,
+            origin_latitude: transform.origin_latitude,
+            pixel_latitude: transform.pixel_latitude,
+            min_longitude: transform.origin_longitude.min(other_longitude),
+            max_longitude: transform.origin_longitude.max(other_longitude),
+            min_latitude: transform.origin_latitude.min(other_latitude),
+            max_latitude: transform.origin_latitude.max(other_latitude),
+        }
+    }
+
+    fn area_degrees(&self) -> f64 {
+        ((self.max_longitude - self.min_longitude) * (self.max_latitude - self.min_latitude)).abs()
+    }
+
+    fn contains(&self, longitude: f64, latitude: f64) -> bool {
+        longitude >= self.min_longitude
+            && longitude < self.max_longitude
+            && latitude >= self.min_latitude
+            && latitude < self.max_latitude
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetImageSize {
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MetGeoTransform {
+    origin_longitude: f64,
+    pixel_longitude: f64,
+    origin_latitude: f64,
+    pixel_latitude: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetTileOrigin {
+    latitude_direction: u8,
+    latitude: i32,
+    longitude_direction: u8,
+    longitude: i32,
+}
+
+#[derive(Debug)]
+struct MetTerrainImage {
+    width: usize,
+    height: usize,
+    pixels: Vec<RgbColor>,
+}
+
+impl MetTerrainImage {
+    fn pixel(&self, x: usize, y: usize) -> RgbColor {
+        self.pixels[y * self.width + x]
+    }
+}
+
+fn add_nested_met_image_export_roots(parent: &Path, tiles: &mut Vec<MetTerrainTile>) -> Result<()> {
+    if !parent.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(parent)? {
+        let child = entry?.path();
+        if child.is_dir() {
+            add_met_image_export_root(&child.join("image_exports"), tiles)?;
+        }
+    }
+    Ok(())
+}
+
+fn add_met_image_export_root(image_exports: &Path, tiles: &mut Vec<MetTerrainTile>) -> Result<()> {
+    if !image_exports.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(image_exports)? {
+        let tile_dir = entry?.path();
+        if tile_dir.is_dir() {
+            add_met_tile(&tile_dir, tiles)?;
+        }
+    }
+    Ok(())
+}
+
+fn add_met_tile(tile_dir: &Path, tiles: &mut Vec<MetTerrainTile>) -> Result<()> {
+    let Some(tile_name) = tile_dir.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let Some(origin) = parse_met_tile_name(tile_name) else {
+        return Ok(());
+    };
+    let Some(image_path) = met_terrain_image_path(tile_dir, tile_name) else {
+        return Ok(());
+    };
+    let Some(terrain_size) = met_png_image_size(&image_path)? else {
+        return Ok(());
+    };
+    let exported_image_path = tile_dir
+        .join("heightmap")
+        .join(format!("{tile_name}_exported.png"));
+    let aux_path = tile_dir
+        .join("heightmap")
+        .join(format!("{tile_name}_exported.png.aux.xml"));
+    if aux_path.is_file() {
+        if let Some(transform) = read_met_geo_transform(&aux_path)? {
+            let exported_size = met_png_image_size(&exported_image_path)?;
+            if exported_size.is_some_and(|size| size != terrain_size) {
+                return Ok(());
+            }
+            tiles.push(MetTerrainTile::from_geo_transform(
+                absolute_normalized_path(&image_path)?,
+                terrain_size,
+                transform,
+            ));
+            return Ok(());
+        }
+    }
+    if let Some(tile) = infer_fallback_met_tile(&image_path, origin, terrain_size)? {
+        tiles.push(tile);
+    }
+    Ok(())
+}
+
+fn met_terrain_image_path(tile_dir: &Path, tile_name: &str) -> Option<PathBuf> {
+    [
+        tile_dir.join(format!("{tile_name}_terrain_reduced_colors.png")),
+        tile_dir.join("terrain_reduced_colors.png"),
+        tile_dir.join(format!("{tile_name}_terrain.png")),
+        tile_dir.join("terrain.png"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+fn infer_fallback_met_tile(
+    image_path: &Path,
+    origin: MetTileOrigin,
+    terrain_size: MetImageSize,
+) -> Result<Option<MetTerrainTile>> {
+    if terrain_size.width != 512 || terrain_size.height != 512 {
+        return Ok(None);
+    }
+    let west = if origin.longitude_direction == b'E' {
+        f64::from(origin.longitude)
+    } else {
+        -f64::from(origin.longitude) - 1.0
+    };
+    let north = if origin.latitude_direction == b'N' {
+        f64::from(origin.latitude) + 1.0
+    } else {
+        -f64::from(origin.latitude)
+    };
+    Ok(Some(MetTerrainTile::from_geo_transform(
+        absolute_normalized_path(image_path)?,
+        terrain_size,
+        MetGeoTransform {
+            origin_longitude: west,
+            pixel_longitude: 1.0 / terrain_size.width as f64,
+            origin_latitude: north,
+            pixel_latitude: -1.0 / terrain_size.height as f64,
+        },
+    )))
+}
+
+fn met_png_image_size(image_path: &Path) -> Result<Option<MetImageSize>> {
+    if !image_path.is_file() {
+        return Ok(None);
+    }
+    let decoder = png::Decoder::new(File::open(image_path)?);
+    let reader = decoder.read_info().map_err(|error| {
+        SurfaceError::invalid(format!(
+            "failed to read terrain token PNG metadata {}: {error}",
+            image_path.display()
+        ))
+    })?;
+    let info = reader.info();
+    Ok(Some(MetImageSize {
+        width: info.width as usize,
+        height: info.height as usize,
+    }))
+}
+
+fn load_met_png_rgb(image_path: &Path) -> Result<MetTerrainImage> {
+    let mut decoder = png::Decoder::new(File::open(image_path)?);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|error| {
+        SurfaceError::invalid(format!(
+            "failed to decode terrain token PNG {}: {error}",
+            image_path.display()
+        ))
+    })?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).map_err(|error| {
+        SurfaceError::invalid(format!(
+            "failed to read terrain token PNG {}: {error}",
+            image_path.display()
+        ))
+    })?;
+    let bytes = &buffer[..info.buffer_size()];
+    let width = info.width as usize;
+    let height = info.height as usize;
+    let mut pixels = Vec::with_capacity(width.saturating_mul(height));
+    match info.color_type {
+        png::ColorType::Rgb => {
+            for chunk in bytes.chunks_exact(3) {
+                pixels.push(RgbColor::of(chunk[0], chunk[1], chunk[2]));
+            }
+        }
+        png::ColorType::Rgba => {
+            for chunk in bytes.chunks_exact(4) {
+                pixels.push(RgbColor::of(chunk[0], chunk[1], chunk[2]));
+            }
+        }
+        png::ColorType::Grayscale => {
+            for gray in bytes {
+                pixels.push(RgbColor::of(*gray, *gray, *gray));
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for chunk in bytes.chunks_exact(2) {
+                pixels.push(RgbColor::of(chunk[0], chunk[0], chunk[0]));
+            }
+        }
+        png::ColorType::Indexed => {
+            return Err(SurfaceError::invalid(format!(
+                "unsupported indexed terrain token PNG after expansion: {}",
+                image_path.display()
+            )));
+        }
+    }
+    if pixels.len() != width.saturating_mul(height) {
+        return Err(SurfaceError::invalid(format!(
+            "unexpected terrain token PNG buffer size: {}",
+            image_path.display()
+        )));
+    }
+    Ok(MetTerrainImage {
+        width,
+        height,
+        pixels,
+    })
+}
+
+fn read_met_geo_transform(aux_path: &Path) -> Result<Option<MetGeoTransform>> {
+    let xml = fs::read_to_string(aux_path)?;
+    let mut reader = Reader::from_str(&xml);
+    reader.config_mut().trim_text(true);
+    let mut capture = false;
+    let mut capture_text = String::new();
+    loop {
+        match reader.read_event().map_err(|error| {
+            SurfaceError::invalid(format!(
+                "failed to parse terrain aux XML {}: {error}",
+                aux_path.display()
+            ))
+        })? {
+            Event::Start(element) if element.name().as_ref() == b"GeoTransform" => {
+                capture = true;
+                capture_text.clear();
+            }
+            Event::Text(text) if capture => {
+                capture_text.push_str(&text.decode().map_err(|error| {
+                    SurfaceError::invalid(format!(
+                        "failed to decode terrain aux XML {}: {error}",
+                        aux_path.display()
+                    ))
+                })?);
+            }
+            Event::CData(text) if capture => {
+                capture_text.push_str(&text.decode().map_err(|error| {
+                    SurfaceError::invalid(format!(
+                        "failed to decode terrain aux XML {}: {error}",
+                        aux_path.display()
+                    ))
+                })?);
+            }
+            Event::GeneralRef(reference) if capture => {
+                capture_text.push_str(&decode_met_xml_general_ref(&reference, aux_path)?);
+            }
+            Event::End(end) if end.name().as_ref() == b"GeoTransform" && capture => {
+                return parse_met_geo_transform(&capture_text, aux_path);
+            }
+            Event::Eof => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+fn decode_met_xml_general_ref(
+    reference: &quick_xml::events::BytesRef<'_>,
+    aux_path: &Path,
+) -> Result<String> {
+    let name = reference.decode().map_err(|error| {
+        SurfaceError::invalid(format!(
+            "failed to decode terrain aux XML {}: {error}",
+            aux_path.display()
+        ))
+    })?;
+    match name.as_ref() {
+        "amp" => Ok("&".to_string()),
+        "lt" => Ok("<".to_string()),
+        "gt" => Ok(">".to_string()),
+        "quot" => Ok("\"".to_string()),
+        "apos" => Ok("'".to_string()),
+        text if text.starts_with("#x") || text.starts_with("#X") => {
+            let codepoint = u32::from_str_radix(&text[2..], 16).map_err(|_| {
+                SurfaceError::invalid(format!(
+                    "unrecognized terrain aux XML entity {} in {}",
+                    text,
+                    aux_path.display()
+                ))
+            })?;
+            char::from_u32(codepoint)
+                .map(|ch| ch.to_string())
+                .ok_or_else(|| {
+                    SurfaceError::invalid(format!(
+                        "unrecognized terrain aux XML entity {} in {}",
+                        text,
+                        aux_path.display()
+                    ))
+                })
+        }
+        text if text.starts_with('#') => {
+            let codepoint = text[1..].parse::<u32>().map_err(|_| {
+                SurfaceError::invalid(format!(
+                    "unrecognized terrain aux XML entity {} in {}",
+                    text,
+                    aux_path.display()
+                ))
+            })?;
+            char::from_u32(codepoint)
+                .map(|ch| ch.to_string())
+                .ok_or_else(|| {
+                    SurfaceError::invalid(format!(
+                        "unrecognized terrain aux XML entity {} in {}",
+                        text,
+                        aux_path.display()
+                    ))
+                })
+        }
+        text => Err(SurfaceError::invalid(format!(
+            "unrecognized terrain aux XML entity {} in {}",
+            text,
+            aux_path.display()
+        ))),
+    }
+}
+
+fn parse_met_geo_transform(text: &str, aux_path: &Path) -> Result<Option<MetGeoTransform>> {
+    let parts = text.trim().split(',').collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return Ok(None);
+    }
+    let parse_part = |index: usize| {
+        parts[index].trim().parse::<f64>().map_err(|error| {
+            SurfaceError::invalid(format!(
+                "failed to parse terrain aux GeoTransform {}: {error}",
+                aux_path.display()
+            ))
+        })
+    };
+    let origin_longitude = parse_part(0)?;
+    let pixel_longitude = parse_part(1)?;
+    let rotation_x = parse_part(2)?;
+    let origin_latitude = parse_part(3)?;
+    let rotation_y = parse_part(4)?;
+    let pixel_latitude = parse_part(5)?;
+    if rotation_x != 0.0 || rotation_y != 0.0 || pixel_longitude == 0.0 || pixel_latitude == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(MetGeoTransform {
+        origin_longitude,
+        pixel_longitude,
+        origin_latitude,
+        pixel_latitude,
+    }))
+}
+
+fn parse_met_tile_name(tile_name: &str) -> Option<MetTileOrigin> {
+    let bytes = tile_name.as_bytes();
+    if bytes.len() != 7 {
+        return None;
+    }
+    let latitude_direction = bytes[0];
+    let longitude_direction = bytes[3];
+    if !matches!(latitude_direction, b'N' | b'S') || !matches!(longitude_direction, b'E' | b'W') {
+        return None;
+    }
+    if !bytes[1..3].iter().all(u8::is_ascii_digit) || !bytes[4..7].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(MetTileOrigin {
+        latitude_direction,
+        latitude: tile_name[1..3].parse().ok()?,
+        longitude_direction,
+        longitude: tile_name[4..7].parse().ok()?,
+    })
+}
+
+fn met_candidate_roots(true_marble_path: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let normalized = absolute_normalized_path(true_marble_path)?;
+    if let Some(earth_root) = normalized
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        push_distinct_path(&mut roots, earth_root.to_path_buf());
+    }
+    for root in ["E:/earthmap", "D:/earthmap", "F:/earthmap"] {
+        push_distinct_path(&mut roots, absolute_normalized_path(Path::new(root))?);
+    }
+    Ok(roots)
+}
+
+fn build_met_tile_index(tiles: &[MetTerrainTile]) -> HashMap<i64, Vec<usize>> {
+    let mut index = HashMap::<i64, Vec<usize>>::new();
+    for (tile_index, tile) in tiles.iter().enumerate() {
+        let min_lon = tile.min_longitude.floor() as i32;
+        let max_lon = next_down_f64(tile.max_longitude).floor() as i32;
+        let min_lat = tile.min_latitude.floor() as i32;
+        let max_lat = next_down_f64(tile.max_latitude).floor() as i32;
+        for lat in min_lat..=max_lat {
+            for lon in min_lon..=max_lon {
+                index
+                    .entry(met_index_key(lon, lat))
+                    .or_default()
+                    .push(tile_index);
+            }
+        }
+    }
+    index
+}
+
+fn met_index_key(longitude_cell: i32, latitude_cell: i32) -> i64 {
+    (i64::from(longitude_cell) << 32) ^ (i64::from(latitude_cell) & 0xffff_ffff)
+}
+
+fn next_down_f64(value: f64) -> f64 {
+    if value.is_nan() || value == f64::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    if value > 0.0 {
+        f64::from_bits(bits - 1)
+    } else {
+        f64::from_bits(bits + 1)
+    }
+}
+
+fn absolute_normalized_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(normalize_path_components(&absolute))
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3628,6 +4243,98 @@ mod tests {
     }
 
     #[test]
+    fn met_image_export_terrain_sampler_matches_java_tile_discovery_and_sampling() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-surface-met-terrain-sampler-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let terrain = root.join("TifFiles").join("terrain");
+        std::fs::create_dir_all(&terrain).unwrap();
+        let true_marble = terrain.join("TrueMarble.vrt");
+        std::fs::write(
+            &true_marble,
+            r#"<VRTDataset rasterXSize="1" rasterYSize="1" />"#,
+        )
+        .unwrap();
+
+        let tile = root.join("image_exports").join("N10E020");
+        std::fs::create_dir_all(tile.join("heightmap")).unwrap();
+        write_synthetic_met_png(&tile.join("N10E020_terrain_reduced_colors.png"), 4, 4);
+        write_synthetic_met_png(&tile.join("heightmap").join("N10E020_exported.png"), 4, 4);
+        std::fs::write(
+            tile.join("heightmap").join("N10E020_exported.png.aux.xml"),
+            r#"
+<PAMDataset>
+  <GeoTransform> 20.0, 0.25, 0.0, 11.0, 0.0, -0.25</GeoTransform>
+</PAMDataset>
+"#,
+        )
+        .unwrap();
+
+        let unsafe_tile = root.join("image_exports").join("N12E022");
+        std::fs::create_dir_all(&unsafe_tile).unwrap();
+        write_synthetic_met_png(
+            &unsafe_tile.join("N12E022_terrain_reduced_colors.png"),
+            1024,
+            1024,
+        );
+
+        let terrain_only_tile = root.join("image_exports").join("N13E023");
+        std::fs::create_dir_all(&terrain_only_tile).unwrap();
+        write_synthetic_met_png(&terrain_only_tile.join("N13E023_terrain.png"), 512, 512);
+
+        let sampler = MetImageExportTerrainSampler::open_auto(&true_marble)
+            .unwrap()
+            .expect("sampler should discover aux-backed MET terrain tile");
+        assert!(sampler.tile_count() >= 2);
+        assert_eq!(
+            sampler.sample(20.10, 10.90).unwrap(),
+            RgbColor::of(167, 146, 103)
+        );
+        assert_eq!(
+            sampler.sample(20.90, 10.10).unwrap(),
+            RgbColor::of(230, 205, 160)
+        );
+        assert_eq!(
+            sampler.sample(23.10, 13.90).unwrap(),
+            RgbColor::of(167, 146, 103)
+        );
+        assert!(!sampler.sample(22.10, 12.90).unwrap().available);
+
+        drop(sampler);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn met_aux_geo_transform_decodes_xml_entities_like_java_dom() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-surface-met-aux-entities-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let aux = root.join("tile.png.aux.xml");
+        std::fs::write(
+            &aux,
+            r#"
+<PAMDataset>
+  <GeoTransform> 20&#46;0, 0&#x2e;25, 0, 11&#46;0, 0, -0&#46;25</GeoTransform>
+</PAMDataset>
+"#,
+        )
+        .unwrap();
+
+        let transform = read_met_geo_transform(&aux).unwrap().unwrap();
+        assert_eq!(transform.origin_longitude, 20.0);
+        assert_eq!(transform.pixel_longitude, 0.25);
+        assert_eq!(transform.origin_latitude, 11.0);
+        assert_eq!(transform.pixel_latitude, -0.25);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn earth_data_surface_material_sampler_samples_optional_rasters_and_caches() {
         let root = std::env::temp_dir().join(format!(
             "earthmap-surface-earth-data-{}",
@@ -3642,6 +4349,25 @@ mod tests {
         std::fs::create_dir_all(&vegetation).unwrap();
         std::fs::create_dir_all(&shape_dir).unwrap();
         std::fs::create_dir_all(root.join(".earthmap-cache")).unwrap();
+        let met_tile = root.join("image_exports").join("N00E001");
+        std::fs::create_dir_all(met_tile.join("heightmap")).unwrap();
+        write_synthetic_met_png(&met_tile.join("N00E001_terrain_reduced_colors.png"), 4, 4);
+        write_synthetic_met_png(
+            &met_tile.join("heightmap").join("N00E001_exported.png"),
+            4,
+            4,
+        );
+        std::fs::write(
+            met_tile
+                .join("heightmap")
+                .join("N00E001_exported.png.aux.xml"),
+            r#"
+<PAMDataset>
+  <GeoTransform> 1.0, 0.25, 0.0, 1.0, 0.0, -0.25</GeoTransform>
+</PAMDataset>
+"#,
+        )
+        .unwrap();
         std::fs::write(terrain.join("tiny.tif"), synthetic_classic_rgb_tiff()).unwrap();
         std::fs::write(shape_dir.join("wwf_terr_ecos.shp"), b"shape placeholder").unwrap();
         std::fs::write(shape_dir.join("wwf_terr_ecos.dbf"), b"dbf placeholder").unwrap();
@@ -3695,14 +4421,8 @@ mod tests {
 
         let sample = sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap();
         assert_eq!(sample.color, RgbColor::of(70, 80, 90));
-        assert_eq!(
-            sample.terrain_token_color,
-            MetTerrainVocabulary::nearest(sample.color).color()
-        );
-        assert_eq!(
-            sample.terrain_token_source,
-            TerrainTokenSource::JavaStandardPalette
-        );
+        assert_eq!(sample.terrain_token_color, RgbColor::of(167, 146, 103));
+        assert_eq!(sample.terrain_token_source, TerrainTokenSource::Export);
         assert_eq!(sample.climate_class, 2);
         assert_eq!(sample.evergreen_broadleaf_trees, 10);
         assert_eq!(sample.deciduous_broadleaf_trees, 20);
@@ -3725,6 +4445,8 @@ mod tests {
 
         let water = sampler.sample_water(1.25, 0.75, 0.0, 0.0).unwrap();
         assert_eq!(water.color, RgbColor::of(70, 80, 90));
+        assert_eq!(water.terrain_token_color, RgbColor::of(167, 146, 103));
+        assert_eq!(water.terrain_token_source, TerrainTokenSource::Export);
         assert_eq!(water.climate_class, SurfaceMaterialSample::UNKNOWN);
         assert_eq!(water.ocean_temperature, 12);
         assert_eq!(water.bathymetry_meters, -123);
@@ -4217,6 +4939,29 @@ mod tests {
 
     fn push_f64_be(out: &mut Vec<u8>, value: f64) {
         out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_synthetic_met_png(path: &Path, width: u32, height: u32) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let file = File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
+        for _y in 0..height {
+            for x in 0..width {
+                let color = if x < width / 2 {
+                    RgbColor::of(167, 146, 103)
+                } else {
+                    RgbColor::of(230, 205, 160)
+                };
+                pixels.extend_from_slice(&[color.red, color.green, color.blue]);
+            }
+        }
+        writer.write_image_data(&pixels).unwrap();
     }
 
     fn synthetic_classic_rgb_tiff() -> Vec<u8> {

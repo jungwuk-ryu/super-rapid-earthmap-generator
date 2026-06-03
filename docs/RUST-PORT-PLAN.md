@@ -602,9 +602,12 @@ Bootstrap implementation status on 2026-06-03:
 - Rust `WwfEcoregionSampler` bootstrap reads Java-generated WWF ecoregion cache files, runs Java-compatible
   point-in-polygon sampling, and lets `EarthDataSurfaceMaterialSampler` auto-load cache-backed ecoregion evidence when
   present.
-- Remaining Phase 5 work: port WWF shapefile/DBF source parsing and cache freshness regeneration, MET export
-  terrain-token raster integration, land-shallow-topographic/photo source selection, photo solver, smoothing/coastal
-  policies, OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
+- Rust `MetImageExportTerrainSampler` bootstrap discovers Java MET `image_exports` terrain-token PNG tiles, parses GDAL
+  aux GeoTransform metadata, keeps Java's 512x512 fallback rule, samples token colors through a bounded image cache,
+  and lets `EarthDataSurfaceMaterialSampler` prefer exported terrain tokens over Java standard-palette synthesis.
+- Remaining Phase 5 work: port WWF shapefile/DBF source parsing and cache freshness regeneration,
+  land-shallow-topographic/photo source selection, photo solver, smoothing/coastal policies, OSM overlay, surface biome
+  cell writing, and fixed-region `generate-surface-region` payload parity.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
