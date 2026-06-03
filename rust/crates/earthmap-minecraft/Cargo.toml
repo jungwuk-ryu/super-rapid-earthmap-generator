@@ -1,0 +1,12 @@
+[package]
+name = "earthmap-minecraft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+earthmap-core = { path = "../earthmap-core" }
+flate2.workspace = true
+
+[lib]
+path = "src/lib.rs"

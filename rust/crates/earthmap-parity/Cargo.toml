@@ -1,0 +1,14 @@
+[package]
+name = "earthmap-parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+earthmap-core = { path = "../earthmap-core" }
+earthmap-region = { path = "../earthmap-region" }
+sha2.workspace = true
+walkdir.workspace = true
+
+[lib]
+path = "src/lib.rs"

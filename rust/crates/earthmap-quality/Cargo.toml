@@ -1,0 +1,13 @@
+[package]
+name = "earthmap-quality"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+earthmap-core = { path = "../earthmap-core" }
+earthmap-region = { path = "../earthmap-region" }
+
+[lib]
+path = "src/lib.rs"
+

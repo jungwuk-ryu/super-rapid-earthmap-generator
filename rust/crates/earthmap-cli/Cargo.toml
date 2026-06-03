@@ -1,0 +1,23 @@
+[package]
+name = "earthmap-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+earthmap-core = { path = "../earthmap-core" }
+earthmap-geo = { path = "../earthmap-geo" }
+earthmap-minecraft = { path = "../earthmap-minecraft" }
+earthmap-parity = { path = "../earthmap-parity" }
+earthmap-region = { path = "../earthmap-region" }
+earthmap-surface = { path = "../earthmap-surface" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "earthmap-rs"
+path = "src/main.rs"
