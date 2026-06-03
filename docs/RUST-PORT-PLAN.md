@@ -687,9 +687,11 @@ Bootstrap implementation status on 2026-06-03:
 - Rust ecoregion fallback now ports Java's `classifyByEcoregion` stage, including transition deferral plus beach,
   snow/peaks, swamp, jungle, savanna, desert, badlands, forest/taiga, meadow, and plains biome-key handling after
   intent/environment fallbacks.
+- Rust no-climate herbaceous/shrub orange-texture environment fallback now mirrors Java's `classifyByEnvironment`
+  dry-grass promotion instead of falling through to broad badlands/rock color rules.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
-  remaining dry-savanna/desert-edge intent predicates, broader compiler-backed intent, and environment edge cases;
-  then finish full photo solver parity and fixed-region Java/Rust payload parity for surface material/photo output.
+  remaining dry-savanna/desert-edge intent predicates and broader compiler-backed intent; then finish full photo
+  solver parity and fixed-region Java/Rust payload parity for surface material/photo output.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

@@ -1436,6 +1436,24 @@ fn classify_surface_material_land(
         );
     }
 
+    if !sample.has_climate_class()
+        && (sample.herbaceous_cover() >= 0.30 || sample.shrub_cover() >= 0.30)
+        && orange_rock_like
+        && elevation_meters < 1_500.0
+    {
+        let biome = dry_grass_biome(
+            dry_savanna_score.max(sahel_score).max(0.45),
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        );
+        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.44);
+        return mark_surface_material(
+            surface_material_with_surface(base, top, block_state_ids::DIRT, biome),
+            "environment",
+        );
+    }
+
     if !is_sahel_latitude(latitude)
         && terrain.confident()
         && terrain.kind == MetTerrainKind::Vegetated
@@ -15091,6 +15109,72 @@ mod tests {
         );
         assert_eq!(desert_edge.biome_id, "minecraft:savanna");
         assert_eq!(desert_edge.decision_source, "intent");
+    }
+
+    #[test]
+    fn surface_material_classifier_environment_matches_java_bootstrap_cases() {
+        let base_land = surface_column(
+            false,
+            SEA_LEVEL_Y + 10,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+
+        let herbaceous_orange_patch = SurfaceMaterialSample::land(
+            RgbColor::of(150, 70, 45),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            35,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+        let (orange_longitude, orange_latitude) = (-180..=180)
+            .flat_map(|longitude| {
+                (36..=55)
+                    .chain(-55..=-36)
+                    .map(move |latitude| (longitude, latitude))
+            })
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                surface_material_sahara_score(longitude, latitude) < 0.25
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.20
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+            })
+            .expect("test fixture should find a low-intent herbaceous orange coordinate");
+        let herbaceous_environment = apply_test_surface_material_sample(
+            &base_land,
+            herbaceous_orange_patch,
+            420.0,
+            f64::from(orange_longitude),
+            f64::from(orange_latitude),
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            herbaceous_environment.top_block_state_id,
+            block_state_ids::GRASS_BLOCK | block_state_ids::COARSE_DIRT
+        ));
+        assert_eq!(
+            herbaceous_environment.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert!(!herbaceous_environment.biome_id.contains("badlands"));
+        assert_eq!(herbaceous_environment.decision_source, "environment");
     }
 
     #[test]
