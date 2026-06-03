@@ -1373,6 +1373,7 @@ fn classify_surface_material_land(
         sahel_score,
         rainforest_score,
         dry_savanna_score,
+        mediterranean_score,
         patch_noise,
         fine_noise,
         local_relief_meters,
@@ -1697,6 +1698,7 @@ fn classify_surface_material_by_semantic_intent(
     sahel_score: f64,
     rainforest_score: f64,
     dry_savanna_score: f64,
+    mediterranean_score: f64,
     patch_noise: f64,
     fine_noise: f64,
     local_relief_meters: f64,
@@ -1902,6 +1904,17 @@ fn classify_surface_material_by_semantic_intent(
             top,
             block_state_ids::DIRT,
             biome,
+        ));
+    }
+
+    let strong_dry_core = is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
+        || (is_desert_climate(climate) && !vegetation_evidence && sahara_score >= 0.35);
+    if mediterranean_score >= 0.40 && !strong_dry_core {
+        return Some(surface_material_with_surface(
+            base,
+            mediterranean_surface(sample, metrics, fine_noise),
+            block_state_ids::DIRT,
+            mediterranean_biome(sample, metrics, patch_noise),
         ));
     }
 
@@ -2892,6 +2905,58 @@ fn temperate_grassland_biome(latitude: f64, patch_noise: f64, fine_noise: f64) -
         return "minecraft:sunflower_plains".to_string();
     }
     "minecraft:plains".to_string()
+}
+
+fn mediterranean_surface(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    fine_noise: f64,
+) -> i32 {
+    let low_vegetation = sample
+        .tree_cover()
+        .max(sample.herbaceous_cover())
+        .max(sample.shrub_cover())
+        < 0.10;
+    if low_vegetation && !is_green_like(metrics) && metrics.value < 0.50 && fine_noise >= 0.92 {
+        return block_state_ids::COARSE_DIRT;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn mediterranean_biome(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    patch_noise: f64,
+) -> String {
+    if sample.has_ecoregion()
+        && sample
+            .ecoregion_name
+            .to_ascii_lowercase()
+            .contains("mediterranean")
+        && patch_noise < 0.34
+        && !is_green_like(metrics)
+    {
+        return if patch_noise < 0.16 {
+            "minecraft:sunflower_plains"
+        } else {
+            "minecraft:savanna"
+        }
+        .to_string();
+    }
+    if sample.tree_cover() >= 0.12 || metrics.value < 0.42 || patch_noise >= 0.58 {
+        return if patch_noise >= 0.82 && sample.tree_cover() >= 0.18 {
+            "minecraft:dark_forest"
+        } else {
+            "minecraft:forest"
+        }
+        .to_string();
+    }
+    if patch_noise >= 0.42 {
+        "minecraft:sunflower_plains"
+    } else {
+        "minecraft:plains"
+    }
+    .to_string()
 }
 
 fn temperate_forest_surface(
@@ -12485,6 +12550,84 @@ mod tests {
                 | "minecraft:sunflower_plains"
         ));
         assert_eq!(olive_sahel.decision_source, "intent");
+
+        let mediterranean_open_scrub = SurfaceMaterialSample::color_only(RgbColor::of(118, 98, 58));
+        let mediterranean_metrics = SurfaceColorMetrics::from(mediterranean_open_scrub.color);
+        assert!(!is_green_like(mediterranean_metrics));
+        let (mediterranean_longitude, mediterranean_latitude) = (-11..=43)
+            .flat_map(|longitude| (31..=46).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let patch_noise =
+                    surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
+                let fine_noise = surface_material_ecology_noise(
+                    longitude,
+                    latitude,
+                    7.5,
+                    0x9d6c63b5a8e33f21_u64 as i64,
+                );
+                surface_material_mediterranean_score(longitude, latitude) >= 0.40
+                    && (0.42..0.58).contains(&patch_noise)
+                    && fine_noise < 0.92
+            })
+            .expect("test fixture should find an open Mediterranean scrub coordinate");
+        let mediterranean_scrub = apply_test_surface_material_sample(
+            &base_land,
+            mediterranean_open_scrub,
+            260.0,
+            f64::from(mediterranean_longitude),
+            f64::from(mediterranean_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            mediterranean_scrub.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            mediterranean_scrub.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert_eq!(mediterranean_scrub.biome_id, "minecraft:sunflower_plains");
+        assert_eq!(mediterranean_scrub.decision_source, "intent");
+
+        let vegetated_dry_ecoregion_mediterranean = SurfaceMaterialSample::land(
+            RgbColor::of(86, 112, 68),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            22,
+            8,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Mediterranean desert steppe",
+            "minecraft:desert",
+            0.82,
+        );
+        let vegetated_mediterranean = apply_test_surface_material_sample(
+            &base_land,
+            vegetated_dry_ecoregion_mediterranean,
+            260.0,
+            f64::from(mediterranean_longitude),
+            f64::from(mediterranean_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            vegetated_mediterranean.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            vegetated_mediterranean.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert_eq!(vegetated_mediterranean.decision_source, "intent");
 
         let coarse_token_savanna = SurfaceMaterialSample::new(
             RgbColor::of(140, 80, 50),
