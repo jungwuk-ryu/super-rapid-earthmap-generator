@@ -55,8 +55,8 @@ Rust may add diagnostic commands, but existing command names, required arguments
 manifest keys must stay stable unless a separate compatibility decision is recorded in `docs/DECISIONS.md`.
 The `generate-survival-*` names are legacy Java compatibility command names for vanilla-delegated terrain, manifest,
 finalization, and evidence workflows. They are not approval to add Rust-side direct generation of ores, caves,
-structures, strongholds, End portals, loot, or spawners, and there is intentionally no Rust "Survival And Gameplay"
-generation phase.
+structures, strongholds, End portals, loot, or spawners. The former "Survival And Gameplay" phase is intentionally
+deleted from the Rust plan.
 
 ## Baseline Evidence
 
@@ -606,9 +606,9 @@ Bootstrap implementation status on 2026-06-03:
   terrain-token raster integration, land-shallow-topographic/photo source selection, photo solver, smoothing/coastal
   policies, OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 
-### Vanilla-Delegated Survival Scope
+### Non-Phase: Vanilla-Delegated Survival Scope
 
-Direct gameplay population was removed from the Rust phase plan. Production Java output is centered on
+Direct gameplay population is not part of the Rust phase plan. Production Java output is centered on
 `generate-vanilla-delegated-*` commands: EarthMap writes Earth-shaped terrain chunks and metadata, then vanilla
 Minecraft/DivineMC continues chunk generation when chunks are loaded or force-loaded.
 
@@ -630,7 +630,7 @@ Port or bridge:
 - `DynmapTileMosaicBuilder`
 - contact sheet generation
 - metric reports
-- survival manifest/evidence validators and scanners
+- vanilla-delegation manifest/evidence validators and scanners
 - nation-war readiness reports
 
 Acceptance:
