@@ -342,6 +342,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.metTerrainVocabularyBootstrap - MetTerrainVocabulary exact and ImageMagick-style octree nearest remap contracts are ported for Java standard terrain-token synthesis fixture cases."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.surfaceTerrainTokenSynthesisBootstrap - Surface terrain-token synthesis now prefers exported tokens and falls back to Java standard palette matches like EarthDataSurfaceMaterialSampler.withTerrainToken fixture cases."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",

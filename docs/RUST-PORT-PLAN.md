@@ -591,6 +591,8 @@ Bootstrap implementation status on 2026-06-03:
   normalization, cell-degree clamps, longitude wrapping, and quantized cache keys.
 - Rust `MetTerrainVocabulary` bootstrap ports Java's exact lookup and ImageMagick-style octree nearest remap for
   standard terrain-token synthesis fixture cases.
+- Rust surface terrain-token synthesis bootstrap matches Java `EarthDataSurfaceMaterialSampler.withTerrainToken`
+  fixture cases for exported-token priority and Java standard palette fallback.
 - Remaining Phase 5 work: port EarthData surface material raster sampling, photo solver, smoothing/coastal policies,
   OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 

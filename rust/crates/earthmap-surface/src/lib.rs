@@ -915,6 +915,48 @@ impl MetTerrainMatch {
     }
 }
 
+pub fn with_surface_terrain_token(
+    sample: &SurfaceMaterialSample,
+    exported_terrain_token_color: RgbColor,
+) -> SurfaceMaterialSample {
+    let mut terrain_token_color = exported_terrain_token_color;
+    let mut terrain_token_source = if exported_terrain_token_color.available {
+        TerrainTokenSource::Export
+    } else {
+        TerrainTokenSource::None
+    };
+    if !terrain_token_color.available && sample.color.available {
+        let synthetic = MetTerrainVocabulary::nearest(sample.color);
+        if synthetic.kind != MetTerrainKind::Unknown {
+            terrain_token_color = synthetic.color();
+            terrain_token_source = TerrainTokenSource::JavaStandardPalette;
+        }
+    }
+    if !terrain_token_color.available && !sample.terrain_token_color.available {
+        return sample.clone();
+    }
+    SurfaceMaterialSample::new(
+        sample.color,
+        terrain_token_color,
+        terrain_token_source,
+        sample.climate_class,
+        sample.evergreen_broadleaf_trees,
+        sample.deciduous_broadleaf_trees,
+        sample.needleleaf_trees,
+        sample.mixed_trees,
+        sample.herbaceous_vegetation,
+        sample.shrubs,
+        sample.snow_cover,
+        sample.swamp_cover,
+        sample.ocean_temperature,
+        sample.bathymetry_meters,
+        sample.slope_permille,
+        sample.ecoregion_name.clone(),
+        sample.ecoregion_biome_id.clone(),
+        sample.ecoregion_confidence,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceQuantizedCell {
     pub key: i64,
@@ -2772,6 +2814,74 @@ mod tests {
         assert_eq!(exact_unknown.kind, MetTerrainKind::Unknown);
         assert!(!exact_unknown.confident());
         assert_eq!(exact_unknown.color(), RgbColor::unavailable());
+    }
+
+    #[test]
+    fn surface_terrain_token_synthesis_matches_java_with_terrain_token() {
+        let sample = SurfaceMaterialSample::land(
+            RgbColor::of(254, 201, 63),
+            2,
+            10,
+            20,
+            30,
+            40,
+            50,
+            60,
+            70,
+            80,
+            90,
+            100,
+            110,
+            "ecoregion",
+            "minecraft:desert",
+            0.75,
+        );
+
+        let exported = with_surface_terrain_token(&sample, RgbColor::of(1, 2, 3));
+        assert_eq!(exported.terrain_token_color, RgbColor::of(1, 2, 3));
+        assert_eq!(exported.terrain_token_source, TerrainTokenSource::Export);
+        assert_eq!(exported.color, sample.color);
+        assert_eq!(exported.ecoregion_name, "ecoregion");
+
+        let synthetic = with_surface_terrain_token(&sample, RgbColor::unavailable());
+        assert_eq!(synthetic.terrain_token_color, RgbColor::of(255, 200, 64));
+        assert_eq!(
+            synthetic.terrain_token_source,
+            TerrainTokenSource::JavaStandardPalette
+        );
+        assert_eq!(synthetic.climate_class, 2);
+        assert_eq!(synthetic.ecoregion_biome_id, "minecraft:desert");
+        assert_eq!(synthetic.ecoregion_confidence, 0.75);
+
+        let unavailable = SurfaceMaterialSample::color_only(RgbColor::unavailable());
+        assert_eq!(
+            with_surface_terrain_token(&unavailable, RgbColor::unavailable()),
+            unavailable
+        );
+
+        let existing_token = SurfaceMaterialSample::with_export_token(
+            RgbColor::unavailable(),
+            RgbColor::of(9, 9, 9),
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+        let rebuilt = with_surface_terrain_token(&existing_token, RgbColor::unavailable());
+        assert_eq!(rebuilt.terrain_token_color, RgbColor::unavailable());
+        assert_eq!(rebuilt.terrain_token_source, TerrainTokenSource::None);
+        assert_eq!(rebuilt.color, RgbColor::unavailable());
     }
 
     #[test]
