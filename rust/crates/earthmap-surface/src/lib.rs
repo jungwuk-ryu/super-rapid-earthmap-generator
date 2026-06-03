@@ -222,6 +222,139 @@ pub enum TerrainTokenSource {
     JavaStandardPalette,
 }
 
+pub const OSM_OVERLAY_ROAD: i32 = 1;
+pub const OSM_OVERLAY_WATERWAY: i32 = 1 << 1;
+pub const OSM_OVERLAY_LANDUSE: i32 = 1 << 2;
+pub const OSM_OVERLAY_BUILDING: i32 = 1 << 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OsmFeatureKind {
+    Road,
+    Waterway,
+    Landuse,
+    Building,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OsmRegionFeatureMask {
+    flags: Vec<i32>,
+}
+
+impl OsmRegionFeatureMask {
+    pub fn new() -> Self {
+        Self {
+            flags: vec![0; (REGION_SIZE_BLOCKS * REGION_SIZE_BLOCKS) as usize],
+        }
+    }
+
+    pub fn mark(&mut self, kind: OsmFeatureKind, local_x: i32, local_z: i32) {
+        let Some(index) = osm_region_mask_index(local_x, local_z) else {
+            return;
+        };
+        self.flags[index] |= osm_feature_flag(kind);
+    }
+
+    pub fn mark_line(&mut self, kind: OsmFeatureKind, x0: i32, z0: i32, x1: i32, z1: i32) {
+        let dx = (x1 - x0).abs();
+        let dz = (z1 - z0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sz = if z0 < z1 { 1 } else { -1 };
+        let mut error = dx - dz;
+        let mut x = x0;
+        let mut z = z0;
+        loop {
+            self.mark(kind, x, z);
+            if x == x1 && z == z1 {
+                return;
+            }
+            let double_error = error * 2;
+            if double_error > -dz {
+                error -= dz;
+                x += sx;
+            }
+            if double_error < dx {
+                error += dx;
+                z += sz;
+            }
+        }
+    }
+
+    pub fn road_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        Ok((self.flags_at(local_x, local_z)? & OSM_OVERLAY_ROAD) != 0)
+    }
+
+    pub fn waterway_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        Ok((self.flags_at(local_x, local_z)? & OSM_OVERLAY_WATERWAY) != 0)
+    }
+
+    pub fn landuse_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        Ok((self.flags_at(local_x, local_z)? & OSM_OVERLAY_LANDUSE) != 0)
+    }
+
+    pub fn building_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        Ok((self.flags_at(local_x, local_z)? & OSM_OVERLAY_BUILDING) != 0)
+    }
+
+    pub fn flags_at(&self, local_x: i32, local_z: i32) -> Result<i32> {
+        let Some(index) = osm_region_mask_index(local_x, local_z) else {
+            return Err(SurfaceError::invalid(format!(
+                "local coordinate outside region: {local_x},{local_z}"
+            )));
+        };
+        Ok(self.flags[index])
+    }
+
+    pub fn road_count(&self) -> usize {
+        self.flags
+            .iter()
+            .filter(|&&flags| (flags & OSM_OVERLAY_ROAD) != 0)
+            .count()
+    }
+
+    pub fn waterway_count(&self) -> usize {
+        self.flags
+            .iter()
+            .filter(|&&flags| (flags & OSM_OVERLAY_WATERWAY) != 0)
+            .count()
+    }
+
+    pub fn landuse_count(&self) -> usize {
+        self.flags
+            .iter()
+            .filter(|&&flags| (flags & OSM_OVERLAY_LANDUSE) != 0)
+            .count()
+    }
+
+    pub fn building_count(&self) -> usize {
+        self.flags
+            .iter()
+            .filter(|&&flags| (flags & OSM_OVERLAY_BUILDING) != 0)
+            .count()
+    }
+}
+
+impl Default for OsmRegionFeatureMask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn osm_feature_flag(kind: OsmFeatureKind) -> i32 {
+    match kind {
+        OsmFeatureKind::Road => OSM_OVERLAY_ROAD,
+        OsmFeatureKind::Waterway => OSM_OVERLAY_WATERWAY,
+        OsmFeatureKind::Landuse => OSM_OVERLAY_LANDUSE,
+        OsmFeatureKind::Building => OSM_OVERLAY_BUILDING,
+    }
+}
+
+fn osm_region_mask_index(local_x: i32, local_z: i32) -> Option<usize> {
+    if !(0..REGION_SIZE_BLOCKS).contains(&local_x) || !(0..REGION_SIZE_BLOCKS).contains(&local_z) {
+        return None;
+    }
+    Some(((local_z * REGION_SIZE_BLOCKS) + local_x) as usize)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EarthSurfaceColumn {
     pub water: bool,
@@ -5578,6 +5711,130 @@ fn fill_height_only_column(
     Ok(())
 }
 
+pub fn apply_osm_surface_overlay(
+    chunk: &mut ChunkModel,
+    local_x: i32,
+    local_z: i32,
+    column: &EarthSurfaceColumn,
+    mask: Option<&OsmRegionFeatureMask>,
+    region_local_x: i32,
+    region_local_z: i32,
+) -> Result<i32> {
+    let Some(mask) = mask else {
+        return Ok(0);
+    };
+    let waterway = mask.waterway_at(region_local_x, region_local_z)?;
+    let building = mask.building_at(region_local_x, region_local_z)?;
+    let road = mask.road_at(region_local_x, region_local_z)?;
+    let landuse = mask.landuse_at(region_local_x, region_local_z)?;
+
+    if waterway {
+        apply_osm_waterway(chunk, local_x, local_z, column)?;
+        return Ok(OSM_OVERLAY_WATERWAY);
+    }
+    if !column.water && building {
+        apply_osm_building(chunk, local_x, local_z, column)?;
+        return Ok(OSM_OVERLAY_BUILDING);
+    }
+    if !column.water && road {
+        apply_osm_road(chunk, local_x, local_z, column)?;
+        return Ok(OSM_OVERLAY_ROAD);
+    }
+    if !column.water && landuse {
+        apply_osm_landuse(chunk, local_x, local_z, column)?;
+        return Ok(OSM_OVERLAY_LANDUSE);
+    }
+    Ok(0)
+}
+
+pub fn osm_overlay_has_waterway(flags: i32) -> bool {
+    (flags & OSM_OVERLAY_WATERWAY) != 0
+}
+
+pub fn osm_overlay_has_road(flags: i32) -> bool {
+    (flags & OSM_OVERLAY_ROAD) != 0
+}
+
+pub fn osm_overlay_has_landuse(flags: i32) -> bool {
+    (flags & OSM_OVERLAY_LANDUSE) != 0
+}
+
+pub fn osm_overlay_has_building(flags: i32) -> bool {
+    (flags & OSM_OVERLAY_BUILDING) != 0
+}
+
+fn apply_osm_road(
+    chunk: &mut ChunkModel,
+    local_x: i32,
+    local_z: i32,
+    column: &EarthSurfaceColumn,
+) -> Result<()> {
+    let surface_y = column.ground_surface_y;
+    chunk.set_block_state_id(local_x, surface_y, local_z, block_state_ids::STONE)?;
+    if surface_y > chunk.dimension().min_y() {
+        chunk.set_block_state_id(local_x, surface_y - 1, local_z, block_state_ids::STONE)?;
+    }
+    Ok(())
+}
+
+fn apply_osm_building(
+    chunk: &mut ChunkModel,
+    local_x: i32,
+    local_z: i32,
+    column: &EarthSurfaceColumn,
+) -> Result<()> {
+    let surface_y = column.ground_surface_y;
+    chunk.set_block_state_id(local_x, surface_y, local_z, block_state_ids::STONE_BRICKS)?;
+    if surface_y < chunk.dimension().max_y_inclusive() {
+        chunk.set_block_state_id(
+            local_x,
+            surface_y + 1,
+            local_z,
+            block_state_ids::STONE_BRICKS,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_osm_landuse(
+    chunk: &mut ChunkModel,
+    local_x: i32,
+    local_z: i32,
+    column: &EarthSurfaceColumn,
+) -> Result<()> {
+    chunk.set_block_state_id(
+        local_x,
+        column.ground_surface_y,
+        local_z,
+        block_state_ids::GRASS_BLOCK,
+    )?;
+    Ok(())
+}
+
+fn apply_osm_waterway(
+    chunk: &mut ChunkModel,
+    local_x: i32,
+    local_z: i32,
+    column: &EarthSurfaceColumn,
+) -> Result<()> {
+    let surface_y = column.ground_surface_y;
+    if surface_y > chunk.dimension().min_y() {
+        chunk.set_block_state_id(local_x, surface_y - 1, local_z, block_state_ids::SAND)?;
+    }
+    chunk.set_block_state_id(local_x, surface_y, local_z, block_state_ids::WATER)?;
+    let bank_top_y = surface_y.saturating_add(1).min(column.water_surface_y);
+    if bank_top_y > surface_y {
+        chunk.fill_column(
+            local_x,
+            local_z,
+            surface_y + 1,
+            bank_top_y,
+            block_state_ids::WATER,
+        )?;
+    }
+    Ok(())
+}
+
 fn fill_surface_column(
     chunk: &mut ChunkModel,
     local_x: i32,
@@ -7335,6 +7592,114 @@ mod tests {
 
         assert!(clean_coastal_surface_columns(&[inland.clone()], &[0.0], 0).is_err());
         assert!(clean_coastal_surface_columns(&[inland], &[], 1).is_err());
+    }
+
+    #[test]
+    fn osm_region_feature_mask_marks_java_line_fixture_cases() {
+        let mut mask = OsmRegionFeatureMask::new();
+        mask.mark_line(OsmFeatureKind::Road, 10, 10, 20, 10);
+        mask.mark_line(OsmFeatureKind::Waterway, 30, 30, 30, 40);
+        mask.mark_line(OsmFeatureKind::Building, 50, 50, 52, 52);
+        mask.mark_line(OsmFeatureKind::Landuse, -5, 60, 5, 60);
+
+        assert!(mask.road_at(10, 10).unwrap());
+        assert!(mask.road_at(20, 10).unwrap());
+        assert!(mask.waterway_at(30, 35).unwrap());
+        assert!(mask.building_at(51, 51).unwrap());
+        assert!(mask.landuse_at(0, 60).unwrap());
+        assert_eq!(mask.road_count(), 11);
+        assert_eq!(mask.waterway_count(), 11);
+        assert_eq!(mask.building_count(), 3);
+        assert_eq!(mask.landuse_count(), 6);
+        assert!(mask.flags_at(-1, 0).is_err());
+    }
+
+    #[test]
+    fn osm_surface_overlay_matches_java_fixture_cases() {
+        let mut mask = OsmRegionFeatureMask::new();
+        mask.mark(OsmFeatureKind::Road, 10, 10);
+        mask.mark(OsmFeatureKind::Building, 20, 20);
+        mask.mark(OsmFeatureKind::Waterway, 30, 30);
+        mask.mark(OsmFeatureKind::Landuse, 40, 40);
+
+        let mut chunk = ChunkModel::overworld(0, 0);
+        let land = surface_column(
+            false,
+            70,
+            SEA_LEVEL_Y,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let desert = surface_column(
+            false,
+            70,
+            SEA_LEVEL_Y,
+            block_state_ids::SAND,
+            block_state_ids::SAND,
+            "minecraft:desert",
+        );
+
+        fill_surface_column(&mut chunk, 10, 10, &land).unwrap();
+        let road_flags =
+            apply_osm_surface_overlay(&mut chunk, 10, 10, &land, Some(&mask), 10, 10).unwrap();
+        assert!(osm_overlay_has_road(road_flags));
+        assert_eq!(
+            chunk.get_block_state_id(10, 70, 10).unwrap(),
+            block_state_ids::STONE
+        );
+        assert_eq!(
+            chunk.get_block_state_id(10, 69, 10).unwrap(),
+            block_state_ids::STONE
+        );
+
+        fill_surface_column(&mut chunk, 4, 4, &land).unwrap();
+        let no_flags =
+            apply_osm_surface_overlay(&mut chunk, 4, 4, &land, Some(&mask), 4, 4).unwrap();
+        assert_eq!(no_flags, 0);
+        assert_eq!(
+            apply_osm_surface_overlay(&mut chunk, 4, 4, &land, None, 4, 4).unwrap(),
+            0
+        );
+        assert_eq!(
+            chunk.get_block_state_id(4, 70, 4).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+
+        fill_surface_column(&mut chunk, 12, 4, &land).unwrap();
+        let building_flags =
+            apply_osm_surface_overlay(&mut chunk, 12, 4, &land, Some(&mask), 20, 20).unwrap();
+        assert!(osm_overlay_has_building(building_flags));
+        assert_eq!(
+            chunk.get_block_state_id(12, 70, 4).unwrap(),
+            block_state_ids::STONE_BRICKS
+        );
+        assert_eq!(
+            chunk.get_block_state_id(12, 71, 4).unwrap(),
+            block_state_ids::STONE_BRICKS
+        );
+
+        fill_surface_column(&mut chunk, 14, 14, &land).unwrap();
+        let waterway_flags =
+            apply_osm_surface_overlay(&mut chunk, 14, 14, &land, Some(&mask), 30, 30).unwrap();
+        assert!(osm_overlay_has_waterway(waterway_flags));
+        assert_eq!(
+            chunk.get_block_state_id(14, 69, 14).unwrap(),
+            block_state_ids::SAND
+        );
+        assert_eq!(
+            chunk.get_block_state_id(14, 70, 14).unwrap(),
+            block_state_ids::WATER
+        );
+
+        fill_surface_column(&mut chunk, 8, 8, &desert).unwrap();
+        let landuse_flags =
+            apply_osm_surface_overlay(&mut chunk, 8, 8, &desert, Some(&mask), 40, 40).unwrap();
+        assert!(osm_overlay_has_landuse(landuse_flags));
+        assert_eq!(
+            chunk.get_block_state_id(8, 70, 8).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
     }
 
     #[test]
