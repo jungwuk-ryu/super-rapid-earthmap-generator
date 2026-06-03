@@ -638,6 +638,10 @@ Bootstrap implementation status on 2026-06-03:
 - Rust `generate-surface-region` command bootstrap wires Java-shaped region-wide no-material sampling with Java default
   photo-mode post-processing, distance-transform coast-factor calculation, chunk building, level.dat writing,
   exploration-only surface manifest metadata, region writing, and Java-shaped stdout for the default command path.
+- Rust `SurfaceTextureMode` bootstrap ports Java texture-mode IDs and parser aliases, keeps `photo` as the default
+  `SurfaceRegionSettings` mode, routes the no-material region sampler through matching classified/photo post-processing
+  chains, and lets surface-region manifests preserve the selected mode for the upcoming fixed-region material/photo
+  output wiring.
 - Remaining Phase 5 work: full photo solver parity and fixed-region Java/Rust payload parity for surface material/photo
   output.
 

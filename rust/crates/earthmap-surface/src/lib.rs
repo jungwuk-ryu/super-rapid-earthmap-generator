@@ -109,6 +109,38 @@ impl OutputFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceTextureMode {
+    Classified,
+    Photo,
+}
+
+impl SurfaceTextureMode {
+    pub const DEFAULT: Self = Self::Photo;
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Classified => "classified",
+            Self::Photo => "photo",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        if text.trim().is_empty() {
+            return Err(SurfaceError::invalid("textureMode must not be blank"));
+        }
+        let normalized = text.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "classified" | "classify" | "semantic" | "terrain" => Ok(Self::Classified),
+            "photo" | "photographic" | "satellite" | "satellite-photo" | "true-marble"
+            | "truemarble" => Ok(Self::Photo),
+            _ => Err(SurfaceError::invalid(format!(
+                "textureMode must be classified or photo: {text}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeightOnlySettings {
     pub heightmap_path: PathBuf,
@@ -186,6 +218,7 @@ pub struct SurfaceRegionSettings {
     pub write_world_metadata: bool,
     pub chunk_status: ChunkGenerationStatus,
     pub vertical_scale: f64,
+    pub texture_mode: SurfaceTextureMode,
 }
 
 impl SurfaceRegionSettings {
@@ -232,6 +265,39 @@ impl SurfaceRegionSettings {
         chunk_status: ChunkGenerationStatus,
         vertical_scale: f64,
     ) -> Result<Self> {
+        Self::new_with_texture_options(
+            heightmap_path,
+            world_dir,
+            level_name,
+            seed,
+            scale_denominator,
+            region_x,
+            region_z,
+            output_format,
+            cache_rows,
+            write_world_metadata,
+            chunk_status,
+            vertical_scale,
+            SurfaceTextureMode::DEFAULT,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_texture_options(
+        heightmap_path: impl Into<PathBuf>,
+        world_dir: impl Into<PathBuf>,
+        level_name: impl Into<String>,
+        seed: i64,
+        scale_denominator: i32,
+        region_x: i32,
+        region_z: i32,
+        output_format: OutputFormat,
+        cache_rows: usize,
+        write_world_metadata: bool,
+        chunk_status: ChunkGenerationStatus,
+        vertical_scale: f64,
+        texture_mode: SurfaceTextureMode,
+    ) -> Result<Self> {
         let level_name = level_name.into();
         if level_name.trim().is_empty() {
             return Err(SurfaceError::invalid("levelName must not be blank"));
@@ -256,6 +322,7 @@ impl SurfaceRegionSettings {
             write_world_metadata,
             chunk_status,
             vertical_scale,
+            texture_mode,
         })
     }
 }
@@ -5086,12 +5153,13 @@ pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<Surfa
     }
 
     let phase_start = Instant::now();
-    let region_surface = sample_surface_region_scaled(
+    let region_surface = sample_surface_region_scaled_with_texture_mode(
         settings.region_x,
         settings.region_z,
         &mapping,
         &sampler,
         settings.vertical_scale,
+        settings.texture_mode,
     )?;
     let surface_sample_nanos = phase_start.elapsed().as_nanos();
 
@@ -5473,6 +5541,24 @@ pub fn sample_surface_region_scaled(
     sampler: &HeightmapScalarSampler<'_>,
     vertical_scale: f64,
 ) -> Result<SurfaceRegionSample> {
+    sample_surface_region_scaled_with_texture_mode(
+        region_x,
+        region_z,
+        mapping,
+        sampler,
+        vertical_scale,
+        SurfaceTextureMode::DEFAULT,
+    )
+}
+
+pub fn sample_surface_region_scaled_with_texture_mode(
+    region_x: i32,
+    region_z: i32,
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    vertical_scale: f64,
+    texture_mode: SurfaceTextureMode,
+) -> Result<SurfaceRegionSample> {
     sample_surface_region_with_elevation_fn(
         region_x,
         region_z,
@@ -5483,6 +5569,7 @@ pub fn sample_surface_region_scaled(
                 .bilinear_meters(longitude, latitude)
                 .map_err(Into::into)
         },
+        texture_mode,
     )
 }
 
@@ -5492,6 +5579,7 @@ fn sample_surface_region_with_elevation_fn<F>(
     mapping: &EarthScaleMapping,
     vertical_scale: f64,
     mut elevation_fn: F,
+    texture_mode: SurfaceTextureMode,
 ) -> Result<SurfaceRegionSample>
 where
     F: FnMut(f64, f64) -> Result<f64>,
@@ -5563,14 +5651,34 @@ where
         }
     }
 
-    let stabilized =
-        stabilize_surface_biome_families_preserving_surfaces(&columns, SURFACE_REGION_WIDTH)?;
-    let smoothed = smooth_photo_textures(&stabilized, SURFACE_REGION_WIDTH)?;
-    let post_smoothed =
-        stabilize_small_surface_biome_family_components(&smoothed, SURFACE_REGION_WIDTH, true);
-    let cleaned =
-        clean_coastal_surface_columns(&post_smoothed, &coast_factors, SURFACE_REGION_WIDTH)?;
+    let cleaned = post_process_surface_region_columns(
+        &columns,
+        &coast_factors,
+        SURFACE_REGION_WIDTH,
+        texture_mode,
+    )?;
     SurfaceRegionSample::new(cleaned)
+}
+
+fn post_process_surface_region_columns(
+    columns: &[EarthSurfaceColumn],
+    coast_factors: &[f64],
+    width: usize,
+    texture_mode: SurfaceTextureMode,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    let post_smoothed = match texture_mode {
+        SurfaceTextureMode::Photo => {
+            let stabilized = stabilize_surface_biome_families_preserving_surfaces(columns, width)?;
+            let smoothed = smooth_photo_textures(&stabilized, width)?;
+            stabilize_small_surface_biome_family_components(&smoothed, width, true)
+        }
+        SurfaceTextureMode::Classified => {
+            let stabilized = stabilize_surface_biome_families(columns, width)?;
+            let smoothed = smooth_surface_classes(&stabilized, width)?;
+            stabilize_small_surface_biome_family_components(&smoothed, width, false)
+        }
+    };
+    clean_coastal_surface_columns(&post_smoothed, coast_factors, width)
 }
 
 pub fn smooth_surface_classes(
@@ -9083,7 +9191,10 @@ fn write_surface_region_manifest(settings: &SurfaceRegionSettings) -> Result<Pat
         "generation.verticalScale".to_string(),
         java_double_properties_string(settings.vertical_scale),
     );
-    values.insert("generation.textureMode".to_string(), "photo".to_string());
+    values.insert(
+        "generation.textureMode".to_string(),
+        settings.texture_mode.id().to_string(),
+    );
     values.insert(
         "generation.progressionPlacementPolicy".to_string(),
         "none".to_string(),
@@ -9201,6 +9312,157 @@ struct ChunkBuild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_texture_mode_parse_matches_java_aliases() {
+        assert_eq!(
+            SurfaceTextureMode::parse("classified").unwrap(),
+            SurfaceTextureMode::Classified
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("classify").unwrap(),
+            SurfaceTextureMode::Classified
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("semantic").unwrap(),
+            SurfaceTextureMode::Classified
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("terrain").unwrap(),
+            SurfaceTextureMode::Classified
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("photo").unwrap(),
+            SurfaceTextureMode::Photo
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("satellite_photo").unwrap(),
+            SurfaceTextureMode::Photo
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("true-marble").unwrap(),
+            SurfaceTextureMode::Photo
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("truemarble").unwrap(),
+            SurfaceTextureMode::Photo
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("").unwrap_err().to_string(),
+            "textureMode must not be blank"
+        );
+        assert_eq!(
+            SurfaceTextureMode::parse("painted")
+                .unwrap_err()
+                .to_string(),
+            "textureMode must be classified or photo: painted"
+        );
+    }
+
+    #[test]
+    fn surface_region_settings_default_to_java_photo_texture_mode() {
+        let settings = SurfaceRegionSettings::new(
+            "height.tif",
+            "world",
+            "SR EarthMap Surface",
+            0,
+            5000,
+            0,
+            0,
+            OutputFormat::LinearV2,
+            DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+        )
+        .unwrap();
+
+        assert_eq!(settings.texture_mode, SurfaceTextureMode::Photo);
+    }
+
+    #[test]
+    fn surface_region_settings_can_preserve_classified_texture_mode_for_manifest() {
+        let world_dir = std::env::temp_dir().join(format!(
+            "earthmap-surface-manifest-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&world_dir);
+        let settings = SurfaceRegionSettings::new_with_texture_options(
+            "height.tif",
+            &world_dir,
+            "SR EarthMap Surface",
+            0,
+            5000,
+            -1,
+            2,
+            OutputFormat::Mca,
+            DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+            true,
+            ChunkGenerationStatus::Surface,
+            DEFAULT_VERTICAL_SCALE,
+            SurfaceTextureMode::Classified,
+        )
+        .unwrap();
+
+        let manifest_path = write_surface_region_manifest(&settings).unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+
+        assert!(manifest.contains("generation.textureMode=classified\n"));
+        assert!(manifest.contains("features.surfaceMaterialRaster=false\n"));
+        assert!(manifest.contains("generation.chunkStatus=minecraft:surface\n"));
+
+        fs::remove_dir_all(world_dir).unwrap();
+    }
+
+    #[test]
+    fn surface_region_post_processing_follows_texture_mode() {
+        let mut patch = filled_surface_columns(
+            5,
+            5,
+            land_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                "minecraft:forest",
+                SEA_LEVEL_Y + 4,
+            ),
+        );
+        patch[surface_class_index(2, 2, 5)] = land_surface_column(
+            block_state_ids::RED_SAND,
+            "minecraft:desert",
+            SEA_LEVEL_Y + 4,
+        );
+        let coast_factors = vec![0.0; patch.len()];
+
+        let classified = post_process_surface_region_columns(
+            &patch,
+            &coast_factors,
+            5,
+            SurfaceTextureMode::Classified,
+        )
+        .unwrap();
+        let photo = post_process_surface_region_columns(
+            &patch,
+            &coast_factors,
+            5,
+            SurfaceTextureMode::Photo,
+        )
+        .unwrap();
+
+        let center = surface_class_index(2, 2, 5);
+        assert_eq!(
+            classified[center].top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(classified[center].decision_source, "intent-stabilized-cell");
+        assert_eq!(
+            photo[center].top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_ne!(
+            classified[center].decision_source,
+            photo[center].decision_source
+        );
+    }
 
     #[test]
     fn earth_surface_rules_match_java_contract_cases() {
