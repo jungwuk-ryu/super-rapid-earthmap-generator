@@ -2017,7 +2017,7 @@ fn classify_surface_material_by_semantic_intent(
         ));
     }
 
-    let savanna_like_ecoregion_precedes_java_standard = savanna_like
+    let savanna_like_ecoregion_precedes_later_intents = savanna_like
         && sample.ecoregion_confidence >= 0.55
         && !is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
         && !is_tropical_rain_climate(climate);
@@ -2028,7 +2028,7 @@ fn classify_surface_material_by_semantic_intent(
         && latitude.abs() <= 35.0
         && (sahel_score >= 0.18 || dry_savanna_score >= 0.18 || mediterranean_score >= 0.32)
         && metrics.value < 0.76
-        && !savanna_like_ecoregion_precedes_java_standard
+        && !savanna_like_ecoregion_precedes_later_intents
     {
         let desert_edge = sahara_score >= 0.35 || is_desert_climate(climate);
         let dry_score =
@@ -2055,6 +2055,29 @@ fn classify_surface_material_by_semantic_intent(
             top,
             block_state_ids::DIRT,
             biome,
+        ));
+    }
+
+    if orange_rock_like
+        && is_exposed_dry_rock(
+            metrics,
+            elevation_meters,
+            longitude,
+            latitude,
+            sahara_score,
+            dry_savanna_score,
+            local_relief_meters,
+            sample.slope_ratio(),
+        )
+        && (elevation_meters >= 700.0 || local_relief_meters >= 240.0)
+        && !savanna_like_ecoregion_precedes_later_intents
+    {
+        return Some(highland_rock_surface(
+            base,
+            metrics,
+            elevation_meters,
+            patch_noise,
+            fine_noise,
         ));
     }
 
@@ -3017,6 +3040,34 @@ fn elevation_friendly_meadow(
         && metrics.value >= 0.40
         && patch_noise >= 0.68
         && fine_noise <= 0.34
+}
+
+fn highland_rock_surface(
+    base: &EarthSurfaceColumn,
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> EarthSurfaceColumn {
+    if elevation_meters >= 2_400.0 || base.ground_surface_y >= 165 {
+        return surface_material_with_surface(
+            base,
+            block_state_ids::STONE,
+            block_state_ids::STONE,
+            "minecraft:windswept_hills",
+        );
+    }
+    let top = if metrics.hue <= 35.0 || metrics.red > metrics.green * 1.18 {
+        block_state_ids::ORANGE_TERRACOTTA
+    } else {
+        block_state_ids::TERRACOTTA
+    };
+    let biome = if elevation_meters >= 1_200.0 || fine_noise >= 0.68 || patch_noise >= 0.68 {
+        "minecraft:wooded_badlands"
+    } else {
+        "minecraft:badlands"
+    };
+    surface_material_with_surface(base, top, top, biome)
 }
 
 fn mediterranean_surface(
@@ -13254,6 +13305,86 @@ mod tests {
                 | "minecraft:sunflower_plains"
         ));
         assert_eq!(java_standard_token_dry.decision_source, "intent");
+
+        let exposed_highland_rock = SurfaceMaterialSample::color_only(RgbColor::of(181, 96, 46));
+        let highland_metrics = SurfaceColorMetrics::from(exposed_highland_rock.color);
+        assert!(is_orange_rock_like(highland_metrics));
+        let (highland_longitude, highland_latitude) = (-180..=180)
+            .flat_map(|longitude| (-45..=45).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let sahara = surface_material_sahara_score(longitude, latitude);
+                let dry_savanna = surface_material_dry_savanna_score(longitude, latitude);
+                surface_material_sahel_score(longitude, latitude) < 0.18
+                    && dry_savanna < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && is_exposed_dry_rock(
+                        highland_metrics,
+                        1_200.0,
+                        longitude,
+                        latitude,
+                        sahara,
+                        dry_savanna,
+                        260.0,
+                        0.0,
+                    )
+            })
+            .expect("test fixture should find an exposed highland rock coordinate");
+        let highland_rock = apply_test_surface_material_sample(
+            &base_land,
+            exposed_highland_rock,
+            1_200.0,
+            f64::from(highland_longitude),
+            f64::from(highland_latitude),
+            0.0,
+            260.0,
+        );
+        assert_eq!(
+            highland_rock.top_block_state_id,
+            block_state_ids::ORANGE_TERRACOTTA
+        );
+        assert_eq!(
+            highland_rock.filler_block_state_id,
+            block_state_ids::ORANGE_TERRACOTTA
+        );
+        assert_eq!(highland_rock.biome_id, "minecraft:wooded_badlands");
+        assert_eq!(highland_rock.decision_source, "intent");
+
+        let savanna_like_highland_candidate = SurfaceMaterialSample::land(
+            RgbColor::of(181, 96, 46),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            20,
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Tropical savanna",
+            "minecraft:savanna",
+            0.82,
+        );
+        let savanna_like_highland = apply_test_surface_material_sample(
+            &base_land,
+            savanna_like_highland_candidate,
+            1_200.0,
+            f64::from(highland_longitude),
+            f64::from(highland_latitude),
+            0.0,
+            260.0,
+        );
+        assert_ne!(
+            savanna_like_highland.top_block_state_id,
+            block_state_ids::ORANGE_TERRACOTTA
+        );
+        assert!(!savanna_like_highland.biome_id.contains("badlands"));
+        assert_eq!(savanna_like_highland.decision_source, "intent");
 
         let temperate_steppe = SurfaceMaterialSample::land(
             RgbColor::of(134, 126, 82),
