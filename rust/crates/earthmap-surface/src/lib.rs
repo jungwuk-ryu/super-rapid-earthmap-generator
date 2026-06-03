@@ -17334,7 +17334,7 @@ mod tests {
         ));
 
         let snow_input = PhotoSurfaceInput::new(
-            plains,
+            plains.clone(),
             SurfaceMaterialSample::climate_only(
                 RgbColor::of(230, 232, 224),
                 SurfaceMaterialSample::UNKNOWN,
@@ -17363,6 +17363,36 @@ mod tests {
         assert_eq!("photo-ecology", snow.decision_source);
         assert_eq!("photo-ecology", snow_decision.recipe_id);
         assert_eq!("source-render-solver", snow_decision.stage_id);
+
+        let calcite_input = PhotoSurfaceInput::new(
+            plains,
+            SurfaceMaterialSample::climate_only(
+                RgbColor::of(224, 220, 204),
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                40,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+            ),
+            2_300.0,
+            86.9,
+            28.0,
+            0.0,
+            80.0,
+            104,
+            100,
+        );
+        let calcite_decision = solve_photo_surface(&calcite_input).unwrap();
+        let calcite = calcite_decision.to_column(&calcite_input.semantic_column);
+        assert_eq!(block_state_ids::CALCITE, calcite.top_block_state_id);
+        assert_eq!("photo-texture", calcite.decision_source);
+        assert_eq!("photo-texture", calcite_decision.recipe_id);
+        assert_eq!("source-render-solver", calcite_decision.stage_id);
     }
 
     #[test]
