@@ -513,7 +513,19 @@ Bootstrap implementation status on 2026-06-03:
   - evidence folders:
     `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0001`
     and `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0002-mca`
-- Remaining Phase 4 work: expand the height-only corpus beyond one real region before promotion.
+- Additional height-only region parity against `E:\HQheightmap.tif` passed on 2026-06-03 for region `r.-1.-1` at scale
+  `1:5000`:
+  - Linear V2 Java/Rust region SHA-256:
+    `8578E86D037A2BC0FE2AEB1DB3608502D4BF89DC8FFE4D00974BD5EA3C64DE91`
+  - MCA Java/Rust region SHA-256:
+    `9C0F01C4681F3078DEFAA72A48DEB07B848F25988B4CADADAF35D264C6CF631F`
+  - payload manifest parity OK for both formats
+  - normalized CLI stdout parity OK for both formats
+  - exploration-only survival manifest parity OK for both formats
+  - evidence folder:
+    `D:\earthmap\rust-port-golden\phase4-height-region-parity-20260603-0003-r-neg1-neg1`
+- Remaining Phase 4 work: none for the current GeoTIFF/VRT reader, cache, diagnostic CLI, and height-only region
+  bootstrap scope. Broader surface/photo/OSM behavior moves to Phase 5.
 
 ## Phase 5: Surface Rules And Photo Solver
 

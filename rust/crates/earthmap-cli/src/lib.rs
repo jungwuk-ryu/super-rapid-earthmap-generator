@@ -307,7 +307,7 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "DONE rust.phase4.heightOnlyRegionByteParity - Java/Rust height-only r.0.0 MCA and Linear region bytes, payload manifests, normalized stdout, and survival manifests match for E:\\HQheightmap.tif at 1:5000."
+        "DONE rust.phase4.heightOnlyRegionByteParity - Java/Rust height-only r.0.0 and r.-1.-1 MCA/Linear region bytes, payload manifests, normalized stdout, and exploration-only survival manifests match for E:\\HQheightmap.tif at 1:5000."
     )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
