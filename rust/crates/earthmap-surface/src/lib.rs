@@ -11152,6 +11152,175 @@ mod tests {
                 | block_state_ids::DEEPSLATE
         ));
 
+        let standard_grass_token_dry_open = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(143, 128, 82),
+                RgbColor::of(167, 146, 103),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                0,
+                0,
+                0,
+                0,
+                24,
+                18,
+                -1,
+                -1,
+                28,
+                -1,
+                36,
+                "West Sudanian savanna",
+                "minecraft:savanna",
+                0.95,
+            ),
+            260.0,
+            16.0,
+            10.0,
+            0.0,
+            30.0,
+            318,
+            236,
+        ))
+        .unwrap();
+        assert!(matches!(
+            standard_grass_token_dry_open.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+                | block_state_ids::MOSS_BLOCK
+                | block_state_ids::PODZOL
+                | block_state_ids::COARSE_DIRT
+                | block_state_ids::ROOTED_DIRT
+                | block_state_ids::MYCELIUM
+                | block_state_ids::MUD
+                | block_state_ids::PACKED_MUD
+                | block_state_ids::MUD_BRICKS
+                | block_state_ids::DRIPSTONE_BLOCK
+                | block_state_ids::GREEN_TERRACOTTA
+                | block_state_ids::LIME_TERRACOTTA
+        ));
+
+        let standard_grass_token_dark_dry = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(112, 100, 63),
+                RgbColor::of(167, 146, 103),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                0,
+                0,
+                0,
+                0,
+                14,
+                8,
+                -1,
+                -1,
+                28,
+                -1,
+                50,
+                "West Sudanian savanna",
+                "minecraft:savanna",
+                0.95,
+            ),
+            260.0,
+            16.0,
+            10.0,
+            0.0,
+            30.0,
+            500,
+            500,
+        ))
+        .unwrap();
+        assert_ne!(
+            standard_grass_token_dark_dry.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert!(
+            photo_weighted_render_distance(
+                RgbColor::of(112, 100, 63),
+                standard_grass_token_dark_dry.top_block_state_id,
+                &standard_grass_token_dark_dry.biome_id
+            ) + 8.0
+                < photo_weighted_render_distance(
+                    RgbColor::of(112, 100, 63),
+                    block_state_ids::GRASS_BLOCK,
+                    "minecraft:savanna"
+                )
+        );
+
+        let dark_standard_vegetation = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            jungle.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(35, 82, 32),
+                RgbColor::of(50, 60, 30),
+                TerrainTokenSource::JavaStandardPalette,
+                2,
+                32,
+                10,
+                0,
+                0,
+                30,
+                12,
+                -1,
+                -1,
+                28,
+                -1,
+                30,
+                "Central Congolian lowland forests",
+                "minecraft:jungle",
+                0.95,
+            ),
+            300.0,
+            20.0,
+            -2.0,
+            0.0,
+            30.0,
+            320,
+            240,
+        ))
+        .unwrap();
+        assert!(matches!(
+            dark_standard_vegetation.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+                | block_state_ids::OAK_LEAVES
+                | block_state_ids::JUNGLE_LEAVES
+        ));
+
+        let dark_olive_standard_vegetation = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            savanna.clone(),
+            SurfaceMaterialSample::new(
+                RgbColor::of(69, 99, 23),
+                RgbColor::of(75, 85, 60),
+                TerrainTokenSource::JavaStandardPalette,
+                3,
+                2,
+                0,
+                0,
+                0,
+                14,
+                8,
+                -1,
+                -1,
+                28,
+                -1,
+                42,
+                "Guinean forest-savanna mosaic",
+                "minecraft:savanna",
+                0.90,
+            ),
+            240.0,
+            12.0,
+            8.0,
+            0.0,
+            28.0,
+            824,
+            534,
+        ))
+        .unwrap();
+        assert!(
+            dark_olive_standard_vegetation.top_block_state_id != block_state_ids::GRASS_BLOCK
+                || !dark_olive_standard_vegetation.biome_id.contains("savanna")
+        );
+
         let dark_standard_natural_shadow = apply_photo_surface_material(&PhotoSurfaceInput::new(
             jungle,
             SurfaceMaterialSample::new(

@@ -379,7 +379,7 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "DONE rust.phase5.photoSurfaceSolverVegetationTokenBootstrap - Java Standard vegetation terrain-token handling has bounded fixture coverage for near-black shadow carriers and gray-olive static carrier selection."
+        "DONE rust.phase5.photoSurfaceSolverVegetationTokenBootstrap - Java Standard vegetation terrain-token handling has bounded fixture coverage for near-black shadow carriers, gray-olive static carrier selection, dry-open vegetation/crust, and dark canopy cases."
     )?;
     writeln!(
         out,
