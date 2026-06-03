@@ -360,6 +360,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.surfaceClassSmootherBootstrap - SurfaceClassSmoother non-photo isolated-column smoothing, protected water surfaces, and snowy-biome top compatibility match Java fixture cases."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.earthDataSurfaceMaterialSamplerBootstrap - EarthDataSurfaceMaterialSampler opens TrueMarble plus optional climate, vegetation, ocean-temperature, bathymetry, and slope rasters, then samples Java-compatible quantized land/water SurfaceMaterialSample fixture cases with bounded cache reuse and terrain-token fallback."
     )?;
     writeln!(

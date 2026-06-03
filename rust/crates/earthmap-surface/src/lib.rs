@@ -4200,6 +4200,51 @@ pub fn sample_surface_chunk_scaled(
     )
 }
 
+pub fn smooth_surface_classes(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    if width == 0 || columns.len() % width != 0 {
+        return Err(SurfaceError::invalid("width must divide columns length"));
+    }
+    let height = columns.len() / width;
+    let mut result = columns.to_vec();
+    for z in 0..height {
+        for x in 0..width {
+            let index = surface_class_index(x, z, width);
+            let column = &columns[index];
+            if column.water {
+                continue;
+            }
+            let stats = surface_neighborhood_stats(columns, width, height, x, z);
+            if stats.land_count < SURFACE_SMOOTHER_MAJORITY_COUNT_MIN {
+                continue;
+            }
+            let top = column.top_block_state_id;
+            let biome = &column.biome_id;
+            let mut smoothed_top = top;
+            let mut smoothed_biome = biome.clone();
+            if stats.count_top(top) <= SURFACE_SMOOTHER_ISOLATED_COUNT_MAX
+                && stats.majority_top_count >= SURFACE_SMOOTHER_MAJORITY_COUNT_MIN
+                && !is_protected_surface_for_smoothing(top, biome)
+            {
+                smoothed_top = stats.majority_top;
+            }
+            if stats.count_biome(biome) <= SURFACE_SMOOTHER_ISOLATED_COUNT_MAX
+                && stats.majority_biome_count >= SURFACE_SMOOTHER_MAJORITY_COUNT_MIN
+                && biome != "minecraft:beach"
+            {
+                smoothed_biome = stats.majority_biome.clone();
+            }
+            smoothed_top = compatible_top_for_smoother_biome(smoothed_top, &smoothed_biome);
+            if smoothed_top != top || smoothed_biome != *biome {
+                result[index] = smoother_replacement(column, smoothed_top, &smoothed_biome);
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub fn is_allowed_production_top(block: i32, _biome: &str) -> bool {
     is_allowed_natural_surface_top(block)
 }
@@ -5728,6 +5773,179 @@ fn surface_chunk_map_position_valid(mapping: &EarthScaleMapping, map_x: i32, map
     map_x >= 0 && map_x < mapping.width_blocks && map_z >= 0 && map_z < mapping.height_blocks
 }
 
+const SURFACE_SMOOTHER_NEIGHBOR_RADIUS: i32 = 1;
+const SURFACE_SMOOTHER_ISOLATED_COUNT_MAX: i32 = 2;
+const SURFACE_SMOOTHER_MAJORITY_COUNT_MIN: i32 = 5;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfaceNeighborhoodStats {
+    land_count: i32,
+    top_counts: BTreeMap<i32, i32>,
+    biome_counts: BTreeMap<String, i32>,
+    majority_top: i32,
+    majority_top_count: i32,
+    majority_biome: String,
+    majority_biome_count: i32,
+}
+
+impl SurfaceNeighborhoodStats {
+    fn count_top(&self, top: i32) -> i32 {
+        self.top_counts.get(&top).copied().unwrap_or(0)
+    }
+
+    fn count_biome(&self, biome: &str) -> i32 {
+        self.biome_counts.get(biome).copied().unwrap_or(0)
+    }
+}
+
+fn surface_neighborhood_stats(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+    height: usize,
+    center_x: usize,
+    center_z: usize,
+) -> SurfaceNeighborhoodStats {
+    let mut top_counts = BTreeMap::<i32, i32>::new();
+    let mut biome_counts = BTreeMap::<String, i32>::new();
+    let mut land_count = 0;
+    for dz in -SURFACE_SMOOTHER_NEIGHBOR_RADIUS..=SURFACE_SMOOTHER_NEIGHBOR_RADIUS {
+        for dx in -SURFACE_SMOOTHER_NEIGHBOR_RADIUS..=SURFACE_SMOOTHER_NEIGHBOR_RADIUS {
+            let x = center_x as i32 + dx;
+            let z = center_z as i32 + dz;
+            if x < 0 || x >= width as i32 || z < 0 || z >= height as i32 {
+                continue;
+            }
+            let column = &columns[surface_class_index(x as usize, z as usize, width)];
+            if column.water {
+                continue;
+            }
+            land_count += 1;
+            *top_counts.entry(column.top_block_state_id).or_insert(0) += 1;
+            *biome_counts.entry(column.biome_id.clone()).or_insert(0) += 1;
+        }
+    }
+    let (majority_top, majority_top_count) = surface_majority_i32(&top_counts);
+    let (majority_biome, majority_biome_count) = surface_majority_string(&biome_counts);
+    SurfaceNeighborhoodStats {
+        land_count,
+        top_counts,
+        biome_counts,
+        majority_top,
+        majority_top_count,
+        majority_biome,
+        majority_biome_count,
+    }
+}
+
+fn is_protected_surface_for_smoothing(top: i32, biome: &str) -> bool {
+    top == block_state_ids::SNOW_BLOCK || top == block_state_ids::MUD || biome == "minecraft:beach"
+}
+
+fn compatible_top_for_smoother_biome(current_top: i32, biome: &str) -> i32 {
+    if !biome.contains("snow") && !biome.contains("frozen") {
+        return current_top;
+    }
+    if matches!(
+        current_top,
+        block_state_ids::SNOW_BLOCK
+            | block_state_ids::STONE
+            | block_state_ids::GRAVEL
+            | block_state_ids::ANDESITE
+            | block_state_ids::GRANITE
+            | block_state_ids::DIORITE
+            | block_state_ids::TUFF
+            | block_state_ids::CALCITE
+    ) {
+        return current_top;
+    }
+    block_state_ids::SNOW_BLOCK
+}
+
+fn smoother_replacement(column: &EarthSurfaceColumn, top: i32, biome: &str) -> EarthSurfaceColumn {
+    let mut replacement = EarthSurfaceColumn::new(
+        false,
+        column.ground_surface_y,
+        column.water_surface_y,
+        top,
+        smoother_filler_for(top),
+        biome.to_string(),
+        "smoother-isolated",
+    );
+    replacement.terrain_token_source = column.terrain_token_source;
+    replacement.data_evidence_flags = column.data_evidence_flags;
+    replacement
+}
+
+fn smoother_filler_for(top: i32) -> i32 {
+    match top {
+        block_state_ids::SAND
+        | block_state_ids::SANDSTONE
+        | block_state_ids::RED_SAND
+        | block_state_ids::END_STONE
+        | block_state_ids::END_STONE_BRICKS
+        | block_state_ids::SMOOTH_SANDSTONE
+        | block_state_ids::CUT_SANDSTONE
+        | block_state_ids::CHISELED_SANDSTONE
+        | block_state_ids::SMOOTH_RED_SANDSTONE
+        | block_state_ids::CUT_RED_SANDSTONE
+        | block_state_ids::CHISELED_RED_SANDSTONE
+        | block_state_ids::TERRACOTTA
+        | block_state_ids::ORANGE_TERRACOTTA
+        | block_state_ids::BROWN_TERRACOTTA
+        | block_state_ids::WHITE_TERRACOTTA
+        | block_state_ids::LIGHT_GRAY_TERRACOTTA
+        | block_state_ids::GRAY_TERRACOTTA
+        | block_state_ids::BLACK_TERRACOTTA
+        | block_state_ids::YELLOW_TERRACOTTA
+        | block_state_ids::RED_TERRACOTTA
+        | block_state_ids::GREEN_TERRACOTTA
+        | block_state_ids::CYAN_TERRACOTTA
+        | block_state_ids::LIME_TERRACOTTA
+        | block_state_ids::ROOTED_DIRT
+        | block_state_ids::MYCELIUM
+        | block_state_ids::MUD_BRICKS
+        | block_state_ids::DRIPSTONE_BLOCK => top,
+        block_state_ids::STONE
+        | block_state_ids::GRAVEL
+        | block_state_ids::CLAY
+        | block_state_ids::ANDESITE
+        | block_state_ids::GRANITE
+        | block_state_ids::DIORITE
+        | block_state_ids::TUFF
+        | block_state_ids::CALCITE => block_state_ids::STONE,
+        block_state_ids::MUD | block_state_ids::PACKED_MUD => block_state_ids::MUD,
+        _ => block_state_ids::DIRT,
+    }
+}
+
+fn surface_majority_i32(counts: &BTreeMap<i32, i32>) -> (i32, i32) {
+    let mut best = 0;
+    let mut best_count = 0;
+    for (&value, &count) in counts {
+        if count > best_count {
+            best = value;
+            best_count = count;
+        }
+    }
+    (best, best_count)
+}
+
+fn surface_majority_string(counts: &BTreeMap<String, i32>) -> (String, i32) {
+    let mut best = String::new();
+    let mut best_count = 0;
+    for (value, &count) in counts {
+        if count > best_count {
+            best = value.clone();
+            best_count = count;
+        }
+    }
+    (best, best_count)
+}
+
+fn surface_class_index(x: usize, z: usize, width: usize) -> usize {
+    (z * width) + x
+}
+
 fn top_block_state_id(
     _elevation_meters: f64,
     longitude: f64,
@@ -6801,6 +7019,109 @@ mod tests {
             |_longitude, _latitude| { Ok(0.0) }
         )
         .is_err());
+    }
+
+    #[test]
+    fn surface_class_smoother_matches_java_non_photo_fixture_cases() {
+        let mut patch = filled_surface_columns(
+            5,
+            5,
+            land_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                "minecraft:forest",
+                SEA_LEVEL_Y + 4,
+            ),
+        );
+        patch[surface_class_index(2, 2, 5)] = land_surface_column(
+            block_state_ids::RED_SAND,
+            "minecraft:desert",
+            SEA_LEVEL_Y + 4,
+        );
+
+        let smoothed = smooth_surface_classes(&patch, 5).unwrap();
+        let center = &smoothed[surface_class_index(2, 2, 5)];
+        assert_eq!(center.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(center.filler_block_state_id, block_state_ids::DIRT);
+        assert_eq!(center.biome_id, "minecraft:forest");
+        assert_eq!(center.decision_source, "smoother-isolated");
+
+        let mut coast = filled_surface_columns(
+            5,
+            5,
+            land_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                "minecraft:forest",
+                SEA_LEVEL_Y + 4,
+            ),
+        );
+        coast[surface_class_index(2, 2, 5)] = water_surface_column();
+        let coast_smoothed = smooth_surface_classes(&coast, 5).unwrap();
+        let water = &coast_smoothed[surface_class_index(2, 2, 5)];
+        assert!(water.water);
+        assert_eq!(water.top_block_state_id, block_state_ids::CLAY);
+
+        let mut snow_neighborhood = filled_surface_columns(
+            5,
+            5,
+            land_surface_column(
+                block_state_ids::SNOW_BLOCK,
+                "minecraft:snowy_plains",
+                SEA_LEVEL_Y + 4,
+            ),
+        );
+        snow_neighborhood[surface_class_index(2, 2, 5)] = land_surface_column(
+            block_state_ids::GRASS_BLOCK,
+            "minecraft:plains",
+            SEA_LEVEL_Y + 4,
+        );
+        let snow_smoothed = smooth_surface_classes(&snow_neighborhood, 5).unwrap();
+        let center = &snow_smoothed[surface_class_index(2, 2, 5)];
+        assert_eq!(center.biome_id, "minecraft:snowy_plains");
+        assert_eq!(center.top_block_state_id, block_state_ids::SNOW_BLOCK);
+        assert_eq!(center.filler_block_state_id, block_state_ids::DIRT);
+
+        let mut beach = filled_surface_columns(
+            5,
+            5,
+            land_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                "minecraft:forest",
+                SEA_LEVEL_Y + 4,
+            ),
+        );
+        beach[surface_class_index(2, 2, 5)] =
+            land_surface_column(block_state_ids::SAND, "minecraft:beach", SEA_LEVEL_Y + 4);
+        let beach_smoothed = smooth_surface_classes(&beach, 5).unwrap();
+        let center = &beach_smoothed[surface_class_index(2, 2, 5)];
+        assert_eq!(center.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(center.biome_id, "minecraft:beach");
+
+        let mut wetland = filled_surface_columns(
+            5,
+            5,
+            land_surface_column(
+                block_state_ids::GRASS_BLOCK,
+                "minecraft:savanna",
+                SEA_LEVEL_Y + 4,
+            ),
+        );
+        let mut swamp =
+            land_surface_column(block_state_ids::MUD, "minecraft:swamp", SEA_LEVEL_Y + 4);
+        swamp.terrain_token_source = TerrainTokenSource::JavaStandardPalette;
+        swamp.data_evidence_flags = surface_data_evidence::SWAMP;
+        wetland[surface_class_index(2, 2, 5)] = swamp;
+        let wetland_smoothed = smooth_surface_classes(&wetland, 5).unwrap();
+        let center = &wetland_smoothed[surface_class_index(2, 2, 5)];
+        assert_eq!(center.top_block_state_id, block_state_ids::MUD);
+        assert_eq!(center.biome_id, "minecraft:savanna");
+        assert_eq!(
+            center.terrain_token_source,
+            TerrainTokenSource::JavaStandardPalette
+        );
+        assert_eq!(center.data_evidence_flags, surface_data_evidence::SWAMP);
+
+        assert!(smooth_surface_classes(&patch, 0).is_err());
+        assert!(smooth_surface_classes(&patch, 4).is_err());
     }
 
     #[test]
@@ -7906,6 +8227,25 @@ mod tests {
 
     fn land_surface_column(top: i32, biome: &str, y: i32) -> EarthSurfaceColumn {
         surface_column(false, y, i32::MIN, top, top, biome)
+    }
+
+    fn water_surface_column() -> EarthSurfaceColumn {
+        surface_column(
+            true,
+            SEA_LEVEL_Y - 4,
+            SEA_LEVEL_Y,
+            block_state_ids::CLAY,
+            block_state_ids::CLAY,
+            "minecraft:ocean",
+        )
+    }
+
+    fn filled_surface_columns(
+        width: usize,
+        height: usize,
+        column: EarthSurfaceColumn,
+    ) -> Vec<EarthSurfaceColumn> {
+        vec![column; width * height]
     }
 
     fn clean_single_coastal_column(

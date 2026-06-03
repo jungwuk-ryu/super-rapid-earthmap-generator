@@ -613,13 +613,15 @@ Bootstrap implementation status on 2026-06-03:
   Java-style dominant default-biome selection, and `SurfaceBiomeCellWriter` application fixture cases.
 - Rust `EarthSurfaceChunkSampler` basic-path bootstrap samples heightmap-backed chunk columns with Java-compatible
   water decisions, smoothing, coast factors, shaped classification, and coastal cleanup fixture cases.
+- Rust `SurfaceClassSmoother` non-photo bootstrap ports isolated-column smoothing, protected water surfaces, and
+  snowy-biome top compatibility fixture cases.
 - Rust `LandShallowTopoPhotoSampler` bootstrap discovers Java's west/east `land_shallow_topo_*.tif` halves, samples
   topographic colors with Java half-world coordinate mapping, and lets `EarthDataSurfaceMaterialSampler.sample_photo`
   follow Java photo-source preference, coarse evidence caching, and terrain-token attachment rules.
 - Rust production surface cleanup bootstrap ports Java `NaturalSurfaceBlockPolicy` and `CoastalSurfaceCleaner` fixture
   cases for replacing artificial palette carrier blocks with natural top/filler blocks; full surface-region output wiring
   remains part of fixed-region `generate-surface-region` parity.
-- Remaining Phase 5 work: photo solver, broader `SurfaceClassSmoother`/biome intent smoothing, OSM overlay,
+- Remaining Phase 5 work: photo solver, photo texture smoothing and biome intent smoothing, OSM overlay,
   region-level `generate-surface-region` command and payload parity.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
