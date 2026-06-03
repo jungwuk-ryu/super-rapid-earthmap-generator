@@ -273,6 +273,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase4.vrtRgbMosaicReaderBootstrap - Synthetic single-source and split-source VRT RGB mosaic sampling, indexed source lookup, and aggregated tile stats match the Java fixture path."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase4.heightmapScalarSamplerUncached - HeightmapScalarSampler nearest and bilinear math matches Java for the uncached synthetic fixture path."
     )?;
     writeln!(

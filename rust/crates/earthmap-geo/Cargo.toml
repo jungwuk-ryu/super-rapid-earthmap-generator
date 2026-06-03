@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 earthmap-core = { path = "../earthmap-core" }
+quick-xml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

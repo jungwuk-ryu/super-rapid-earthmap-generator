@@ -1,12 +1,19 @@
 #![forbid(unsafe_code)]
 
+use quick_xml::events::{BytesCData, BytesRef, BytesStart, BytesText, Event};
+use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::{cell::RefCell, collections::BTreeMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, HashMap},
+};
 
 pub const MODULE_STATUS: &str = "phase4-earth-scale-mapping-bootstrap";
 
@@ -195,6 +202,71 @@ struct RgbTileState {
 struct CachedTile {
     bytes: Vec<u8>,
     access_stamp: u64,
+}
+
+#[derive(Debug)]
+pub struct VrtRgbMosaicReader {
+    vrt_path: PathBuf,
+    raster_width: i32,
+    raster_height: i32,
+    origin_x: f64,
+    pixel_width: f64,
+    origin_y: f64,
+    pixel_height: f64,
+    sources: Vec<VrtSource>,
+    source_lookup: VrtSourceLookup,
+    readers: Mutex<HashMap<VrtReaderKey, Arc<GeoTiffRgbReader>>>,
+    sample_nearest_requests: AtomicU64,
+    sample_averaged_requests: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VrtRgbMosaicStats {
+    pub source_count: usize,
+    pub open_readers: usize,
+    pub resident_tiles: u64,
+    pub tile_hits: u64,
+    pub tile_misses: u64,
+    pub tile_evictions: u64,
+    pub sample_nearest_requests: u64,
+    pub sample_averaged_requests: u64,
+    pub indexed_source_lookup: bool,
+    pub source_lookup_cells: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VrtSource {
+    path: PathBuf,
+    src: VrtRect,
+    dst: VrtRect,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct VrtReaderKey {
+    path: PathBuf,
+    thread_id: std::thread::ThreadId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VrtRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Clone, Debug)]
+enum VrtSourceLookup {
+    Linear {
+        sources: Vec<VrtSource>,
+    },
+    Grid {
+        cell_width: i32,
+        cell_height: i32,
+        columns: i32,
+        grid: Vec<Option<usize>>,
+        sources: Vec<VrtSource>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -548,6 +620,729 @@ impl GeoTiffRgbReader {
     }
 }
 
+impl VrtRgbMosaicReader {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let vrt_path = absolute_existing_path(path.as_ref())?;
+        let parsed = parse_vrt_rgb_mosaic(&vrt_path)?;
+        if parsed.sources.is_empty() {
+            return Err(GeoError::invalid(format!(
+                "VRT has no RGB sources: {}",
+                vrt_path.display()
+            )));
+        }
+        let source_lookup = VrtSourceLookup::create(
+            parsed.sources.clone(),
+            parsed.raster_width,
+            parsed.raster_height,
+        );
+        Ok(Self {
+            vrt_path,
+            raster_width: parsed.raster_width,
+            raster_height: parsed.raster_height,
+            origin_x: parsed.origin_x,
+            pixel_width: parsed.pixel_width,
+            origin_y: parsed.origin_y,
+            pixel_height: parsed.pixel_height,
+            sources: parsed.sources,
+            source_lookup,
+            readers: Mutex::new(HashMap::new()),
+            sample_nearest_requests: AtomicU64::new(0),
+            sample_averaged_requests: AtomicU64::new(0),
+        })
+    }
+
+    pub fn sample_nearest(&self, longitude: f64, latitude: f64) -> Result<RgbColor> {
+        self.sample_nearest_requests.fetch_add(1, Ordering::Relaxed);
+        self.sample_nearest_internal(longitude, latitude)
+    }
+
+    pub fn sample_averaged(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<RgbColor> {
+        self.sample_averaged_requests
+            .fetch_add(1, Ordering::Relaxed);
+        let lon_offset = longitude_span_degrees.abs().max(self.pixel_width.abs()) / 3.0;
+        let lat_offset = latitude_span_degrees.abs().max(self.pixel_height.abs()) / 3.0;
+        let mut red = 0u64;
+        let mut green = 0u64;
+        let mut blue = 0u64;
+        let mut samples = 0u64;
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let sample_longitude = longitude + (f64::from(dx) * lon_offset);
+                let sample_latitude = latitude + (f64::from(dz) * lat_offset);
+                if !(-180.0..180.0).contains(&sample_longitude)
+                    || !(-90.0..=90.0).contains(&sample_latitude)
+                {
+                    continue;
+                }
+                let packed =
+                    self.sample_nearest_packed_internal(sample_longitude, sample_latitude)?;
+                if packed < 0 {
+                    continue;
+                }
+                red += ((packed >> 16) & 0xff) as u64;
+                green += ((packed >> 8) & 0xff) as u64;
+                blue += (packed & 0xff) as u64;
+                samples += 1;
+            }
+        }
+        if samples == 0 {
+            return Ok(RgbColor::unavailable());
+        }
+        Ok(RgbColor::of(
+            java_round(red as f64 / samples as f64) as u8,
+            java_round(green as f64 / samples as f64) as u8,
+            java_round(blue as f64 / samples as f64) as u8,
+        ))
+    }
+
+    pub fn stats(&self) -> VrtRgbMosaicStats {
+        let readers = self
+            .readers
+            .lock()
+            .expect("VRT reader cache lock not poisoned");
+        let mut resident_tiles = 0u64;
+        let mut tile_hits = 0u64;
+        let mut tile_misses = 0u64;
+        let mut tile_evictions = 0u64;
+        for reader in readers.values() {
+            let stats = reader.stats();
+            resident_tiles += stats.resident_tiles as u64;
+            tile_hits += stats.tile_hits;
+            tile_misses += stats.tile_misses;
+            tile_evictions += stats.tile_evictions;
+        }
+        VrtRgbMosaicStats {
+            source_count: self.sources.len(),
+            open_readers: readers.len(),
+            resident_tiles,
+            tile_hits,
+            tile_misses,
+            tile_evictions,
+            sample_nearest_requests: self.sample_nearest_requests.load(Ordering::Relaxed),
+            sample_averaged_requests: self.sample_averaged_requests.load(Ordering::Relaxed),
+            indexed_source_lookup: self.source_lookup.indexed(),
+            source_lookup_cells: self.source_lookup.cells(),
+        }
+    }
+
+    pub fn raster_width(&self) -> i32 {
+        self.raster_width
+    }
+
+    pub fn raster_height(&self) -> i32 {
+        self.raster_height
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.vrt_path
+    }
+
+    fn sample_nearest_internal(&self, longitude: f64, latitude: f64) -> Result<RgbColor> {
+        let pixel_x = ((longitude - self.origin_x) / self.pixel_width).floor() as i32;
+        let pixel_y = ((latitude - self.origin_y) / self.pixel_height).floor() as i32;
+        self.sample_pixel(pixel_x, pixel_y)
+    }
+
+    fn sample_nearest_packed_internal(&self, longitude: f64, latitude: f64) -> Result<i32> {
+        let pixel_x = ((longitude - self.origin_x) / self.pixel_width).floor() as i32;
+        let pixel_y = ((latitude - self.origin_y) / self.pixel_height).floor() as i32;
+        self.sample_pixel_packed(pixel_x, pixel_y)
+    }
+
+    fn sample_pixel(&self, pixel_x: i32, pixel_y: i32) -> Result<RgbColor> {
+        let packed = self.sample_pixel_packed(pixel_x, pixel_y)?;
+        if packed < 0 {
+            return Ok(RgbColor::unavailable());
+        }
+        Ok(RgbColor::of(
+            ((packed >> 16) & 0xff) as u8,
+            ((packed >> 8) & 0xff) as u8,
+            (packed & 0xff) as u8,
+        ))
+    }
+
+    fn sample_pixel_packed(&self, pixel_x: i32, pixel_y: i32) -> Result<i32> {
+        if pixel_x < 0
+            || pixel_x >= self.raster_width
+            || pixel_y < 0
+            || pixel_y >= self.raster_height
+        {
+            return Ok(-1);
+        }
+        let Some(source_index) = self.source_lookup.source_at(pixel_x, pixel_y) else {
+            return Ok(-1);
+        };
+        let source = &self.sources[source_index];
+        let source_x = source.source_x(pixel_x);
+        let source_y = source.source_y(pixel_y);
+        let reader = {
+            let reader_key = VrtReaderKey {
+                path: source.path.clone(),
+                thread_id: std::thread::current().id(),
+            };
+            let mut readers = self
+                .readers
+                .lock()
+                .map_err(|_| GeoError::invalid("VRT reader cache lock poisoned"))?;
+            if !readers.contains_key(&reader_key) {
+                readers.insert(
+                    reader_key.clone(),
+                    Arc::new(GeoTiffRgbReader::open(&source.path)?),
+                );
+            }
+            Arc::clone(
+                readers
+                    .get(&reader_key)
+                    .expect("reader was inserted or already present"),
+            )
+        };
+        reader.sample_pixel_packed(source_x, source_y)
+    }
+}
+
+impl VrtSource {
+    fn contains(&self, pixel_x: i32, pixel_y: i32) -> bool {
+        pixel_x >= self.dst.x
+            && pixel_x < self.dst.x.saturating_add(self.dst.width)
+            && pixel_y >= self.dst.y
+            && pixel_y < self.dst.y.saturating_add(self.dst.height)
+    }
+
+    fn source_x(&self, pixel_x: i32) -> i32 {
+        let fraction = f64::from(pixel_x - self.dst.x) / f64::from(self.dst.width);
+        self.src.x + (self.src.width - 1).min((fraction * f64::from(self.src.width)).floor() as i32)
+    }
+
+    fn source_y(&self, pixel_y: i32) -> i32 {
+        let fraction = f64::from(pixel_y - self.dst.y) / f64::from(self.dst.height);
+        self.src.y
+            + (self.src.height - 1).min((fraction * f64::from(self.src.height)).floor() as i32)
+    }
+}
+
+impl VrtSourceLookup {
+    fn create(sources: Vec<VrtSource>, raster_width: i32, raster_height: i32) -> Self {
+        Self::try_create_grid(sources.clone(), raster_width, raster_height)
+            .unwrap_or(Self::Linear { sources })
+    }
+
+    fn source_at(&self, pixel_x: i32, pixel_y: i32) -> Option<usize> {
+        match self {
+            Self::Linear { sources } => sources
+                .iter()
+                .enumerate()
+                .find_map(|(index, source)| source.contains(pixel_x, pixel_y).then_some(index)),
+            Self::Grid {
+                cell_width,
+                cell_height,
+                columns,
+                grid,
+                sources,
+            } => {
+                let column = pixel_x / *cell_width;
+                let row = pixel_y / *cell_height;
+                let index = row
+                    .checked_mul(*columns)
+                    .and_then(|value| value.checked_add(column))?;
+                let source_index = *grid.get(usize::try_from(index).ok()?)?;
+                let source = &sources[source_index?];
+                source.contains(pixel_x, pixel_y).then_some(source_index?)
+            }
+        }
+    }
+
+    fn indexed(&self) -> bool {
+        matches!(self, Self::Grid { .. })
+    }
+
+    fn cells(&self) -> usize {
+        match self {
+            Self::Linear { sources } => sources.len(),
+            Self::Grid { grid, .. } => grid.len(),
+        }
+    }
+
+    fn try_create_grid(
+        sources: Vec<VrtSource>,
+        raster_width: i32,
+        raster_height: i32,
+    ) -> Option<Self> {
+        let first = sources.first()?;
+        let cell_width = first.dst.width;
+        let cell_height = first.dst.height;
+        if cell_width <= 0
+            || cell_height <= 0
+            || raster_width % cell_width != 0
+            || raster_height % cell_height != 0
+        {
+            return None;
+        }
+        let columns = raster_width / cell_width;
+        let rows = raster_height / cell_height;
+        let cell_count = usize::try_from(columns.checked_mul(rows)?).ok()?;
+        let mut grid = vec![None; cell_count];
+        for (source_index, source) in sources.iter().enumerate() {
+            let dst = source.dst;
+            if dst.width != cell_width
+                || dst.height != cell_height
+                || dst.x < 0
+                || dst.y < 0
+                || dst.x + dst.width > raster_width
+                || dst.y + dst.height > raster_height
+                || dst.x % cell_width != 0
+                || dst.y % cell_height != 0
+            {
+                return None;
+            }
+            let column = dst.x / cell_width;
+            let row = dst.y / cell_height;
+            let index = usize::try_from((row * columns) + column).ok()?;
+            if grid[index].is_some() {
+                return None;
+            }
+            grid[index] = Some(source_index);
+        }
+        Some(Self::Grid {
+            cell_width,
+            cell_height,
+            columns,
+            grid,
+            sources,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ParsedVrtRgbMosaic {
+    raster_width: i32,
+    raster_height: i32,
+    origin_x: f64,
+    pixel_width: f64,
+    origin_y: f64,
+    pixel_height: f64,
+    sources: Vec<VrtSource>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedSimpleSource {
+    filename: Option<ParsedSourceFilename>,
+    src: Option<VrtRect>,
+    dst: Option<VrtRect>,
+}
+
+#[derive(Debug)]
+struct ParsedSourceFilename {
+    text: String,
+    relative_to_vrt: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VrtTextCapture {
+    GeoTransform,
+    SourceFilename { relative_to_vrt: bool },
+}
+
+fn parse_vrt_rgb_mosaic(vrt_path: &Path) -> Result<ParsedVrtRgbMosaic> {
+    let xml = fs::read_to_string(vrt_path).map_err(|error| GeoError::invalid(error.to_string()))?;
+    let mut reader = Reader::from_str(&xml);
+    reader.config_mut().trim_text(true);
+    let mut stack = Vec::<Vec<u8>>::new();
+    let mut root_seen = false;
+    let mut raster_width = None;
+    let mut raster_height = None;
+    let mut geo_transform = None;
+    let mut saw_band_1 = false;
+    let mut red_band_depth = None::<usize>;
+    let mut current_simple_source = None::<ParsedSimpleSource>;
+    let mut capture = None::<VrtTextCapture>;
+    let mut capture_text = String::new();
+    let mut sources = Vec::new();
+    let base_dir = vrt_path.parent().unwrap_or_else(|| Path::new("."));
+
+    loop {
+        match reader
+            .read_event()
+            .map_err(|error| GeoError::invalid(format!("failed to parse VRT: {error}")))?
+        {
+            Event::Start(element) => {
+                let name = element.name().as_ref().to_vec();
+                let depth = stack.len();
+                if !root_seen {
+                    if name.as_slice() != b"VRTDataset" {
+                        return Err(GeoError::invalid(format!(
+                            "not a VRTDataset: {}",
+                            vrt_path.display()
+                        )));
+                    }
+                    raster_width =
+                        Some(parse_vrt_i32_attr(&element, b"rasterXSize", "rasterXSize")?);
+                    raster_height =
+                        Some(parse_vrt_i32_attr(&element, b"rasterYSize", "rasterYSize")?);
+                    root_seen = true;
+                }
+
+                if name.as_slice() == b"VRTRasterBand"
+                    && attr_string(&element, b"band")?.as_deref() == Some("1")
+                {
+                    saw_band_1 = true;
+                    red_band_depth = Some(depth);
+                }
+                if name.as_slice() == b"GeoTransform"
+                    && stack.last().is_some_and(|n| n == b"VRTDataset")
+                {
+                    capture = Some(VrtTextCapture::GeoTransform);
+                    capture_text.clear();
+                }
+                if red_band_depth.is_some() && name.as_slice() == b"SimpleSource" {
+                    current_simple_source = Some(ParsedSimpleSource::default());
+                }
+                if let Some(simple_source) = current_simple_source.as_mut() {
+                    match name.as_slice() {
+                        b"SourceFilename" => {
+                            capture = Some(VrtTextCapture::SourceFilename {
+                                relative_to_vrt: attr_string(&element, b"relativeToVRT")?
+                                    .as_deref()
+                                    == Some("1"),
+                            });
+                            capture_text.clear();
+                        }
+                        b"SrcRect" => simple_source.src = Some(parse_vrt_rect(&element)?),
+                        b"DstRect" => simple_source.dst = Some(parse_vrt_rect(&element)?),
+                        _ => {}
+                    }
+                }
+                stack.push(name);
+            }
+            Event::Empty(element) => {
+                let name = element.name().as_ref().to_vec();
+                if let Some(simple_source) = current_simple_source.as_mut() {
+                    match name.as_slice() {
+                        b"SrcRect" => simple_source.src = Some(parse_vrt_rect(&element)?),
+                        b"DstRect" => simple_source.dst = Some(parse_vrt_rect(&element)?),
+                        b"SourceFilename" => {
+                            simple_source.filename = Some(ParsedSourceFilename {
+                                text: String::new(),
+                                relative_to_vrt: attr_string(&element, b"relativeToVRT")?
+                                    .as_deref()
+                                    == Some("1"),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::Text(text) => {
+                if capture.is_some() {
+                    capture_text.push_str(&decoded_xml_text(&text)?);
+                }
+            }
+            Event::CData(text) => {
+                if capture.is_some() {
+                    capture_text.push_str(&decoded_cdata_text(&text)?);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if capture.is_some() {
+                    capture_text.push_str(&decoded_general_ref(&reference)?);
+                }
+            }
+            Event::End(end) => {
+                let name = end.name().as_ref().to_vec();
+                if name.as_slice() == b"GeoTransform"
+                    && capture == Some(VrtTextCapture::GeoTransform)
+                {
+                    geo_transform = Some(capture_text.trim().to_string());
+                    capture = None;
+                    capture_text.clear();
+                } else if name.as_slice() == b"SourceFilename" {
+                    if let Some(VrtTextCapture::SourceFilename { relative_to_vrt }) = capture {
+                        if let Some(simple_source) = current_simple_source.as_mut() {
+                            simple_source.filename = Some(ParsedSourceFilename {
+                                text: capture_text.trim().to_string(),
+                                relative_to_vrt,
+                            });
+                        }
+                        capture = None;
+                        capture_text.clear();
+                    }
+                } else if name.as_slice() == b"SimpleSource" {
+                    if let Some(simple_source) = current_simple_source.take() {
+                        if let Some(source) = finish_vrt_simple_source(base_dir, simple_source)? {
+                            sources.push(source);
+                        }
+                    }
+                }
+
+                let depth = stack.len().saturating_sub(1);
+                if red_band_depth == Some(depth) && name.as_slice() == b"VRTRasterBand" {
+                    red_band_depth = None;
+                }
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if !root_seen {
+        return Err(GeoError::invalid(format!(
+            "not a VRTDataset: {}",
+            vrt_path.display()
+        )));
+    }
+    let raster_width =
+        raster_width.ok_or_else(|| GeoError::invalid("missing integer attribute: rasterXSize"))?;
+    let raster_height =
+        raster_height.ok_or_else(|| GeoError::invalid("missing integer attribute: rasterYSize"))?;
+    let transform = parse_vrt_geo_transform(geo_transform.as_deref(), vrt_path)?;
+    if !saw_band_1 {
+        return Err(GeoError::invalid(format!(
+            "VRT is missing band 1: {}",
+            vrt_path.display()
+        )));
+    }
+    add_true_marble_grid_fallback_sources(&mut sources, base_dir, raster_width, raster_height);
+    Ok(ParsedVrtRgbMosaic {
+        raster_width,
+        raster_height,
+        origin_x: transform[0],
+        pixel_width: transform[1],
+        origin_y: transform[3],
+        pixel_height: transform[5],
+        sources,
+    })
+}
+
+fn finish_vrt_simple_source(
+    base_dir: &Path,
+    simple_source: ParsedSimpleSource,
+) -> Result<Option<VrtSource>> {
+    let (Some(filename), Some(src), Some(dst)) =
+        (simple_source.filename, simple_source.src, simple_source.dst)
+    else {
+        return Ok(None);
+    };
+    let source_path = vrt_source_path(base_dir, &filename)?;
+    if !source_path.is_file() {
+        return Err(GeoError::invalid(format!(
+            "VRT source is missing: {}",
+            source_path.display()
+        )));
+    }
+    Ok(Some(VrtSource {
+        path: absolute_existing_path(&source_path)?,
+        src,
+        dst,
+    }))
+}
+
+fn vrt_source_path(base_dir: &Path, filename: &ParsedSourceFilename) -> Result<PathBuf> {
+    let raw = PathBuf::from(filename.text.trim());
+    let path = if filename.relative_to_vrt && !raw.is_absolute() {
+        base_dir.join(raw)
+    } else if raw.is_absolute() {
+        raw
+    } else {
+        std::env::current_dir()
+            .map_err(|error| GeoError::invalid(error.to_string()))?
+            .join(raw)
+    };
+    Ok(path)
+}
+
+fn add_true_marble_grid_fallback_sources(
+    sources: &mut Vec<VrtSource>,
+    base_dir: &Path,
+    raster_width: i32,
+    raster_height: i32,
+) {
+    if raster_width % 8 != 0 || raster_height % 4 != 0 {
+        return;
+    }
+    let tile_width = raster_width / 8;
+    let tile_height = raster_height / 4;
+    for column in 0..8 {
+        for row in 0..4 {
+            let dst = VrtRect {
+                x: column * tile_width,
+                y: row * tile_height,
+                width: tile_width,
+                height: tile_height,
+            };
+            if has_destination(sources, dst) {
+                continue;
+            }
+            let tile_name = format!(
+                "TrueMarble.250m.21600x21600.{}{}.tif",
+                (b'A' + column as u8) as char,
+                row + 1
+            );
+            if let Some(source_path) = first_valid_true_marble_tile(base_dir, &tile_name) {
+                sources.push(VrtSource {
+                    path: source_path,
+                    src: VrtRect {
+                        x: 0,
+                        y: 0,
+                        width: tile_width,
+                        height: tile_height,
+                    },
+                    dst,
+                });
+            }
+        }
+    }
+}
+
+fn has_destination(sources: &[VrtSource], dst: VrtRect) -> bool {
+    sources.iter().any(|source| source.dst == dst)
+}
+
+fn first_valid_true_marble_tile(base_dir: &Path, tile_name: &str) -> Option<PathBuf> {
+    [
+        base_dir.join(tile_name),
+        PathBuf::from("E:/earthmap/TifFiles/terrain").join(tile_name),
+        PathBuf::from("D:/earthmap/TifFiles/terrain").join(tile_name),
+        PathBuf::from("F:/earthmap/TifFiles/terrain").join(tile_name),
+    ]
+    .into_iter()
+    .filter_map(|candidate| absolute_existing_path(&candidate).ok())
+    .find(|candidate| {
+        candidate.is_file() && GeoTiffRgbReader::open_with_tile_cache_entries(candidate, 1).is_ok()
+    })
+}
+
+fn parse_vrt_geo_transform(text: Option<&str>, path: &Path) -> Result<[f64; 6]> {
+    let Some(text) = text else {
+        return Err(GeoError::invalid(format!(
+            "VRT is missing GeoTransform: {}",
+            path.display()
+        )));
+    };
+    if text.trim().is_empty() {
+        return Err(GeoError::invalid(format!(
+            "VRT is missing GeoTransform: {}",
+            path.display()
+        )));
+    }
+    let parts = text.split(',').collect::<Vec<_>>();
+    if parts.len() != 6 {
+        return Err(GeoError::invalid(format!(
+            "VRT GeoTransform must have 6 values: {}",
+            path.display()
+        )));
+    }
+    let mut values = [0.0f64; 6];
+    for (index, part) in parts.iter().enumerate() {
+        values[index] = parse_java_double(part.trim()).map_err(GeoError::invalid)?;
+    }
+    if values[2] != 0.0 || values[4] != 0.0 || values[1] == 0.0 || values[5] == 0.0 {
+        return Err(GeoError::invalid(format!(
+            "rotated or degenerate VRT GeoTransform is not supported: {}",
+            path.display()
+        )));
+    }
+    Ok(values)
+}
+
+fn parse_vrt_rect(element: &BytesStart<'_>) -> Result<VrtRect> {
+    Ok(VrtRect {
+        x: parse_vrt_i32_attr(element, b"xOff", "xOff")?,
+        y: parse_vrt_i32_attr(element, b"yOff", "yOff")?,
+        width: parse_vrt_i32_attr(element, b"xSize", "xSize")?,
+        height: parse_vrt_i32_attr(element, b"ySize", "ySize")?,
+    })
+}
+
+fn parse_vrt_i32_attr(element: &BytesStart<'_>, key: &[u8], name: &str) -> Result<i32> {
+    let Some(value) = attr_string(element, key)? else {
+        return Err(GeoError::invalid(format!(
+            "missing integer attribute: {name}"
+        )));
+    };
+    if value.trim().is_empty() {
+        return Err(GeoError::invalid(format!(
+            "missing integer attribute: {name}"
+        )));
+    }
+    value
+        .trim()
+        .parse::<i32>()
+        .map_err(|error| GeoError::invalid(error.to_string()))
+}
+
+fn decoded_xml_text(text: &BytesText<'_>) -> Result<String> {
+    Ok(text
+        .decode()
+        .map_err(|error| GeoError::invalid(error.to_string()))?
+        .into_owned())
+}
+
+fn decoded_cdata_text(text: &BytesCData<'_>) -> Result<String> {
+    Ok(text
+        .decode()
+        .map_err(|error| GeoError::invalid(error.to_string()))?
+        .into_owned())
+}
+
+fn decoded_general_ref(reference: &BytesRef<'_>) -> Result<String> {
+    let name = reference
+        .decode()
+        .map_err(|error| GeoError::invalid(error.to_string()))?;
+    let value = match name.as_ref() {
+        "amp" => "&".to_string(),
+        "lt" => "<".to_string(),
+        "gt" => ">".to_string(),
+        "quot" => "\"".to_string(),
+        "apos" => "'".to_string(),
+        text if text.starts_with("#x") || text.starts_with("#X") => {
+            let codepoint = u32::from_str_radix(&text[2..], 16)
+                .map_err(|_| GeoError::invalid(format!("unrecognized XML entity: {text}")))?;
+            char::from_u32(codepoint)
+                .ok_or_else(|| GeoError::invalid(format!("unrecognized XML entity: {text}")))?
+                .to_string()
+        }
+        text if text.starts_with('#') => {
+            let codepoint = text[1..]
+                .parse::<u32>()
+                .map_err(|_| GeoError::invalid(format!("unrecognized XML entity: {text}")))?;
+            char::from_u32(codepoint)
+                .ok_or_else(|| GeoError::invalid(format!("unrecognized XML entity: {text}")))?
+                .to_string()
+        }
+        text => {
+            return Err(GeoError::invalid(format!(
+                "unrecognized XML entity: {text}"
+            )))
+        }
+    };
+    Ok(value)
+}
+
+fn attr_string(element: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>> {
+    for attribute in element.attributes() {
+        let attribute = attribute.map_err(|error| GeoError::invalid(error.to_string()))?;
+        if attribute.key.as_ref() == key {
+            return Ok(Some(
+                attribute
+                    .normalized_value(XmlVersion::Implicit1_0)
+                    .map_err(|error| GeoError::invalid(error.to_string()))?
+                    .into_owned(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn absolute_existing_path(path: &Path) -> Result<PathBuf> {
+    fs::canonicalize(path).map_err(|error| GeoError::invalid(error.to_string()))
+}
+
 impl<'a> GeoTiffRowCache<'a> {
     pub fn new(reader: &'a GeoTiffHeightmapReader, max_rows: usize) -> Result<Self> {
         Self::with_prefetch(reader, max_rows, 0)
@@ -866,6 +1661,14 @@ fn round_to_i32_exact(value: f64) -> Result<i32> {
         )));
     }
     Ok(rounded as i32)
+}
+
+fn java_round(value: f64) -> i64 {
+    if value.is_nan() {
+        0
+    } else {
+        (value + 0.5).floor() as i64
+    }
 }
 
 fn clamp(value: i32, exclusive_max: i32) -> i32 {
@@ -2142,6 +2945,155 @@ mod tests {
         assert_eq!(stats.tile_misses, 1);
         assert_eq!(stats.tile_hits, 1);
         assert_eq!(stats.tile_evictions, 0);
+    }
+
+    #[test]
+    fn synthetic_vrt_rgb_mosaic_reader_matches_java_fixture_paths() {
+        let temp = tempdir().unwrap();
+        let tiff = temp.path().join("tiny.tif");
+        fs::write(&tiff, synthetic_classic_rgb_tiff()).unwrap();
+        let vrt = temp.path().join("tiny.vrt");
+        fs::write(
+            &vrt,
+            r#"
+<VRTDataset rasterXSize="2" rasterYSize="2">
+  <GeoTransform> 0, 1, 0, 2, 0, -1</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">tiny.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2" />
+      <DstRect xOff="0" yOff="0" xSize="2" ySize="2" />
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"#,
+        )
+        .unwrap();
+        let reader = VrtRgbMosaicReader::open(&vrt).unwrap();
+        assert_eq!(
+            reader.sample_nearest(0.25, 1.75).unwrap(),
+            RgbColor::of(10, 20, 30)
+        );
+        assert_eq!(
+            reader.sample_nearest(1.25, 0.75).unwrap(),
+            RgbColor::of(100, 110, 120)
+        );
+        let stats = reader.stats();
+        assert_eq!(stats.source_count, 1);
+        assert_eq!(stats.open_readers, 1);
+        assert_eq!(stats.resident_tiles, 1);
+        assert_eq!(stats.tile_misses, 1);
+        assert_eq!(stats.tile_hits, 1);
+        assert_eq!(stats.sample_nearest_requests, 2);
+        assert!(stats.indexed_source_lookup);
+        assert_eq!(stats.source_lookup_cells, 1);
+
+        let left = temp.path().join("left.tif");
+        let right = temp.path().join("right.tif");
+        fs::write(
+            &left,
+            synthetic_classic_rgb_tiff_with_pixels([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+        )
+        .unwrap();
+        fs::write(
+            &right,
+            synthetic_classic_rgb_tiff_with_pixels([
+                101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112,
+            ]),
+        )
+        .unwrap();
+        let split_vrt = temp.path().join("split.vrt");
+        fs::write(
+            &split_vrt,
+            r#"
+<VRTDataset rasterXSize="4" rasterYSize="2">
+  <GeoTransform> 0, 1, 0, 2, 0, -1</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">left.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2" />
+      <DstRect xOff="0" yOff="0" xSize="2" ySize="2" />
+    </SimpleSource>
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">right.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2" />
+      <DstRect xOff="2" yOff="0" xSize="2" ySize="2" />
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"#,
+        )
+        .unwrap();
+        let split_reader = VrtRgbMosaicReader::open(&split_vrt).unwrap();
+        let split_stats = split_reader.stats();
+        assert!(split_stats.indexed_source_lookup);
+        assert_eq!(split_stats.source_lookup_cells, 2);
+        assert_eq!(
+            split_reader.sample_nearest(0.25, 1.75).unwrap(),
+            RgbColor::of(1, 2, 3)
+        );
+        assert_eq!(
+            split_reader.sample_nearest(2.25, 1.75).unwrap(),
+            RgbColor::of(101, 102, 103)
+        );
+    }
+
+    #[test]
+    fn synthetic_vrt_reader_decodes_xml_entities_like_java_dom() {
+        let temp = tempdir().unwrap();
+        let tiff = temp.path().join("a&b.tif");
+        fs::write(&tiff, synthetic_classic_rgb_tiff()).unwrap();
+        let vrt = temp.path().join("entity.vrt");
+        fs::write(
+            &vrt,
+            r#"
+<VRTDataset rasterXSize="2" rasterYSize="2">
+  <GeoTransform> 0, 1, 0, 2, 0, -1</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">a&amp;b.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2" />
+      <DstRect xOff="0" yOff="0" xSize="2" ySize="2" />
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>
+"#,
+        )
+        .unwrap();
+
+        let reader = VrtRgbMosaicReader::open(&vrt).unwrap();
+        assert_eq!(
+            reader.sample_nearest(0.25, 1.75).unwrap(),
+            RgbColor::of(10, 20, 30)
+        );
+    }
+
+    #[test]
+    fn synthetic_vrt_reader_rejects_missing_band_one_before_fallback() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("TrueMarble.250m.21600x21600.A1.tif"),
+            synthetic_classic_rgb_tiff(),
+        )
+        .unwrap();
+        let vrt = temp.path().join("missing-band.vrt");
+        fs::write(
+            &vrt,
+            r#"
+<VRTDataset rasterXSize="8" rasterYSize="4">
+  <GeoTransform> 0, 1, 0, 4, 0, -1</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="2" />
+</VRTDataset>
+"#,
+        )
+        .unwrap();
+
+        let error = VrtRgbMosaicReader::open(&vrt).unwrap_err().to_string();
+        assert!(error.contains("VRT is missing band 1"));
     }
 
     #[test]
