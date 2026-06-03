@@ -360,6 +360,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.wwfEcoregionSourceBootstrap - WwfEcoregionSampler reads WWF shapefile/DBF source data, rebuilds Java-compatible ecoregion cache files, and falls back from stale or corrupt caches like Java."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.metImageExportTerrainSamplerBootstrap - MetImageExportTerrainSampler discovers Java MET image_exports tiles, parses aux GeoTransform metadata, samples PNG terrain-token colors with a bounded image cache, and EarthDataSurfaceMaterialSampler prefers exported tokens when present."
     )?;
     writeln!(

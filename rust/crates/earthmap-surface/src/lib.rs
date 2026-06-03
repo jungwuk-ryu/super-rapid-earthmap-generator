@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -618,9 +618,11 @@ pub struct EcoregionSample {
 
 impl EcoregionSample {
     pub fn new(name: impl Into<String>, biome_id: impl Into<String>) -> Self {
+        let name = name.into();
+        let biome_id = biome_id.into();
         Self {
-            name: name.into().trim().to_string(),
-            biome_id: biome_id.into().trim().to_string(),
+            name: java_string_trim(&name).to_string(),
+            biome_id: java_string_trim(&biome_id).to_string(),
         }
     }
 
@@ -2189,6 +2191,26 @@ impl WwfEcoregionSampler {
         Self::read_cache(&mut file)
     }
 
+    pub fn open(shape_path: impl AsRef<Path>, mapping_csv: impl AsRef<Path>) -> Result<Self> {
+        let shape_path = shape_path.as_ref();
+        let mapping_csv = mapping_csv.as_ref();
+        let dbf_path = shape_path.with_extension("dbf");
+        if !shape_path.is_file() || !dbf_path.is_file() || !mapping_csv.is_file() {
+            return Err(SurfaceError::invalid(
+                "WWF ecoregion shapefile or mapping CSV is missing",
+            ));
+        }
+        let biome_by_ecoregion = read_wwf_biome_mapping(mapping_csv)?;
+        let names = read_wwf_ecoregion_names(&dbf_path)?;
+        let polygons = read_wwf_polygons(shape_path, &names, &biome_by_ecoregion)?;
+        let grid = Self::build_grid(&polygons);
+        Ok(Self {
+            polygons,
+            grid,
+            last_hit: Mutex::new(None),
+        })
+    }
+
     fn open_auto_cache(true_marble_path: &Path) -> Result<Option<Self>> {
         for root in wwf_candidate_roots(true_marble_path) {
             let shape = root
@@ -2200,18 +2222,33 @@ impl WwfEcoregionSampler {
             let cache = root
                 .join(".earthmap-cache")
                 .join(format!("wwf-ecoregions-v{}.bin", Self::CACHE_VERSION));
-            if !shape.is_file()
-                || !dbf.is_file()
-                || !mapping.is_file()
-                || !is_fresh_wwf_cache(&cache, &[shape, dbf, mapping])
-            {
+            if !shape.is_file() || !dbf.is_file() || !mapping.is_file() {
                 continue;
             }
-            if let Ok(sampler) = Self::open_cache(cache) {
+            if let Ok(sampler) = Self::open_cached(&shape, &mapping, &cache) {
                 return Ok(Some(sampler));
             }
         }
         Ok(None)
+    }
+
+    fn open_cached(shape_path: &Path, mapping_csv: &Path, cache_path: &Path) -> Result<Self> {
+        let dbf_path = shape_path.with_extension("dbf");
+        if is_fresh_wwf_cache(
+            cache_path,
+            &[
+                shape_path.to_path_buf(),
+                dbf_path,
+                mapping_csv.to_path_buf(),
+            ],
+        ) {
+            if let Ok(sampler) = Self::open_cache(cache_path) {
+                return Ok(sampler);
+            }
+        }
+        let sampler = Self::open(shape_path, mapping_csv)?;
+        let _ = sampler.write_cache(cache_path);
+        Ok(sampler)
     }
 
     pub fn sample(&self, longitude: f64, latitude: f64) -> EcoregionSample {
@@ -2278,6 +2315,38 @@ impl WwfEcoregionSampler {
         })
     }
 
+    fn write_cache(&self, cache_path: &Path) -> Result<()> {
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = File::create(cache_path)?;
+        write_i32_be(&mut output, Self::CACHE_MAGIC)?;
+        write_i32_be(&mut output, Self::CACHE_VERSION)?;
+        write_i32_be(
+            &mut output,
+            usize_to_i32(self.polygons.len(), "ecoregion polygon count")?,
+        )?;
+        for polygon in &self.polygons {
+            write_f64_be(&mut output, polygon.min_x)?;
+            write_f64_be(&mut output, polygon.min_y)?;
+            write_f64_be(&mut output, polygon.max_x)?;
+            write_f64_be(&mut output, polygon.max_y)?;
+            write_usize_array_be(&mut output, &polygon.parts)?;
+            write_f64_array_be(&mut output, &polygon.xs)?;
+            write_f64_array_be(&mut output, &polygon.ys)?;
+            write_java_utf(&mut output, &polygon.sample.name)?;
+            write_java_utf(&mut output, &polygon.sample.biome_id)?;
+        }
+        write_i32_be(
+            &mut output,
+            usize_to_i32(self.grid.len(), "ecoregion grid length")?,
+        )?;
+        for cell in &self.grid {
+            write_usize_array_be(&mut output, cell)?;
+        }
+        Ok(())
+    }
+
     fn sample_internal(&self, longitude: f64, latitude: f64) -> EcoregionSample {
         if longitude.is_nan() || latitude.is_nan() || !(-90.0..=90.0).contains(&latitude) {
             return EcoregionSample::unknown();
@@ -2312,18 +2381,34 @@ impl WwfEcoregionSampler {
     }
 
     fn cell_index(&self, longitude: f64, latitude: f64) -> usize {
-        (self.grid_y(latitude) * Self::GRID_WIDTH) + self.grid_x(longitude)
+        (Self::grid_y(latitude) * Self::GRID_WIDTH) + Self::grid_x(longitude)
     }
 
-    fn grid_x(&self, longitude: f64) -> usize {
+    fn grid_x(longitude: f64) -> usize {
         let raw = ((normalize_longitude(longitude) - Self::MIN_LONGITUDE) / Self::CELL_DEGREES)
             .floor() as i32;
         clamp_i32(raw, 0, (Self::GRID_WIDTH - 1) as i32) as usize
     }
 
-    fn grid_y(&self, latitude: f64) -> usize {
+    fn grid_y(latitude: f64) -> usize {
         let raw = ((latitude - Self::MIN_LATITUDE) / Self::CELL_DEGREES).floor() as i32;
         clamp_i32(raw, 0, (Self::GRID_HEIGHT - 1) as i32) as usize
+    }
+
+    fn build_grid(polygons: &[WwfEcoregionPolygon]) -> Vec<Vec<usize>> {
+        let mut cells = vec![Vec::<usize>::new(); Self::GRID_WIDTH * Self::GRID_HEIGHT];
+        for (index, polygon) in polygons.iter().enumerate() {
+            let min_x = Self::grid_x(polygon.min_x);
+            let max_x = Self::grid_x(polygon.max_x);
+            let min_y = Self::grid_y(polygon.min_y);
+            let max_y = Self::grid_y(polygon.max_y);
+            for y in min_y..=max_y {
+                for x in min_x..=max_x {
+                    cells[(y * Self::GRID_WIDTH) + x].push(index);
+                }
+            }
+        }
+        cells
     }
 }
 
@@ -2373,6 +2458,328 @@ impl WwfEcoregionPolygon {
             }
         }
         inside
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WwfDbfField {
+    name: String,
+    offset: usize,
+    length: usize,
+}
+
+fn read_wwf_biome_mapping(mapping_csv: &Path) -> Result<HashMap<String, String>> {
+    let text = fs::read_to_string(mapping_csv)?;
+    let mut mappings = HashMap::new();
+    for line in text.lines() {
+        if java_string_is_blank(line) {
+            continue;
+        }
+        let columns = parse_wwf_csv_line(line);
+        if columns.len() < 2 {
+            continue;
+        }
+        let name = java_string_trim(&columns[0]).to_string();
+        let biome = wwf_minecraft_biome_id(java_string_trim(&columns[1]));
+        if !name.is_empty() && !biome.is_empty() {
+            mappings.insert(name, biome);
+        }
+    }
+    Ok(mappings)
+}
+
+fn read_wwf_ecoregion_names(dbf_path: &Path) -> Result<Vec<String>> {
+    let mut file = File::open(dbf_path)?;
+    let mut header = [0u8; 32];
+    file.read_exact(&mut header)?;
+    let record_count = little_i32(&header, 4);
+    if record_count < 0 {
+        return Err(SurfaceError::invalid("negative DBF record count"));
+    }
+    let header_length = usize::from(little_u16(&header, 8));
+    let record_length = usize::from(little_u16(&header, 10));
+    if header_length < 33 || record_length == 0 {
+        return Err(SurfaceError::invalid("malformed DBF header"));
+    }
+    let mut fields = Vec::new();
+    let mut offset = 1usize;
+    while file.stream_position()? < header_length.saturating_sub(1) as u64 {
+        let mut descriptor = [0u8; 32];
+        file.read_exact(&mut descriptor)?;
+        if descriptor[0] == 0x0d {
+            break;
+        }
+        let name = decode_wwf_dbf_text(&descriptor, 0, 11)?;
+        let length = usize::from(descriptor[16]);
+        fields.push(WwfDbfField {
+            name,
+            offset,
+            length,
+        });
+        offset = offset
+            .checked_add(length)
+            .ok_or_else(|| SurfaceError::invalid("DBF field offset overflow"))?;
+    }
+    let eco_name = fields
+        .iter()
+        .find(|field| field.name.eq_ignore_ascii_case("ECO_NAME"))
+        .ok_or_else(|| {
+            SurfaceError::invalid(format!("ECO_NAME field missing in {}", dbf_path.display()))
+        })?;
+    file.seek(SeekFrom::Start(header_length as u64))?;
+    let mut names = Vec::with_capacity(record_count as usize);
+    let mut record = vec![0u8; record_length];
+    for _ in 0..record_count {
+        file.read_exact(&mut record)?;
+        if record[0] == b'*' {
+            names.push(String::new());
+        } else {
+            names.push(decode_wwf_dbf_text(
+                &record,
+                eco_name.offset,
+                eco_name.length,
+            )?);
+        }
+    }
+    Ok(names)
+}
+
+fn read_wwf_polygons(
+    shape_path: &Path,
+    names: &[String],
+    biome_by_ecoregion: &HashMap<String, String>,
+) -> Result<Vec<WwfEcoregionPolygon>> {
+    let mut file = File::open(shape_path)?;
+    let file_length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(100))?;
+    let mut record_index = 0usize;
+    let mut polygons = Vec::with_capacity(names.len());
+    while file.stream_position()? < file_length {
+        let _record_number = read_i32_be(&mut file)?;
+        let content_words = read_i32_be(&mut file)?;
+        if content_words < 0 {
+            return Err(SurfaceError::invalid("negative shapefile record length"));
+        }
+        let content_bytes = i64::from(content_words)
+            .checked_mul(2)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or_else(|| SurfaceError::invalid("shapefile record length overflow"))?;
+        let record_end = file
+            .stream_position()?
+            .checked_add(content_bytes)
+            .ok_or_else(|| SurfaceError::invalid("shapefile record end overflow"))?;
+        let shape_type = read_i32_le(&mut file)?;
+        if shape_type == 0 {
+            file.seek(SeekFrom::Start(record_end))?;
+            record_index += 1;
+            continue;
+        }
+        if shape_type != 5 {
+            return Err(SurfaceError::invalid(format!(
+                "Unsupported ecoregion shape type {shape_type}"
+            )));
+        }
+        let min_x = read_f64_le(&mut file)?;
+        let min_y = read_f64_le(&mut file)?;
+        let max_x = read_f64_le(&mut file)?;
+        let max_y = read_f64_le(&mut file)?;
+        let part_count = read_i32_le(&mut file)?;
+        let point_count = read_i32_le(&mut file)?;
+        if part_count < 0 || point_count < 0 {
+            return Err(SurfaceError::invalid("negative shapefile polygon counts"));
+        }
+        let part_count = usize::try_from(part_count)
+            .map_err(|_| SurfaceError::invalid("shapefile part count overflow"))?;
+        let point_count = usize::try_from(point_count)
+            .map_err(|_| SurfaceError::invalid("shapefile point count overflow"))?;
+        let mut parts = Vec::with_capacity(part_count + 1);
+        for _ in 0..part_count {
+            let part = read_i32_le(&mut file)?;
+            if part < 0 {
+                return Err(SurfaceError::invalid("negative shapefile part index"));
+            }
+            parts.push(
+                usize::try_from(part)
+                    .map_err(|_| SurfaceError::invalid("shapefile part index overflow"))?,
+            );
+        }
+        parts.push(point_count);
+        if parts.len() < 2
+            || parts
+                .windows(2)
+                .any(|pair| pair[0] > pair[1] || pair[1] > point_count)
+        {
+            return Err(SurfaceError::invalid("malformed shapefile polygon parts"));
+        }
+        let mut xs = Vec::with_capacity(point_count);
+        let mut ys = Vec::with_capacity(point_count);
+        for _ in 0..point_count {
+            xs.push(read_f64_le(&mut file)?);
+            ys.push(read_f64_le(&mut file)?);
+        }
+        let name = names.get(record_index).cloned().unwrap_or_default();
+        let biome = biome_by_ecoregion.get(&name).cloned().unwrap_or_default();
+        polygons.push(WwfEcoregionPolygon {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            parts,
+            xs,
+            ys,
+            sample: EcoregionSample::new(name, biome),
+        });
+        file.seek(SeekFrom::Start(record_end))?;
+        record_index += 1;
+    }
+    Ok(polygons)
+}
+
+fn parse_wwf_csv_line(line: &str) -> Vec<String> {
+    let mut columns = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    quoted = false;
+                }
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '"' {
+            quoted = true;
+        } else if ch == ',' {
+            columns.push(std::mem::take(&mut current));
+        } else {
+            current.push(ch);
+        }
+    }
+    columns.push(current);
+    columns
+}
+
+fn wwf_minecraft_biome_id(csv_biome: &str) -> String {
+    if java_string_is_blank(csv_biome) {
+        return String::new();
+    }
+    let key = match java_string_trim(csv_biome).to_ascii_uppercase().as_str() {
+        "DESERT_LAKES" => "DESERT".to_string(),
+        "COLD_BEACH" => "SNOWY_BEACH".to_string(),
+        other => other.to_string(),
+    };
+    format!("minecraft:{}", key.to_ascii_lowercase())
+}
+
+fn decode_wwf_dbf_text(data: &[u8], offset: usize, length: usize) -> Result<String> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| SurfaceError::invalid("DBF text range overflow"))?;
+    let slice = data
+        .get(offset..end)
+        .ok_or_else(|| SurfaceError::invalid("DBF text range outside record"))?;
+    let text = slice
+        .iter()
+        .map(|&byte| {
+            if byte == 0 {
+                ' '
+            } else {
+                windows_1252_char(byte)
+            }
+        })
+        .collect::<String>();
+    Ok(java_string_trim(&text).to_string())
+}
+
+fn java_string_trim(value: &str) -> &str {
+    let Some((start, _)) = value.char_indices().find(|&(_, ch)| ch as u32 > 0x20) else {
+        return "";
+    };
+    let end = value
+        .char_indices()
+        .rev()
+        .find(|&(_, ch)| ch as u32 > 0x20)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(start);
+    &value[start..end]
+}
+
+fn java_string_is_blank(value: &str) -> bool {
+    value.chars().all(java_character_is_whitespace)
+}
+
+fn java_character_is_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0009}'..='\u{000d}'
+            | '\u{001c}'..='\u{0020}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{205f}'
+            | '\u{3000}'
+    )
+}
+
+fn system_time_to_java_millis(time: std::time::SystemTime) -> Option<i128> {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => {
+            Some((i128::from(duration.as_secs()) * 1_000) + i128::from(duration.subsec_millis()))
+        }
+        Err(error) => {
+            let duration = error.duration();
+            let millis = (i128::from(duration.as_secs()) * 1_000)
+                + i128::from((duration.subsec_nanos() + 999_999) / 1_000_000);
+            Some(-millis)
+        }
+    }
+}
+
+fn file_modified_java_millis(path: &Path) -> Option<i128> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    system_time_to_java_millis(metadata.modified().ok()?)
+}
+
+fn windows_1252_char(byte: u8) -> char {
+    match byte {
+        0x80 => '\u{20ac}',
+        0x81 | 0x8d | 0x8f | 0x90 | 0x9d => '\u{fffd}',
+        0x82 => '\u{201a}',
+        0x83 => '\u{0192}',
+        0x84 => '\u{201e}',
+        0x85 => '\u{2026}',
+        0x86 => '\u{2020}',
+        0x87 => '\u{2021}',
+        0x88 => '\u{02c6}',
+        0x89 => '\u{2030}',
+        0x8a => '\u{0160}',
+        0x8b => '\u{2039}',
+        0x8c => '\u{0152}',
+        0x8e => '\u{017d}',
+        0x91 => '\u{2018}',
+        0x92 => '\u{2019}',
+        0x93 => '\u{201c}',
+        0x94 => '\u{201d}',
+        0x95 => '\u{2022}',
+        0x96 => '\u{2013}',
+        0x97 => '\u{2014}',
+        0x98 => '\u{02dc}',
+        0x99 => '\u{2122}',
+        0x9a => '\u{0161}',
+        0x9b => '\u{203a}',
+        0x9c => '\u{0153}',
+        0x9e => '\u{017e}',
+        0x9f => '\u{0178}',
+        _ => char::from(byte),
     }
 }
 
@@ -3115,14 +3522,11 @@ fn push_distinct_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn is_fresh_wwf_cache(cache: &Path, sources: &[PathBuf]) -> bool {
-    let Ok(cache_modified) = std::fs::metadata(cache).and_then(|metadata| metadata.modified())
-    else {
+    let Some(cache_modified) = file_modified_java_millis(cache) else {
         return false;
     };
     for source in sources {
-        let Ok(source_modified) =
-            std::fs::metadata(source).and_then(|metadata| metadata.modified())
-        else {
+        let Some(source_modified) = file_modified_java_millis(source) else {
             return false;
         };
         if source_modified > cache_modified {
@@ -3222,6 +3626,90 @@ fn read_f64_be(input: &mut impl Read) -> Result<f64> {
     let mut bytes = [0u8; 8];
     input.read_exact(&mut bytes)?;
     Ok(f64::from_be_bytes(bytes))
+}
+
+fn read_i32_le(input: &mut impl Read) -> Result<i32> {
+    let mut bytes = [0u8; 4];
+    input.read_exact(&mut bytes)?;
+    Ok(i32::from_le_bytes(bytes))
+}
+
+fn read_f64_le(input: &mut impl Read) -> Result<f64> {
+    let mut bytes = [0u8; 8];
+    input.read_exact(&mut bytes)?;
+    Ok(f64::from_le_bytes(bytes))
+}
+
+fn write_i32_be(output: &mut impl Write, value: i32) -> Result<()> {
+    output.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
+fn write_f64_be(output: &mut impl Write, value: f64) -> Result<()> {
+    output.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
+fn write_usize_array_be(output: &mut impl Write, values: &[usize]) -> Result<()> {
+    write_i32_be(output, usize_to_i32(values.len(), "array length")?)?;
+    for &value in values {
+        write_i32_be(output, usize_to_i32(value, "array value")?)?;
+    }
+    Ok(())
+}
+
+fn write_f64_array_be(output: &mut impl Write, values: &[f64]) -> Result<()> {
+    write_i32_be(output, usize_to_i32(values.len(), "double array length")?)?;
+    for &value in values {
+        write_f64_be(output, value)?;
+    }
+    Ok(())
+}
+
+fn write_java_utf(output: &mut impl Write, value: &str) -> Result<()> {
+    let bytes = modified_utf8_bytes(value);
+    if bytes.len() > usize::from(u16::MAX) {
+        return Err(SurfaceError::invalid("modified UTF-8 string is too long"));
+    }
+    output.write_all(&(bytes.len() as u16).to_be_bytes())?;
+    output.write_all(&bytes)?;
+    Ok(())
+}
+
+fn modified_utf8_bytes(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(value.len());
+    for code_unit in value.encode_utf16() {
+        match code_unit {
+            0x0001..=0x007f => bytes.push(code_unit as u8),
+            0x0000..=0x07ff => {
+                bytes.push((0xc0 | ((code_unit >> 6) & 0x1f)) as u8);
+                bytes.push((0x80 | (code_unit & 0x3f)) as u8);
+            }
+            _ => {
+                bytes.push((0xe0 | ((code_unit >> 12) & 0x0f)) as u8);
+                bytes.push((0x80 | ((code_unit >> 6) & 0x3f)) as u8);
+                bytes.push((0x80 | (code_unit & 0x3f)) as u8);
+            }
+        }
+    }
+    bytes
+}
+
+fn usize_to_i32(value: usize, label: &str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| SurfaceError::invalid(format!("{label} exceeds i32 range")))
+}
+
+fn little_i32(data: &[u8], offset: usize) -> i32 {
+    i32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
+}
+
+fn little_u16(data: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([data[offset], data[offset + 1]])
 }
 
 fn open_surface_raster(
@@ -4977,6 +5465,96 @@ mod tests {
     }
 
     #[test]
+    fn wwf_ecoregion_sampler_regenerates_java_cache_from_source_fixture() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-surface-wwf-source-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let terrain = root.join("TifFiles").join("terrain");
+        let shape_dir = root.join("ShapeFiles").join("ecoregionsOrig");
+        std::fs::create_dir_all(&terrain).unwrap();
+        std::fs::create_dir_all(&shape_dir).unwrap();
+        let true_marble = terrain.join("TrueMarble.vrt");
+        std::fs::write(&true_marble, b"placeholder").unwrap();
+        let shape = shape_dir.join("wwf_terr_ecos.shp");
+        std::fs::write(&shape, synthetic_wwf_polygon_shapefile()).unwrap();
+        std::fs::write(shape_dir.join("wwf_terr_ecos.dbf"), synthetic_wwf_dbf()).unwrap();
+        std::fs::write(root.join("ecoregions.csv"), b"Cache Jungle,JUNGLE\n").unwrap();
+        let cache = root.join(".earthmap-cache").join("wwf-ecoregions-v2.bin");
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, b"corrupt").unwrap();
+
+        let sampler = WwfEcoregionSampler::open_auto_cache(&true_marble)
+            .unwrap()
+            .expect("WWF source fixture should be discovered");
+        assert_eq!(
+            sampler.sample(1.0, 1.0),
+            EcoregionSample::new("Cache Jungle", "minecraft:jungle")
+        );
+        assert_eq!(sampler.sample(3.0, 1.0), EcoregionSample::unknown());
+        assert_eq!(
+            sampler.sample(5.0, 1.0),
+            EcoregionSample::new("Cache Jungle", "minecraft:jungle")
+        );
+
+        assert!(cache.is_file());
+        assert_ne!(std::fs::read(&cache).unwrap(), b"corrupt");
+        let cached = WwfEcoregionSampler::open_cache(&cache).unwrap();
+        assert_eq!(
+            cached.sample(1.0, 1.0),
+            EcoregionSample::new("Cache Jungle", "minecraft:jungle")
+        );
+        assert_eq!(
+            cached.sample(5.0, 1.0),
+            EcoregionSample::new("Cache Jungle", "minecraft:jungle")
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn wwf_text_decoding_matches_java_trim_and_windows_1252_edges() {
+        assert_eq!(java_string_trim(" \tCache Jungle\r\n"), "Cache Jungle");
+        assert_eq!(
+            java_string_trim("\u{00a0}Cache Jungle\u{00a0}"),
+            "\u{00a0}Cache Jungle\u{00a0}"
+        );
+        assert!(java_string_is_blank(" \t\r\n"));
+        assert!(!java_string_is_blank("\u{00a0}"));
+
+        let decoded = decode_wwf_dbf_text(&[b' ', 0xa0, b'N', 0x81, b' '], 0, 5).unwrap();
+        assert_eq!(decoded, "\u{00a0}N\u{fffd}");
+        assert_eq!(
+            EcoregionSample::new("\u{00a0}Cache Jungle\u{00a0}", " minecraft:jungle ").name,
+            "\u{00a0}Cache Jungle\u{00a0}"
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("earthmap-surface-wwf-text-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mapping = root.join("ecoregions.csv");
+        std::fs::write(&mapping, "\u{00a0}Cache Jungle\u{00a0}, COLD_BEACH\n").unwrap();
+        let mappings = read_wwf_biome_mapping(&mapping).unwrap();
+        assert_eq!(
+            mappings.get("\u{00a0}Cache Jungle\u{00a0}"),
+            Some(&"minecraft:snowy_beach".to_string())
+        );
+        assert!(!mappings.contains_key("Cache Jungle"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn wwf_cache_freshness_uses_java_millisecond_precision() {
+        let same_java_millis = std::time::UNIX_EPOCH + std::time::Duration::new(123, 999_999);
+        let next_java_millis = std::time::UNIX_EPOCH + std::time::Duration::new(123, 1_000_000);
+
+        assert_eq!(system_time_to_java_millis(same_java_millis), Some(123_000));
+        assert_eq!(system_time_to_java_millis(next_java_millis), Some(123_001));
+    }
+
+    #[test]
     fn earth_data_sampler_helper_math_matches_java_contract() {
         assert_eq!(
             normalized_slope_permille(f64::NAN),
@@ -5314,6 +5892,75 @@ mod tests {
         out
     }
 
+    fn synthetic_wwf_polygon_shapefile() -> Vec<u8> {
+        let parts = [0, 5];
+        let points = [
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (2.0, 2.0),
+            (0.0, 2.0),
+            (0.0, 0.0),
+            (4.0, 0.0),
+            (6.0, 0.0),
+            (6.0, 2.0),
+            (4.0, 2.0),
+            (4.0, 0.0),
+        ];
+        let content_bytes = 4 + 32 + 4 + 4 + (parts.len() * 4) + (points.len() * 16);
+        let record_bytes = 8 + content_bytes;
+        let file_bytes = 100 + record_bytes;
+        let mut out = vec![0u8; 100];
+        put_i32_be(&mut out, 0, 9994);
+        put_i32_be(&mut out, 24, (file_bytes / 2) as i32);
+        put_i32_le(&mut out, 28, 1000);
+        put_i32_le(&mut out, 32, 5);
+        put_f64_le(&mut out, 36, 0.0);
+        put_f64_le(&mut out, 44, 0.0);
+        put_f64_le(&mut out, 52, 6.0);
+        put_f64_le(&mut out, 60, 2.0);
+
+        push_i32_be(&mut out, 1);
+        push_i32_be(&mut out, (content_bytes / 2) as i32);
+        push_i32_le(&mut out, 5);
+        for value in [0.0, 0.0, 6.0, 2.0] {
+            push_f64_le(&mut out, value);
+        }
+        push_i32_le(&mut out, parts.len() as i32);
+        push_i32_le(&mut out, points.len() as i32);
+        for part in parts {
+            push_i32_le(&mut out, part);
+        }
+        for (x, y) in points {
+            push_f64_le(&mut out, x);
+            push_f64_le(&mut out, y);
+        }
+        out
+    }
+
+    fn synthetic_wwf_dbf() -> Vec<u8> {
+        let record_count = 1;
+        let field_length = 20usize;
+        let header_length = 32 + 32 + 1;
+        let record_length = 1 + field_length;
+        let mut out = vec![0u8; header_length + record_length];
+        out[0] = 0x03;
+        put_i32_le(&mut out, 4, record_count);
+        put_u16(&mut out, 8, header_length as u16);
+        put_u16(&mut out, 10, record_length as u16);
+        let descriptor = 32;
+        out[descriptor..descriptor + 8].copy_from_slice(b"ECO_NAME");
+        out[descriptor + 11] = b'C';
+        out[descriptor + 16] = field_length as u8;
+        out[header_length - 1] = 0x0d;
+        out[header_length] = b' ';
+        let name = b"Cache Jungle";
+        out[header_length + 1..header_length + 1 + name.len()].copy_from_slice(name);
+        for byte in &mut out[header_length + 1 + name.len()..header_length + record_length] {
+            *byte = b' ';
+        }
+        out
+    }
+
     fn push_i32_array_be(out: &mut Vec<u8>, values: &[i32]) {
         push_i32_be(out, values.len() as i32);
         for &value in values {
@@ -5358,8 +6005,16 @@ mod tests {
         out.extend_from_slice(&value.to_be_bytes());
     }
 
+    fn push_i32_le(out: &mut Vec<u8>, value: i32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
     fn push_f64_be(out: &mut Vec<u8>, value: f64) {
         out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_f64_le(out: &mut Vec<u8>, value: f64) {
+        out.extend_from_slice(&value.to_le_bytes());
     }
 
     fn write_synthetic_met_png(path: &Path, width: u32, height: u32) {
@@ -5658,6 +6313,18 @@ mod tests {
 
     fn put_u16(out: &mut [u8], offset: usize, value: u16) {
         out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i32_le(out: &mut [u8], offset: usize, value: i32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_i32_be(out: &mut [u8], offset: usize, value: i32) {
+        out[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    fn put_f64_le(out: &mut [u8], offset: usize, value: f64) {
+        out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     fn put_u32(out: &mut [u8], offset: usize, value: u32) {
