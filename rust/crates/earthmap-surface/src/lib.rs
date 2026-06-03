@@ -2297,6 +2297,31 @@ fn classify_surface_material_by_semantic_intent(
         ));
     }
 
+    if forest_like
+        && sample.ecoregion_confidence >= 0.45
+        && !is_desert_climate(climate)
+        && !ecoregion_dry_core
+    {
+        return Some(surface_material_with_surface(
+            base,
+            temperate_forest_surface(sample, metrics, patch_noise, fine_noise),
+            block_state_ids::DIRT,
+            temperate_biome(latitude, sample, metrics, patch_noise, fine_noise),
+        ));
+    }
+
+    if (has_climate && (is_temperate_climate(climate) || is_cold_climate(climate)))
+        || tree_cover >= 0.12
+        || green_like
+    {
+        return Some(surface_material_with_surface(
+            base,
+            temperate_forest_surface(sample, metrics, patch_noise, fine_noise),
+            block_state_ids::DIRT,
+            temperate_biome(latitude, sample, metrics, patch_noise, fine_noise),
+        ));
+    }
+
     if is_desert_climate(climate) {
         if (tree_cover >= 0.12 || herb_cover >= 0.35 || shrub_cover >= 0.35 || green_like)
             && (savanna_like || is_sahel_latitude(latitude) || sahel_score >= 0.18)
@@ -3198,6 +3223,84 @@ fn forest_biome_for_environment(
     "minecraft:forest".to_string()
 }
 
+fn temperate_biome(
+    latitude: f64,
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> String {
+    let eco_name = sample.ecoregion_name.to_ascii_lowercase();
+    let broadleaf = eco_name.contains("broadleaf")
+        || eco_name.contains("mixed")
+        || eco_name.contains("temperate");
+    let boreal =
+        eco_name.contains("boreal") || eco_name.contains("conifer") || eco_name.contains("taiga");
+    if is_forest_like_ecoregion(sample) && sample.ecoregion_confidence >= 0.55 {
+        if boreal || (latitude.abs() >= 55.0 && !broadleaf) {
+            return if patch_noise >= 0.42 {
+                "minecraft:taiga"
+            } else {
+                "minecraft:forest"
+            }
+            .to_string();
+        }
+        if patch_noise >= 0.72 && metrics.value < 0.46 {
+            return "minecraft:dark_forest".to_string();
+        }
+        if sample.tree_cover() >= 0.14 && fine_noise <= 0.18 && patch_noise >= 0.46 {
+            return "minecraft:flower_forest".to_string();
+        }
+        if fine_noise < 0.22
+            && sample.tree_cover() < 0.08
+            && metrics.value >= 0.38
+            && !sample.has_vegetation_presence()
+        {
+            return if patch_noise >= 0.42 {
+                "minecraft:sunflower_plains"
+            } else {
+                "minecraft:plains"
+            }
+            .to_string();
+        }
+        return "minecraft:forest".to_string();
+    }
+    if latitude.abs() >= 50.0
+        && (sample.tree_cover() >= 0.06 || (is_green_like(metrics) && metrics.value < 0.46))
+    {
+        if sample.tree_cover() >= 0.14 && fine_noise <= 0.16 {
+            return "minecraft:flower_forest".to_string();
+        }
+        return "minecraft:forest".to_string();
+    }
+    if latitude.abs() >= 56.0 {
+        return if sample.tree_cover() >= 0.10 || patch_noise >= 0.46 {
+            "minecraft:taiga"
+        } else {
+            "minecraft:plains"
+        }
+        .to_string();
+    }
+    if sample.tree_cover() >= 0.12 || metrics.value < 0.42 || patch_noise >= 0.56 {
+        if sample.tree_cover() >= 0.14 && fine_noise <= 0.16 {
+            return "minecraft:flower_forest".to_string();
+        }
+        return forest_biome_for_environment(
+            latitude,
+            sample.climate_class,
+            sample.tree_cover(),
+            is_green_like(metrics) && metrics.value < 0.48,
+            patch_noise,
+        );
+    }
+    if patch_noise >= 0.70 {
+        "minecraft:sunflower_plains"
+    } else {
+        "minecraft:plains"
+    }
+    .to_string()
+}
+
 fn temperate_grassland_biome(
     latitude: f64,
     sample: &SurfaceMaterialSample,
@@ -3487,13 +3590,17 @@ fn mediterranean_biome(
 }
 
 fn temperate_forest_surface(
-    _sample: &SurfaceMaterialSample,
+    sample: &SurfaceMaterialSample,
     metrics: SurfaceColorMetrics,
-    _patch_noise: f64,
+    patch_noise: f64,
     fine_noise: f64,
 ) -> i32 {
-    if !is_green_like(metrics) && fine_noise >= 0.90 && metrics.value < 0.50 {
-        return block_state_ids::COARSE_DIRT;
+    let dark_green = is_green_like(metrics) && metrics.value < 0.46;
+    if (sample.tree_cover() >= 0.20 || dark_green) && patch_noise >= 0.74 && fine_noise >= 0.34 {
+        return block_state_ids::MOSS_BLOCK;
+    }
+    if sample.tree_cover() >= 0.10 && patch_noise <= 0.24 && fine_noise >= 0.58 {
+        return block_state_ids::PODZOL;
     }
     block_state_ids::GRASS_BLOCK
 }
@@ -14055,6 +14162,214 @@ mod tests {
         );
         assert_eq!(desert_vegetation_edge.biome_id, "minecraft:savanna");
         assert_eq!(desert_vegetation_edge.decision_source, "intent");
+
+        let forest_like_ecoregion = SurfaceMaterialSample::land(
+            RgbColor::of(92, 126, 72),
+            SurfaceMaterialSample::UNKNOWN,
+            10,
+            0,
+            4,
+            0,
+            10,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Temperate broadleaf forest",
+            "minecraft:forest",
+            0.60,
+        );
+        let (forest_like_longitude, forest_like_latitude) = (-180..=180)
+            .flat_map(|longitude| (-52..=52).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                surface_material_sahara_score(longitude, latitude) < 0.45
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+            })
+            .expect("test fixture should find a forest-like ecoregion coordinate");
+        let forest_like_intent = apply_test_surface_material_sample(
+            &base_land,
+            forest_like_ecoregion,
+            420.0,
+            f64::from(forest_like_longitude),
+            f64::from(forest_like_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            forest_like_intent.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            forest_like_intent.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert_eq!(forest_like_intent.biome_id, "minecraft:forest");
+        assert_eq!(forest_like_intent.decision_source, "intent");
+
+        let low_tree_temperate_climate = SurfaceMaterialSample::land(
+            RgbColor::of(134, 126, 82),
+            8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+        let (temperate_forest_longitude, temperate_forest_latitude) = (-180..=180)
+            .flat_map(|longitude| (-49..=49).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let patch_noise =
+                    surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
+                surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && (0.56..0.70).contains(&patch_noise)
+            })
+            .expect("test fixture should find a low-tree temperate forest coordinate");
+        let temperate_climate_forest = apply_test_surface_material_sample(
+            &base_land,
+            low_tree_temperate_climate,
+            380.0,
+            f64::from(temperate_forest_longitude),
+            f64::from(temperate_forest_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            temperate_climate_forest.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            temperate_climate_forest.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert_eq!(temperate_climate_forest.biome_id, "minecraft:forest");
+        assert_eq!(temperate_climate_forest.decision_source, "intent");
+
+        let moss_temperate_forest = SurfaceMaterialSample::land(
+            RgbColor::of(54, 96, 48),
+            8,
+            22,
+            0,
+            0,
+            0,
+            22,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Temperate mixed forest",
+            "minecraft:forest",
+            0.60,
+        );
+        let (moss_longitude, moss_latitude) = (-180..=180)
+            .flat_map(|longitude| (-49..=49).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let patch_noise =
+                    surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
+                let fine_noise = surface_material_ecology_noise(
+                    longitude,
+                    latitude,
+                    7.5,
+                    0x9d6c63b5a8e33f21_u64 as i64,
+                );
+                surface_material_sahara_score(longitude, latitude) < 0.45
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && patch_noise >= 0.74
+                    && fine_noise >= 0.34
+            })
+            .expect("test fixture should find a moss temperate forest coordinate");
+        let moss_forest = apply_test_surface_material_sample(
+            &base_land,
+            moss_temperate_forest,
+            420.0,
+            f64::from(moss_longitude),
+            f64::from(moss_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(moss_forest.top_block_state_id, block_state_ids::MOSS_BLOCK);
+        assert_eq!(moss_forest.filler_block_state_id, block_state_ids::DIRT);
+        assert_eq!(moss_forest.decision_source, "intent");
+
+        let podzol_temperate_forest = SurfaceMaterialSample::land(
+            RgbColor::of(92, 126, 72),
+            8,
+            10,
+            0,
+            0,
+            0,
+            10,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Temperate mixed forest",
+            "minecraft:forest",
+            0.60,
+        );
+        let (podzol_longitude, podzol_latitude) = (-180..=180)
+            .flat_map(|longitude| (-49..=49).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let patch_noise =
+                    surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
+                let fine_noise = surface_material_ecology_noise(
+                    longitude,
+                    latitude,
+                    7.5,
+                    0x9d6c63b5a8e33f21_u64 as i64,
+                );
+                surface_material_sahara_score(longitude, latitude) < 0.45
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && patch_noise <= 0.24
+                    && fine_noise >= 0.58
+            })
+            .expect("test fixture should find a podzol temperate forest coordinate");
+        let podzol_forest = apply_test_surface_material_sample(
+            &base_land,
+            podzol_temperate_forest,
+            420.0,
+            f64::from(podzol_longitude),
+            f64::from(podzol_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(podzol_forest.top_block_state_id, block_state_ids::PODZOL);
+        assert_eq!(podzol_forest.filler_block_state_id, block_state_ids::DIRT);
+        assert_eq!(podzol_forest.decision_source, "intent");
 
         let savanna_like_highland_candidate = SurfaceMaterialSample::land(
             RgbColor::of(181, 96, 46),
