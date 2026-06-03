@@ -4250,9 +4250,20 @@ pub fn stabilize_surface_biome_families(
     width: usize,
 ) -> Result<Vec<EarthSurfaceColumn>> {
     require_surface_grid_width(columns, width)?;
-    let cell_pass = stabilize_surface_biome_cells(columns, width);
+    let cell_pass = stabilize_surface_biome_cells(columns, width, false);
     Ok(stabilize_small_surface_biome_family_components(
-        &cell_pass, width,
+        &cell_pass, width, false,
+    ))
+}
+
+pub fn stabilize_surface_biome_families_preserving_surfaces(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    require_surface_grid_width(columns, width)?;
+    let cell_pass = stabilize_surface_biome_cells(columns, width, true);
+    Ok(stabilize_small_surface_biome_family_components(
+        &cell_pass, width, true,
     ))
 }
 
@@ -4262,7 +4273,17 @@ pub fn stabilize_small_surface_biome_components(
 ) -> Result<Vec<EarthSurfaceColumn>> {
     require_surface_grid_width(columns, width)?;
     Ok(stabilize_small_surface_biome_family_components(
-        columns, width,
+        columns, width, false,
+    ))
+}
+
+pub fn stabilize_small_surface_biome_components_preserving_surfaces(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    require_surface_grid_width(columns, width)?;
+    Ok(stabilize_small_surface_biome_family_components(
+        columns, width, true,
     ))
 }
 
@@ -5988,6 +6009,7 @@ fn require_surface_grid_width(columns: &[EarthSurfaceColumn], width: usize) -> R
 fn stabilize_surface_biome_cells(
     columns: &[EarthSurfaceColumn],
     width: usize,
+    preserve_surface: bool,
 ) -> Vec<EarthSurfaceColumn> {
     let height = columns.len() / width;
     let mut result = columns.to_vec();
@@ -6032,15 +6054,26 @@ fn stabilize_surface_biome_cells(
                     }
                     let index = surface_class_index(cell_x + dx, cell_z + dz, width);
                     let column = &result[index];
-                    if column.water || is_protected_intent_biome(&column.biome_id) {
+                    if column.water
+                        || is_protected_intent_biome(&column.biome_id)
+                        || (preserve_surface && is_render_locked_photo_biome(column))
+                    {
                         continue;
                     }
                     if column.biome_id != majority_biome {
-                        result[index] = intent_surface_compatible_replacement(
-                            column,
-                            &majority_biome,
-                            "intent-stabilized-cell",
-                        );
+                        result[index] = if preserve_surface {
+                            intent_biome_only_replacement(
+                                column,
+                                &majority_biome,
+                                "intent-stabilized-cell",
+                            )
+                        } else {
+                            intent_surface_compatible_replacement(
+                                column,
+                                &majority_biome,
+                                "intent-stabilized-cell",
+                            )
+                        };
                     }
                 }
             }
@@ -6052,6 +6085,7 @@ fn stabilize_surface_biome_cells(
 fn stabilize_small_surface_biome_family_components(
     columns: &[EarthSurfaceColumn],
     width: usize,
+    preserve_surface: bool,
 ) -> Vec<EarthSurfaceColumn> {
     let height = columns.len() / width;
     let mut result = columns.to_vec();
@@ -6064,7 +6098,10 @@ fn stabilize_small_surface_biome_family_components(
             continue;
         }
         let seed = &columns[index];
-        if seed.water || is_protected_intent_biome(&seed.biome_id) {
+        if seed.water
+            || is_protected_intent_biome(&seed.biome_id)
+            || (preserve_surface && is_render_locked_photo_biome(seed))
+        {
             visited[index] = true;
             continue;
         }
@@ -6086,6 +6123,7 @@ fn stabilize_small_surface_biome_family_components(
                 current.wrapping_sub(width),
                 z > 0,
                 &family,
+                preserve_surface,
             );
             enqueue_same_intent_family(
                 columns,
@@ -6095,6 +6133,7 @@ fn stabilize_small_surface_biome_family_components(
                 current + width,
                 z < height - 1,
                 &family,
+                preserve_surface,
             );
             enqueue_same_intent_family(
                 columns,
@@ -6104,6 +6143,7 @@ fn stabilize_small_surface_biome_family_components(
                 current.wrapping_sub(1),
                 x > 0,
                 &family,
+                preserve_surface,
             );
             enqueue_same_intent_family(
                 columns,
@@ -6113,6 +6153,7 @@ fn stabilize_small_surface_biome_family_components(
                 current + 1,
                 x < width - 1,
                 &family,
+                preserve_surface,
             );
         }
         if component.len() <= SMALL_BIOME_COMPONENT_MAX {
@@ -6127,10 +6168,15 @@ fn stabilize_small_surface_biome_family_components(
                         ))
                 {
                     for &component_index in &component {
-                        result[component_index] = intent_surface_compatible_replacement(
+                        if preserve_surface
+                            && is_render_locked_photo_biome(&result[component_index])
+                        {
+                            continue;
+                        }
+                        result[component_index] = intent_component_replacement(
                             &result[component_index],
                             &replacement_biome,
-                            "intent-stabilized-component",
+                            preserve_surface,
                         );
                     }
                 }
@@ -6151,12 +6197,16 @@ fn enqueue_same_intent_family(
     index: usize,
     in_bounds: bool,
     family: &str,
+    preserve_surface: bool,
 ) {
     if !in_bounds || visited[index] {
         return;
     }
     let column = &columns[index];
-    if column.water || is_protected_intent_biome(&column.biome_id) {
+    if column.water
+        || is_protected_intent_biome(&column.biome_id)
+        || (preserve_surface && is_render_locked_photo_biome(column))
+    {
         return;
     }
     if intent_biome_family(&column.biome_id) != family {
@@ -6274,6 +6324,17 @@ fn java_string_hash_code(text: &str) -> i32 {
     hash
 }
 
+fn intent_component_replacement(
+    column: &EarthSurfaceColumn,
+    biome: &str,
+    preserve_surface: bool,
+) -> EarthSurfaceColumn {
+    if preserve_surface {
+        return intent_biome_only_replacement(column, biome, "intent-stabilized-component");
+    }
+    intent_surface_compatible_replacement(column, biome, "intent-stabilized-component")
+}
+
 fn intent_surface_compatible_replacement(
     column: &EarthSurfaceColumn,
     biome: &str,
@@ -6286,6 +6347,25 @@ fn intent_surface_compatible_replacement(
         column.water_surface_y,
         top,
         intent_filler_for(top),
+        biome.to_string(),
+        source.to_string(),
+    );
+    replacement.terrain_token_source = column.terrain_token_source;
+    replacement.data_evidence_flags = column.data_evidence_flags;
+    replacement
+}
+
+fn intent_biome_only_replacement(
+    column: &EarthSurfaceColumn,
+    biome: &str,
+    source: &str,
+) -> EarthSurfaceColumn {
+    let mut replacement = EarthSurfaceColumn::new(
+        false,
+        column.ground_surface_y,
+        column.water_surface_y,
+        column.top_block_state_id,
+        column.filler_block_state_id,
         biome.to_string(),
         source.to_string(),
     );
@@ -6341,6 +6421,24 @@ fn is_protected_intent_biome(biome: &str) -> bool {
         || biome.contains("snow")
         || biome.contains("swamp")
         || biome.contains("mangrove")
+}
+
+fn is_render_locked_photo_biome(column: &EarthSurfaceColumn) -> bool {
+    is_tinted_intent_render_surface(column.top_block_state_id)
+        && (column.terrain_token_source == TerrainTokenSource::Export
+            || column.terrain_token_source == TerrainTokenSource::JavaStandardPalette
+            || column.decision_source == "photo-palette")
+}
+
+fn is_tinted_intent_render_surface(top: i32) -> bool {
+    matches!(
+        top,
+        block_state_ids::GRASS_BLOCK
+            | block_state_ids::OAK_LEAVES
+            | block_state_ids::JUNGLE_LEAVES
+            | block_state_ids::DARK_OAK_LEAVES
+            | block_state_ids::SPRUCE_LEAVES
+    )
 }
 
 fn is_snow_intent_biome(biome: &str) -> bool {
@@ -7656,6 +7754,68 @@ mod tests {
             "intent-stabilized-cell"
         );
 
+        let mut photo_cell = filled_surface_columns(
+            4,
+            4,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:forest",
+            ),
+        );
+        photo_cell[surface_class_index(3, 3, 4)] = photo_palette_surface_column(
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:savanna",
+        );
+        let photo_cell_smoothed =
+            stabilize_surface_biome_families_preserving_surfaces(&photo_cell, 4).unwrap();
+        assert_eq!(
+            photo_cell_smoothed[surface_class_index(3, 3, 4)].biome_id,
+            "minecraft:savanna"
+        );
+        assert_eq!(
+            photo_cell_smoothed[surface_class_index(3, 3, 4)].decision_source,
+            "photo-palette"
+        );
+
+        let mut preserve_cell = filled_surface_columns(
+            4,
+            4,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:forest",
+            ),
+        );
+        preserve_cell[surface_class_index(3, 3, 4)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::RED_SAND,
+            block_state_ids::RED_SAND,
+            "minecraft:desert",
+        );
+        let preserve_smoothed =
+            stabilize_surface_biome_families_preserving_surfaces(&preserve_cell, 4).unwrap();
+        let preserved_surface = &preserve_smoothed[surface_class_index(3, 3, 4)];
+        assert_eq!(preserved_surface.biome_id, "minecraft:forest");
+        assert_eq!(
+            preserved_surface.top_block_state_id,
+            block_state_ids::RED_SAND
+        );
+        assert_eq!(
+            preserved_surface.filler_block_state_id,
+            block_state_ids::RED_SAND
+        );
+        assert_eq!(preserved_surface.decision_source, "intent-stabilized-cell");
+
         let mut snow_cell = filled_surface_columns(
             4,
             4,
@@ -7747,6 +7907,38 @@ mod tests {
         assert!(island_smoothed[surface_class_index(3, 3, 8)]
             .decision_source
             .starts_with("intent-stabilized"));
+
+        let mut photo_island = filled_surface_columns(
+            8,
+            8,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+        );
+        for z in 3..=4 {
+            for x in 3..=4 {
+                photo_island[surface_class_index(x, z, 8)] = photo_palette_surface_column(
+                    block_state_ids::GRASS_BLOCK,
+                    block_state_ids::DIRT,
+                    "minecraft:jungle",
+                );
+            }
+        }
+        let photo_island_smoothed =
+            stabilize_surface_biome_families_preserving_surfaces(&photo_island, 8).unwrap();
+        assert_eq!(
+            photo_island_smoothed[surface_class_index(3, 3, 8)].biome_id,
+            "minecraft:jungle"
+        );
+        assert_eq!(
+            photo_island_smoothed[surface_class_index(3, 3, 8)].decision_source,
+            "photo-palette"
+        );
 
         let mut tied_neighbors = filled_surface_columns(5, 5, water_surface_column());
         tied_neighbors[surface_class_index(2, 2, 5)] = surface_column(
@@ -8936,6 +9128,12 @@ mod tests {
 
     fn land_surface_column(top: i32, biome: &str, y: i32) -> EarthSurfaceColumn {
         surface_column(false, y, i32::MIN, top, top, biome)
+    }
+
+    fn photo_palette_surface_column(top: i32, filler: i32, biome: &str) -> EarthSurfaceColumn {
+        surface_column(false, SEA_LEVEL_Y + 4, i32::MIN, top, filler, biome)
+            .with_decision_source("photo-palette")
+            .with_terrain_token_source(TerrainTokenSource::JavaStandardPalette)
     }
 
     fn water_surface_column() -> EarthSurfaceColumn {
