@@ -611,6 +611,8 @@ Bootstrap implementation status on 2026-06-03:
   coverage, and static carrier fallback fixture cases.
 - Rust surface chunk builder bootstrap wires normalized chunk columns through production natural-surface sanitization,
   Java-style dominant default-biome selection, and `SurfaceBiomeCellWriter` application fixture cases.
+- Rust `EarthSurfaceChunkSampler` basic-path bootstrap samples heightmap-backed chunk columns with Java-compatible
+  water decisions, smoothing, coast factors, shaped classification, and coastal cleanup fixture cases.
 - Rust `LandShallowTopoPhotoSampler` bootstrap discovers Java's west/east `land_shallow_topo_*.tif` halves, samples
   topographic colors with Java half-world coordinate mapping, and lets `EarthDataSurfaceMaterialSampler.sample_photo`
   follow Java photo-source preference, coarse evidence caching, and terrain-token attachment rules.

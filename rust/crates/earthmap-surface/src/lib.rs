@@ -182,6 +182,39 @@ pub struct SurfaceChunkBuild {
     pub water_by_local_column: Vec<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceChunkSample {
+    columns: Vec<EarthSurfaceColumn>,
+}
+
+impl SurfaceChunkSample {
+    pub fn new(columns: Vec<EarthSurfaceColumn>) -> Result<Self> {
+        if columns.len() != CHUNK_WIDTH * CHUNK_WIDTH {
+            return Err(SurfaceError::invalid(
+                "columns must contain one entry per chunk column",
+            ));
+        }
+        Ok(Self { columns })
+    }
+
+    pub fn columns(&self) -> &[EarthSurfaceColumn] {
+        &self.columns
+    }
+
+    pub fn column(&self, local_x: i32, local_z: i32) -> Result<&EarthSurfaceColumn> {
+        if local_x < 0
+            || local_x >= CHUNK_WIDTH as i32
+            || local_z < 0
+            || local_z >= CHUNK_WIDTH as i32
+        {
+            return Err(SurfaceError::invalid(format!(
+                "local column outside chunk: {local_x},{local_z}"
+            )));
+        }
+        Ok(&self.columns[(local_z as usize * CHUNK_WIDTH) + local_x as usize])
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerrainTokenSource {
     None,
@@ -4138,6 +4171,35 @@ pub fn build_surface_chunk(
     })
 }
 
+pub fn sample_surface_chunk(
+    chunk_x: i32,
+    chunk_z: i32,
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+) -> Result<SurfaceChunkSample> {
+    sample_surface_chunk_scaled(chunk_x, chunk_z, mapping, sampler, DEFAULT_VERTICAL_SCALE)
+}
+
+pub fn sample_surface_chunk_scaled(
+    chunk_x: i32,
+    chunk_z: i32,
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    vertical_scale: f64,
+) -> Result<SurfaceChunkSample> {
+    sample_surface_chunk_with_elevation_fn(
+        chunk_x,
+        chunk_z,
+        mapping,
+        vertical_scale,
+        |longitude, latitude| {
+            sampler
+                .bilinear_meters(longitude, latitude)
+                .map_err(Into::into)
+        },
+    )
+}
+
 pub fn is_allowed_production_top(block: i32, _biome: &str) -> bool {
     is_allowed_natural_surface_top(block)
 }
@@ -5470,6 +5532,202 @@ fn fill_surface_column(
     Ok(())
 }
 
+const SURFACE_CHUNK_COAST_RADIUS: usize = 64;
+const SURFACE_CHUNK_SMOOTH_RADIUS: i32 = 5;
+const SURFACE_CHUNK_EXTENT: usize = CHUNK_WIDTH + (SURFACE_CHUNK_COAST_RADIUS * 2);
+
+fn sample_surface_chunk_with_elevation_fn<F>(
+    chunk_x: i32,
+    chunk_z: i32,
+    mapping: &EarthScaleMapping,
+    vertical_scale: f64,
+    mut elevation_fn: F,
+) -> Result<SurfaceChunkSample>
+where
+    F: FnMut(f64, f64) -> Result<f64>,
+{
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let mut elevations = vec![0.0; SURFACE_CHUNK_EXTENT * SURFACE_CHUNK_EXTENT];
+    let mut valid = vec![false; SURFACE_CHUNK_EXTENT * SURFACE_CHUNK_EXTENT];
+    for z in 0..SURFACE_CHUNK_EXTENT {
+        for x in 0..SURFACE_CHUNK_EXTENT {
+            let global_block_x = chunk_x
+                .wrapping_mul(CHUNK_WIDTH as i32)
+                .wrapping_add(x as i32)
+                .wrapping_sub(SURFACE_CHUNK_COAST_RADIUS as i32);
+            let global_block_z = chunk_z
+                .wrapping_mul(CHUNK_WIDTH as i32)
+                .wrapping_add(z as i32)
+                .wrapping_sub(SURFACE_CHUNK_COAST_RADIUS as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let index = surface_chunk_extent_index(x, z);
+            if !surface_chunk_map_position_valid(mapping, map_x, map_z) {
+                elevations[index] = 0.0;
+                valid[index] = false;
+                continue;
+            }
+            let longitude = mapping.longitude_for_block_x(map_x)?;
+            let latitude = mapping.latitude_for_block_z(map_z)?;
+            elevations[index] = elevation_fn(longitude, latitude)?;
+            valid[index] = true;
+        }
+    }
+
+    let water_mask = surface_chunk_water_decision_mask(&elevations, &valid);
+    let mut columns = Vec::with_capacity(CHUNK_WIDTH * CHUNK_WIDTH);
+    for local_z in 0..CHUNK_WIDTH {
+        for local_x in 0..CHUNK_WIDTH {
+            let center_x = local_x + SURFACE_CHUNK_COAST_RADIUS;
+            let center_z = local_z + SURFACE_CHUNK_COAST_RADIUS;
+            let global_block_x = chunk_x
+                .wrapping_mul(CHUNK_WIDTH as i32)
+                .wrapping_add(local_x as i32);
+            let global_block_z = chunk_z
+                .wrapping_mul(CHUNK_WIDTH as i32)
+                .wrapping_add(local_z as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
+                0.0
+            } else {
+                mapping.longitude_for_block_x(map_x)?
+            };
+            let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
+                0.0
+            } else {
+                mapping.latitude_for_block_z(map_z)?
+            };
+            let sample_index = surface_chunk_extent_index(center_x, center_z);
+            let smoothed_elevation =
+                surface_chunk_smoothed_elevation(&elevations, &valid, center_x, center_z);
+            let water = water_mask[sample_index];
+            let coast_factor =
+                surface_chunk_coast_factor(&valid, &water_mask, center_x, center_z, water);
+            let column = classify_shaped_surface_scaled(
+                smoothed_elevation,
+                longitude,
+                latitude,
+                water,
+                coast_factor,
+                vertical_scale,
+            )?;
+            columns.push(clean_coastal_surface_column(&column, coast_factor));
+        }
+    }
+    SurfaceChunkSample::new(columns)
+}
+
+fn surface_chunk_smoothed_elevation(
+    elevations: &[f64],
+    valid: &[bool],
+    center_x: usize,
+    center_z: usize,
+) -> f64 {
+    let mut weighted = 0.0;
+    let mut weights = 0.0;
+    for dz in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
+        for dx in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
+            let x = center_x as i32 + dx;
+            let z = center_z as i32 + dz;
+            if x < 0
+                || x >= SURFACE_CHUNK_EXTENT as i32
+                || z < 0
+                || z >= SURFACE_CHUNK_EXTENT as i32
+            {
+                continue;
+            }
+            let index = surface_chunk_extent_index(x as usize, z as usize);
+            if !valid[index] {
+                continue;
+            }
+            let distance_squared = f64::from((dx * dx) + (dz * dz));
+            let weight = 1.0 / (1.0 + distance_squared);
+            weighted += elevations[index] * weight;
+            weights += weight;
+        }
+    }
+    if weights == 0.0 {
+        0.0
+    } else {
+        weighted / weights
+    }
+}
+
+fn surface_chunk_water_decision(raw_elevation: f64, smoothed_elevation: f64) -> bool {
+    if raw_elevation <= -6.0 {
+        return true;
+    }
+    if raw_elevation >= 8.0 {
+        return false;
+    }
+    smoothed_elevation <= 0.0
+}
+
+fn surface_chunk_water_decision_mask(elevations: &[f64], valid: &[bool]) -> Vec<bool> {
+    let mut water_mask = vec![false; SURFACE_CHUNK_EXTENT * SURFACE_CHUNK_EXTENT];
+    for z in 0..SURFACE_CHUNK_EXTENT {
+        for x in 0..SURFACE_CHUNK_EXTENT {
+            let index = surface_chunk_extent_index(x, z);
+            if !valid[index] {
+                continue;
+            }
+            let raw_elevation = elevations[index];
+            let smoothed_elevation =
+                if surface_chunk_requires_smoothed_water_decision(raw_elevation) {
+                    surface_chunk_smoothed_elevation(elevations, valid, x, z)
+                } else {
+                    0.0
+                };
+            water_mask[index] = surface_chunk_water_decision(raw_elevation, smoothed_elevation);
+        }
+    }
+    water_mask
+}
+
+fn surface_chunk_requires_smoothed_water_decision(raw_elevation: f64) -> bool {
+    raw_elevation > -6.0 && raw_elevation < 8.0
+}
+
+fn surface_chunk_coast_factor(
+    valid: &[bool],
+    water_mask: &[bool],
+    center_x: usize,
+    center_z: usize,
+    water: bool,
+) -> f64 {
+    let mut nearest_squared = i32::MAX;
+    let radius = SURFACE_CHUNK_COAST_RADIUS as i32;
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            let x = center_x as i32 + dx;
+            let z = center_z as i32 + dz;
+            let index = surface_chunk_extent_index(x as usize, z as usize);
+            if !valid[index] {
+                continue;
+            }
+            if water_mask[index] == water {
+                continue;
+            }
+            let distance_squared = (dx * dx) + (dz * dz);
+            nearest_squared = nearest_squared.min(distance_squared);
+        }
+    }
+    if nearest_squared == i32::MAX || nearest_squared > radius * radius {
+        return 0.0;
+    }
+    let nearest = f64::from(nearest_squared).sqrt();
+    clamp_unit((f64::from(radius) + 1.0 - nearest) / f64::from(radius))
+}
+
+fn surface_chunk_extent_index(x: usize, z: usize) -> usize {
+    (z * SURFACE_CHUNK_EXTENT) + x
+}
+
+fn surface_chunk_map_position_valid(mapping: &EarthScaleMapping, map_x: i32, map_z: i32) -> bool {
+    map_x >= 0 && map_x < mapping.width_blocks && map_z >= 0 && map_z < mapping.height_blocks
+}
+
 fn top_block_state_id(
     _elevation_meters: f64,
     longitude: f64,
@@ -6486,6 +6744,63 @@ mod tests {
         ];
 
         assert!(build_surface_chunk(0, 0, &columns).is_err());
+    }
+
+    #[test]
+    fn surface_chunk_sampler_water_and_coast_helpers_match_java_contract() {
+        assert!(surface_chunk_water_decision(-6.0, 100.0));
+        assert!(!surface_chunk_water_decision(8.0, -100.0));
+        assert!(surface_chunk_water_decision(0.0, 0.0));
+        assert!(!surface_chunk_water_decision(0.0, 0.1));
+        assert!(surface_chunk_requires_smoothed_water_decision(0.0));
+        assert!(!surface_chunk_requires_smoothed_water_decision(-6.0));
+        assert!(!surface_chunk_requires_smoothed_water_decision(8.0));
+
+        let mut valid = vec![true; SURFACE_CHUNK_EXTENT * SURFACE_CHUNK_EXTENT];
+        let mut water_mask = vec![false; SURFACE_CHUNK_EXTENT * SURFACE_CHUNK_EXTENT];
+        assert_eq!(
+            surface_chunk_coast_factor(&valid, &water_mask, 64, 64, false),
+            0.0
+        );
+        water_mask[surface_chunk_extent_index(65, 64)] = true;
+        assert_eq!(
+            surface_chunk_coast_factor(&valid, &water_mask, 64, 64, false),
+            1.0
+        );
+        valid[surface_chunk_extent_index(65, 64)] = false;
+        assert_eq!(
+            surface_chunk_coast_factor(&valid, &water_mask, 64, 64, false),
+            0.0
+        );
+    }
+
+    #[test]
+    fn surface_chunk_sampler_generates_java_shaped_columns_from_heightmap_closure() {
+        let mapping = EarthScaleMapping::for_denominator(1_000_000, -90.0, 90.0).unwrap();
+        let sample =
+            sample_surface_chunk_with_elevation_fn(0, 0, &mapping, 1.0, |longitude, _latitude| {
+                Ok(if longitude < 90.0 { -20.0 } else { 100.0 })
+            })
+            .unwrap();
+
+        assert_eq!(sample.columns().len(), CHUNK_WIDTH * CHUNK_WIDTH);
+        let water = sample.column(0, 0).unwrap();
+        assert!(water.water);
+        assert_eq!(water.water_surface_y, SEA_LEVEL_Y);
+        assert!(water.ground_surface_y < SEA_LEVEL_Y);
+        let land = sample.column(15, 0).unwrap();
+        assert!(!land.water);
+        assert_eq!(land.water_surface_y, i32::MIN);
+        assert!(land.ground_surface_y > SEA_LEVEL_Y);
+        assert!(sample.column(-1, 0).is_err());
+        assert!(sample_surface_chunk_with_elevation_fn(
+            0,
+            0,
+            &mapping,
+            0.0,
+            |_longitude, _latitude| { Ok(0.0) }
+        )
+        .is_err());
     }
 
     #[test]

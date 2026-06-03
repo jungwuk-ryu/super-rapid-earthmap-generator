@@ -356,6 +356,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.earthSurfaceChunkSamplerBootstrap - EarthSurfaceChunkSampler basic path samples heightmap-backed chunk columns with Java-compatible water decisions, smoothing, coast factors, shaped classification, and coastal cleanup fixture cases."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.earthDataSurfaceMaterialSamplerBootstrap - EarthDataSurfaceMaterialSampler opens TrueMarble plus optional climate, vegetation, ocean-temperature, bathymetry, and slope rasters, then samples Java-compatible quantized land/water SurfaceMaterialSample fixture cases with bounded cache reuse and terrain-token fallback."
     )?;
     writeln!(
