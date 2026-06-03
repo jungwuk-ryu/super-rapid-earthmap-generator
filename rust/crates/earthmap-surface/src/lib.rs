@@ -829,6 +829,92 @@ impl SurfaceMaterialRasterStats {
     }
 }
 
+pub struct MetTerrainVocabulary;
+
+impl MetTerrainVocabulary {
+    pub fn nearest(color: RgbColor) -> MetTerrainMatch {
+        if !color.available {
+            return MetTerrainMatch::unavailable();
+        }
+        let Some(entry_index) = nearest_image_magick_remap(color) else {
+            return MetTerrainMatch::unavailable();
+        };
+        let entry = MET_TERRAIN_ENTRIES[entry_index];
+        MetTerrainMatch::from_entry(entry, met_terrain_distance_squared(color, entry))
+    }
+
+    pub fn exact(color: RgbColor) -> MetTerrainMatch {
+        if !color.available {
+            return MetTerrainMatch::unavailable();
+        }
+        for entry in MET_TERRAIN_ENTRIES {
+            if color.red == entry.red && color.green == entry.green && color.blue == entry.blue {
+                return MetTerrainMatch::from_entry(entry, 0);
+            }
+        }
+        MetTerrainMatch::unavailable()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MetTerrainKind {
+    Vegetated,
+    Sand,
+    RedSand,
+    CoarseDirt,
+    Gravel,
+    Rock,
+    Snow,
+    Wet,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MetTerrainMatch {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+    pub top_block_state_id: i32,
+    pub kind: MetTerrainKind,
+    pub distance_squared: i32,
+}
+
+impl MetTerrainMatch {
+    pub fn unavailable() -> Self {
+        Self {
+            red: 0,
+            green: 0,
+            blue: 0,
+            top_block_state_id: block_state_ids::GRASS_BLOCK,
+            kind: MetTerrainKind::Unknown,
+            distance_squared: i32::MAX,
+        }
+    }
+
+    pub fn confident(self) -> bool {
+        self.distance_squared <= MET_TERRAIN_CONFIDENT_DISTANCE_SQUARED
+    }
+
+    pub fn color(self) -> RgbColor {
+        if self.kind == MetTerrainKind::Unknown {
+            RgbColor::unavailable()
+        } else {
+            RgbColor::of(self.red, self.green, self.blue)
+        }
+    }
+
+    fn from_entry(entry: MetTerrainEntry, distance_squared: i32) -> Self {
+        Self {
+            red: entry.red,
+            green: entry.green,
+            blue: entry.blue,
+            top_block_state_id: entry.top_block_state_id,
+            kind: entry.kind,
+            distance_squared,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceQuantizedCell {
     pub key: i64,
@@ -916,6 +1002,366 @@ pub fn quantized_cell(longitude: f64, latitude: f64, cell_degrees: f64) -> Surfa
         center_longitude,
         center_latitude,
     }
+}
+
+const MET_TERRAIN_CONFIDENT_DISTANCE_SQUARED: i32 = 2_200;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetTerrainEntry {
+    red: u8,
+    green: u8,
+    blue: u8,
+    top_block_state_id: i32,
+    kind: MetTerrainKind,
+}
+
+impl MetTerrainEntry {
+    const fn new(
+        red: u8,
+        green: u8,
+        blue: u8,
+        top_block_state_id: i32,
+        kind: MetTerrainKind,
+    ) -> Self {
+        Self {
+            red,
+            green,
+            blue,
+            top_block_state_id,
+            kind,
+        }
+    }
+}
+
+const MET_TERRAIN_ENTRIES: [MetTerrainEntry; 42] = [
+    MetTerrainEntry::new(0, 0, 0, block_state_ids::PODZOL, MetTerrainKind::Vegetated),
+    MetTerrainEntry::new(20, 20, 20, block_state_ids::MUD, MetTerrainKind::Wet),
+    MetTerrainEntry::new(
+        50,
+        60,
+        30,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        0,
+        50,
+        0,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        75,
+        85,
+        60,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        55,
+        70,
+        50,
+        block_state_ids::MOSS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        50,
+        150,
+        50,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        50,
+        200,
+        50,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        95,
+        100,
+        75,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        100,
+        140,
+        110,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        140,
+        150,
+        110,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        155,
+        160,
+        110,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(64, 64, 64, block_state_ids::STONE, MetTerrainKind::Rock),
+    MetTerrainEntry::new(
+        163,
+        142,
+        232,
+        block_state_ids::MYCELIUM,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        192,
+        192,
+        192,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+    MetTerrainEntry::new(
+        100,
+        80,
+        50,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        100,
+        85,
+        60,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        100,
+        90,
+        75,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(
+        255,
+        255,
+        220,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+    MetTerrainEntry::new(255, 200, 128, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(255, 200, 64, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(255, 255, 190, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(230, 205, 160, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(
+        167,
+        146,
+        103,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(166, 152, 126, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(173, 143, 115, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(155, 127, 103, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(164, 135, 91, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(
+        158,
+        144,
+        117,
+        block_state_ids::GRAVEL,
+        MetTerrainKind::Gravel,
+    ),
+    MetTerrainEntry::new(
+        149,
+        134,
+        103,
+        block_state_ids::GRASS_BLOCK,
+        MetTerrainKind::Vegetated,
+    ),
+    MetTerrainEntry::new(190, 150, 120, block_state_ids::SAND, MetTerrainKind::Sand),
+    MetTerrainEntry::new(
+        190,
+        130,
+        80,
+        block_state_ids::RED_SAND,
+        MetTerrainKind::RedSand,
+    ),
+    MetTerrainEntry::new(
+        170,
+        105,
+        60,
+        block_state_ids::RED_SAND,
+        MetTerrainKind::RedSand,
+    ),
+    MetTerrainEntry::new(
+        255,
+        0,
+        0,
+        block_state_ids::RED_SAND,
+        MetTerrainKind::RedSand,
+    ),
+    MetTerrainEntry::new(
+        128,
+        50,
+        0,
+        block_state_ids::RED_SAND,
+        MetTerrainKind::RedSand,
+    ),
+    MetTerrainEntry::new(
+        140,
+        80,
+        50,
+        block_state_ids::COARSE_DIRT,
+        MetTerrainKind::CoarseDirt,
+    ),
+    MetTerrainEntry::new(
+        255,
+        255,
+        255,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+    MetTerrainEntry::new(
+        110,
+        150,
+        170,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+    MetTerrainEntry::new(
+        25,
+        50,
+        110,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+    MetTerrainEntry::new(
+        230,
+        255,
+        230,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+    MetTerrainEntry::new(
+        240,
+        255,
+        240,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+    MetTerrainEntry::new(
+        250,
+        255,
+        250,
+        block_state_ids::SNOW_BLOCK,
+        MetTerrainKind::Snow,
+    ),
+];
+
+#[derive(Clone, Debug)]
+struct MetOctreeNode {
+    parent: Option<usize>,
+    children: [Option<usize>; 8],
+    entry: Option<usize>,
+}
+
+impl MetOctreeNode {
+    fn new(parent: Option<usize>) -> Self {
+        Self {
+            parent,
+            children: [None; 8],
+            entry: None,
+        }
+    }
+}
+
+fn nearest_image_magick_remap(color: RgbColor) -> Option<usize> {
+    let nodes = build_met_remap_tree();
+    let rgb = met_rgb(color);
+    let mut node = 0usize;
+    for bit in (1..=7).rev() {
+        let child = nodes[node].children[met_node_id(rgb, bit)];
+        let Some(child) = child else {
+            break;
+        };
+        node = child;
+    }
+    let search_root = nodes[node].parent.unwrap_or(node);
+    let mut closest = MetClosestMatch {
+        entry: None,
+        distance_squared: i32::MAX,
+    };
+    find_met_closest(&nodes, search_root, color, &mut closest);
+    closest.entry
+}
+
+fn build_met_remap_tree() -> Vec<MetOctreeNode> {
+    let mut nodes = vec![MetOctreeNode::new(None)];
+    for (entry_index, entry) in MET_TERRAIN_ENTRIES.iter().enumerate() {
+        let rgb = met_entry_rgb(*entry);
+        let mut node = 0usize;
+        for bit in (0..=7).rev() {
+            let id = met_node_id(rgb, bit);
+            let child = if let Some(child) = nodes[node].children[id] {
+                child
+            } else {
+                let child = nodes.len();
+                nodes.push(MetOctreeNode::new(Some(node)));
+                nodes[node].children[id] = Some(child);
+                child
+            };
+            node = child;
+        }
+        nodes[node].entry = Some(entry_index);
+    }
+    nodes
+}
+
+fn find_met_closest(
+    nodes: &[MetOctreeNode],
+    node_index: usize,
+    color: RgbColor,
+    closest: &mut MetClosestMatch,
+) {
+    for child in nodes[node_index].children.into_iter().flatten() {
+        find_met_closest(nodes, child, color, closest);
+    }
+    let Some(entry_index) = nodes[node_index].entry else {
+        return;
+    };
+    let distance_squared = met_terrain_distance_squared(color, MET_TERRAIN_ENTRIES[entry_index]);
+    if distance_squared <= closest.distance_squared {
+        closest.entry = Some(entry_index);
+        closest.distance_squared = distance_squared;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetClosestMatch {
+    entry: Option<usize>,
+    distance_squared: i32,
+}
+
+fn met_node_id(rgb: i32, bit: i32) -> usize {
+    let red = (rgb >> (16 + bit)) & 1;
+    let green = ((rgb >> (8 + bit)) & 1) << 1;
+    let blue = ((rgb >> bit) & 1) << 2;
+    (red | green | blue) as usize
+}
+
+fn met_rgb(color: RgbColor) -> i32 {
+    (i32::from(color.red) << 16) | (i32::from(color.green) << 8) | i32::from(color.blue)
+}
+
+fn met_entry_rgb(entry: MetTerrainEntry) -> i32 {
+    (i32::from(entry.red) << 16) | (i32::from(entry.green) << 8) | i32::from(entry.blue)
+}
+
+fn met_terrain_distance_squared(color: RgbColor, entry: MetTerrainEntry) -> i32 {
+    let red = i32::from(color.red) - i32::from(entry.red);
+    let green = i32::from(color.green) - i32::from(entry.green);
+    let blue = i32::from(color.blue) - i32::from(entry.blue);
+    (red * red) + (green * green) + (blue * blue)
 }
 
 pub fn generate_height_only_region(
@@ -2291,6 +2737,41 @@ mod tests {
                 sample_averaged_requests: 12,
             }
         );
+    }
+
+    #[test]
+    fn met_terrain_vocabulary_matches_java_exact_and_remap_contracts() {
+        assert_eq!(
+            MetTerrainVocabulary::exact(RgbColor::unavailable()),
+            MetTerrainMatch::unavailable()
+        );
+        assert_eq!(
+            MetTerrainVocabulary::nearest(RgbColor::unavailable()),
+            MetTerrainMatch::unavailable()
+        );
+
+        let exact_sand = MetTerrainVocabulary::exact(RgbColor::of(255, 200, 64));
+        assert_eq!(exact_sand.kind, MetTerrainKind::Sand);
+        assert_eq!(exact_sand.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(exact_sand.distance_squared, 0);
+        assert!(exact_sand.confident());
+        assert_eq!(exact_sand.color(), RgbColor::of(255, 200, 64));
+
+        let near_sand = MetTerrainVocabulary::nearest(RgbColor::of(254, 201, 63));
+        assert_eq!(near_sand.kind, MetTerrainKind::Sand);
+        assert_eq!(near_sand.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(near_sand.distance_squared, 3);
+        assert_eq!(near_sand.color(), RgbColor::of(255, 200, 64));
+        assert!(near_sand.confident());
+
+        let near_red_sand = MetTerrainVocabulary::nearest(RgbColor::of(180, 120, 70));
+        assert_eq!(near_red_sand.kind, MetTerrainKind::RedSand);
+        assert_eq!(near_red_sand.top_block_state_id, block_state_ids::RED_SAND);
+
+        let exact_unknown = MetTerrainVocabulary::exact(RgbColor::of(1, 2, 3));
+        assert_eq!(exact_unknown.kind, MetTerrainKind::Unknown);
+        assert!(!exact_unknown.confident());
+        assert_eq!(exact_unknown.color(), RgbColor::unavailable());
     }
 
     #[test]

@@ -589,6 +589,8 @@ Bootstrap implementation status on 2026-06-03:
   Java-compatible nearest sampling, coordinate flooring, and NoData handling for synthetic Classic TIFF fixtures.
 - Rust EarthData sampler helper bootstrap matches Java fixture cases for raster stat deltas, slope permille
   normalization, cell-degree clamps, longitude wrapping, and quantized cache keys.
+- Rust `MetTerrainVocabulary` bootstrap ports Java's exact lookup and ImageMagick-style octree nearest remap for
+  standard terrain-token synthesis fixture cases.
 - Remaining Phase 5 work: port EarthData surface material raster sampling, photo solver, smoothing/coastal policies,
   OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 

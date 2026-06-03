@@ -338,6 +338,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.earthDataSamplerHelperBootstrap - EarthData sampler helper math for raster stat deltas, slope permille normalization, cell-degree clamps, longitude wrapping, and quantized cache keys matches Java fixture cases."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.metTerrainVocabularyBootstrap - MetTerrainVocabulary exact and ImageMagick-style octree nearest remap contracts are ported for Java standard terrain-token synthesis fixture cases."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",
