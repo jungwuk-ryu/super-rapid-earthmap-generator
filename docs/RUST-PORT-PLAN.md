@@ -666,6 +666,8 @@ Bootstrap implementation status on 2026-06-03:
   non-strong-dry-core coordinates before broader temperate/dry fallbacks.
 - Rust steppe climate intent now follows Java's dry-savanna threshold gates and Java-shaped temperate grassland biome
   selection instead of treating all low-latitude steppe as dry savanna.
+- Rust dry-savanna score intent now mirrors Java's `drySavannaScore >= 0.35 && !ecoregionDryCore` compiler gate before
+  desert and broader environment fallbacks.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
   remaining dry-savanna/desert-edge intent predicates, ecoregion transition, broader compiler-backed intent, and
   environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface

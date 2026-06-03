@@ -1995,6 +1995,28 @@ fn classify_surface_material_by_semantic_intent(
         ));
     }
 
+    if dry_savanna_score >= 0.35
+        && !is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
+    {
+        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
+            patch_noise,
+            fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
+        );
+        return Some(surface_material_with_surface(
+            base,
+            top,
+            block_state_ids::DIRT,
+            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise),
+        ));
+    }
+
     if is_desert_climate(climate) {
         if (tree_cover >= 0.12 || herb_cover >= 0.35 || shrub_cover >= 0.35 || green_like)
             && (savanna_like || is_sahel_latitude(latitude) || sahel_score >= 0.18)
@@ -13085,6 +13107,46 @@ mod tests {
         assert_eq!(low_steppe.filler_block_state_id, block_state_ids::DIRT);
         assert_eq!(low_steppe.biome_id, "minecraft:sunflower_plains");
         assert_eq!(low_steppe.decision_source, "intent");
+
+        let dry_savanna_score_only = SurfaceMaterialSample::color_only(RgbColor::of(126, 123, 70));
+        let (dry_score_longitude, dry_score_latitude) = (-180..=180)
+            .flat_map(|longitude| (-35..=35).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                !is_sahel_latitude(latitude)
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) >= 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+            })
+            .expect("test fixture should find a standalone dry-savanna-score coordinate");
+        let dry_score_savanna = apply_test_surface_material_sample(
+            &base_land,
+            dry_savanna_score_only,
+            340.0,
+            f64::from(dry_score_longitude),
+            f64::from(dry_score_latitude),
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            dry_score_savanna.top_block_state_id,
+            block_state_ids::GRASS_BLOCK | block_state_ids::COARSE_DIRT
+        ));
+        assert_eq!(
+            dry_score_savanna.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert!(matches!(
+            dry_score_savanna.biome_id.as_str(),
+            "minecraft:savanna"
+                | "minecraft:savanna_plateau"
+                | "minecraft:windswept_savanna"
+                | "minecraft:plains"
+                | "minecraft:sunflower_plains"
+        ));
+        assert_eq!(dry_score_savanna.decision_source, "intent");
 
         let temperate_steppe = SurfaceMaterialSample::land(
             RgbColor::of(134, 126, 82),
