@@ -348,6 +348,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.surfaceBiomeCellWriterBootstrap - SurfaceBiomeCellWriter ports Java render-aware 4x4 biome cell selection, vertical surface-band coverage, and static carrier fallback fixture contracts."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.earthDataSurfaceMaterialSamplerBootstrap - EarthDataSurfaceMaterialSampler opens TrueMarble plus optional climate, vegetation, ocean-temperature, bathymetry, and slope rasters, then samples Java-compatible quantized land/water SurfaceMaterialSample fixture cases with bounded cache reuse and terrain-token fallback."
     )?;
     writeln!(

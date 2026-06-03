@@ -14,7 +14,7 @@ use earthmap_geo::{
     HeightmapScalarSampler, RgbColor, VrtRgbMosaicReader,
 };
 use earthmap_minecraft::block_state_ids;
-use earthmap_minecraft::chunk_model::{ChunkModel, CHUNK_WIDTH};
+use earthmap_minecraft::chunk_model::{ChunkModel, BIOME_CELL_WIDTH, CHUNK_WIDTH};
 use earthmap_minecraft::{chunk_nbt_encoder, level_dat_template, MinecraftError};
 use earthmap_region::{ChunkLocalPos, RegionError};
 use quick_xml::events::Event;
@@ -4638,6 +4638,554 @@ fn lower_surface_biome(biome: &str) -> String {
     biome.to_ascii_lowercase()
 }
 
+const SURFACE_BIOME_BELOW_PADDING: i32 = 4;
+const SURFACE_BIOME_ABOVE_PADDING: i32 = 12;
+const STATIC_CARRIER_MIN_IMPROVEMENT: i64 = 900;
+const STATIC_CARRIER_MIN_Y: i32 = SEA_LEVEL_Y + 5;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfaceBiomeCell {
+    biome: String,
+    min_y: i32,
+    max_y: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StaticCarrier {
+    block: i32,
+    error: i64,
+}
+
+pub fn apply_surface_biome_cells(
+    chunk: &mut ChunkModel,
+    biome_by_local_column: &[String],
+    min_y_by_local_column: &[i32],
+    max_y_by_local_column: &[i32],
+    chunk_default_biome: &str,
+) -> Result<()> {
+    let expected_columns = CHUNK_WIDTH * CHUNK_WIDTH;
+    if biome_by_local_column.len() != expected_columns
+        || min_y_by_local_column.len() != expected_columns
+        || max_y_by_local_column.len() != expected_columns
+    {
+        return Err(SurfaceError::invalid(
+            "biome arrays must have one entry per chunk column",
+        ));
+    }
+    for cell_z in 0..BIOME_CELL_WIDTH {
+        for cell_x in 0..BIOME_CELL_WIDTH {
+            let cell = render_aware_surface_biome_cell(
+                chunk,
+                biome_by_local_column,
+                min_y_by_local_column,
+                max_y_by_local_column,
+                cell_x,
+                cell_z,
+            )?;
+            apply_static_carrier_fallbacks(
+                chunk,
+                biome_by_local_column,
+                min_y_by_local_column,
+                cell_x,
+                cell_z,
+                &cell.biome,
+            )?;
+            if cell.biome == chunk_default_biome {
+                continue;
+            }
+            let cell_origin_x = (cell_x * BIOME_CELL_WIDTH) as i32;
+            let cell_origin_z = (cell_z * BIOME_CELL_WIDTH) as i32;
+            let min_y = align_down_surface_biome_y(clamp_chunk_y(
+                chunk,
+                cell.min_y - SURFACE_BIOME_BELOW_PADDING,
+            ));
+            let max_y = align_down_surface_biome_y(clamp_chunk_y(
+                chunk,
+                cell.max_y + SURFACE_BIOME_ABOVE_PADDING,
+            ));
+            let mut y = min_y;
+            while y <= max_y {
+                chunk.set_biome_id_at(cell_origin_x, y, cell_origin_z, cell.biome.clone())?;
+                y += BIOME_CELL_WIDTH as i32;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn render_aware_surface_biome_cell(
+    chunk: &ChunkModel,
+    biome_by_local_column: &[String],
+    min_y_by_local_column: &[i32],
+    max_y_by_local_column: &[i32],
+    cell_x: usize,
+    cell_z: usize,
+) -> Result<SurfaceBiomeCell> {
+    let mut counts = BTreeMap::<String, i32>::new();
+    let mut min_y = i32::MAX;
+    let mut max_y = i32::MIN;
+    for dz in 0..BIOME_CELL_WIDTH {
+        for dx in 0..BIOME_CELL_WIDTH {
+            let local_x = (cell_x * BIOME_CELL_WIDTH) + dx;
+            let local_z = (cell_z * BIOME_CELL_WIDTH) + dz;
+            let column_index = (local_z * CHUNK_WIDTH) + local_x;
+            *counts
+                .entry(biome_by_local_column[column_index].clone())
+                .or_insert(0) += 1;
+            min_y = min_y.min(min_y_by_local_column[column_index]);
+            max_y = max_y.max(max_y_by_local_column[column_index]);
+        }
+    }
+    Ok(SurfaceBiomeCell {
+        biome: best_render_surface_biome(
+            chunk,
+            biome_by_local_column,
+            min_y_by_local_column,
+            &counts,
+            cell_x,
+            cell_z,
+        )?,
+        min_y,
+        max_y,
+    })
+}
+
+fn best_render_surface_biome(
+    chunk: &ChunkModel,
+    biome_by_local_column: &[String],
+    min_y_by_local_column: &[i32],
+    counts: &BTreeMap<String, i32>,
+    cell_x: usize,
+    cell_z: usize,
+) -> Result<String> {
+    let dominant = dominant_surface_biome(counts);
+    let mut best = dominant.clone();
+    let mut best_error = i64::MAX;
+    let mut best_count = -1;
+    for (candidate, &count) in counts {
+        let error = render_error_for_surface_biome_cell(
+            chunk,
+            biome_by_local_column,
+            min_y_by_local_column,
+            cell_x,
+            cell_z,
+            candidate,
+        )?;
+        if error < best_error
+            || (error == best_error && count > best_count)
+            || (error == best_error && count == best_count && candidate == &dominant)
+        {
+            best = candidate.clone();
+            best_error = error;
+            best_count = count;
+        }
+    }
+    Ok(best)
+}
+
+fn render_error_for_surface_biome_cell(
+    chunk: &ChunkModel,
+    biome_by_local_column: &[String],
+    min_y_by_local_column: &[i32],
+    cell_x: usize,
+    cell_z: usize,
+    candidate_biome: &str,
+) -> Result<i64> {
+    let mut error = 0_i64;
+    for dz in 0..BIOME_CELL_WIDTH {
+        for dx in 0..BIOME_CELL_WIDTH {
+            let local_x = (cell_x * BIOME_CELL_WIDTH) + dx;
+            let local_z = (cell_z * BIOME_CELL_WIDTH) + dz;
+            let column_index = (local_z * CHUNK_WIDTH) + local_x;
+            let top = chunk.get_block_state_id(
+                local_x as i32,
+                min_y_by_local_column[column_index],
+                local_z as i32,
+            )?;
+            let intended = render_surface_color(top, Some(&biome_by_local_column[column_index]));
+            let actual = render_surface_color(top, Some(candidate_biome));
+            error += squared_rgb_distance(actual, intended);
+        }
+    }
+    Ok(error)
+}
+
+fn apply_static_carrier_fallbacks(
+    chunk: &mut ChunkModel,
+    biome_by_local_column: &[String],
+    min_y_by_local_column: &[i32],
+    cell_x: usize,
+    cell_z: usize,
+    cell_biome: &str,
+) -> Result<()> {
+    for dz in 0..BIOME_CELL_WIDTH {
+        for dx in 0..BIOME_CELL_WIDTH {
+            let local_x = (cell_x * BIOME_CELL_WIDTH) + dx;
+            let local_z = (cell_z * BIOME_CELL_WIDTH) + dz;
+            let column_index = (local_z * CHUNK_WIDTH) + local_x;
+            let y = min_y_by_local_column[column_index];
+            let mut top = chunk.get_block_state_id(local_x as i32, y, local_z as i32)?;
+            let column_biome = &biome_by_local_column[column_index];
+            if !is_allowed_production_top(top, column_biome) {
+                top = production_surface_top(top, column_biome);
+                chunk.set_block_state_id(local_x as i32, y, local_z as i32, top)?;
+            }
+            if y < STATIC_CARRIER_MIN_Y || !is_tinted_vegetation_block(top) {
+                continue;
+            }
+            let intended_color = render_surface_color(top, Some(column_biome));
+            let tinted_error =
+                replacement_score(render_surface_color(top, Some(cell_biome)), intended_color);
+            let carrier = nearest_static_carrier(intended_color, cell_biome);
+            if is_sand_like_surface(carrier.block) && !is_naturally_sandy_biome(column_biome) {
+                continue;
+            }
+            if carrier.block >= 0 && carrier.error + STATIC_CARRIER_MIN_IMPROVEMENT < tinted_error {
+                chunk.set_block_state_id(local_x as i32, y, local_z as i32, carrier.block)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn nearest_static_carrier(target_color: i32, biome: &str) -> StaticCarrier {
+    let mut best = StaticCarrier {
+        block: -1,
+        error: i64::MAX,
+    };
+    for &block in STATIC_CARRIER_BLOCKS {
+        if !is_allowed_production_top(block, biome) {
+            continue;
+        }
+        let error = replacement_score(render_surface_color(block, None), target_color);
+        if error < best.error {
+            best = StaticCarrier { block, error };
+        }
+    }
+    best
+}
+
+fn dominant_surface_biome(counts: &BTreeMap<String, i32>) -> String {
+    let mut dominant = String::new();
+    let mut max_count = -1;
+    for (biome, &count) in counts {
+        if count > max_count {
+            dominant = biome.clone();
+            max_count = count;
+        }
+    }
+    dominant
+}
+
+fn clamp_chunk_y(chunk: &ChunkModel, y: i32) -> i32 {
+    y.clamp(
+        chunk.dimension().min_y(),
+        chunk.dimension().max_y_inclusive(),
+    )
+}
+
+fn align_down_surface_biome_y(y: i32) -> i32 {
+    y.div_euclid(BIOME_CELL_WIDTH as i32) * BIOME_CELL_WIDTH as i32
+}
+
+const STATIC_CARRIER_BLOCKS: &[i32] = &[
+    block_state_ids::GREEN_TERRACOTTA,
+    block_state_ids::LIME_TERRACOTTA,
+    block_state_ids::COARSE_DIRT,
+    block_state_ids::ROOTED_DIRT,
+    block_state_ids::PACKED_MUD,
+    block_state_ids::MUD,
+    block_state_ids::MYCELIUM,
+    block_state_ids::PODZOL,
+    block_state_ids::BLACK_TERRACOTTA,
+    block_state_ids::GRAY_TERRACOTTA,
+    block_state_ids::DEEPSLATE,
+    block_state_ids::TUFF,
+    block_state_ids::STONE,
+    block_state_ids::ANDESITE,
+    block_state_ids::GRAVEL,
+    block_state_ids::CYAN_TERRACOTTA,
+    block_state_ids::TERRACOTTA,
+    block_state_ids::BROWN_TERRACOTTA,
+    block_state_ids::YELLOW_TERRACOTTA,
+    block_state_ids::ORANGE_TERRACOTTA,
+    block_state_ids::RED_TERRACOTTA,
+    block_state_ids::SAND,
+    block_state_ids::SANDSTONE,
+    block_state_ids::RED_SAND,
+    block_state_ids::WHITE_TERRACOTTA,
+    block_state_ids::LIGHT_GRAY_TERRACOTTA,
+    block_state_ids::CALCITE,
+    block_state_ids::BONE_BLOCK,
+    block_state_ids::QUARTZ_BLOCK,
+    block_state_ids::END_STONE,
+    block_state_ids::END_STONE_BRICKS,
+    block_state_ids::SMOOTH_SANDSTONE,
+    block_state_ids::CUT_SANDSTONE,
+    block_state_ids::CHISELED_SANDSTONE,
+    block_state_ids::SMOOTH_RED_SANDSTONE,
+    block_state_ids::CUT_RED_SANDSTONE,
+    block_state_ids::CHISELED_RED_SANDSTONE,
+    block_state_ids::MUD_BRICKS,
+    block_state_ids::DRIPSTONE_BLOCK,
+    block_state_ids::SNOW_BLOCK,
+];
+
+fn render_surface_color(block: i32, biome: Option<&str>) -> i32 {
+    rendered_surface_color_for_block(block, biome, 0)
+}
+
+fn rendered_surface_color_for_block(block: i32, biome: Option<&str>, fallback_rgb: i32) -> i32 {
+    if block == block_state_ids::GRASS_BLOCK {
+        return grass_render_color(biome);
+    }
+    if is_leaf_block(block) {
+        return leaf_render_color(block, biome);
+    }
+    match block {
+        block_state_ids::DIRT => rgb(115, 82, 48),
+        block_state_ids::COARSE_DIRT => rgb(112, 92, 58),
+        block_state_ids::ROOTED_DIRT => rgb(123, 91, 57),
+        block_state_ids::PODZOL => rgb(94, 64, 36),
+        block_state_ids::MOSS_BLOCK => rgb(75, 112, 41),
+        block_state_ids::MYCELIUM => rgb(111, 99, 85),
+        block_state_ids::MUD => rgb(72, 64, 54),
+        block_state_ids::PACKED_MUD => rgb(142, 106, 79),
+        block_state_ids::SAND => rgb(218, 202, 142),
+        block_state_ids::RED_SAND => rgb(181, 97, 45),
+        block_state_ids::SANDSTONE => rgb(213, 191, 121),
+        block_state_ids::END_STONE => rgb(221, 214, 164),
+        block_state_ids::END_STONE_BRICKS => rgb(216, 207, 163),
+        block_state_ids::SMOOTH_SANDSTONE => rgb(216, 195, 137),
+        block_state_ids::CUT_SANDSTONE => rgb(214, 190, 121),
+        block_state_ids::CHISELED_SANDSTONE => rgb(215, 192, 129),
+        block_state_ids::SMOOTH_RED_SANDSTONE => rgb(181, 101, 57),
+        block_state_ids::CUT_RED_SANDSTONE => rgb(166, 91, 50),
+        block_state_ids::CHISELED_RED_SANDSTONE => rgb(179, 98, 54),
+        block_state_ids::MUD_BRICKS => rgb(137, 107, 78),
+        block_state_ids::DRIPSTONE_BLOCK => rgb(138, 106, 89),
+        block_state_ids::GRAVEL => rgb(112, 112, 106),
+        block_state_ids::CLAY => rgb(145, 158, 160),
+        block_state_ids::STONE => rgb(118, 122, 118),
+        block_state_ids::DEEPSLATE => rgb(79, 79, 82),
+        block_state_ids::TUFF => rgb(108, 109, 103),
+        block_state_ids::ANDESITE => rgb(136, 136, 136),
+        block_state_ids::GRANITE => rgb(149, 103, 85),
+        block_state_ids::DIORITE => rgb(188, 188, 182),
+        block_state_ids::TERRACOTTA => rgb(154, 102, 76),
+        block_state_ids::ORANGE_TERRACOTTA => rgb(184, 92, 42),
+        block_state_ids::RED_TERRACOTTA => rgb(143, 61, 47),
+        block_state_ids::BROWN_TERRACOTTA => rgb(104, 66, 48),
+        block_state_ids::YELLOW_TERRACOTTA => rgb(186, 133, 36),
+        block_state_ids::WHITE_TERRACOTTA => rgb(210, 178, 161),
+        block_state_ids::LIGHT_GRAY_TERRACOTTA => rgb(135, 107, 98),
+        block_state_ids::GRAY_TERRACOTTA => rgb(57, 41, 35),
+        block_state_ids::BLACK_TERRACOTTA => rgb(37, 23, 16),
+        block_state_ids::GREEN_TERRACOTTA => rgb(76, 83, 42),
+        block_state_ids::LIME_TERRACOTTA => rgb(104, 117, 53),
+        block_state_ids::CYAN_TERRACOTTA => rgb(86, 91, 91),
+        block_state_ids::BLACK_CONCRETE => rgb(8, 10, 15),
+        block_state_ids::SNOW_BLOCK => rgb(232, 238, 236),
+        block_state_ids::QUARTZ_BLOCK => rgb(236, 229, 220),
+        block_state_ids::BONE_BLOCK => rgb(229, 224, 195),
+        block_state_ids::CALCITE => rgb(224, 220, 204),
+        _ => fallback_rgb,
+    }
+}
+
+fn is_tinted_vegetation_block(block: i32) -> bool {
+    block == block_state_ids::GRASS_BLOCK || is_leaf_block(block)
+}
+
+fn is_leaf_block(block: i32) -> bool {
+    matches!(
+        block,
+        block_state_ids::OAK_LEAVES
+            | block_state_ids::JUNGLE_LEAVES
+            | block_state_ids::DARK_OAK_LEAVES
+            | block_state_ids::SPRUCE_LEAVES
+    )
+}
+
+fn grass_render_color(biome: Option<&str>) -> i32 {
+    let Some(biome) = biome else {
+        return rgb(99, 139, 63);
+    };
+    if biome.contains("sparse_jungle") {
+        return rgb(72, 130, 54);
+    }
+    if biome.contains("bamboo_jungle") {
+        return rgb(54, 136, 48);
+    }
+    if biome.contains("jungle") {
+        return rgb(45, 118, 45);
+    }
+    if biome.contains("meadow") {
+        return rgb(119, 151, 82);
+    }
+    if biome.contains("windswept_savanna") {
+        return rgb(135, 141, 75);
+    }
+    if biome.contains("savanna") {
+        return rgb(151, 153, 77);
+    }
+    if biome.contains("dark_forest") {
+        return rgb(42, 82, 45);
+    }
+    if biome.contains("flower_forest") {
+        return rgb(76, 135, 62);
+    }
+    if biome.contains("forest") {
+        return rgb(64, 124, 54);
+    }
+    if biome.contains("sunflower_plains") {
+        return rgb(117, 153, 68);
+    }
+    if biome.contains("taiga") {
+        return rgb(88, 120, 92);
+    }
+    if biome.contains("swamp") {
+        return rgb(73, 101, 56);
+    }
+    if biome.contains("snowy") {
+        return rgb(157, 179, 145);
+    }
+    rgb(100, 146, 67)
+}
+
+fn leaf_render_color(block: i32, biome: Option<&str>) -> i32 {
+    let Some(biome) = biome else {
+        if block == block_state_ids::DARK_OAK_LEAVES {
+            return rgb(26, 58, 28);
+        }
+        if block == block_state_ids::SPRUCE_LEAVES {
+            return rgb(55, 82, 49);
+        }
+        return if block == block_state_ids::JUNGLE_LEAVES {
+            rgb(35, 98, 37)
+        } else {
+            rgb(48, 89, 43)
+        };
+    };
+    if block == block_state_ids::DARK_OAK_LEAVES {
+        if biome.contains("savanna") {
+            return rgb(72, 80, 38);
+        }
+        return rgb(25, 58, 28);
+    }
+    if block == block_state_ids::SPRUCE_LEAVES {
+        if biome.contains("taiga") || biome.contains("snow") {
+            return rgb(50, 76, 53);
+        }
+        return rgb(55, 82, 49);
+    }
+    if biome.contains("jungle") {
+        return if block == block_state_ids::JUNGLE_LEAVES {
+            rgb(30, 92, 34)
+        } else {
+            rgb(38, 91, 39)
+        };
+    }
+    if biome.contains("dark_forest") {
+        return rgb(25, 58, 28);
+    }
+    if biome.contains("forest") {
+        return rgb(38, 86, 38);
+    }
+    if biome.contains("taiga") {
+        return rgb(58, 86, 62);
+    }
+    if biome.contains("swamp") {
+        return rgb(44, 70, 32);
+    }
+    if biome.contains("savanna") {
+        return rgb(92, 96, 45);
+    }
+    if block == block_state_ids::JUNGLE_LEAVES {
+        rgb(35, 98, 37)
+    } else {
+        rgb(48, 89, 43)
+    }
+}
+
+fn squared_rgb_distance(left: i32, right: i32) -> i64 {
+    let red = ((left >> 16) & 0xff) - ((right >> 16) & 0xff);
+    let green = ((left >> 8) & 0xff) - ((right >> 8) & 0xff);
+    let blue = (left & 0xff) - (right & 0xff);
+    i64::from((red * red) + (green * green) + (blue * blue))
+}
+
+fn replacement_score(actual_color: i32, target_color: i32) -> i64 {
+    let error = squared_rgb_distance(actual_color, target_color);
+    if is_gray_olive_tint_target(target_color) {
+        let luma_delta = luma10000(actual_color) - luma10000(target_color);
+        return error + (i64::from(luma_delta) * i64::from(luma_delta) * 12 / 100_000_000);
+    }
+    if is_dark_green_tint_target(target_color) {
+        let luma_delta = luma10000(actual_color) - luma10000(target_color);
+        return error
+            + (i64::from(luma_delta) * i64::from(luma_delta) * 8 / 100_000_000)
+            + dark_green_hue_penalty(actual_color);
+    }
+    error
+}
+
+fn is_naturally_sandy_biome(biome: &str) -> bool {
+    if biome.trim().is_empty() {
+        return false;
+    }
+    let lower = biome.to_ascii_lowercase();
+    lower.contains("desert") || lower.contains("badlands")
+}
+
+fn is_gray_olive_tint_target(color: i32) -> bool {
+    let red = (color >> 16) & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = color & 0xff;
+    (120..=142).contains(&red)
+        && (128..=146).contains(&green)
+        && (65..=95).contains(&blue)
+        && (red - green).abs() <= 16
+}
+
+fn is_dark_green_tint_target(color: i32) -> bool {
+    let red = (color >> 16) & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = color & 0xff;
+    (18..=58).contains(&red)
+        && (54..=88).contains(&green)
+        && (18..=44).contains(&blue)
+        && green >= red + 12
+        && green >= blue + 20
+}
+
+fn dark_green_hue_penalty(color: i32) -> i64 {
+    let red = (color >> 16) & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = color & 0xff;
+    let mut penalty = 0_i64;
+    if green < red {
+        let miss = red - green;
+        penalty += 4_800 + i64::from(miss * miss * 18);
+    }
+    if green < blue + 8 {
+        let miss = (blue + 8) - green;
+        penalty += 1_800 + i64::from(miss * miss * 12);
+    }
+    penalty
+}
+
+fn luma10000(color: i32) -> i32 {
+    let red = (color >> 16) & 0xff;
+    let green = (color >> 8) & 0xff;
+    let blue = color & 0xff;
+    (red * 2126) + (green * 7152) + (blue * 722)
+}
+
+const fn rgb(red: i32, green: i32, blue: i32) -> i32 {
+    ((red & 0xff) << 16) | ((green & 0xff) << 8) | (blue & 0xff)
+}
+
 pub fn require_valid_vertical_scale(vertical_scale: f64) -> Result<f64> {
     if !vertical_scale.is_finite()
         || !(MIN_VERTICAL_SCALE..=MAX_VERTICAL_SCALE).contains(&vertical_scale)
@@ -5593,6 +6141,159 @@ mod tests {
 
         assert!(clean_coastal_surface_columns(&[inland.clone()], &[0.0], 0).is_err());
         assert!(clean_coastal_surface_columns(&[inland], &[], 1).is_err());
+    }
+
+    #[test]
+    fn surface_biome_cell_writer_covers_java_surface_band_fixture() {
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.set_biome_id("minecraft:plains").unwrap();
+        let (mut biomes, mut min_y, mut max_y) = surface_biome_arrays("minecraft:plains", 64);
+        for z in 0..BIOME_CELL_WIDTH {
+            for x in 0..BIOME_CELL_WIDTH {
+                let index = local_column_index(x, z);
+                biomes[index] = "minecraft:jungle".to_string();
+                min_y[index] = 60 + x as i32 + z as i32;
+                max_y[index] = 88 - x as i32 + z as i32;
+            }
+        }
+
+        apply_surface_biome_cells(&mut chunk, &biomes, &min_y, &max_y, "minecraft:plains").unwrap();
+
+        assert_eq!(chunk.get_biome_id_at(0, 60, 0).unwrap(), "minecraft:jungle");
+        assert_eq!(chunk.get_biome_id_at(0, 88, 0).unwrap(), "minecraft:jungle");
+        assert_eq!(chunk.get_biome_id_at(0, 96, 0).unwrap(), "minecraft:jungle");
+        assert_eq!(chunk.get_biome_id_at(8, 64, 0).unwrap(), "minecraft:plains");
+    }
+
+    #[test]
+    fn surface_biome_cell_writer_static_carriers_match_java_fixtures() {
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.set_biome_id("minecraft:savanna").unwrap();
+        let (mut biomes, min_y, max_y) = surface_biome_arrays("minecraft:savanna", 64);
+        fill_surface_top(&mut chunk, 64, block_state_ids::GRASS_BLOCK);
+        biomes[local_column_index(0, 0)] = "minecraft:swamp".to_string();
+        biomes[local_column_index(1, 0)] = "minecraft:swamp".to_string();
+
+        apply_surface_biome_cells(&mut chunk, &biomes, &min_y, &max_y, "minecraft:savanna")
+            .unwrap();
+
+        require_natural_ground(
+            chunk.get_block_state_id(0, 64, 0).unwrap(),
+            "minecraft:swamp",
+        );
+        require_natural_ground(
+            chunk.get_block_state_id(1, 64, 0).unwrap(),
+            "minecraft:swamp",
+        );
+        assert_eq!(
+            chunk.get_block_state_id(2, 64, 0).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            chunk.get_biome_id_at(0, 64, 0).unwrap(),
+            "minecraft:savanna"
+        );
+
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.set_biome_id("minecraft:dark_forest").unwrap();
+        let y = SEA_LEVEL_Y + 20;
+        let (mut biomes, min_y, max_y) = surface_biome_arrays("minecraft:dark_forest", y);
+        fill_surface_top(&mut chunk, y, block_state_ids::GRASS_BLOCK);
+        biomes[local_column_index(0, 0)] = "minecraft:windswept_savanna".to_string();
+        biomes[local_column_index(1, 0)] = "minecraft:windswept_savanna".to_string();
+
+        apply_surface_biome_cells(&mut chunk, &biomes, &min_y, &max_y, "minecraft:dark_forest")
+            .unwrap();
+
+        assert_eq!(
+            chunk.get_block_state_id(0, y, 0).unwrap(),
+            block_state_ids::ANDESITE
+        );
+        assert_eq!(
+            chunk.get_block_state_id(1, y, 0).unwrap(),
+            block_state_ids::ANDESITE
+        );
+        assert_eq!(
+            chunk.get_block_state_id(2, y, 0).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.set_biome_id("minecraft:dark_forest").unwrap();
+        let y = SEA_LEVEL_Y + 1;
+        let (mut biomes, min_y, max_y) = surface_biome_arrays("minecraft:dark_forest", y);
+        fill_surface_top(&mut chunk, y, block_state_ids::GRASS_BLOCK);
+        biomes[local_column_index(0, 0)] = "minecraft:windswept_savanna".to_string();
+        biomes[local_column_index(1, 0)] = "minecraft:windswept_savanna".to_string();
+
+        apply_surface_biome_cells(&mut chunk, &biomes, &min_y, &max_y, "minecraft:dark_forest")
+            .unwrap();
+
+        assert_eq!(
+            chunk.get_block_state_id(0, y, 0).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            chunk.get_block_state_id(1, y, 0).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+    }
+
+    #[test]
+    fn surface_biome_cell_writer_dark_green_and_leaf_fixtures_match_java() {
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.set_biome_id("minecraft:savanna").unwrap();
+        let (mut biomes, min_y, max_y) = surface_biome_arrays("minecraft:savanna", 64);
+        fill_surface_top(&mut chunk, 64, block_state_ids::GRASS_BLOCK);
+        biomes[local_column_index(0, 0)] = "minecraft:dark_forest".to_string();
+        biomes[local_column_index(1, 0)] = "minecraft:swamp".to_string();
+
+        apply_surface_biome_cells(&mut chunk, &biomes, &min_y, &max_y, "minecraft:savanna")
+            .unwrap();
+
+        require_natural_ground(
+            chunk.get_block_state_id(0, 64, 0).unwrap(),
+            "minecraft:dark_forest",
+        );
+        require_natural_ground(
+            chunk.get_block_state_id(1, 64, 0).unwrap(),
+            "minecraft:swamp",
+        );
+        assert_eq!(
+            chunk.get_block_state_id(2, 64, 0).unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.set_biome_id("minecraft:savanna").unwrap();
+        let (mut biomes, min_y, max_y) = surface_biome_arrays("minecraft:savanna", 64);
+        fill_surface_top(&mut chunk, 64, block_state_ids::OAK_LEAVES);
+        biomes[local_column_index(0, 0)] = "minecraft:dark_forest".to_string();
+        biomes[local_column_index(1, 0)] = "minecraft:dark_forest".to_string();
+
+        apply_surface_biome_cells(&mut chunk, &biomes, &min_y, &max_y, "minecraft:savanna")
+            .unwrap();
+
+        require_natural_ground(
+            chunk.get_block_state_id(0, 64, 0).unwrap(),
+            "minecraft:dark_forest",
+        );
+        require_natural_ground(
+            chunk.get_block_state_id(1, 64, 0).unwrap(),
+            "minecraft:dark_forest",
+        );
+        let majority = chunk.get_block_state_id(2, 64, 0).unwrap();
+        require_natural_ground(majority, "minecraft:savanna");
+        assert_ne!(majority, block_state_ids::OAK_LEAVES);
+    }
+
+    #[test]
+    fn surface_biome_cell_writer_uses_java_zero_render_fallback_for_unknown_blocks() {
+        assert_eq!(
+            render_surface_color(block_state_ids::AIR, Some("minecraft:plains")),
+            0
+        );
+        assert_eq!(render_surface_color(i32::MAX, None), 0);
     }
 
     #[test]
@@ -6707,6 +7408,59 @@ mod tests {
         clean_coastal_surface_columns(&[column], &[coast_factor], 1)
             .unwrap()
             .remove(0)
+    }
+
+    fn surface_biome_arrays(default_biome: &str, y: i32) -> (Vec<String>, Vec<i32>, Vec<i32>) {
+        let columns = CHUNK_WIDTH * CHUNK_WIDTH;
+        (
+            vec![default_biome.to_string(); columns],
+            vec![y; columns],
+            vec![y; columns],
+        )
+    }
+
+    fn local_column_index(x: usize, z: usize) -> usize {
+        (z * CHUNK_WIDTH) + x
+    }
+
+    fn fill_surface_top(chunk: &mut ChunkModel, y: i32, block: i32) {
+        for z in 0..CHUNK_WIDTH {
+            for x in 0..CHUNK_WIDTH {
+                chunk
+                    .set_block_state_id(x as i32, y, z as i32, block)
+                    .unwrap();
+            }
+        }
+    }
+
+    fn require_natural_ground(block: i32, biome: &str) {
+        assert!(
+            is_allowed_production_top(block, biome),
+            "block should be production-safe natural ground: {block}"
+        );
+        assert!(
+            !matches!(
+                block,
+                block_state_ids::OAK_LEAVES
+                    | block_state_ids::JUNGLE_LEAVES
+                    | block_state_ids::DARK_OAK_LEAVES
+                    | block_state_ids::SPRUCE_LEAVES
+                    | block_state_ids::TERRACOTTA
+                    | block_state_ids::ORANGE_TERRACOTTA
+                    | block_state_ids::BROWN_TERRACOTTA
+                    | block_state_ids::RED_TERRACOTTA
+                    | block_state_ids::YELLOW_TERRACOTTA
+                    | block_state_ids::WHITE_TERRACOTTA
+                    | block_state_ids::LIGHT_GRAY_TERRACOTTA
+                    | block_state_ids::GRAY_TERRACOTTA
+                    | block_state_ids::BLACK_TERRACOTTA
+                    | block_state_ids::GREEN_TERRACOTTA
+                    | block_state_ids::CYAN_TERRACOTTA
+                    | block_state_ids::LIME_TERRACOTTA
+                    | block_state_ids::BLACK_CONCRETE
+            ),
+            "block should not be an artificial palette carrier: {block}"
+        );
     }
 
     fn synthetic_wwf_ecoregion_cache() -> Vec<u8> {
