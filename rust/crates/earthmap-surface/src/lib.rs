@@ -165,6 +165,92 @@ pub struct HeightOnlyRegionReport {
     pub cache_stats: GeoTiffRowCacheStats,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerrainTokenSource {
+    None,
+    Export,
+    JavaStandardPalette,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EarthSurfaceColumn {
+    pub water: bool,
+    pub ground_surface_y: i32,
+    pub water_surface_y: i32,
+    pub top_block_state_id: i32,
+    pub filler_block_state_id: i32,
+    pub biome_id: String,
+    pub decision_source: String,
+    pub terrain_token_source: TerrainTokenSource,
+    pub data_evidence_flags: i32,
+}
+
+impl EarthSurfaceColumn {
+    pub fn new(
+        water: bool,
+        ground_surface_y: i32,
+        water_surface_y: i32,
+        top_block_state_id: i32,
+        filler_block_state_id: i32,
+        biome_id: impl Into<String>,
+        decision_source: impl Into<String>,
+    ) -> Self {
+        let biome_id = normalize_text_default(biome_id.into(), "minecraft:plains");
+        let decision_source = normalize_text_default(decision_source.into(), "unknown");
+        Self {
+            water,
+            ground_surface_y,
+            water_surface_y,
+            top_block_state_id,
+            filler_block_state_id,
+            biome_id,
+            decision_source,
+            terrain_token_source: TerrainTokenSource::None,
+            data_evidence_flags: 0,
+        }
+    }
+
+    pub fn with_decision_source(&self, source: impl Into<String>) -> Self {
+        let mut column = self.clone();
+        column.decision_source = normalize_text_default(source.into(), "unknown");
+        column
+    }
+
+    pub fn with_biome_id(&self, biome: impl Into<String>) -> Self {
+        let mut column = self.clone();
+        column.biome_id = normalize_text_default(biome.into(), "minecraft:plains");
+        column
+    }
+
+    pub fn with_terrain_token_source(&self, source: TerrainTokenSource) -> Self {
+        let mut column = self.clone();
+        column.terrain_token_source = source;
+        column
+    }
+
+    pub fn with_terrain_token_available(&self, available: bool) -> Self {
+        self.with_terrain_token_source(if available {
+            TerrainTokenSource::Export
+        } else {
+            TerrainTokenSource::None
+        })
+    }
+
+    pub fn with_data_evidence_flags(&self, flags: i32) -> Self {
+        let mut column = self.clone();
+        column.data_evidence_flags = flags;
+        column
+    }
+
+    pub fn has_data_evidence(&self, mask: i32) -> bool {
+        (self.data_evidence_flags & mask) != 0
+    }
+
+    pub fn terrain_token_available(&self) -> bool {
+        self.terrain_token_source != TerrainTokenSource::None
+    }
+}
+
 pub fn generate_height_only_region(
     settings: &HeightOnlySettings,
 ) -> Result<HeightOnlyRegionReport> {
@@ -250,6 +336,231 @@ pub fn surface_y_for_elevation_meters(elevation_meters: f64) -> i32 {
     y.clamp(-60, 319)
 }
 
+pub const DEFAULT_VERTICAL_SCALE: f64 = 1.0;
+
+const BEACH_COAST_FACTOR: f64 = 0.985;
+const SHAPED_ELEVATION_METERS_PER_BLOCK: f64 = 45.0;
+const MIN_VERTICAL_SCALE: f64 = 0.25;
+const MAX_VERTICAL_SCALE: f64 = 4.0;
+const MIN_SURFACE_Y: i32 = -60;
+const MAX_SURFACE_Y: i32 = 319;
+
+pub fn classify_surface(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+) -> EarthSurfaceColumn {
+    let water = elevation_meters <= 0.0;
+    let ground_y = ground_surface_y_at(elevation_meters, longitude, latitude, water);
+    let biome = biome_id(elevation_meters, longitude, latitude, water, ground_y, 0.0);
+    let top = top_block_state_id(
+        elevation_meters,
+        longitude,
+        latitude,
+        water,
+        ground_y,
+        &biome,
+        0.0,
+    );
+    let filler = filler_block_state_id(top, water);
+    let water_surface_y = if water { SEA_LEVEL_Y } else { i32::MIN };
+    EarthSurfaceColumn::new(
+        water,
+        ground_y,
+        water_surface_y,
+        top,
+        filler,
+        biome,
+        "height-rule",
+    )
+}
+
+pub fn classify_shaped_surface(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+    coast_factor: f64,
+) -> Result<EarthSurfaceColumn> {
+    classify_shaped_surface_scaled(
+        elevation_meters,
+        longitude,
+        latitude,
+        water,
+        coast_factor,
+        DEFAULT_VERTICAL_SCALE,
+    )
+}
+
+pub fn classify_shaped_surface_scaled(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+    coast_factor: f64,
+    vertical_scale: f64,
+) -> Result<EarthSurfaceColumn> {
+    let coast_factor = clamp_unit(coast_factor);
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let ground_y = shaped_ground_surface_y(
+        elevation_meters,
+        longitude,
+        latitude,
+        water,
+        coast_factor,
+        vertical_scale,
+    );
+    let biome = biome_id(
+        elevation_meters,
+        longitude,
+        latitude,
+        water,
+        ground_y,
+        coast_factor,
+    );
+    let top = top_block_state_id(
+        elevation_meters,
+        longitude,
+        latitude,
+        water,
+        ground_y,
+        &biome,
+        coast_factor,
+    );
+    let filler = filler_block_state_id(top, water);
+    let water_surface_y = if water { SEA_LEVEL_Y } else { i32::MIN };
+    Ok(EarthSurfaceColumn::new(
+        water,
+        ground_y,
+        water_surface_y,
+        top,
+        filler,
+        biome,
+        "height-rule",
+    ))
+}
+
+pub fn normalize_surface_column_for_chunk(column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
+    if !column.water {
+        return column.clone();
+    }
+    let water_surface_y = if column.water_surface_y == i32::MIN {
+        SEA_LEVEL_Y
+    } else {
+        clamp_surface_y(column.water_surface_y)
+    };
+    let mut ground_y = clamp_surface_y(column.ground_surface_y.min(water_surface_y - 1));
+    if ground_y >= water_surface_y {
+        ground_y = MIN_SURFACE_Y.max(water_surface_y - 1);
+    }
+    if ground_y == column.ground_surface_y && water_surface_y == column.water_surface_y {
+        return column.clone();
+    }
+    let mut normalized = EarthSurfaceColumn::new(
+        true,
+        ground_y,
+        water_surface_y,
+        column.top_block_state_id,
+        column.filler_block_state_id,
+        column.biome_id.clone(),
+        format!("{}+water-volume", column.decision_source),
+    );
+    normalized.terrain_token_source = column.terrain_token_source;
+    normalized.data_evidence_flags = column.data_evidence_flags;
+    normalized
+}
+
+pub fn require_valid_vertical_scale(vertical_scale: f64) -> Result<f64> {
+    if !vertical_scale.is_finite()
+        || !(MIN_VERTICAL_SCALE..=MAX_VERTICAL_SCALE).contains(&vertical_scale)
+    {
+        return Err(SurfaceError::invalid(format!(
+            "verticalScale must be between {MIN_VERTICAL_SCALE} and {MAX_VERTICAL_SCALE}"
+        )));
+    }
+    Ok(vertical_scale)
+}
+
+pub fn ground_surface_y(elevation_meters: f64, water: bool) -> i32 {
+    ground_surface_y_at(elevation_meters, 0.0, 0.0, water)
+}
+
+pub fn ground_surface_y_at(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+) -> i32 {
+    if water {
+        let depth_blocks = ocean_depth_blocks(
+            elevation_meters,
+            longitude,
+            latitude,
+            DEFAULT_VERTICAL_SCALE,
+        );
+        return clamp_surface_y(SEA_LEVEL_Y - depth_blocks);
+    }
+    let y = SEA_LEVEL_Y.wrapping_add(java_math_round_double_to_narrowed_i32(
+        elevation_meters / ELEVATION_METERS_PER_BLOCK,
+    ));
+    clamp_surface_y(y)
+}
+
+pub fn biome_id(
+    _elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+    surface_y: i32,
+    coast_factor: f64,
+) -> String {
+    let abs_lat = latitude.abs();
+    if water {
+        if abs_lat >= 70.0 {
+            return "minecraft:frozen_ocean".to_string();
+        }
+        let depth = 1.max(SEA_LEVEL_Y - surface_y);
+        if depth >= 28 {
+            if abs_lat <= 34.0 {
+                return "minecraft:deep_lukewarm_ocean".to_string();
+            }
+            if abs_lat >= 56.0 {
+                return "minecraft:deep_cold_ocean".to_string();
+            }
+            return "minecraft:deep_ocean".to_string();
+        }
+        if abs_lat <= 23.5 {
+            return "minecraft:warm_ocean".to_string();
+        }
+        if abs_lat <= 38.0 {
+            return "minecraft:lukewarm_ocean".to_string();
+        }
+        if abs_lat >= 55.0 {
+            return "minecraft:cold_ocean".to_string();
+        }
+        return "minecraft:ocean".to_string();
+    }
+    if is_beach_band(coast_factor, surface_y, longitude, latitude) {
+        return "minecraft:beach".to_string();
+    }
+    if desert_score(longitude, latitude) >= 0.58 {
+        return "minecraft:desert".to_string();
+    }
+    if abs_lat >= 66.0 || surface_y >= 210 || (surface_y >= 165 && abs_lat >= 28.0) {
+        return "minecraft:snowy_plains".to_string();
+    }
+    if jungle_score(longitude, latitude) >= 0.55 {
+        return "minecraft:jungle".to_string();
+    }
+    if (25.0..=55.0).contains(&abs_lat) && forest_score(longitude, latitude) >= 0.35 {
+        return "minecraft:forest".to_string();
+    }
+    if abs_lat <= 23.5 {
+        return "minecraft:savanna".to_string();
+    }
+    "minecraft:plains".to_string()
+}
+
 fn height_only_chunk(
     chunk_x: i32,
     chunk_z: i32,
@@ -321,6 +632,335 @@ fn fill_height_only_column(
     )?;
     chunk.set_block_state_id(local_x, surface_y, local_z, block_state_ids::GRASS_BLOCK)?;
     Ok(())
+}
+
+fn top_block_state_id(
+    _elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+    surface_y: i32,
+    biome_id: &str,
+    coast_factor: f64,
+) -> i32 {
+    if water {
+        return block_state_ids::GRAVEL;
+    }
+    if biome_id == "minecraft:desert"
+        || (biome_id == "minecraft:beach" && default_beach_sand_likely(longitude, latitude))
+        || is_beach_band(coast_factor, surface_y, longitude, latitude)
+    {
+        return block_state_ids::SAND;
+    }
+    if biome_id == "minecraft:snowy_plains" {
+        return block_state_ids::SNOW_BLOCK;
+    }
+    if surface_y >= 140 {
+        return block_state_ids::STONE;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn shaped_ground_surface_y(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+    coast_factor: f64,
+    vertical_scale: f64,
+) -> i32 {
+    if water {
+        let mut depth_blocks =
+            ocean_depth_blocks(elevation_meters, longitude, latitude, vertical_scale);
+        depth_blocks =
+            coastal_shelf_adjusted_depth_blocks(depth_blocks, coast_factor, vertical_scale);
+        return clamp_surface_y(SEA_LEVEL_Y - clamp_i32(depth_blocks, 1, 123));
+    }
+    let positive_elevation = elevation_meters.max(0.0);
+    let mut extra_blocks = java_math_round_double_to_narrowed_i32(
+        (positive_elevation * vertical_scale) / SHAPED_ELEVATION_METERS_PER_BLOCK,
+    );
+    if coast_factor > 0.55 {
+        let near_shore = clamp_unit((coast_factor - 0.55) / 0.45);
+        let inland_distance = 1.0 - near_shore;
+        let coast_limit = java_math_round_double_to_narrowed_i32(
+            2.0 + (inland_distance.powf(1.15) * 28.0 * vertical_scale.sqrt()),
+        );
+        if extra_blocks > coast_limit {
+            let coast_pull = smooth_step(near_shore);
+            extra_blocks = java_math_round_double_to_narrowed_i32(lerp(
+                f64::from(extra_blocks),
+                f64::from(coast_limit),
+                coast_pull,
+            ));
+        }
+    }
+    clamp_surface_y(SEA_LEVEL_Y.wrapping_add(extra_blocks))
+}
+
+fn desert_score(longitude: f64, latitude: f64) -> f64 {
+    let mut score: f64 = 0.0;
+    score = score.max(smooth_box(
+        longitude, latitude, -17.0, 60.0, 12.0, 35.0, 5.5,
+    ));
+    score = score.max(smooth_box(
+        longitude, latitude, 112.0, 155.0, -34.0, -16.0, 4.5,
+    ));
+    score = score.max(smooth_box(
+        longitude, latitude, 66.0, 105.0, 35.0, 47.0, 4.0,
+    ));
+    score = score.max(smooth_box(
+        longitude, latitude, -75.0, -66.0, -28.0, -16.0, 2.5,
+    ));
+    let texture = value_noise(
+        (longitude * 0.23) + 15.0,
+        (latitude * 0.23) - 41.0,
+        0x52dce729,
+    );
+    clamp_unit(score + ((texture - 0.5) * 0.22))
+}
+
+fn is_beach_band(coast_factor: f64, surface_y: i32, longitude: f64, latitude: f64) -> bool {
+    coast_factor >= BEACH_COAST_FACTOR
+        && surface_y <= SEA_LEVEL_Y + 2
+        && default_beach_sand_likely(longitude, latitude)
+}
+
+fn default_beach_sand_likely(longitude: f64, latitude: f64) -> bool {
+    let abs_lat = latitude.abs();
+    let desert = desert_score(longitude, latitude);
+    if desert >= 0.50 {
+        return true;
+    }
+    if abs_lat >= 25.0 {
+        return false;
+    }
+    if abs_lat >= 58.0 {
+        return false;
+    }
+    let shore_texture = value_noise(
+        (longitude * 0.83) + 17.0,
+        (latitude * 0.83) - 29.0,
+        0x4f1bbcdc6e3c2a19_u64 as i64,
+    );
+    if desert >= 0.30 {
+        return shore_texture >= 0.46;
+    }
+    if abs_lat <= 28.0 {
+        return shore_texture >= 0.82;
+    }
+    shore_texture >= 0.90
+}
+
+fn filler_block_state_id(top: i32, water: bool) -> i32 {
+    if water {
+        return top;
+    }
+    if top == block_state_ids::SAND {
+        block_state_ids::SAND
+    } else {
+        block_state_ids::DIRT
+    }
+}
+
+fn jungle_score(longitude: f64, latitude: f64) -> f64 {
+    let mut score: f64 = 0.0;
+    score = score.max(smooth_box(
+        longitude, latitude, -77.0, -45.0, -16.0, 7.0, 4.5,
+    ));
+    score = score.max(smooth_box(longitude, latitude, 10.0, 32.0, -9.0, 7.0, 4.0));
+    score = score.max(smooth_box(
+        longitude, latitude, 95.0, 145.0, -11.0, 20.0, 4.5,
+    ));
+    let texture = value_noise(
+        (longitude * 0.19) - 31.0,
+        (latitude * 0.19) + 8.0,
+        0x7f4a7c15,
+    );
+    clamp_unit(score + ((texture - 0.5) * 0.18))
+}
+
+fn forest_score(longitude: f64, latitude: f64) -> f64 {
+    let abs_lat = latitude.abs();
+    let mid_latitude = 1.0 - clamp_unit((abs_lat - 40.0).abs() / 25.0);
+    let moisture = value_noise(
+        (longitude * 0.12) + 73.0,
+        (latitude * 0.12) - 11.0,
+        0x94d049bb,
+    );
+    clamp_unit((mid_latitude * 0.65) + (moisture * 0.45))
+}
+
+fn smooth_box(
+    longitude: f64,
+    latitude: f64,
+    min_longitude: f64,
+    max_longitude: f64,
+    min_latitude: f64,
+    max_latitude: f64,
+    edge_degrees: f64,
+) -> f64 {
+    let west = smooth_step(clamp_unit((longitude - min_longitude) / edge_degrees));
+    let east = smooth_step(clamp_unit((max_longitude - longitude) / edge_degrees));
+    let south = smooth_step(clamp_unit((latitude - min_latitude) / edge_degrees));
+    let north = smooth_step(clamp_unit((max_latitude - latitude) / edge_degrees));
+    west * east * south * north
+}
+
+fn ocean_depth_blocks(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    vertical_scale: f64,
+) -> i32 {
+    let abs_lat = latitude.abs();
+    let basin = fractal_value_noise(longitude * 0.08, latitude * 0.08, 4, 0x6d2b79f5);
+    let detail = fractal_value_noise(
+        (longitude * 0.55) + 19.0,
+        (latitude * 0.55) - 37.0,
+        3,
+        0x9e3779b97f4a7c15_u64 as i64,
+    );
+    let trench = fractal_value_noise(
+        (longitude * 0.18) - 71.0,
+        (latitude * 0.18) + 43.0,
+        2,
+        0xbf58476d1ce4e5b9_u64 as i64,
+    )
+    .powf(3.0);
+    let polar_shelf = if abs_lat > 68.0 {
+        (abs_lat - 68.0) * 0.35
+    } else {
+        0.0
+    };
+    let mut synthetic_depth = java_math_round_double_to_narrowed_i32(
+        (9.0 + (basin * 29.0) + (detail * 8.0) + (trench * 12.0) - polar_shelf)
+            * vertical_scale.sqrt(),
+    );
+    synthetic_depth = clamp_i32(synthetic_depth, 6, 56);
+    if elevation_meters < 0.0 {
+        let source_depth = 1.max(java_math_round_double_to_narrowed_i32(
+            (-elevation_meters * vertical_scale) / ELEVATION_METERS_PER_BLOCK,
+        ));
+        let roughness = java_math_round_double_to_narrowed_i32((detail - 0.5) * 5.0);
+        return clamp_i32(source_depth.max(synthetic_depth / 2) + roughness, 2, 123);
+    }
+    synthetic_depth
+}
+
+fn coastal_shelf_adjusted_depth_blocks(
+    depth_blocks: i32,
+    coast_factor: f64,
+    vertical_scale: f64,
+) -> i32 {
+    let near_shore = clamp_unit((coast_factor - 0.88) / 0.12);
+    if near_shore <= 0.0 {
+        return depth_blocks;
+    }
+    let shelf_scale = vertical_scale.sqrt();
+    let minimum_depth = if depth_blocks >= 12 { 3 } else { 2 };
+    let shelf_depth = java_math_round_double_to_narrowed_i32(
+        (f64::from(minimum_depth) + ((1.0 - near_shore).powf(1.20) * 6.0)) * shelf_scale,
+    );
+    let shelf_pull = near_shore.powf(1.75);
+    clamp_i32(
+        java_math_round_double_to_narrowed_i32(lerp(
+            f64::from(depth_blocks),
+            f64::from(shelf_depth),
+            shelf_pull,
+        )),
+        1,
+        123,
+    )
+}
+
+fn fractal_value_noise(x: f64, z: f64, octaves: i32, seed: i64) -> f64 {
+    let mut value = 0.0;
+    let mut amplitude = 1.0;
+    let mut amplitude_sum = 0.0;
+    let mut frequency = 1.0;
+    for octave in 0..octaves {
+        value += value_noise(
+            x * frequency,
+            z * frequency,
+            seed.wrapping_add((octave as i64).wrapping_mul(0x632be59bd9b4e019)),
+        ) * amplitude;
+        amplitude_sum += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    value / amplitude_sum
+}
+
+fn value_noise(x: f64, z: f64, seed: i64) -> f64 {
+    let x0 = fast_floor(x);
+    let z0 = fast_floor(z);
+    let tx = smooth_step(x - f64::from(x0));
+    let tz = smooth_step(z - f64::from(z0));
+    let a = lattice_value(x0, z0, seed);
+    let next_x = x0.wrapping_add(1);
+    let next_z = z0.wrapping_add(1);
+    let b = lattice_value(next_x, z0, seed);
+    let c = lattice_value(x0, next_z, seed);
+    let d = lattice_value(next_x, next_z, seed);
+    let ab = lerp(a, b, tx);
+    let cd = lerp(c, d, tx);
+    lerp(ab, cd, tz)
+}
+
+fn lattice_value(x: i32, z: i32, seed: i64) -> f64 {
+    let mut hash = seed;
+    hash ^= (x as i64).wrapping_mul(0x9e3779b97f4a7c15_u64 as i64);
+    hash ^= (z as i64).wrapping_mul(0xbf58476d1ce4e5b9_u64 as i64);
+    hash ^= ((hash as u64) >> 30) as i64;
+    hash = hash.wrapping_mul(0xbf58476d1ce4e5b9_u64 as i64);
+    hash ^= ((hash as u64) >> 27) as i64;
+    hash = hash.wrapping_mul(0x94d049bb133111eb_u64 as i64);
+    hash ^= ((hash as u64) >> 31) as i64;
+    (((hash as u64) >> 11) as f64) * (1.0 / ((1u64 << 53) as f64))
+}
+
+fn fast_floor(value: f64) -> i32 {
+    let integer = value as i32;
+    if value < f64::from(integer) {
+        integer - 1
+    } else {
+        integer
+    }
+}
+
+fn smooth_step(value: f64) -> f64 {
+    value * value * (3.0 - (2.0 * value))
+}
+
+fn lerp(a: f64, b: f64, amount: f64) -> f64 {
+    a + ((b - a) * amount)
+}
+
+fn clamp_unit(value: f64) -> f64 {
+    if value < 0.0 {
+        return 0.0;
+    }
+    if value > 1.0 {
+        return 1.0;
+    }
+    value
+}
+
+fn clamp_surface_y(y: i32) -> i32 {
+    clamp_i32(y, MIN_SURFACE_Y, MAX_SURFACE_Y)
+}
+
+fn clamp_i32(value: i32, min: i32, max: i32) -> i32 {
+    value.max(min).min(max)
+}
+
+fn normalize_text_default(value: String, default: &str) -> String {
+    if value.trim().is_empty() {
+        default.to_string()
+    } else {
+        value
+    }
 }
 
 fn mapping_for(
@@ -469,6 +1109,98 @@ struct ChunkBuild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn earth_surface_rules_match_java_contract_cases() {
+        let ocean = classify_surface(0.0, -150.0, 0.0);
+        assert!(ocean.water);
+        assert!(ocean.ground_surface_y < SEA_LEVEL_Y);
+        assert_eq!(ocean.water_surface_y, SEA_LEVEL_Y);
+        assert_eq!(ocean.top_block_state_id, block_state_ids::GRAVEL);
+        assert!(ocean.biome_id.ends_with("ocean"));
+
+        let second_ocean = classify_surface(0.0, 20.0, -35.0);
+        assert!(second_ocean.ground_surface_y < SEA_LEVEL_Y);
+        assert_ne!(ocean.ground_surface_y, second_ocean.ground_surface_y);
+        assert_eq!(
+            ocean.ground_surface_y,
+            classify_surface(0.0, -150.0, 0.0).ground_surface_y
+        );
+        let shallow_sea = classify_surface(-35.0, 10.0, 45.0);
+        assert!(shallow_sea.ground_surface_y < SEA_LEVEL_Y);
+
+        let sahara = classify_surface(350.0, 13.0, 23.0);
+        assert!(!sahara.water);
+        assert_eq!(sahara.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(sahara.biome_id, "minecraft:desert");
+
+        let everest = classify_surface(8765.0, 86.925, 27.9881);
+        assert!(!everest.water);
+        assert_eq!(everest.ground_surface_y, 313);
+        assert!(
+            everest.top_block_state_id == block_state_ids::SNOW_BLOCK
+                || everest.top_block_state_id == block_state_ids::STONE
+        );
+
+        let amazon = classify_surface(120.0, -60.0, -3.0);
+        assert_eq!(amazon.biome_id, "minecraft:jungle");
+
+        let coastal_land = classify_shaped_surface(900.0, 0.0, 40.0, false, 1.0).unwrap();
+        assert!(coastal_land.ground_surface_y <= SEA_LEVEL_Y + 2);
+        assert_ne!(coastal_land.top_block_state_id, block_state_ids::SAND);
+
+        let desert_coast = classify_shaped_surface(120.0, 13.0, 23.0, false, 1.0).unwrap();
+        assert_eq!(desert_coast.top_block_state_id, block_state_ids::SAND);
+
+        let coastal_slope = classify_shaped_surface(1800.0, 0.0, 40.0, false, 0.75).unwrap();
+        let inland_mountain = classify_shaped_surface(1800.0, 0.0, 40.0, false, 0.0).unwrap();
+        let taller_inland_mountain =
+            classify_shaped_surface_scaled(1800.0, 0.0, 40.0, false, 0.0, 1.35).unwrap();
+        assert!(coastal_slope.ground_surface_y > SEA_LEVEL_Y + 20);
+        assert!(inland_mountain.ground_surface_y >= coastal_slope.ground_surface_y);
+        assert!(taller_inland_mountain.ground_surface_y > inland_mountain.ground_surface_y);
+        assert_ne!(coastal_slope.top_block_state_id, block_state_ids::SAND);
+        let mid_coast_slope = classify_shaped_surface(1800.0, 0.0, 40.0, false, 0.50).unwrap();
+        assert!(mid_coast_slope.ground_surface_y >= coastal_slope.ground_surface_y);
+
+        let coastal_water = classify_shaped_surface(-2000.0, 0.0, 0.0, true, 1.0).unwrap();
+        assert!(coastal_water.ground_surface_y <= SEA_LEVEL_Y - 2);
+        assert_eq!(coastal_water.biome_id, "minecraft:warm_ocean");
+
+        let shelf_water = classify_shaped_surface(-4500.0, 0.0, 0.0, true, 0.75).unwrap();
+        assert!(shelf_water.ground_surface_y <= SEA_LEVEL_Y - 16);
+
+        let deep_water = classify_shaped_surface(-4500.0, 0.0, 5.0, true, 0.0).unwrap();
+        let mid_depth_water = classify_shaped_surface(-1200.0, 0.0, 5.0, true, 0.0).unwrap();
+        let deeper_scaled_water =
+            classify_shaped_surface_scaled(-1200.0, 0.0, 5.0, true, 0.0, 1.35).unwrap();
+        assert_eq!(deep_water.biome_id, "minecraft:deep_lukewarm_ocean");
+        assert!(deeper_scaled_water.ground_surface_y < mid_depth_water.ground_surface_y);
+
+        let impossible_water = EarthSurfaceColumn::new(
+            true,
+            SEA_LEVEL_Y + 5,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            "minecraft:ocean",
+            "test",
+        );
+        let normalized_water = normalize_surface_column_for_chunk(&impossible_water);
+        assert!(normalized_water.water);
+        assert_eq!(normalized_water.ground_surface_y, SEA_LEVEL_Y - 1);
+        assert_eq!(normalized_water.water_surface_y, SEA_LEVEL_Y);
+
+        let korea = classify_shaped_surface(320.0, 126.9, 36.0, false, 0.0).unwrap();
+        assert_eq!(korea.biome_id, "minecraft:forest");
+    }
+
+    #[test]
+    fn value_noise_neighbor_coordinates_wrap_like_java_int_addition() {
+        let edge = f64::from(i32::MAX);
+        assert!(value_noise(edge, edge, 0x52dce729).is_finite());
+        assert!(value_noise(edge + 0.25, edge + 0.25, 0x52dce729).is_finite());
+    }
 
     #[test]
     fn surface_y_matches_java_height_only_rounding_and_clamps() {

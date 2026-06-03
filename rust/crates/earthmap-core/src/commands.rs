@@ -127,6 +127,11 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
         note: "locate longitude/latitude in the Java-compatible Earth grid",
     },
     CommandSpec {
+        name: "classify-surface-point",
+        status: CommandStatus::ImplementedShellOnly,
+        note: "classify a heightmap-backed Java-compatible surface point",
+    },
+    CommandSpec {
         name: "sample-vrt-rgb",
         status: CommandStatus::ImplementedShellOnly,
         note: "sample a Java-compatible VRT RGB mosaic",

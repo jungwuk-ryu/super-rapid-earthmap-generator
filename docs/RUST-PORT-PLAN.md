@@ -32,6 +32,7 @@ Initial command compatibility:
 generate
 inspect-heightmap
 locate-heightmap-point
+classify-surface-point
 generate-height-region
 generate-surface-region
 generate-vanilla-delegated-region
@@ -566,6 +567,21 @@ Acceptance:
 - `classify-surface-point` parity for a point corpus.
 - `generate-surface-region` payload parity for fixed regions.
 - `quality-production-sample-batch` produces Java-equivalent current render and metric artifacts.
+
+Bootstrap implementation status on 2026-06-03:
+
+- Rust `earthmap-surface` includes an `EarthSurfaceRules` bootstrap with Java-compatible `classify`,
+  `classifyShaped`, vertical scale validation, water-column normalization, biome selection, top/filler block selection,
+  deterministic value-noise scoring, and Java-style rounding for the Java `EarthSurfaceRulesTest` fixture cases.
+- Rust CLI `classify-surface-point <heightmap> <scale> <longitude> <latitude>` is implemented as a diagnostic command
+  backed by the file-backed heightmap reader, `GeoTiffRowCache`, `HeightmapScalarSampler`, and the Rust
+  `EarthSurfaceRules` bootstrap.
+- Real `classify-surface-point` smoke checks against `E:\HQheightmap.tif` passed on 2026-06-03:
+  - Java/Rust stdout parity OK for `origin`, `sahara`, `amazon`, `korea`, and `everest` sample points
+  - evidence folder:
+    `D:\earthmap\rust-port-golden\phase5-classify-surface-point-smoke-20260603-0001`
+- Remaining Phase 5 work: port surface material sampling, photo solver, smoothing/coastal policies, OSM overlay,
+  surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 
 ### Vanilla-Delegated Survival Scope
 

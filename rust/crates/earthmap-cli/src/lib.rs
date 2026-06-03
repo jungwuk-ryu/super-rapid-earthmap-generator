@@ -8,11 +8,13 @@ use earthmap_core::build_info;
 use earthmap_core::commands::{self, CommandStatus};
 use earthmap_core::progress;
 use earthmap_geo::{
-    EarthScaleMapping, GeoTiffHeightmapReader, GeoTiffMetadata, VrtRgbMosaicReader,
+    EarthScaleMapping, GeoTiffHeightmapReader, GeoTiffMetadata, GeoTiffRowCache,
+    HeightmapScalarSampler, VrtRgbMosaicReader,
 };
 use earthmap_region::{ChunkLocalPos, RegionError};
 use earthmap_surface::{
-    HeightOnlySettings, OutputFormat, DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
+    classify_surface, HeightOnlySettings, OutputFormat, DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+    SURVIVAL_MANIFEST_FILE_NAME,
 };
 
 const EXIT_OK: i32 = 0;
@@ -54,6 +56,9 @@ where
             write_result(inspect_heightmap(stdout, stderr, &args[1]))
         }
         "locate-heightmap-point" if args.len() == 5 => write_result(locate_heightmap_point(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4],
+        )),
+        "classify-surface-point" if args.len() == 5 => write_result(classify_surface_point(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4],
         )),
         "sample-vrt-rgb" if args.len() == 4 => {
@@ -145,6 +150,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  locate-heightmap-point <heightmap> <scale> <longitude> <latitude>"
+    )?;
+    writeln!(
+        out,
+        "  classify-surface-point <heightmap> <scale> <longitude> <latitude>"
     )?;
     writeln!(out, "  sample-vrt-rgb <terrainVrt> <longitude> <latitude>")?;
     for name in commands::INITIAL_COMMANDS
@@ -309,6 +318,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase4.heightOnlyRegionByteParity - Java/Rust height-only r.0.0 and r.-1.-1 MCA/Linear region bytes, payload manifests, normalized stdout, and exploration-only survival manifests match for E:\\HQheightmap.tif at 1:5000."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.earthSurfaceRulesBootstrap - EarthSurfaceRules classify/classifyShaped/normalizeForChunk contracts and classify-surface-point diagnostic match Java fixture cases and E:\\HQheightmap.tif smoke points."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",
@@ -444,6 +457,71 @@ fn locate_heightmap_point_impl(
         format!("regionZ={region_z}"),
         format!("localBlockX={local_block_x}"),
         format!("localBlockZ={local_block_z}"),
+    ])
+}
+
+fn classify_surface_point(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    longitude_text: &str,
+    latitude_text: &str,
+) -> io::Result<i32> {
+    match classify_surface_point_impl(heightmap_path, scale_text, longitude_text, latitude_text) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Surface point classification failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn classify_surface_point_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    longitude_text: &str,
+    latitude_text: &str,
+) -> earthmap_geo::Result<Vec<String>> {
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))?;
+    let scale = parse_i32(scale_text)?;
+    let longitude = parse_f64(longitude_text)?;
+    let latitude = parse_f64(latitude_text)?;
+    let mapping = mapping_for(reader.metadata(), scale)?;
+    let map_x = mapping.block_x_for_longitude(longitude)?;
+    let map_z = mapping.block_z_for_latitude(latitude)?;
+    let cache = GeoTiffRowCache::new(&reader, 8)?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let sampled_longitude = mapping.longitude_for_block_x(map_x)?;
+    let sampled_latitude = mapping.latitude_for_block_z(map_z)?;
+    let elevation = sampler.bilinear_meters(sampled_longitude, sampled_latitude)?;
+    let column = classify_surface(elevation, sampled_longitude, sampled_latitude);
+    Ok(vec![
+        "Surface point classified".to_string(),
+        format!("scale=1:{scale}"),
+        format!("longitude={}", java_double_string(longitude)),
+        format!("latitude={}", java_double_string(latitude)),
+        format!("sampledLongitude={}", java_double_string(sampled_longitude)),
+        format!("sampledLatitude={}", java_double_string(sampled_latitude)),
+        format!("elevationMeters={}", java_double_string(elevation)),
+        format!("water={}", column.water),
+        format!("groundSurfaceY={}", column.ground_surface_y),
+        format!(
+            "waterSurfaceY={}",
+            if column.water {
+                column.water_surface_y.to_string()
+            } else {
+                "NONE".to_string()
+            }
+        ),
+        format!("topBlockStateId={}", column.top_block_state_id),
+        format!("fillerBlockStateId={}", column.filler_block_state_id),
+        format!("biome={}", column.biome_id),
     ])
 }
 
@@ -1003,6 +1081,7 @@ mod tests {
         assert!(out.contains("write-region-writer-parity-fixtures <outputDir>"));
         assert!(out.contains("inspect-heightmap <path>"));
         assert!(out.contains("locate-heightmap-point <heightmap> <scale> <longitude> <latitude>"));
+        assert!(out.contains("classify-surface-point <heightmap> <scale> <longitude> <latitude>"));
         assert!(out.contains("sample-vrt-rgb <terrainVrt> <longitude> <latitude>"));
     }
 
@@ -1126,6 +1205,43 @@ localBlockZ=55\n"
             err,
             "Heightmap point location failed: For input string: \"nan\"\n"
         );
+    }
+
+    #[test]
+    fn classify_surface_point_matches_java_stdout_contract_shape() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-cli-classify.tif");
+        fs::write(&path, synthetic_bigtiff_heightmap()).unwrap();
+
+        let args = [
+            "classify-surface-point",
+            path.to_str().unwrap(),
+            "1000",
+            "0.0",
+            "1.0",
+        ];
+        let (code, out, err) = run_capture(&args);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        let expected = classify_surface_point_impl(path.to_str().unwrap(), "1000", "0.0", "1.0")
+            .unwrap()
+            .join("\n")
+            + "\n";
+        assert_eq!(out, expected);
+        assert!(out.contains("Surface point classified\n"));
+        assert!(out.contains("scale=1:1000\n"));
+        assert!(out.contains("longitude=0.0\n"));
+        assert!(out.contains("latitude=1.0\n"));
+        assert!(out.contains("sampledLongitude="));
+        assert!(out.contains("sampledLatitude="));
+        assert!(out.contains("elevationMeters="));
+        assert!(out.contains("water="));
+        assert!(out.contains("groundSurfaceY="));
+        assert!(out.contains("waterSurfaceY="));
+        assert!(out.contains("topBlockStateId="));
+        assert!(out.contains("fillerBlockStateId="));
+        assert!(out.contains("biome="));
     }
 
     #[test]
