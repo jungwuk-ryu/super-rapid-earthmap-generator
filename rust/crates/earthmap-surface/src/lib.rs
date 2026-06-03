@@ -1963,30 +1963,33 @@ fn classify_surface_material_by_semantic_intent(
     }
 
     if is_steppe_climate(climate) {
-        if latitude.abs() >= 35.0 {
-            let biome = temperate_grassland_biome(latitude, patch_noise, fine_noise);
+        if dry_savanna_score >= 0.35
+            || sahel_score >= 0.18
+            || (latitude.abs() <= 32.0 && dry_savanna_score >= 0.18)
+        {
+            let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+            let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
+                patch_noise,
+                fine_noise,
+                dry_score,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
+            );
             return Some(surface_material_with_surface(
                 base,
-                block_state_ids::GRASS_BLOCK,
+                top,
                 block_state_ids::DIRT,
                 biome,
             ));
         }
-        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
-        let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
-        let top = dry_grass_surface_conservative(
-            metrics,
-            sample,
-            patch_noise,
-            fine_noise,
-            dry_score,
-            terrain,
-            semantic_terrain,
-            local_relief_meters,
-        );
+        let biome = temperate_grassland_biome(latitude, sample, metrics, patch_noise, fine_noise);
         return Some(surface_material_with_surface(
             base,
-            top,
+            block_state_ids::GRASS_BLOCK,
             block_state_ids::DIRT,
             biome,
         ));
@@ -2893,18 +2896,64 @@ fn forest_biome_for_environment(
     "minecraft:forest".to_string()
 }
 
-fn temperate_grassland_biome(latitude: f64, patch_noise: f64, fine_noise: f64) -> String {
+fn temperate_grassland_biome(
+    latitude: f64,
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> String {
     let abs_lat = latitude.abs();
-    if abs_lat >= 54.0 && patch_noise >= 0.48 {
+    let eco_name = sample.ecoregion_name.to_ascii_lowercase();
+    let forest_edge = is_forest_like_ecoregion(sample)
+        || eco_name.contains("woodland")
+        || eco_name.contains("mosaic");
+    let tree_patch =
+        sample.tree_cover() >= 0.10 || (sample.tree_cover() >= 0.06 && patch_noise >= 0.64);
+    if abs_lat >= 56.0 && (tree_patch || patch_noise >= 0.76) {
         return "minecraft:taiga".to_string();
     }
-    if abs_lat >= 40.0 && patch_noise >= 0.64 {
-        return "minecraft:forest".to_string();
+    if elevation_friendly_meadow(sample, metrics, patch_noise, fine_noise) {
+        return "minecraft:meadow".to_string();
     }
-    if patch_noise <= 0.22 && fine_noise <= 0.36 {
+    if forest_edge && tree_patch && patch_noise >= 0.58 {
+        return forest_biome_for_environment(
+            latitude,
+            sample.climate_class,
+            sample.tree_cover(),
+            is_green_like(metrics) && metrics.value < 0.48,
+            patch_noise,
+        );
+    }
+    if fine_noise >= 0.92
+        && sample.shrub_cover() > sample.tree_cover().max(sample.herbaceous_cover())
+    {
+        return if abs_lat >= 45.0 {
+            "minecraft:taiga"
+        } else {
+            "minecraft:forest"
+        }
+        .to_string();
+    }
+    if patch_noise >= 0.58 && sample.herbaceous_cover() >= sample.shrub_cover() {
         return "minecraft:sunflower_plains".to_string();
     }
     "minecraft:plains".to_string()
+}
+
+fn elevation_friendly_meadow(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> bool {
+    if sample.tree_cover() >= 0.10 || sample.shrub_cover() > sample.herbaceous_cover() {
+        return false;
+    }
+    sample.herbaceous_cover() >= 0.12
+        && metrics.value >= 0.40
+        && patch_noise >= 0.68
+        && fine_noise <= 0.34
 }
 
 fn mediterranean_surface(
@@ -12982,6 +13031,60 @@ mod tests {
                 || no_color_tropical_edge.biome_id.contains("forest")
         );
         assert_eq!(no_color_tropical_edge.decision_source, "intent");
+
+        let low_latitude_steppe = SurfaceMaterialSample::land(
+            RgbColor::of(134, 126, 82),
+            6,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            18,
+            4,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            45,
+            SurfaceMaterialSample::UNKNOWN,
+            "Low latitude steppe",
+            "minecraft:plains",
+            0.45,
+        );
+        let (low_steppe_longitude, low_steppe_latitude) = (-180..=180)
+            .flat_map(|longitude| (-32..=32).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let patch_noise =
+                    surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
+                let fine_noise = surface_material_ecology_noise(
+                    longitude,
+                    latitude,
+                    7.5,
+                    0x9d6c63b5a8e33f21_u64 as i64,
+                );
+                !is_sahel_latitude(latitude)
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.18
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && patch_noise >= 0.72
+                    && (0.34..0.92).contains(&fine_noise)
+            })
+            .expect("test fixture should find a low-latitude non-dry steppe coordinate");
+        let low_steppe = apply_test_surface_material_sample(
+            &base_land,
+            low_latitude_steppe,
+            320.0,
+            f64::from(low_steppe_longitude),
+            f64::from(low_steppe_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(low_steppe.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(low_steppe.filler_block_state_id, block_state_ids::DIRT);
+        assert_eq!(low_steppe.biome_id, "minecraft:sunflower_plains");
+        assert_eq!(low_steppe.decision_source, "intent");
 
         let temperate_steppe = SurfaceMaterialSample::land(
             RgbColor::of(134, 126, 82),

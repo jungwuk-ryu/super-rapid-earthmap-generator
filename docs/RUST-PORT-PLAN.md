@@ -664,6 +664,8 @@ Bootstrap implementation status on 2026-06-03:
   olive dry-grass, vegetation evidence, and dry Sahel coordinates resolve through intent before environment fallback.
 - Rust Mediterranean semantic intent now uses the Java compiler's Mediterranean surface and biome selection for
   non-strong-dry-core coordinates before broader temperate/dry fallbacks.
+- Rust steppe climate intent now follows Java's dry-savanna threshold gates and Java-shaped temperate grassland biome
+  selection instead of treating all low-latitude steppe as dry savanna.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
   remaining dry-savanna/desert-edge intent predicates, ecoregion transition, broader compiler-backed intent, and
   environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface
