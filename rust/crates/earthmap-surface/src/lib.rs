@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -4245,6 +4245,27 @@ pub fn smooth_surface_classes(
     Ok(result)
 }
 
+pub fn stabilize_surface_biome_families(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    require_surface_grid_width(columns, width)?;
+    let cell_pass = stabilize_surface_biome_cells(columns, width);
+    Ok(stabilize_small_surface_biome_family_components(
+        &cell_pass, width,
+    ))
+}
+
+pub fn stabilize_small_surface_biome_components(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    require_surface_grid_width(columns, width)?;
+    Ok(stabilize_small_surface_biome_family_components(
+        columns, width,
+    ))
+}
+
 pub fn is_allowed_production_top(block: i32, _biome: &str) -> bool {
     is_allowed_natural_surface_top(block)
 }
@@ -5946,6 +5967,485 @@ fn surface_class_index(x: usize, z: usize, width: usize) -> usize {
     (z * width) + x
 }
 
+const BIOME_INTENT_CELL_WIDTH: usize = 4;
+const BIOME_INTENT_CELL_DOMINANCE_MIN: i32 = 10;
+const SMALL_BIOME_COMPONENT_MAX: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JavaHashStringCount {
+    key: String,
+    count: i32,
+    first_order: usize,
+}
+
+fn require_surface_grid_width(columns: &[EarthSurfaceColumn], width: usize) -> Result<()> {
+    if width == 0 || columns.len() % width != 0 {
+        return Err(SurfaceError::invalid("width must divide columns length"));
+    }
+    Ok(())
+}
+
+fn stabilize_surface_biome_cells(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Vec<EarthSurfaceColumn> {
+    let height = columns.len() / width;
+    let mut result = columns.to_vec();
+    for cell_z in (0..height).step_by(BIOME_INTENT_CELL_WIDTH) {
+        for cell_x in (0..width).step_by(BIOME_INTENT_CELL_WIDTH) {
+            let mut counts = BTreeMap::<String, i32>::new();
+            let mut family_counts = BTreeMap::<String, i32>::new();
+            let mut land_count = 0;
+            for dz in 0..BIOME_INTENT_CELL_WIDTH {
+                if cell_z + dz >= height {
+                    break;
+                }
+                for dx in 0..BIOME_INTENT_CELL_WIDTH {
+                    if cell_x + dx >= width {
+                        break;
+                    }
+                    let column = &columns[surface_class_index(cell_x + dx, cell_z + dz, width)];
+                    if column.water {
+                        continue;
+                    }
+                    land_count += 1;
+                    *counts.entry(column.biome_id.clone()).or_insert(0) += 1;
+                    *family_counts
+                        .entry(intent_biome_family(&column.biome_id))
+                        .or_insert(0) += 1;
+                }
+            }
+            let (majority_biome, majority_count) = surface_majority_string(&counts);
+            if land_count < BIOME_INTENT_CELL_DOMINANCE_MIN
+                || majority_count < BIOME_INTENT_CELL_DOMINANCE_MIN
+                || is_arid_transition_cell(&family_counts)
+            {
+                continue;
+            }
+            for dz in 0..BIOME_INTENT_CELL_WIDTH {
+                if cell_z + dz >= height {
+                    break;
+                }
+                for dx in 0..BIOME_INTENT_CELL_WIDTH {
+                    if cell_x + dx >= width {
+                        break;
+                    }
+                    let index = surface_class_index(cell_x + dx, cell_z + dz, width);
+                    let column = &result[index];
+                    if column.water || is_protected_intent_biome(&column.biome_id) {
+                        continue;
+                    }
+                    if column.biome_id != majority_biome {
+                        result[index] = intent_surface_compatible_replacement(
+                            column,
+                            &majority_biome,
+                            "intent-stabilized-cell",
+                        );
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+fn stabilize_small_surface_biome_family_components(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Vec<EarthSurfaceColumn> {
+    let height = columns.len() / width;
+    let mut result = columns.to_vec();
+    let mut visited = vec![false; columns.len()];
+    let mut in_component = vec![false; columns.len()];
+    let mut component = Vec::<usize>::with_capacity(columns.len());
+    let mut queue = VecDeque::<usize>::new();
+    for index in 0..columns.len() {
+        if visited[index] {
+            continue;
+        }
+        let seed = &columns[index];
+        if seed.water || is_protected_intent_biome(&seed.biome_id) {
+            visited[index] = true;
+            continue;
+        }
+        let family = intent_biome_family(&seed.biome_id);
+        component.clear();
+        queue.clear();
+        visited[index] = true;
+        in_component[index] = true;
+        queue.push_back(index);
+        while let Some(current) = queue.pop_front() {
+            component.push(current);
+            let x = current % width;
+            let z = current / width;
+            enqueue_same_intent_family(
+                columns,
+                &mut visited,
+                &mut in_component,
+                &mut queue,
+                current.wrapping_sub(width),
+                z > 0,
+                &family,
+            );
+            enqueue_same_intent_family(
+                columns,
+                &mut visited,
+                &mut in_component,
+                &mut queue,
+                current + width,
+                z < height - 1,
+                &family,
+            );
+            enqueue_same_intent_family(
+                columns,
+                &mut visited,
+                &mut in_component,
+                &mut queue,
+                current.wrapping_sub(1),
+                x > 0,
+                &family,
+            );
+            enqueue_same_intent_family(
+                columns,
+                &mut visited,
+                &mut in_component,
+                &mut queue,
+                current + 1,
+                x < width - 1,
+                &family,
+            );
+        }
+        if component.len() <= SMALL_BIOME_COMPONENT_MAX {
+            if let Some(replacement_biome) =
+                neighboring_intent_majority_biome(columns, width, height, &component, &in_component)
+            {
+                if replacement_biome != seed.biome_id
+                    && !(component.len() > 16
+                        && is_arid_transition_pair(
+                            &family,
+                            &intent_biome_family(&replacement_biome),
+                        ))
+                {
+                    for &component_index in &component {
+                        result[component_index] = intent_surface_compatible_replacement(
+                            &result[component_index],
+                            &replacement_biome,
+                            "intent-stabilized-component",
+                        );
+                    }
+                }
+            }
+        }
+        for &component_index in &component {
+            in_component[component_index] = false;
+        }
+    }
+    result
+}
+
+fn enqueue_same_intent_family(
+    columns: &[EarthSurfaceColumn],
+    visited: &mut [bool],
+    in_component: &mut [bool],
+    queue: &mut VecDeque<usize>,
+    index: usize,
+    in_bounds: bool,
+    family: &str,
+) {
+    if !in_bounds || visited[index] {
+        return;
+    }
+    let column = &columns[index];
+    if column.water || is_protected_intent_biome(&column.biome_id) {
+        return;
+    }
+    if intent_biome_family(&column.biome_id) != family {
+        return;
+    }
+    visited[index] = true;
+    in_component[index] = true;
+    queue.push_back(index);
+}
+
+fn neighboring_intent_majority_biome(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+    height: usize,
+    component: &[usize],
+    in_component: &[bool],
+) -> Option<String> {
+    let mut counts = Vec::<JavaHashStringCount>::new();
+    for &index in component {
+        let x = index % width;
+        let z = index / width;
+        count_neighbor_intent_biome(
+            columns,
+            in_component,
+            &mut counts,
+            index.wrapping_sub(width),
+            z > 0,
+        );
+        count_neighbor_intent_biome(
+            columns,
+            in_component,
+            &mut counts,
+            index + width,
+            z < height - 1,
+        );
+        count_neighbor_intent_biome(
+            columns,
+            in_component,
+            &mut counts,
+            index.wrapping_sub(1),
+            x > 0,
+        );
+        count_neighbor_intent_biome(columns, in_component, &mut counts, index + 1, x < width - 1);
+    }
+    java_hashmap_string_majority(&counts)
+}
+
+fn count_neighbor_intent_biome(
+    columns: &[EarthSurfaceColumn],
+    in_component: &[bool],
+    counts: &mut Vec<JavaHashStringCount>,
+    index: usize,
+    in_bounds: bool,
+) {
+    if !in_bounds || in_component[index] {
+        return;
+    }
+    let column = &columns[index];
+    if column.water || is_protected_intent_biome(&column.biome_id) {
+        return;
+    }
+    increment_java_hash_string_count(counts, &column.biome_id);
+}
+
+fn increment_java_hash_string_count(counts: &mut Vec<JavaHashStringCount>, key: &str) {
+    if let Some(count) = counts.iter_mut().find(|count| count.key == key) {
+        count.count += 1;
+        return;
+    }
+    counts.push(JavaHashStringCount {
+        key: key.to_string(),
+        count: 1,
+        first_order: counts.len(),
+    });
+}
+
+fn java_hashmap_string_majority(counts: &[JavaHashStringCount]) -> Option<String> {
+    let capacity = java_hashmap_capacity_for_size(counts.len());
+    counts
+        .iter()
+        .max_by(|left, right| {
+            left.count
+                .cmp(&right.count)
+                .then_with(|| {
+                    java_hashmap_string_bucket(&right.key, capacity)
+                        .cmp(&java_hashmap_string_bucket(&left.key, capacity))
+                })
+                .then_with(|| right.first_order.cmp(&left.first_order))
+        })
+        .filter(|count| count.count > 0)
+        .map(|count| count.key.clone())
+}
+
+fn java_hashmap_capacity_for_size(size: usize) -> usize {
+    let mut capacity = 16;
+    let mut threshold = (capacity * 3) / 4;
+    while size > threshold {
+        capacity *= 2;
+        threshold = (capacity * 3) / 4;
+    }
+    capacity
+}
+
+fn java_hashmap_string_bucket(key: &str, capacity: usize) -> usize {
+    let hash = java_string_hash_code(key) as u32;
+    let spread = hash ^ (hash >> 16);
+    (spread as usize) & (capacity - 1)
+}
+
+fn java_string_hash_code(text: &str) -> i32 {
+    let mut hash = 0_i32;
+    for unit in text.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    hash
+}
+
+fn intent_surface_compatible_replacement(
+    column: &EarthSurfaceColumn,
+    biome: &str,
+    source: &str,
+) -> EarthSurfaceColumn {
+    let top = intent_compatible_top_for_biome(column.top_block_state_id, biome);
+    let mut replacement = EarthSurfaceColumn::new(
+        false,
+        column.ground_surface_y,
+        column.water_surface_y,
+        top,
+        intent_filler_for(top),
+        biome.to_string(),
+        source.to_string(),
+    );
+    replacement.terrain_token_source = column.terrain_token_source;
+    replacement.data_evidence_flags = column.data_evidence_flags;
+    replacement
+}
+
+fn intent_compatible_top_for_biome(current_top: i32, biome: &str) -> i32 {
+    if is_snow_intent_biome(biome) {
+        if matches!(
+            current_top,
+            block_state_ids::SNOW_BLOCK | block_state_ids::STONE | block_state_ids::GRAVEL
+        ) {
+            return current_top;
+        }
+        return block_state_ids::SNOW_BLOCK;
+    }
+    if is_vegetated_intent_biome(biome)
+        && current_top != block_state_ids::MUD
+        && current_top != block_state_ids::SNOW_BLOCK
+    {
+        if current_top == block_state_ids::COARSE_DIRT && is_dry_vegetated_intent_biome(biome) {
+            return current_top;
+        }
+        if (current_top == block_state_ids::MOSS_BLOCK || current_top == block_state_ids::PODZOL)
+            && is_lush_vegetated_intent_biome(biome)
+        {
+            return current_top;
+        }
+        return block_state_ids::GRASS_BLOCK;
+    }
+    if biome.contains("desert") {
+        return block_state_ids::SAND;
+    }
+    if biome.contains("badlands") {
+        if matches!(
+            current_top,
+            block_state_ids::RED_SAND
+                | block_state_ids::ORANGE_TERRACOTTA
+                | block_state_ids::BROWN_TERRACOTTA
+                | block_state_ids::TERRACOTTA
+        ) {
+            return current_top;
+        }
+        return block_state_ids::TERRACOTTA;
+    }
+    current_top
+}
+
+fn is_protected_intent_biome(biome: &str) -> bool {
+    biome == "minecraft:beach"
+        || biome.contains("snow")
+        || biome.contains("swamp")
+        || biome.contains("mangrove")
+}
+
+fn is_snow_intent_biome(biome: &str) -> bool {
+    biome.contains("snow") || biome.contains("frozen")
+}
+
+fn is_vegetated_intent_biome(biome: &str) -> bool {
+    biome.contains("savanna")
+        || biome.contains("jungle")
+        || biome.contains("forest")
+        || biome.contains("plains")
+        || biome.contains("meadow")
+        || biome.contains("taiga")
+}
+
+fn is_dry_vegetated_intent_biome(biome: &str) -> bool {
+    biome.contains("savanna") || biome.contains("plains")
+}
+
+fn is_lush_vegetated_intent_biome(biome: &str) -> bool {
+    biome.contains("jungle") || biome.contains("forest") || biome.contains("taiga")
+}
+
+fn is_arid_transition_cell(family_counts: &BTreeMap<String, i32>) -> bool {
+    if family_counts.len() <= 1 {
+        return false;
+    }
+    let mut has_arid = false;
+    for family in family_counts.keys() {
+        if is_arid_transition_family(family) {
+            has_arid = true;
+            continue;
+        }
+        return false;
+    }
+    has_arid
+}
+
+fn is_arid_transition_pair(first_family: &str, second_family: &str) -> bool {
+    first_family != second_family
+        && is_arid_transition_family(first_family)
+        && is_arid_transition_family(second_family)
+}
+
+fn is_arid_transition_family(family: &str) -> bool {
+    matches!(family, "desert" | "badlands" | "savanna" | "grassland")
+}
+
+fn intent_biome_family(biome: &str) -> String {
+    if biome.contains("desert") {
+        return "desert".to_string();
+    }
+    if biome.contains("badlands") {
+        return "badlands".to_string();
+    }
+    if biome.contains("savanna") {
+        return "savanna".to_string();
+    }
+    if biome.contains("jungle") {
+        return "jungle".to_string();
+    }
+    if biome.contains("forest") {
+        return "forest".to_string();
+    }
+    if biome.contains("swamp") {
+        return "swamp".to_string();
+    }
+    if biome.contains("taiga") {
+        return "taiga".to_string();
+    }
+    if biome.contains("plains") || biome.contains("meadow") {
+        return "grassland".to_string();
+    }
+    biome.to_string()
+}
+
+fn intent_filler_for(top: i32) -> i32 {
+    match top {
+        block_state_ids::SAND
+        | block_state_ids::RED_SAND
+        | block_state_ids::TERRACOTTA
+        | block_state_ids::SANDSTONE
+        | block_state_ids::END_STONE
+        | block_state_ids::END_STONE_BRICKS
+        | block_state_ids::SMOOTH_SANDSTONE
+        | block_state_ids::CUT_SANDSTONE
+        | block_state_ids::CHISELED_SANDSTONE
+        | block_state_ids::SMOOTH_RED_SANDSTONE
+        | block_state_ids::CUT_RED_SANDSTONE
+        | block_state_ids::CHISELED_RED_SANDSTONE
+        | block_state_ids::ORANGE_TERRACOTTA
+        | block_state_ids::BROWN_TERRACOTTA
+        | block_state_ids::WHITE_TERRACOTTA
+        | block_state_ids::LIGHT_GRAY_TERRACOTTA
+        | block_state_ids::YELLOW_TERRACOTTA
+        | block_state_ids::RED_TERRACOTTA
+        | block_state_ids::MUD_BRICKS
+        | block_state_ids::DRIPSTONE_BLOCK => top,
+        block_state_ids::STONE | block_state_ids::GRAVEL | block_state_ids::CLAY => {
+            block_state_ids::STONE
+        }
+        _ => block_state_ids::DIRT,
+    }
+}
+
 fn top_block_state_id(
     _elevation_meters: f64,
     longitude: f64,
@@ -7122,6 +7622,215 @@ mod tests {
 
         assert!(smooth_surface_classes(&patch, 0).is_err());
         assert!(smooth_surface_classes(&patch, 4).is_err());
+    }
+
+    #[test]
+    fn surface_biome_family_intent_grid_matches_java_non_photo_fixture_cases() {
+        let mut cell = filled_surface_columns(
+            4,
+            4,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:forest",
+            ),
+        );
+        cell[surface_class_index(3, 3, 4)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let cell_smoothed = stabilize_surface_biome_families(&cell, 4).unwrap();
+        assert_eq!(
+            cell_smoothed[surface_class_index(3, 3, 4)].biome_id,
+            "minecraft:forest"
+        );
+        assert_eq!(
+            cell_smoothed[surface_class_index(3, 3, 4)].decision_source,
+            "intent-stabilized-cell"
+        );
+
+        let mut snow_cell = filled_surface_columns(
+            4,
+            4,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::SNOW_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:snowy_plains",
+            ),
+        );
+        snow_cell[surface_class_index(3, 3, 4)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let snow_smoothed = stabilize_surface_biome_families(&snow_cell, 4).unwrap();
+        let snowy = &snow_smoothed[surface_class_index(3, 3, 4)];
+        assert_eq!(snowy.biome_id, "minecraft:snowy_plains");
+        assert_eq!(snowy.top_block_state_id, block_state_ids::SNOW_BLOCK);
+
+        let mut arid_transition = filled_surface_columns(
+            8,
+            8,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+        );
+        for z in 0..4 {
+            for x in 0..8 {
+                arid_transition[surface_class_index(x, z, 8)] = surface_column(
+                    false,
+                    SEA_LEVEL_Y + 4,
+                    i32::MIN,
+                    block_state_ids::SAND,
+                    block_state_ids::SAND,
+                    "minecraft:desert",
+                );
+            }
+        }
+        let arid_smoothed = stabilize_surface_biome_families(&arid_transition, 8).unwrap();
+        assert_eq!(
+            arid_smoothed[surface_class_index(0, 0, 8)].biome_id,
+            "minecraft:desert"
+        );
+        assert_eq!(
+            arid_smoothed[surface_class_index(0, 7, 8)].biome_id,
+            "minecraft:savanna"
+        );
+
+        let mut island = filled_surface_columns(
+            8,
+            8,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+        );
+        for z in 3..=4 {
+            for x in 3..=4 {
+                island[surface_class_index(x, z, 8)] = surface_column(
+                    false,
+                    SEA_LEVEL_Y + 4,
+                    i32::MIN,
+                    block_state_ids::GRASS_BLOCK,
+                    block_state_ids::DIRT,
+                    "minecraft:jungle",
+                );
+            }
+        }
+        let island_smoothed = stabilize_surface_biome_families(&island, 8).unwrap();
+        assert_eq!(
+            island_smoothed[surface_class_index(3, 3, 8)].biome_id,
+            "minecraft:savanna"
+        );
+        assert!(island_smoothed[surface_class_index(3, 3, 8)]
+            .decision_source
+            .starts_with("intent-stabilized"));
+
+        let mut tied_neighbors = filled_surface_columns(5, 5, water_surface_column());
+        tied_neighbors[surface_class_index(2, 2, 5)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:jungle",
+        );
+        tied_neighbors[surface_class_index(2, 1, 5)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:dark_forest",
+        );
+        tied_neighbors[surface_class_index(2, 3, 5)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:dark_forest",
+        );
+        tied_neighbors[surface_class_index(1, 2, 5)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::SAND,
+            block_state_ids::SAND,
+            "minecraft:desert",
+        );
+        tied_neighbors[surface_class_index(3, 2, 5)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::SAND,
+            block_state_ids::SAND,
+            "minecraft:desert",
+        );
+        let tied_smoothed = stabilize_small_surface_biome_components(&tied_neighbors, 5).unwrap();
+        let tied_center = &tied_smoothed[surface_class_index(2, 2, 5)];
+        assert_eq!(tied_center.biome_id, "minecraft:desert");
+        assert_eq!(tied_center.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(tied_center.decision_source, "intent-stabilized-component");
+
+        let mut swamp = filled_surface_columns(
+            8,
+            8,
+            surface_column(
+                false,
+                SEA_LEVEL_Y + 4,
+                i32::MIN,
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ),
+        );
+        for z in 3..=4 {
+            for x in 3..=4 {
+                swamp[surface_class_index(x, z, 8)] = surface_column(
+                    false,
+                    SEA_LEVEL_Y + 4,
+                    i32::MIN,
+                    block_state_ids::MUD,
+                    block_state_ids::MUD,
+                    "minecraft:swamp",
+                );
+            }
+        }
+        let swamp_smoothed = stabilize_surface_biome_families(&swamp, 8).unwrap();
+        assert_eq!(
+            swamp_smoothed[surface_class_index(3, 3, 8)].biome_id,
+            "minecraft:swamp"
+        );
+        assert_eq!(
+            swamp_smoothed[surface_class_index(3, 3, 8)].top_block_state_id,
+            block_state_ids::MUD
+        );
+
+        assert!(stabilize_surface_biome_families(&cell, 0).is_err());
+        assert!(stabilize_small_surface_biome_components(&cell, 3).is_err());
     }
 
     #[test]
