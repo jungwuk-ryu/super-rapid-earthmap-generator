@@ -788,6 +788,164 @@ impl SurfaceMaterialSample {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhotoSurfaceInput {
+    pub semantic_column: EarthSurfaceColumn,
+    pub sample: SurfaceMaterialSample,
+    pub elevation_meters: f64,
+    pub longitude: f64,
+    pub latitude: f64,
+    pub coast_factor: f64,
+    pub local_relief_meters: f64,
+    pub global_block_x: i32,
+    pub global_block_z: i32,
+}
+
+impl PhotoSurfaceInput {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        semantic_column: EarthSurfaceColumn,
+        sample: SurfaceMaterialSample,
+        elevation_meters: f64,
+        longitude: f64,
+        latitude: f64,
+        coast_factor: f64,
+        local_relief_meters: f64,
+        global_block_x: i32,
+        global_block_z: i32,
+    ) -> Self {
+        Self {
+            semantic_column,
+            sample,
+            elevation_meters,
+            longitude,
+            latitude,
+            coast_factor,
+            local_relief_meters,
+            global_block_x,
+            global_block_z,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhotoSurfaceDecision {
+    pub top_block_state_id: i32,
+    pub filler_block_state_id: i32,
+    pub biome_id: String,
+    pub rendered_rgb: i32,
+    pub recipe_id: String,
+    pub stage_id: String,
+    pub trace: String,
+}
+
+impl PhotoSurfaceDecision {
+    pub fn new(
+        top_block_state_id: i32,
+        filler_block_state_id: i32,
+        biome_id: impl Into<String>,
+        rendered_rgb: i32,
+        recipe_id: impl Into<String>,
+        stage_id: impl Into<String>,
+        trace: impl Into<String>,
+    ) -> Self {
+        Self {
+            top_block_state_id,
+            filler_block_state_id,
+            biome_id: normalize_text_default(biome_id.into(), "minecraft:plains"),
+            rendered_rgb,
+            recipe_id: normalize_text_default(recipe_id.into(), "unknown"),
+            stage_id: normalize_text_default(stage_id.into(), "unknown"),
+            trace: trace.into(),
+        }
+    }
+
+    pub fn from_column(column: &EarthSurfaceColumn, stage_id: &str, trace: &str) -> Self {
+        Self::new(
+            column.top_block_state_id,
+            column.filler_block_state_id,
+            column.biome_id.clone(),
+            render_surface_color(column.top_block_state_id, Some(&column.biome_id)),
+            column.decision_source.clone(),
+            stage_id.to_string(),
+            trace.to_string(),
+        )
+    }
+
+    pub fn to_column(&self, semantic_column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
+        if self.top_block_state_id == semantic_column.top_block_state_id
+            && self.filler_block_state_id == semantic_column.filler_block_state_id
+        {
+            return semantic_column
+                .with_biome_id(self.biome_id.clone())
+                .with_decision_source(self.recipe_id.clone());
+        }
+        let mut column = EarthSurfaceColumn::new(
+            false,
+            semantic_column.ground_surface_y,
+            semantic_column.water_surface_y,
+            self.top_block_state_id,
+            self.filler_block_state_id,
+            self.biome_id.clone(),
+            self.recipe_id.clone(),
+        );
+        column.terrain_token_source = semantic_column.terrain_token_source;
+        column.data_evidence_flags = semantic_column.data_evidence_flags;
+        column
+    }
+}
+
+pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDecision> {
+    if input.semantic_column.water {
+        return Ok(PhotoSurfaceDecision::from_column(
+            &input.semantic_column,
+            "water",
+            "semantic water column preserved",
+        ));
+    }
+    let source = input.sample.color;
+    if !source.available || source.is_near_black() {
+        return Ok(PhotoSurfaceDecision::from_column(
+            &input.semantic_column,
+            "no-photo-source",
+            "photo source unavailable or near black",
+        ));
+    }
+    let entry = nearest_photo_palette_entry(source);
+    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    let filler = if entry.block_state_id == input.semantic_column.top_block_state_id {
+        input.semantic_column.filler_block_state_id
+    } else {
+        smoother_filler_for(entry.block_state_id)
+    };
+    Ok(PhotoSurfaceDecision::new(
+        entry.block_state_id,
+        filler,
+        biome.clone(),
+        render_surface_color(entry.block_state_id, Some(&biome)),
+        "photo-texture",
+        "palette-nearest",
+        format!(
+            "nearest photo palette block {} for rgb #{:02X}{:02X}{:02X}",
+            entry.block_state_id, source.red, source.green, source.blue
+        ),
+    ))
+}
+
+pub fn apply_photo_surface_material(input: &PhotoSurfaceInput) -> Result<EarthSurfaceColumn> {
+    Ok(solve_photo_surface(input)?.to_column(&input.semantic_column))
+}
+
+fn photo_solver_biome(
+    semantic_column: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+) -> String {
+    if !sample.ecoregion_biome_id.trim().is_empty() && sample.ecoregion_confidence >= 0.50 {
+        return sample.ecoregion_biome_id.clone();
+    }
+    semantic_column.biome_id.clone()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EcoregionSample {
     pub name: String,
@@ -3252,6 +3410,78 @@ pub fn quantized_cell(longitude: f64, latitude: f64, cell_degrees: f64) -> Surfa
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhotoPaletteEntry {
+    block_state_id: i32,
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl PhotoPaletteEntry {
+    const fn new(block_state_id: i32, red: u8, green: u8, blue: u8) -> Self {
+        Self {
+            block_state_id,
+            red,
+            green,
+            blue,
+        }
+    }
+}
+
+const PHOTO_PALETTE_ENTRIES: [PhotoPaletteEntry; 50] = [
+    PhotoPaletteEntry::new(block_state_ids::GRASS_BLOCK, 92, 133, 62),
+    PhotoPaletteEntry::new(block_state_ids::OAK_LEAVES, 48, 89, 43),
+    PhotoPaletteEntry::new(block_state_ids::JUNGLE_LEAVES, 36, 97, 36),
+    PhotoPaletteEntry::new(block_state_ids::DARK_OAK_LEAVES, 26, 58, 28),
+    PhotoPaletteEntry::new(block_state_ids::SPRUCE_LEAVES, 55, 82, 49),
+    PhotoPaletteEntry::new(block_state_ids::MOSS_BLOCK, 75, 112, 41),
+    PhotoPaletteEntry::new(block_state_ids::PODZOL, 94, 64, 36),
+    PhotoPaletteEntry::new(block_state_ids::COARSE_DIRT, 112, 92, 58),
+    PhotoPaletteEntry::new(block_state_ids::DIRT, 115, 82, 48),
+    PhotoPaletteEntry::new(block_state_ids::ROOTED_DIRT, 123, 91, 57),
+    PhotoPaletteEntry::new(block_state_ids::MUD, 72, 64, 54),
+    PhotoPaletteEntry::new(block_state_ids::PACKED_MUD, 142, 106, 79),
+    PhotoPaletteEntry::new(block_state_ids::MYCELIUM, 111, 99, 85),
+    PhotoPaletteEntry::new(block_state_ids::SAND, 218, 202, 142),
+    PhotoPaletteEntry::new(block_state_ids::SANDSTONE, 213, 191, 121),
+    PhotoPaletteEntry::new(block_state_ids::END_STONE, 221, 214, 164),
+    PhotoPaletteEntry::new(block_state_ids::END_STONE_BRICKS, 216, 207, 163),
+    PhotoPaletteEntry::new(block_state_ids::SMOOTH_SANDSTONE, 216, 195, 137),
+    PhotoPaletteEntry::new(block_state_ids::CUT_SANDSTONE, 214, 190, 121),
+    PhotoPaletteEntry::new(block_state_ids::CHISELED_SANDSTONE, 215, 192, 129),
+    PhotoPaletteEntry::new(block_state_ids::RED_SAND, 181, 97, 45),
+    PhotoPaletteEntry::new(block_state_ids::SMOOTH_RED_SANDSTONE, 181, 101, 57),
+    PhotoPaletteEntry::new(block_state_ids::CUT_RED_SANDSTONE, 166, 91, 50),
+    PhotoPaletteEntry::new(block_state_ids::CHISELED_RED_SANDSTONE, 179, 98, 54),
+    PhotoPaletteEntry::new(block_state_ids::MUD_BRICKS, 137, 107, 78),
+    PhotoPaletteEntry::new(block_state_ids::DRIPSTONE_BLOCK, 138, 106, 89),
+    PhotoPaletteEntry::new(block_state_ids::YELLOW_TERRACOTTA, 186, 133, 36),
+    PhotoPaletteEntry::new(block_state_ids::ORANGE_TERRACOTTA, 184, 92, 42),
+    PhotoPaletteEntry::new(block_state_ids::TERRACOTTA, 154, 102, 76),
+    PhotoPaletteEntry::new(block_state_ids::BROWN_TERRACOTTA, 104, 66, 48),
+    PhotoPaletteEntry::new(block_state_ids::RED_TERRACOTTA, 143, 61, 47),
+    PhotoPaletteEntry::new(block_state_ids::WHITE_TERRACOTTA, 210, 178, 161),
+    PhotoPaletteEntry::new(block_state_ids::LIGHT_GRAY_TERRACOTTA, 135, 107, 98),
+    PhotoPaletteEntry::new(block_state_ids::GREEN_TERRACOTTA, 76, 83, 42),
+    PhotoPaletteEntry::new(block_state_ids::LIME_TERRACOTTA, 104, 117, 53),
+    PhotoPaletteEntry::new(block_state_ids::CYAN_TERRACOTTA, 86, 91, 91),
+    PhotoPaletteEntry::new(block_state_ids::STONE, 118, 122, 118),
+    PhotoPaletteEntry::new(block_state_ids::ANDESITE, 136, 136, 136),
+    PhotoPaletteEntry::new(block_state_ids::GRANITE, 149, 103, 85),
+    PhotoPaletteEntry::new(block_state_ids::DIORITE, 188, 188, 182),
+    PhotoPaletteEntry::new(block_state_ids::TUFF, 108, 109, 103),
+    PhotoPaletteEntry::new(block_state_ids::GRAVEL, 112, 112, 106),
+    PhotoPaletteEntry::new(block_state_ids::CLAY, 145, 158, 160),
+    PhotoPaletteEntry::new(block_state_ids::DEEPSLATE, 79, 79, 82),
+    PhotoPaletteEntry::new(block_state_ids::GRAY_TERRACOTTA, 57, 41, 35),
+    PhotoPaletteEntry::new(block_state_ids::BLACK_TERRACOTTA, 37, 23, 16),
+    PhotoPaletteEntry::new(block_state_ids::BONE_BLOCK, 229, 224, 195),
+    PhotoPaletteEntry::new(block_state_ids::QUARTZ_BLOCK, 236, 229, 220),
+    PhotoPaletteEntry::new(block_state_ids::CALCITE, 224, 220, 204),
+    PhotoPaletteEntry::new(block_state_ids::SNOW_BLOCK, 232, 238, 236),
+];
+
 const MET_TERRAIN_CONFIDENT_DISTANCE_SQUARED: i32 = 2_200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3541,6 +3771,26 @@ fn nearest_image_magick_remap(color: RgbColor) -> Option<usize> {
     };
     find_met_closest(&nodes, search_root, color, &mut closest);
     closest.entry
+}
+
+fn nearest_photo_palette_entry(color: RgbColor) -> PhotoPaletteEntry {
+    let mut best = PHOTO_PALETTE_ENTRIES[0];
+    let mut best_distance = photo_palette_distance_squared(color, best);
+    for &entry in PHOTO_PALETTE_ENTRIES.iter().skip(1) {
+        let distance = photo_palette_distance_squared(color, entry);
+        if distance < best_distance {
+            best = entry;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
+fn photo_palette_distance_squared(color: RgbColor, entry: PhotoPaletteEntry) -> i32 {
+    let dr = i32::from(color.red) - i32::from(entry.red);
+    let dg = i32::from(color.green) - i32::from(entry.green);
+    let db = i32::from(color.blue) - i32::from(entry.blue);
+    (dr * dr) + (dg * dg) + (db * db)
 }
 
 fn build_met_remap_tree() -> Vec<MetOctreeNode> {
@@ -8996,6 +9246,134 @@ mod tests {
         assert_eq!(SurfaceMaterialSample::rounded(Some(12.5)), 13);
         assert_eq!(SurfaceMaterialSample::rounded(Some(-12.5)), -12);
         assert_eq!(SurfaceMaterialSample::rounded(Some(f64::NAN)), 0);
+    }
+
+    #[test]
+    fn photo_surface_solver_bootstrap_matches_java_contract_fixture_cases() {
+        let semantic = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let input = PhotoSurfaceInput::new(
+            semantic.clone(),
+            SurfaceMaterialSample::color_only(RgbColor::of(218, 184, 92)),
+            240.0,
+            13.0,
+            24.0,
+            0.0,
+            15.0,
+            101,
+            100,
+        );
+        let decision = solve_photo_surface(&input).unwrap();
+        let solved = decision.to_column(&semantic);
+        let applied = apply_photo_surface_material(&input).unwrap();
+        assert_eq!(solved, applied);
+        assert_ne!(decision.rendered_rgb, 0);
+        assert!(!decision.stage_id.is_empty());
+        assert!(!decision.trace.is_empty());
+        assert!(matches!(
+            applied.top_block_state_id,
+            block_state_ids::SAND
+                | block_state_ids::SANDSTONE
+                | block_state_ids::END_STONE
+                | block_state_ids::SMOOTH_SANDSTONE
+                | block_state_ids::CUT_SANDSTONE
+                | block_state_ids::CHISELED_SANDSTONE
+                | block_state_ids::YELLOW_TERRACOTTA
+        ));
+
+        let lush_input = PhotoSurfaceInput::new(
+            semantic.clone(),
+            SurfaceMaterialSample::color_only(RgbColor::of(42, 95, 38)),
+            180.0,
+            21.0,
+            -3.0,
+            0.0,
+            35.0,
+            100,
+            100,
+        );
+        let lush = apply_photo_surface_material(&lush_input).unwrap();
+        assert!(matches!(
+            lush.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+                | block_state_ids::OAK_LEAVES
+                | block_state_ids::JUNGLE_LEAVES
+                | block_state_ids::DARK_OAK_LEAVES
+                | block_state_ids::SPRUCE_LEAVES
+                | block_state_ids::MOSS_BLOCK
+                | block_state_ids::PODZOL
+        ));
+
+        let same_top_semantic = surface_column(
+            false,
+            SEA_LEVEL_Y + 9,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::CLAY,
+            "minecraft:plains",
+        );
+        let same_top_input = PhotoSurfaceInput::new(
+            same_top_semantic.clone(),
+            SurfaceMaterialSample::color_only(RgbColor::of(92, 133, 62)),
+            150.0,
+            12.0,
+            35.0,
+            0.0,
+            5.0,
+            8,
+            9,
+        );
+        let same_top = apply_photo_surface_material(&same_top_input).unwrap();
+        assert_eq!(same_top.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(same_top.filler_block_state_id, block_state_ids::CLAY);
+
+        let water = surface_column(
+            true,
+            SEA_LEVEL_Y - 4,
+            SEA_LEVEL_Y,
+            block_state_ids::CLAY,
+            block_state_ids::CLAY,
+            "minecraft:warm_ocean",
+        );
+        let water_input = PhotoSurfaceInput::new(
+            water.clone(),
+            SurfaceMaterialSample::color_only(RgbColor::of(42, 95, 38)),
+            -10.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0,
+            0,
+        );
+        assert_eq!(
+            solve_photo_surface(&water_input).unwrap().to_column(&water),
+            water
+        );
+
+        let no_photo_input = PhotoSurfaceInput::new(
+            semantic.clone(),
+            SurfaceMaterialSample::color_only(RgbColor::unavailable()),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+        );
+        assert_eq!(
+            solve_photo_surface(&no_photo_input)
+                .unwrap()
+                .to_column(&semantic),
+            semantic
+        );
     }
 
     #[test]

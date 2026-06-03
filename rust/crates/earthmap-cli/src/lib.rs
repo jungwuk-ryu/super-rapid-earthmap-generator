@@ -368,6 +368,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "DONE rust.phase5.photoSurfaceSolverContractBootstrap - PhotoSurfaceInput/Decision contract, water/no-photo preservation, and representative color-only nearest-palette photo solver cases are wired in Rust."
+    )?;
+    writeln!(
+        out,
         "DONE rust.phase5.surfaceBiomeFamilyIntentGridBootstrap - SurfaceBiomeFamilyIntentGrid non-photo cell stabilization, small-component absorption, protected wetland/snow/beach handling, and arid-transition preservation match Java fixture cases."
     )?;
     writeln!(
