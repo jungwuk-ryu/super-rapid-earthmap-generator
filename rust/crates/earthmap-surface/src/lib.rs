@@ -2254,6 +2254,49 @@ fn classify_surface_material_by_semantic_intent(
         }
     }
 
+    if ecoregion_dry_core
+        || (has_climate && is_desert_climate(climate))
+        || sahara_score >= 0.45
+        || (desert_sand_like && latitude.abs() <= 38.0 && !green_like && sahara_score >= 0.25)
+    {
+        if (vegetation_evidence || (java_standard_terrain && token_vegetated))
+            && (sahel_score >= 0.18 || dry_savanna_score >= 0.18 || !desert_sand_like)
+        {
+            let dry_score = sahel_score.max(dry_savanna_score).max(0.58);
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
+                patch_noise,
+                fine_noise,
+                dry_score,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
+            );
+            return Some(surface_material_with_surface(
+                base,
+                top,
+                block_state_ids::DIRT,
+                "minecraft:savanna",
+            ));
+        }
+        return Some(hot_desert_surface_column(
+            base,
+            sample,
+            metrics,
+            elevation_meters,
+            longitude,
+            latitude,
+            sahara_score,
+            dry_savanna_score,
+            patch_noise,
+            fine_noise,
+            local_relief_meters,
+            terrain,
+            semantic_terrain,
+        ));
+    }
+
     if is_desert_climate(climate) {
         if (tree_cover >= 0.12 || herb_cover >= 0.35 || shrub_cover >= 0.35 || green_like)
             && (savanna_like || is_sahel_latitude(latitude) || sahel_score >= 0.18)
@@ -13911,6 +13954,107 @@ mod tests {
         );
         assert_eq!(dry_core_transition.biome_id, "minecraft:savanna");
         assert_eq!(dry_core_transition.decision_source, "intent-ecoregion");
+
+        let dry_core_hot_desert_candidate = SurfaceMaterialSample::land(
+            RgbColor::of(230, 205, 160),
+            SurfaceMaterialSample::UNKNOWN,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Sahara desert",
+            "minecraft:desert",
+            0.80,
+        );
+        let dry_core_hot_metrics = SurfaceColorMetrics::from(dry_core_hot_desert_candidate.color);
+        assert!(is_dry_core_ecoregion_evidence(
+            &dry_core_hot_desert_candidate,
+            dry_core_hot_metrics,
+            false
+        ));
+        let (dry_core_hot_longitude, dry_core_hot_latitude) = (-180..=180)
+            .flat_map(|longitude| (-42..=42).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                !is_sahel_latitude(latitude)
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.32
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+            })
+            .expect("test fixture should find a dry-core hot-desert coordinate");
+        let dry_core_hot_desert = apply_test_surface_material_sample(
+            &base_land,
+            dry_core_hot_desert_candidate,
+            300.0,
+            f64::from(dry_core_hot_longitude),
+            f64::from(dry_core_hot_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            dry_core_hot_desert.top_block_state_id,
+            block_state_ids::SAND
+        );
+        assert_eq!(
+            dry_core_hot_desert.filler_block_state_id,
+            block_state_ids::SAND
+        );
+        assert_eq!(dry_core_hot_desert.biome_id, "minecraft:desert");
+        assert_eq!(dry_core_hot_desert.decision_source, "intent-ecoregion");
+
+        let desert_climate_vegetation_edge = SurfaceMaterialSample::land(
+            RgbColor::of(84, 132, 76),
+            4,
+            12,
+            0,
+            18,
+            0,
+            22,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+        let (desert_vegetation_longitude, desert_vegetation_latitude) = (-180..=180)
+            .flat_map(|longitude| (-42..=42).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                !is_sahel_latitude(latitude)
+                    && surface_material_sahel_score(longitude, latitude) < 0.18
+                    && surface_material_dry_savanna_score(longitude, latitude) < 0.18
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+            })
+            .expect("test fixture should find a non-Sahel desert-climate vegetation coordinate");
+        let desert_vegetation_edge = apply_test_surface_material_sample(
+            &base_land,
+            desert_climate_vegetation_edge,
+            260.0,
+            f64::from(desert_vegetation_longitude),
+            f64::from(desert_vegetation_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            desert_vegetation_edge.filler_block_state_id,
+            block_state_ids::DIRT
+        );
+        assert_eq!(desert_vegetation_edge.biome_id, "minecraft:savanna");
+        assert_eq!(desert_vegetation_edge.decision_source, "intent");
 
         let savanna_like_highland_candidate = SurfaceMaterialSample::land(
             RgbColor::of(181, 96, 46),
