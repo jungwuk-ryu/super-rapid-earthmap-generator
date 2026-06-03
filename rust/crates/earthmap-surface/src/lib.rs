@@ -1035,6 +1035,1305 @@ impl SurfaceMaterialSample {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SurfaceColorMetrics {
+    red: f64,
+    green: f64,
+    blue: f64,
+    hue: f64,
+    saturation: f64,
+    value: f64,
+}
+
+impl SurfaceColorMetrics {
+    fn from(color: RgbColor) -> Self {
+        let red = f64::from(color.red) / 255.0;
+        let green = f64::from(color.green) / 255.0;
+        let blue = f64::from(color.blue) / 255.0;
+        let max = red.max(green).max(blue);
+        let min = red.min(green).min(blue);
+        let delta = max - min;
+        let hue = if delta == 0.0 {
+            0.0
+        } else if max == red {
+            (60.0 * ((green - blue) / delta).rem_euclid(6.0)).rem_euclid(360.0)
+        } else if max == green {
+            60.0 * (((blue - red) / delta) + 2.0)
+        } else {
+            60.0 * (((red - green) / delta) + 4.0)
+        };
+        let saturation = if max == 0.0 { 0.0 } else { delta / max };
+        Self {
+            red,
+            green,
+            blue,
+            hue,
+            saturation,
+            value: max,
+        }
+    }
+
+    fn color(self) -> RgbColor {
+        RgbColor::of(
+            clamp_surface_material_color(java_math_round_double_to_narrowed_i32(self.red * 255.0)),
+            clamp_surface_material_color(java_math_round_double_to_narrowed_i32(
+                self.green * 255.0,
+            )),
+            clamp_surface_material_color(java_math_round_double_to_narrowed_i32(self.blue * 255.0)),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_surface_material(
+    base: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    coast_factor: f64,
+    local_relief_meters: f64,
+    vertical_scale: f64,
+) -> Result<EarthSurfaceColumn> {
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let coast_factor = clamp_unit(coast_factor);
+    let local_relief_meters = local_relief_meters.max(0.0);
+    let color = sample.color;
+    let usable_color = color.available && (!color.is_near_black() || base.water);
+    let metrics = usable_color.then(|| SurfaceColorMetrics::from(color));
+    let classified = if base.water {
+        if let Some(metrics) = metrics {
+            if should_source_land_override_water(
+                base,
+                sample,
+                metrics,
+                elevation_meters,
+                longitude,
+                latitude,
+                coast_factor,
+            ) {
+                let ground_y = SEA_LEVEL_Y.max(ground_surface_y_at(
+                    elevation_meters.max(0.0),
+                    longitude,
+                    latitude,
+                    false,
+                ));
+                let biome = biome_id(
+                    elevation_meters.max(0.0),
+                    longitude,
+                    latitude,
+                    false,
+                    ground_y,
+                    coast_factor,
+                );
+                if is_pale_dry_land(metrics) {
+                    EarthSurfaceColumn::new(
+                        false,
+                        ground_y,
+                        i32::MIN,
+                        block_state_ids::CALCITE,
+                        block_state_ids::CALCITE,
+                        "minecraft:desert",
+                        "source-land-override",
+                    )
+                } else if is_desert_sand_like(metrics) || is_dry_land_neutral(metrics) {
+                    EarthSurfaceColumn::new(
+                        false,
+                        ground_y,
+                        i32::MIN,
+                        block_state_ids::SAND,
+                        block_state_ids::SAND,
+                        "minecraft:desert",
+                        "source-land-override",
+                    )
+                } else {
+                    let land_base = EarthSurfaceColumn::new(
+                        false,
+                        ground_y,
+                        i32::MIN,
+                        block_state_ids::SAND,
+                        block_state_ids::SAND,
+                        biome,
+                        "source-land-override",
+                    );
+                    classify_surface_material_land(
+                        &land_base,
+                        metrics,
+                        elevation_meters.max(0.0),
+                        longitude,
+                        latitude,
+                        coast_factor,
+                        sample,
+                        local_relief_meters,
+                    )
+                }
+            } else {
+                classify_surface_material_water(
+                    base,
+                    sample,
+                    Some(metrics),
+                    latitude,
+                    coast_factor,
+                    vertical_scale,
+                )
+            }
+        } else {
+            classify_surface_material_water(
+                base,
+                sample,
+                None,
+                latitude,
+                coast_factor,
+                vertical_scale,
+            )
+        }
+    } else if should_bathymetry_override_land(base, sample, elevation_meters, coast_factor) {
+        let ocean_base = EarthSurfaceColumn::new(
+            true,
+            base.ground_surface_y,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            surface_material_ocean_biome_id(&base.biome_id, sample, latitude, 1),
+            "bathymetry-land-override",
+        );
+        classify_surface_material_water(
+            &ocean_base,
+            sample,
+            metrics,
+            latitude,
+            coast_factor,
+            vertical_scale,
+        )
+    } else if let Some(metrics) = metrics {
+        classify_surface_material_land(
+            base,
+            metrics,
+            elevation_meters,
+            longitude,
+            latitude,
+            coast_factor,
+            sample,
+            local_relief_meters,
+        )
+    } else {
+        base.with_decision_source("base")
+    };
+    Ok(with_surface_material_metadata(classified, sample))
+}
+
+fn classify_surface_material_water(
+    base: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    metrics: Option<SurfaceColorMetrics>,
+    latitude: f64,
+    coast_factor: f64,
+    vertical_scale: f64,
+) -> EarthSurfaceColumn {
+    let ground_y =
+        surface_material_bathymetry_ground_surface_y(base, sample, coast_factor, vertical_scale);
+    let depth = 0.max(base.water_surface_y - ground_y);
+    let top = surface_material_ocean_floor_block(metrics, depth, coast_factor);
+    EarthSurfaceColumn::new(
+        true,
+        ground_y,
+        base.water_surface_y,
+        top,
+        top,
+        surface_material_ocean_biome_id(&base.biome_id, sample, latitude, depth),
+        "water",
+    )
+}
+
+fn surface_material_ocean_floor_block(
+    metrics: Option<SurfaceColorMetrics>,
+    depth: i32,
+    coast_factor: f64,
+) -> i32 {
+    let Some(metrics) = metrics else {
+        return block_state_ids::GRAVEL;
+    };
+    let blue_water = (165.0..=255.0).contains(&metrics.hue)
+        && metrics.blue >= metrics.red * 1.10
+        && metrics.green >= metrics.red * 0.80;
+    let dark_open_water = is_dark_open_water(metrics);
+    let open_water = coast_factor < 0.92 || depth >= 8;
+    if open_water && (blue_water || dark_open_water) {
+        if dark_open_water {
+            return block_state_ids::DEEPSLATE;
+        }
+        if depth >= 30 && metrics.value <= 0.13 {
+            return block_state_ids::DEEPSLATE;
+        }
+        if metrics.value <= 0.13 {
+            return block_state_ids::BLACK_TERRACOTTA;
+        }
+        if depth >= 26 && metrics.value <= 0.24 {
+            return block_state_ids::BLACK_TERRACOTTA;
+        }
+        if depth >= 16 && metrics.value <= 0.38 {
+            return block_state_ids::DEEPSLATE;
+        }
+    }
+    if depth <= 7 && blue_water && metrics.value >= 0.34 && metrics.saturation >= 0.16 {
+        return block_state_ids::CLAY;
+    }
+    block_state_ids::GRAVEL
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_surface_material_land(
+    base: &EarthSurfaceColumn,
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    coast_factor: f64,
+    sample: &SurfaceMaterialSample,
+    local_relief_meters: f64,
+) -> EarthSurfaceColumn {
+    let abs_lat = latitude.abs();
+    let green_like = is_green_like(metrics);
+    let dark_vegetation = green_like && metrics.value < 0.48;
+    let lush_vegetation = green_like && metrics.saturation >= 0.20;
+    let olive_dry_grass = is_olive_dry_grass(metrics);
+    let desert_sand_like = is_desert_sand_like(metrics);
+    let orange_rock_like = is_orange_rock_like(metrics);
+    let sahara_score = surface_material_sahara_score(longitude, latitude);
+    let sahel_score = surface_material_sahel_score(longitude, latitude);
+    let rainforest_score = surface_material_rainforest_score(longitude, latitude);
+    let dry_savanna_score = surface_material_dry_savanna_score(longitude, latitude);
+    let mediterranean_score = surface_material_mediterranean_score(longitude, latitude);
+    let patch_noise = surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
+    let fine_noise =
+        surface_material_ecology_noise(longitude, latitude, 7.5, 0x9d6c63b5a8e33f21_u64 as i64);
+    let immediate_beach = is_immediate_beach(base, coast_factor);
+    let beach_sand_allowed = should_use_beach_sand(metrics, longitude, latitude);
+    let terrain = surface_material_met_terrain(sample, metrics);
+    let semantic_terrain =
+        sample.terrain_token_source == TerrainTokenSource::Export && terrain.confident();
+    let warm_bright_dry_land = abs_lat <= 42.0
+        && metrics.value >= 0.58
+        && (28.0..=72.0).contains(&metrics.hue)
+        && metrics.red >= metrics.blue * 1.01
+        && metrics.green >= metrics.blue * 1.01;
+
+    if immediate_beach && beach_sand_allowed {
+        return mark_surface_material(
+            surface_material_with_surface(
+                base,
+                block_state_ids::SAND,
+                block_state_ids::SAND,
+                "minecraft:beach",
+            ),
+            "shoreline",
+        );
+    }
+
+    let snow_climate =
+        abs_lat >= 58.0 || base.ground_surface_y >= 165 || elevation_meters >= 2_800.0;
+    let snow_like = snow_climate
+        && metrics.value >= 0.70
+        && metrics.saturation <= 0.24
+        && metrics.blue >= metrics.red * 0.90
+        && !warm_bright_dry_land;
+    if snow_like || abs_lat >= 68.0 || (base.ground_surface_y >= 170 && abs_lat >= 25.0) {
+        return mark_surface_material(
+            surface_material_with_surface(
+                base,
+                block_state_ids::SNOW_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:snowy_plains",
+            ),
+            "snow",
+        );
+    }
+
+    if !is_sahel_latitude(latitude)
+        && terrain.confident()
+        && terrain.kind == MetTerrainKind::Vegetated
+        && desert_sand_like
+        && warm_bright_dry_land
+        && (sahara_score >= 0.18 || desert_score(longitude, latitude) >= 0.50)
+    {
+        return surface_material_with_surface(
+            base,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:desert",
+        );
+    }
+
+    if is_sahel_latitude(latitude)
+        && elevation_meters < 1_600.0
+        && metrics.value < 0.74
+        && (green_like
+            || olive_dry_grass
+            || orange_rock_like
+            || (desert_sand_like && metrics.value < 0.66))
+    {
+        let biome = dry_grass_biome(
+            sahel_score.max(0.70),
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        );
+        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+        return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+    }
+
+    if orange_rock_like
+        && is_exposed_dry_rock(
+            metrics,
+            elevation_meters,
+            longitude,
+            latitude,
+            sahara_score,
+            dry_savanna_score,
+            local_relief_meters,
+            sample.slope_ratio(),
+        )
+    {
+        let top = if metrics.hue <= 35.0 || metrics.red > metrics.green * 1.18 {
+            block_state_ids::ORANGE_TERRACOTTA
+        } else {
+            block_state_ids::TERRACOTTA
+        };
+        let biome = if elevation_meters >= 1_200.0 || fine_noise >= 0.68 {
+            "minecraft:wooded_badlands"
+        } else {
+            "minecraft:badlands"
+        };
+        return surface_material_with_surface(base, top, top, biome);
+    }
+
+    if rainforest_score >= 0.35 && (green_like || metrics.value < 0.44) {
+        let biome = rainforest_biome(rainforest_score, dark_vegetation, patch_noise, fine_noise);
+        return surface_material_with_surface(
+            base,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            biome,
+        );
+    }
+
+    if sahel_score >= 0.24 && (green_like || olive_dry_grass || metrics.value < 0.75) {
+        let biome = dry_grass_biome(sahel_score, elevation_meters, patch_noise, fine_noise);
+        let top = dry_grass_surface(
+            metrics,
+            patch_noise,
+            fine_noise,
+            0.42 + (sahel_score * 0.18),
+        );
+        return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+    }
+
+    if is_sahel_latitude(latitude)
+        && metrics.value < 0.72
+        && (olive_dry_grass || desert_sand_like || orange_rock_like)
+    {
+        let biome = dry_grass_biome(
+            sahel_score.max(0.70),
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        );
+        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+        return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+    }
+
+    if sahara_score >= 0.45 && (desert_sand_like || !green_like || warm_bright_dry_land) {
+        if orange_rock_like
+            && metrics.value < 0.42
+            && elevation_meters >= 450.0
+            && local_relief_meters >= 160.0
+            && fine_noise >= 0.60
+        {
+            let top = if metrics.hue <= 35.0 {
+                block_state_ids::ORANGE_TERRACOTTA
+            } else {
+                block_state_ids::TERRACOTTA
+            };
+            return surface_material_with_surface(base, top, top, "minecraft:badlands");
+        }
+        let top = desert_surface(
+            metrics,
+            patch_noise,
+            fine_noise,
+            sahara_score,
+            terrain,
+            semantic_terrain,
+        );
+        return surface_material_with_surface(
+            base,
+            top,
+            desert_filler(top),
+            desert_biome(elevation_meters, patch_noise, fine_noise),
+        );
+    }
+
+    if dry_savanna_score >= 0.35
+        && (green_like || olive_dry_grass || desert_sand_like || orange_rock_like)
+    {
+        let biome = dry_grass_biome(dry_savanna_score, elevation_meters, patch_noise, fine_noise);
+        let top = dry_grass_surface(
+            metrics,
+            patch_noise,
+            fine_noise,
+            0.38 + (dry_savanna_score * 0.18),
+        );
+        return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+    }
+
+    if mediterranean_score >= 0.40
+        && (green_like || olive_dry_grass || orange_rock_like || desert_sand_like)
+    {
+        let biome = if patch_noise >= 0.62 || dark_vegetation {
+            "minecraft:forest"
+        } else {
+            "minecraft:plains"
+        };
+        let top = if fine_noise >= 0.76 && !green_like {
+            block_state_ids::COARSE_DIRT
+        } else {
+            block_state_ids::GRASS_BLOCK
+        };
+        return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+    }
+
+    if lush_vegetation {
+        return surface_material_with_surface(
+            base,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            lush_biome(abs_lat, dark_vegetation, patch_noise),
+        );
+    }
+
+    if !immediate_beach && desert_sand_like {
+        if abs_lat <= 28.0
+            && metrics.value < 0.66
+            && (olive_dry_grass || dry_savanna_score >= 0.20 || sahel_score >= 0.18)
+        {
+            let biome = dry_grass_biome(
+                dry_savanna_score.max(sahel_score).max(0.45),
+                elevation_meters,
+                patch_noise,
+                fine_noise,
+            );
+            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+            return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+        }
+        let sand = if metrics.red > metrics.green * 1.18 && metrics.hue <= 45.0 {
+            block_state_ids::RED_SAND
+        } else {
+            block_state_ids::SAND
+        };
+        return surface_material_with_surface(base, sand, sand, "minecraft:desert");
+    }
+
+    if base.biome_id == "minecraft:desert"
+        && abs_lat <= 42.0
+        && metrics.value >= 0.50
+        && metrics.saturation <= 0.20
+    {
+        return surface_material_with_surface(
+            base,
+            block_state_ids::SAND,
+            block_state_ids::SAND,
+            "minecraft:desert",
+        );
+    }
+
+    if orange_rock_like {
+        if dry_savanna_score >= 0.20 || (abs_lat <= 35.0 && metrics.value >= 0.45) {
+            let biome = dry_grass_biome(
+                dry_savanna_score.max(0.40),
+                elevation_meters,
+                patch_noise,
+                fine_noise,
+            );
+            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
+            return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+        }
+        let top = if metrics.value < 0.36 {
+            block_state_ids::BROWN_TERRACOTTA
+        } else {
+            block_state_ids::ORANGE_TERRACOTTA
+        };
+        return surface_material_with_surface(base, top, top, "minecraft:badlands");
+    }
+
+    let rock_like =
+        metrics.saturation <= 0.16 || base.ground_surface_y >= 150 || elevation_meters >= 3_000.0;
+    if rock_like {
+        let top = if metrics.value < 0.35 {
+            block_state_ids::GRAVEL
+        } else {
+            block_state_ids::STONE
+        };
+        let biome = if base.ground_surface_y >= 150 {
+            "minecraft:snowy_plains".to_string()
+        } else {
+            non_beach_biome(base, latitude)
+        };
+        return surface_material_with_surface(base, top, block_state_ids::STONE, biome);
+    }
+
+    if olive_dry_grass || ((45.0..=95.0).contains(&metrics.hue) && metrics.saturation < 0.28) {
+        let biome = dry_grass_biome(
+            dry_savanna_score.max(0.45),
+            elevation_meters,
+            patch_noise,
+            fine_noise,
+        );
+        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.42);
+        return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
+    }
+
+    surface_material_with_surface(
+        base,
+        block_state_ids::GRASS_BLOCK,
+        block_state_ids::DIRT,
+        fallback_biome(base, latitude, patch_noise),
+    )
+}
+
+fn surface_material_with_surface(
+    base: &EarthSurfaceColumn,
+    top: i32,
+    filler: i32,
+    biome_id: impl Into<String>,
+) -> EarthSurfaceColumn {
+    let mut column = EarthSurfaceColumn::new(
+        base.water,
+        base.ground_surface_y,
+        base.water_surface_y,
+        top,
+        filler,
+        biome_id,
+        "material-rule",
+    );
+    column.terrain_token_source = base.terrain_token_source;
+    column.data_evidence_flags = base.data_evidence_flags;
+    column
+}
+
+fn mark_surface_material(column: EarthSurfaceColumn, decision_source: &str) -> EarthSurfaceColumn {
+    column.with_decision_source(decision_source)
+}
+
+fn with_surface_material_metadata(
+    column: EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+) -> EarthSurfaceColumn {
+    let mut with_evidence =
+        column.with_data_evidence_flags(surface_data_evidence::from_sample(sample));
+    if sample.terrain_token_color.available {
+        with_evidence = with_evidence.with_terrain_token_source(sample.terrain_token_source);
+    }
+    with_evidence
+}
+
+fn surface_material_bathymetry_ground_surface_y(
+    base: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    coast_factor: f64,
+    vertical_scale: f64,
+) -> i32 {
+    if !sample.has_bathymetry() || sample.bathymetry_meters >= -1 {
+        return base.ground_surface_y;
+    }
+    let scaled_depth_meters = f64::from(-sample.bathymetry_meters) * vertical_scale.sqrt();
+    let mut depth_blocks = clamp_i32(
+        java_math_round_double_to_narrowed_i32(scaled_depth_meters / 4.5),
+        2,
+        123,
+    );
+    depth_blocks = coastal_shelf_adjusted_depth_blocks(depth_blocks, coast_factor, vertical_scale);
+    clamp_i32(SEA_LEVEL_Y - depth_blocks, MIN_SURFACE_Y, SEA_LEVEL_Y - 1)
+}
+
+fn surface_material_ocean_biome_id(
+    fallback_biome: &str,
+    sample: &SurfaceMaterialSample,
+    latitude: f64,
+    depth: i32,
+) -> String {
+    let abs_lat = latitude.abs();
+    let deep = depth >= 28;
+    if abs_lat >= 70.0 {
+        return if deep {
+            "minecraft:deep_frozen_ocean"
+        } else {
+            "minecraft:frozen_ocean"
+        }
+        .to_string();
+    }
+    if abs_lat >= 56.0 {
+        return if deep {
+            "minecraft:deep_cold_ocean"
+        } else {
+            "minecraft:cold_ocean"
+        }
+        .to_string();
+    }
+    if abs_lat <= 23.5 {
+        return if deep {
+            "minecraft:deep_lukewarm_ocean"
+        } else {
+            "minecraft:warm_ocean"
+        }
+        .to_string();
+    }
+    if sample.ocean_temperature != SurfaceMaterialSample::UNKNOWN
+        && sample.ocean_temperature >= 30000
+    {
+        return if deep {
+            "minecraft:deep_lukewarm_ocean"
+        } else {
+            "minecraft:lukewarm_ocean"
+        }
+        .to_string();
+    }
+    if fallback_biome.contains("ocean") {
+        if deep && !fallback_biome.contains("deep") {
+            if fallback_biome.contains("lukewarm") || fallback_biome.contains("warm") {
+                return "minecraft:deep_lukewarm_ocean".to_string();
+            }
+            if fallback_biome.contains("cold") {
+                return "minecraft:deep_cold_ocean".to_string();
+            }
+            return "minecraft:deep_ocean".to_string();
+        }
+        return fallback_biome.to_string();
+    }
+    if deep {
+        "minecraft:deep_ocean"
+    } else {
+        "minecraft:ocean"
+    }
+    .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn should_source_land_override_water(
+    base: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    coast_factor: f64,
+) -> bool {
+    if !sample.has_bathymetry() || sample.bathymetry_meters < -1 {
+        return false;
+    }
+    if is_open_water_color(sample.color) {
+        return false;
+    }
+    let land_color = is_desert_sand_like(metrics)
+        || is_green_like(metrics)
+        || is_orange_rock_like(metrics)
+        || is_dry_land_neutral(metrics)
+        || is_pale_dry_land(metrics)
+        || is_snow_like_land(metrics, latitude);
+    if !land_color {
+        return false;
+    }
+    if elevation_meters < -6.0 && coast_factor < 0.80 {
+        return false;
+    }
+    base.ground_surface_y >= SEA_LEVEL_Y - 4
+        || coast_factor >= 0.65
+        || sample.bathymetry_meters >= 0
+        || surface_material_sahara_score(longitude, latitude) >= 0.18
+}
+
+fn should_bathymetry_override_land(
+    base: &EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    elevation_meters: f64,
+    coast_factor: f64,
+) -> bool {
+    let open_ocean_false_island = sample.has_bathymetry()
+        && sample.bathymetry_meters <= -24
+        && is_open_water_color(sample.color)
+        && elevation_meters <= 20.0
+        && base.ground_surface_y <= SEA_LEVEL_Y + 2;
+    open_ocean_false_island
+        || (sample.has_bathymetry()
+            && sample.bathymetry_meters <= -24
+            && coast_factor < 0.35
+            && elevation_meters <= 10.0
+            && base.ground_surface_y <= SEA_LEVEL_Y + 1)
+}
+
+fn is_dark_open_water(metrics: SurfaceColorMetrics) -> bool {
+    metrics.value <= 0.16
+        && metrics.blue >= metrics.red.max(metrics.green) * 1.08
+        && metrics.saturation >= 0.24
+}
+
+fn is_open_water_color(color: RgbColor) -> bool {
+    if !color.available || color.is_near_black() {
+        return false;
+    }
+    let metrics = SurfaceColorMetrics::from(color);
+    (170.0..=245.0).contains(&metrics.hue)
+        && metrics.saturation >= 0.18
+        && metrics.blue >= metrics.red * 1.12
+        && metrics.green >= metrics.red * 1.02
+}
+
+fn is_dry_land_neutral(metrics: SurfaceColorMetrics) -> bool {
+    metrics.value >= 0.34
+        && metrics.saturation >= 0.05
+        && (18.0..=88.0).contains(&metrics.hue)
+        && metrics.red >= metrics.blue * 1.04
+        && metrics.green >= metrics.blue * 0.86
+}
+
+fn is_pale_dry_land(metrics: SurfaceColorMetrics) -> bool {
+    metrics.value >= 0.72
+        && metrics.saturation <= 0.16
+        && metrics.red >= metrics.blue * 0.92
+        && metrics.green >= metrics.blue * 0.92
+}
+
+fn is_snow_like_land(metrics: SurfaceColorMetrics, latitude: f64) -> bool {
+    latitude.abs() >= 45.0
+        && metrics.value >= 0.72
+        && metrics.saturation <= 0.22
+        && metrics.blue >= metrics.red * 0.86
+}
+
+fn is_immediate_beach(base: &EarthSurfaceColumn, coast_factor: f64) -> bool {
+    coast_factor >= BEACH_COAST_FACTOR && base.ground_surface_y <= SEA_LEVEL_Y + 2
+}
+
+fn is_sandy_beach_color(metrics: SurfaceColorMetrics) -> bool {
+    (30.0..=64.0).contains(&metrics.hue)
+        && metrics.value >= 0.50
+        && metrics.saturation >= 0.08
+        && metrics.saturation <= 0.55
+        && metrics.red >= metrics.blue * 1.08
+        && metrics.green >= metrics.blue * 1.03
+        && !is_green_like(metrics)
+}
+
+fn should_use_beach_sand(metrics: SurfaceColorMetrics, longitude: f64, latitude: f64) -> bool {
+    if !is_sandy_beach_color(metrics) {
+        return false;
+    }
+    let abs_lat = latitude.abs();
+    if surface_material_sahara_score(longitude, latitude) >= 0.35 || abs_lat >= 25.0 {
+        return surface_material_sahara_score(longitude, latitude) >= 0.35;
+    }
+    metrics.value >= 0.72 && metrics.saturation <= 0.25
+}
+
+fn is_green_like(metrics: SurfaceColorMetrics) -> bool {
+    (70.0..=170.0).contains(&metrics.hue)
+        && metrics.green >= metrics.red * 0.92
+        && metrics.green >= metrics.blue * 1.03
+}
+
+fn is_olive_dry_grass(metrics: SurfaceColorMetrics) -> bool {
+    (48.0..=92.0).contains(&metrics.hue)
+        && metrics.saturation >= 0.12
+        && metrics.saturation <= 0.48
+        && metrics.value >= 0.24
+        && metrics.value <= 0.62
+}
+
+fn is_desert_sand_like(metrics: SurfaceColorMetrics) -> bool {
+    (25.0..=65.0).contains(&metrics.hue)
+        && metrics.value >= 0.42
+        && metrics.green >= metrics.blue * 1.03
+        && metrics.saturation >= 0.10
+}
+
+fn is_orange_rock_like(metrics: SurfaceColorMetrics) -> bool {
+    (12.0..=44.0).contains(&metrics.hue)
+        && metrics.saturation >= 0.24
+        && metrics.value >= 0.26
+        && metrics.red >= metrics.green * 1.08
+}
+
+fn is_sahel_latitude(latitude: f64) -> bool {
+    (6.0..=19.0).contains(&latitude)
+}
+
+fn dry_grass_biome(
+    dry_score: f64,
+    elevation_meters: f64,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> String {
+    if elevation_meters >= 900.0 && fine_noise >= 0.52 {
+        return "minecraft:windswept_savanna".to_string();
+    }
+    if patch_noise <= 0.22 && dry_score < 0.62 {
+        return if fine_noise <= 0.36 {
+            "minecraft:sunflower_plains"
+        } else {
+            "minecraft:plains"
+        }
+        .to_string();
+    }
+    if dry_score >= 0.68 || patch_noise >= 0.72 {
+        return "minecraft:savanna".to_string();
+    }
+    if fine_noise >= 0.58 {
+        "minecraft:savanna_plateau"
+    } else {
+        "minecraft:plains"
+    }
+    .to_string()
+}
+
+fn dry_grass_surface(
+    metrics: SurfaceColorMetrics,
+    patch_noise: f64,
+    fine_noise: f64,
+    dry_threshold: f64,
+) -> i32 {
+    let dryness = (metrics.saturation * 0.38)
+        + ((1.0 - metrics.value) * 0.28)
+        + (patch_noise * 0.22)
+        + (fine_noise * 0.12);
+    if !is_green_like(metrics)
+        && dryness >= dry_threshold + 0.28
+        && metrics.value < 0.48
+        && fine_noise >= 0.68
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    if !is_green_like(metrics) && fine_noise >= 0.92 && patch_noise >= 0.56 && metrics.value < 0.56
+    {
+        return block_state_ids::COARSE_DIRT;
+    }
+    block_state_ids::GRASS_BLOCK
+}
+
+fn desert_surface(
+    metrics: SurfaceColorMetrics,
+    patch_noise: f64,
+    fine_noise: f64,
+    sahara_score: f64,
+    terrain: MetTerrainMatch,
+    semantic_terrain: bool,
+) -> i32 {
+    if terrain.confident() {
+        if terrain.kind == MetTerrainKind::Vegetated
+            && sahara_score < 0.86
+            && (semantic_terrain || metrics.value < 0.70)
+        {
+            return block_state_ids::GRASS_BLOCK;
+        }
+        if terrain.kind == MetTerrainKind::CoarseDirt && sahara_score < 0.70 && fine_noise >= 0.68 {
+            return block_state_ids::COARSE_DIRT;
+        }
+        if terrain.kind == MetTerrainKind::Gravel && sahara_score < 0.70 && fine_noise >= 0.76 {
+            return block_state_ids::GRAVEL;
+        }
+    }
+    if metrics.red > metrics.green * 1.42
+        && metrics.hue <= 32.0
+        && fine_noise >= 0.94
+        && patch_noise >= 0.58
+    {
+        return block_state_ids::RED_SAND;
+    }
+    if metrics.value < 0.36 && metrics.saturation >= 0.34 && patch_noise >= 0.78 {
+        return if metrics.hue <= 35.0 {
+            block_state_ids::ORANGE_TERRACOTTA
+        } else {
+            block_state_ids::TERRACOTTA
+        };
+    }
+    if sahara_score >= 0.55 && fine_noise >= 0.80 && patch_noise >= 0.50 {
+        return block_state_ids::GRAVEL;
+    }
+    if sahara_score < 0.58 && metrics.value < 0.50 && fine_noise >= 0.84 {
+        return block_state_ids::COARSE_DIRT;
+    }
+    block_state_ids::SAND
+}
+
+fn desert_filler(top: i32) -> i32 {
+    match top {
+        block_state_ids::SAND
+        | block_state_ids::RED_SAND
+        | block_state_ids::TERRACOTTA
+        | block_state_ids::ORANGE_TERRACOTTA
+        | block_state_ids::BROWN_TERRACOTTA => top,
+        _ => block_state_ids::DIRT,
+    }
+}
+
+fn desert_biome(elevation_meters: f64, patch_noise: f64, fine_noise: f64) -> String {
+    if elevation_meters >= 900.0 && fine_noise >= 0.60 {
+        return "minecraft:eroded_badlands".to_string();
+    }
+    if patch_noise >= 0.82 {
+        return "minecraft:badlands".to_string();
+    }
+    "minecraft:desert".to_string()
+}
+
+fn rainforest_biome(
+    rainforest_score: f64,
+    dark_vegetation: bool,
+    patch_noise: f64,
+    fine_noise: f64,
+) -> String {
+    if !dark_vegetation && rainforest_score < 0.55 {
+        return if patch_noise >= 0.62 {
+            "minecraft:sparse_jungle"
+        } else {
+            "minecraft:savanna"
+        }
+        .to_string();
+    }
+    if rainforest_score >= 0.68 && patch_noise >= 0.64 && fine_noise >= 0.44 {
+        return "minecraft:bamboo_jungle".to_string();
+    }
+    if dark_vegetation && fine_noise >= 0.34 {
+        return "minecraft:jungle".to_string();
+    }
+    if rainforest_score >= 0.58 && patch_noise >= 0.48 {
+        return "minecraft:sparse_jungle".to_string();
+    }
+    if patch_noise >= 0.58 {
+        "minecraft:forest"
+    } else {
+        "minecraft:savanna"
+    }
+    .to_string()
+}
+
+fn lush_biome(abs_lat: f64, dark_vegetation: bool, patch_noise: f64) -> String {
+    if abs_lat <= 14.0 && dark_vegetation {
+        return if patch_noise >= 0.68 {
+            "minecraft:bamboo_jungle"
+        } else {
+            "minecraft:jungle"
+        }
+        .to_string();
+    }
+    if abs_lat <= 20.0 {
+        return if patch_noise >= 0.58 {
+            "minecraft:jungle"
+        } else {
+            "minecraft:sparse_jungle"
+        }
+        .to_string();
+    }
+    if abs_lat >= 48.0 {
+        return if dark_vegetation || patch_noise >= 0.55 {
+            "minecraft:taiga"
+        } else {
+            "minecraft:forest"
+        }
+        .to_string();
+    }
+    if dark_vegetation || patch_noise >= 0.64 {
+        return "minecraft:dark_forest".to_string();
+    }
+    if abs_lat >= 24.0 {
+        return "minecraft:forest".to_string();
+    }
+    "minecraft:savanna".to_string()
+}
+
+fn fallback_biome(base: &EarthSurfaceColumn, latitude: f64, patch_noise: f64) -> String {
+    let biome = non_beach_biome(base, latitude);
+    if biome != "minecraft:plains" {
+        return biome;
+    }
+    let abs_lat = latitude.abs();
+    if abs_lat >= 50.0 && patch_noise >= 0.48 {
+        return "minecraft:taiga".to_string();
+    }
+    if abs_lat >= 32.0 && patch_noise >= 0.56 {
+        return "minecraft:forest".to_string();
+    }
+    biome
+}
+
+fn non_beach_biome(base: &EarthSurfaceColumn, latitude: f64) -> String {
+    if base.biome_id != "minecraft:beach" {
+        return base.biome_id.clone();
+    }
+    if latitude.abs() <= 23.5 {
+        "minecraft:savanna"
+    } else {
+        "minecraft:plains"
+    }
+    .to_string()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn is_exposed_dry_rock(
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    sahara_score: f64,
+    dry_savanna_score: f64,
+    local_relief_meters: f64,
+    slope_ratio: f64,
+) -> bool {
+    let strong_slope_evidence = slope_ratio >= 0.20;
+    if !strong_slope_evidence
+        && dry_savanna_score >= 0.35
+        && latitude <= -10.0
+        && elevation_meters < 1_800.0
+        && metrics.value >= 0.40
+    {
+        return false;
+    }
+    let ruggedness =
+        surface_material_ecology_noise(longitude, latitude, 1.8, 0x2c1f8d54c73a92bd_u64 as i64);
+    let high_rock = (elevation_meters >= 1_100.0 && local_relief_meters >= 140.0)
+        || (elevation_meters >= 700.0 && local_relief_meters >= 220.0 && ruggedness >= 0.50)
+        || (elevation_meters >= 550.0 && slope_ratio >= 0.28);
+    let dark_rock = metrics.value <= 0.48 && metrics.saturation >= 0.30;
+    let red_rock = metrics.red >= metrics.green * 1.16 && metrics.saturation >= 0.36;
+    let saharan_massif = sahara_score >= 0.55
+        && elevation_meters >= 550.0
+        && (local_relief_meters >= 180.0 || slope_ratio >= 0.24)
+        && (dark_rock || ruggedness >= 0.70);
+    (high_rock && (dark_rock || red_rock || ruggedness >= 0.60 || slope_ratio >= 0.34))
+        || saharan_massif
+}
+
+fn surface_material_met_terrain(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+) -> MetTerrainMatch {
+    if sample.terrain_token_color.available
+        && sample.terrain_token_source == TerrainTokenSource::Export
+    {
+        let exact = MetTerrainVocabulary::exact(sample.terrain_token_color);
+        if exact.confident() {
+            return exact;
+        }
+    }
+    MetTerrainVocabulary::nearest(metrics.color())
+}
+
+fn surface_material_sahara_score(longitude: f64, latitude: f64) -> f64 {
+    let mut score = surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -20.0,
+        38.0,
+        15.0,
+        34.0,
+        5.5,
+        0x3340b42e9c8f1231,
+    );
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        35.0,
+        60.0,
+        12.0,
+        32.0,
+        4.0,
+        0x5b18c62a7f921935,
+    ));
+    score
+}
+
+fn surface_material_sahel_score(longitude: f64, latitude: f64) -> f64 {
+    surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -20.0,
+        45.0,
+        7.0,
+        17.5,
+        4.5,
+        0x71a9e2d5065c17a1,
+    )
+}
+
+fn surface_material_rainforest_score(longitude: f64, latitude: f64) -> f64 {
+    let mut score = surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -16.0,
+        10.0,
+        3.0,
+        10.0,
+        2.5,
+        0x119b6617db734561,
+    );
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        8.0,
+        33.0,
+        -9.0,
+        7.0,
+        4.0,
+        0x3a86d32fd8e71855,
+    ));
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        95.0,
+        145.0,
+        -11.0,
+        20.0,
+        4.5,
+        0x6e8ac59a6f19d72b,
+    ));
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -77.0,
+        -45.0,
+        -16.0,
+        7.0,
+        4.5,
+        0x243f6a8885a308d3,
+    ));
+    score
+}
+
+fn surface_material_dry_savanna_score(longitude: f64, latitude: f64) -> f64 {
+    let mut score = surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -18.0,
+        42.0,
+        -35.0,
+        -10.0,
+        5.0,
+        0x5225f1ab3df447c9,
+    );
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        24.0,
+        45.0,
+        -8.0,
+        12.0,
+        4.0,
+        0x21cf64acb1a77e15,
+    ));
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -80.0,
+        -36.0,
+        -34.0,
+        -8.0,
+        4.5,
+        0x789f2bc3d49b7011,
+    ));
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        110.0,
+        155.0,
+        -38.0,
+        -12.0,
+        5.0,
+        0x14f9e6b7556303f1,
+    ));
+    let texture = surface_material_ecology_noise(longitude, latitude, 0.35, 0x1f5b28a9c472d733);
+    clamp_unit(score + ((texture - 0.5) * 0.18))
+}
+
+fn surface_material_mediterranean_score(longitude: f64, latitude: f64) -> f64 {
+    let mut score = surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -11.0,
+        43.0,
+        31.0,
+        46.0,
+        4.0,
+        0x68405c2d09d2ec45,
+    );
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        -125.0,
+        -112.0,
+        30.0,
+        42.0,
+        3.0,
+        0x63cf8b99e48aa305,
+    ));
+    score = score.max(surface_material_textured_smooth_box(
+        longitude,
+        latitude,
+        115.0,
+        147.0,
+        -39.0,
+        -28.0,
+        3.5,
+        0x0f73e21989b4c351,
+    ));
+    let texture = surface_material_ecology_noise(longitude, latitude, 0.45, 0x7b3e2f64a91c0d11);
+    clamp_unit(score + ((texture - 0.5) * 0.16))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn surface_material_textured_smooth_box(
+    longitude: f64,
+    latitude: f64,
+    min_longitude: f64,
+    max_longitude: f64,
+    min_latitude: f64,
+    max_latitude: f64,
+    edge_degrees: f64,
+    seed: i64,
+) -> f64 {
+    let longitude_jitter = (surface_material_ecology_noise(longitude, latitude, 0.38, seed) - 0.5)
+        * edge_degrees
+        * 2.8;
+    let latitude_jitter = (surface_material_ecology_noise(
+        longitude,
+        latitude,
+        0.38,
+        seed ^ (0x9e3779b97f4a7c15_u64 as i64),
+    ) - 0.5)
+        * edge_degrees
+        * 2.8;
+    let score = smooth_box(
+        longitude + longitude_jitter,
+        latitude + latitude_jitter,
+        min_longitude,
+        max_longitude,
+        min_latitude,
+        max_latitude,
+        edge_degrees,
+    );
+    let edge_texture = surface_material_ecology_noise(
+        longitude,
+        latitude,
+        1.15,
+        seed ^ (0xbf58476d1ce4e5b9_u64 as i64),
+    );
+    clamp_unit(score + ((edge_texture - 0.5) * 0.20))
+}
+
+fn surface_material_ecology_noise(longitude: f64, latitude: f64, frequency: f64, seed: i64) -> f64 {
+    fractal_value_noise(longitude * frequency, latitude * frequency, 3, seed)
+}
+
+fn clamp_surface_material_color(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhotoSurfaceInput {
     pub semantic_column: EarthSurfaceColumn,
@@ -5811,7 +7110,7 @@ fn sample_surface_region_material(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_surface_region_material_sample(
-    mut semantic_column: EarthSurfaceColumn,
+    semantic_column: EarthSurfaceColumn,
     sample: SurfaceMaterialSample,
     texture_mode: SurfaceTextureMode,
     elevation_meters: f64,
@@ -5823,11 +7122,16 @@ fn apply_surface_region_material_sample(
     global_block_z: i32,
     vertical_scale: f64,
 ) -> Result<EarthSurfaceColumn> {
-    semantic_column =
-        semantic_column.with_data_evidence_flags(surface_data_evidence::from_sample(&sample));
-    if sample.terrain_token_color.available {
-        semantic_column = semantic_column.with_terrain_token_source(sample.terrain_token_source);
-    }
+    let semantic_column = apply_surface_material(
+        &semantic_column,
+        &sample,
+        elevation_meters,
+        longitude,
+        latitude,
+        coast_factor,
+        local_relief_meters,
+        vertical_scale,
+    )?;
     match texture_mode {
         SurfaceTextureMode::Photo => apply_photo_surface_material(&PhotoSurfaceInput::new(
             semantic_column,
@@ -9562,6 +10866,183 @@ mod tests {
     }
 
     #[test]
+    fn surface_material_classifier_color_only_land_matches_java_bootstrap_cases() {
+        let base_land = surface_column(
+            false,
+            SEA_LEVEL_Y + 10,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+
+        let desert = apply_test_surface_material(
+            &base_land,
+            RgbColor::of(240, 213, 126),
+            250.0,
+            13.0,
+            24.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(desert.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(desert.biome_id, "minecraft:desert");
+
+        let met_dry_grass = apply_test_surface_material(
+            &base_land,
+            RgbColor::of(167, 146, 103),
+            250.0,
+            13.0,
+            24.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            met_dry_grass.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(met_dry_grass.biome_id, "minecraft:desert");
+
+        let sahel = apply_test_surface_material(
+            &base_land,
+            RgbColor::of(126, 123, 70),
+            220.0,
+            12.0,
+            12.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(sahel.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert!(matches!(
+            sahel.biome_id.as_str(),
+            "minecraft:savanna" | "minecraft:savanna_plateau"
+        ));
+
+        let dry_sahel = apply_test_surface_material(
+            &base_land,
+            RgbColor::of(174, 151, 86),
+            260.0,
+            8.0,
+            13.0,
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            dry_sahel.top_block_state_id,
+            block_state_ids::GRASS_BLOCK | block_state_ids::COARSE_DIRT
+        ));
+        assert!(matches!(
+            dry_sahel.biome_id.as_str(),
+            "minecraft:savanna" | "minecraft:savanna_plateau"
+        ));
+
+        let congo = apply_test_surface_material(
+            &base_land,
+            RgbColor::of(31, 93, 37),
+            350.0,
+            20.0,
+            -2.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(congo.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert!(matches!(
+            congo.biome_id.as_str(),
+            "minecraft:jungle" | "minecraft:sparse_jungle"
+        ));
+
+        let atlas_rock = apply_test_surface_material(
+            &base_land,
+            RgbColor::of(181, 96, 46),
+            1200.0,
+            -6.0,
+            30.0,
+            0.0,
+            260.0,
+        );
+        assert!(matches!(
+            atlas_rock.top_block_state_id,
+            block_state_ids::ORANGE_TERRACOTTA | block_state_ids::TERRACOTTA
+        ));
+        assert!(matches!(
+            atlas_rock.biome_id.as_str(),
+            "minecraft:badlands" | "minecraft:wooded_badlands"
+        ));
+    }
+
+    #[test]
+    fn surface_material_classifier_color_only_water_matches_java_bootstrap_cases() {
+        let deep_ocean = surface_column(
+            true,
+            SEA_LEVEL_Y - 35,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            "minecraft:ocean",
+        );
+        let dark = apply_test_surface_material(
+            &deep_ocean,
+            RgbColor::of(20, 55, 85),
+            -120.0,
+            -42.0,
+            35.0,
+            0.0,
+            0.0,
+        );
+        assert!(matches!(
+            dark.top_block_state_id,
+            block_state_ids::DEEPSLATE | block_state_ids::BLACK_TERRACOTTA
+        ));
+        assert_eq!(dark.filler_block_state_id, dark.top_block_state_id);
+
+        let shelf_ocean = surface_column(
+            true,
+            SEA_LEVEL_Y - 5,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            "minecraft:ocean",
+        );
+        let shelf = apply_test_surface_material(
+            &shelf_ocean,
+            RgbColor::of(50, 95, 120),
+            -18.0,
+            -60.0,
+            4.0,
+            0.75,
+            0.0,
+        );
+        assert!(matches!(
+            shelf.top_block_state_id,
+            block_state_ids::GRAVEL | block_state_ids::CLAY
+        ));
+        assert_ne!(shelf.top_block_state_id, block_state_ids::SAND);
+
+        let bright_deep = apply_test_surface_material(
+            &deep_ocean,
+            RgbColor::of(65, 118, 155),
+            -120.0,
+            -42.0,
+            35.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(bright_deep.top_block_state_id, block_state_ids::GRAVEL);
+
+        let missing = apply_test_surface_material(
+            &deep_ocean,
+            RgbColor::unavailable(),
+            -120.0,
+            -42.0,
+            35.0,
+            0.0,
+            0.0,
+        );
+        assert_eq!(missing.top_block_state_id, block_state_ids::GRAVEL);
+        assert_eq!(missing.decision_source, "water");
+    }
+
+    #[test]
     fn surface_region_settings_default_to_java_photo_texture_mode() {
         let settings = SurfaceRegionSettings::new(
             "height.tif",
@@ -12912,6 +14393,12 @@ mod tests {
         assert_eq!(near_sand.color(), RgbColor::of(255, 200, 64));
         assert!(near_sand.confident());
 
+        let dry_grass = MetTerrainVocabulary::nearest(RgbColor::of(167, 146, 103));
+        assert_eq!(dry_grass.kind, MetTerrainKind::Vegetated);
+        assert_eq!(dry_grass.top_block_state_id, block_state_ids::GRASS_BLOCK);
+        assert_eq!(dry_grass.distance_squared, 0);
+        assert!(dry_grass.confident());
+
         let near_red_sand = MetTerrainVocabulary::nearest(RgbColor::of(180, 120, 70));
         assert_eq!(near_red_sand.kind, MetTerrainKind::RedSand);
         assert_eq!(near_red_sand.top_block_state_id, block_state_ids::RED_SAND);
@@ -13146,6 +14633,28 @@ mod tests {
             block_state_ids::CLAY,
             "minecraft:ocean",
         )
+    }
+
+    fn apply_test_surface_material(
+        base: &EarthSurfaceColumn,
+        color: RgbColor,
+        elevation_meters: f64,
+        longitude: f64,
+        latitude: f64,
+        coast_factor: f64,
+        local_relief_meters: f64,
+    ) -> EarthSurfaceColumn {
+        apply_surface_material(
+            base,
+            &SurfaceMaterialSample::color_only(color),
+            elevation_meters,
+            longitude,
+            latitude,
+            coast_factor,
+            local_relief_meters,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap()
     }
 
     fn filled_surface_columns(

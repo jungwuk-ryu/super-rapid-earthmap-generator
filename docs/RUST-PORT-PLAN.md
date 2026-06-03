@@ -647,8 +647,12 @@ Bootstrap implementation status on 2026-06-03:
   Rust photo solver to sampled material columns with Java-shaped material-sampling conditions and local-relief inputs,
   records `features.surfaceMaterialRaster=true` when configured, and rejects classified material sampling until the
   full semantic `EarthSurfaceMaterialClassifier` port is wired.
-- Remaining Phase 5 work: full photo solver parity and fixed-region Java/Rust payload parity for surface material/photo
-  output.
+- Rust `EarthSurfaceMaterialClassifier` bootstrap now applies sampled material metadata before photo solving and ports the
+  Java color-only land/water classifier baseline for representative desert dry-grass, Sahel, Congo rainforest, Atlas
+  rock, deep-ocean, shelf-water, bright-water, and missing-raster fixture cases. The full semantic intent/environment/
+  ecoregion classifier remains intentionally tracked as follow-up work before classified material mode is enabled.
+- Remaining Phase 5 work: complete semantic `EarthSurfaceMaterialClassifier` parity, full photo solver parity, and
+  fixed-region Java/Rust payload parity for surface material/photo output.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
