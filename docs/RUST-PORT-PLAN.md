@@ -657,8 +657,11 @@ Bootstrap implementation status on 2026-06-03:
 - Rust semantic intent material selection now mirrors Java compiler behavior for rainforest, wetland, and snow bootstrap
   cases, including lush rainforest `MOSS_BLOCK` terrain-token evidence, muddy wetland fine-noise patches, and
   latitude-based snowy biome selection.
+- Rust dry semantic intent material selection now uses Java-shaped conservative dry-grass top selection for existing
+  dry-savanna/desert-edge bootstrap paths, preserving JavaStandard coarse terrain-token evidence instead of flattening
+  those patches back to plain grass.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
-  dry-savanna/desert-edge authoritative terrain-token, ecoregion transition, broader compiler-backed intent, and
+  remaining dry-savanna/desert-edge intent predicates, ecoregion transition, broader compiler-backed intent, and
   environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface
   material/photo output.
 

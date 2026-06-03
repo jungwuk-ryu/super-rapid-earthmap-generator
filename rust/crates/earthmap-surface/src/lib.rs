@@ -1869,13 +1869,18 @@ fn classify_surface_material_by_semantic_intent(
     if sparse_dry_open_tropical
         && (is_sahel_latitude(latitude) || sahel_score >= 0.22 || dry_savanna_score >= 0.35)
     {
-        let biome = dry_grass_biome(
-            sahel_score.max(dry_savanna_score).max(0.55),
-            elevation_meters,
+        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+        let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
             patch_noise,
             fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
         );
-        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
         return Some(surface_material_with_surface(
             base,
             top,
@@ -1885,13 +1890,18 @@ fn classify_surface_material_by_semantic_intent(
     }
 
     if is_tropical_savanna_climate(climate) {
-        let biome = dry_grass_biome(
-            sahel_score.max(dry_savanna_score).max(0.70),
-            elevation_meters,
+        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+        let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
             patch_noise,
             fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
         );
-        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
         return Some(surface_material_with_surface(
             base,
             top,
@@ -1910,13 +1920,18 @@ fn classify_surface_material_by_semantic_intent(
                 biome,
             ));
         }
-        let biome = dry_grass_biome(
-            sahel_score.max(dry_savanna_score).max(0.58),
-            elevation_meters,
+        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+        let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+        let top = dry_grass_surface_conservative(
+            metrics,
+            sample,
             patch_noise,
             fine_noise,
+            dry_score,
+            terrain,
+            semantic_terrain,
+            local_relief_meters,
         );
-        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
         return Some(surface_material_with_surface(
             base,
             top,
@@ -1929,18 +1944,22 @@ fn classify_surface_material_by_semantic_intent(
         if (tree_cover >= 0.12 || herb_cover >= 0.35 || shrub_cover >= 0.35 || green_like)
             && (savanna_like || is_sahel_latitude(latitude) || sahel_score >= 0.18)
         {
-            let biome = dry_grass_biome(
-                sahel_score.max(dry_savanna_score).max(0.50),
-                elevation_meters,
+            let dry_score = sahel_score.max(dry_savanna_score).max(0.58);
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
                 patch_noise,
                 fine_noise,
+                dry_score,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
             );
-            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
             return Some(surface_material_with_surface(
                 base,
                 top,
                 block_state_ids::DIRT,
-                biome,
+                "minecraft:savanna",
             ));
         }
         if orange_rock_like
@@ -1986,13 +2005,18 @@ fn classify_surface_material_by_semantic_intent(
 
     if is_temperate_climate(climate) {
         if dry_tropical_woodland {
-            let biome = dry_grass_biome(
-                dry_savanna_score.max(0.55),
-                elevation_meters,
+            let dry_score = dry_savanna_score.max(0.45);
+            let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
                 patch_noise,
                 fine_noise,
+                dry_score,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
             );
-            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
             return Some(surface_material_with_surface(
                 base,
                 top,
@@ -2067,13 +2091,18 @@ fn classify_surface_material_by_semantic_intent(
             ));
         }
         if savanna_like && sample.vegetation_cover() > 0.0 {
-            let biome = dry_grass_biome(
-                sahel_score.max(dry_savanna_score).max(0.55),
-                elevation_meters,
+            let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+            let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+            let top = dry_grass_surface_conservative(
+                metrics,
+                sample,
                 patch_noise,
                 fine_noise,
+                dry_score,
+                terrain,
+                semantic_terrain,
+                local_relief_meters,
             );
-            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
             return Some(surface_material_with_surface(
                 base,
                 top,
@@ -12102,7 +12131,11 @@ mod tests {
         );
         assert!(matches!(
             semantic_savanna.biome_id.as_str(),
-            "minecraft:savanna" | "minecraft:savanna_plateau" | "minecraft:windswept_savanna"
+            "minecraft:savanna"
+                | "minecraft:savanna_plateau"
+                | "minecraft:windswept_savanna"
+                | "minecraft:plains"
+                | "minecraft:sunflower_plains"
         ));
         assert_eq!(semantic_savanna.decision_source, "intent");
 
@@ -12384,9 +12417,80 @@ mod tests {
         ));
         assert!(matches!(
             climate_sahel.biome_id.as_str(),
-            "minecraft:savanna" | "minecraft:savanna_plateau" | "minecraft:windswept_savanna"
+            "minecraft:savanna"
+                | "minecraft:savanna_plateau"
+                | "minecraft:windswept_savanna"
+                | "minecraft:plains"
+                | "minecraft:sunflower_plains"
         ));
         assert_eq!(climate_sahel.decision_source, "intent");
+
+        let coarse_token_savanna = SurfaceMaterialSample::new(
+            RgbColor::of(140, 80, 50),
+            RgbColor::of(140, 80, 50),
+            TerrainTokenSource::JavaStandardPalette,
+            3,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            4,
+            4,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "West Sudanian savanna",
+            "minecraft:savanna",
+            1.0,
+        );
+        let coarse_metrics = SurfaceColorMetrics::from(coarse_token_savanna.color);
+        assert_eq!(
+            surface_material_met_terrain(&coarse_token_savanna, coarse_metrics).kind,
+            MetTerrainKind::CoarseDirt
+        );
+        let (coarse_longitude, coarse_latitude) = (-30..=40)
+            .flat_map(|longitude| (5..=20).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let patch_noise = surface_material_ecology_noise(
+                    f64::from(longitude),
+                    f64::from(latitude),
+                    2.4,
+                    0x4165d9e7a1f31c0b,
+                );
+                let fine_noise = surface_material_ecology_noise(
+                    f64::from(longitude),
+                    f64::from(latitude),
+                    7.5,
+                    0x9d6c63b5a8e33f21_u64 as i64,
+                );
+                let dry_score =
+                    surface_material_sahel_score(f64::from(longitude), f64::from(latitude))
+                        .max(surface_material_dry_savanna_score(
+                            f64::from(longitude),
+                            f64::from(latitude),
+                        ))
+                        .max(0.45);
+                dry_score >= 0.52
+                    && fine_noise >= 0.42
+                    && !(fine_noise >= 0.92 && patch_noise >= 0.56)
+            })
+            .expect("test fixture should find a conservative dry terrain-token coordinate");
+        let coarse_savanna = apply_test_surface_material_sample(
+            &base_land,
+            coarse_token_savanna,
+            260.0,
+            f64::from(coarse_longitude),
+            f64::from(coarse_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(
+            coarse_savanna.top_block_state_id,
+            block_state_ids::COARSE_DIRT
+        );
+        assert_eq!(coarse_savanna.decision_source, "intent");
 
         let sparse_dry_open_tropical = SurfaceMaterialSample::land(
             RgbColor::of(126, 123, 70),
@@ -12741,6 +12845,59 @@ mod tests {
         );
         assert_eq!(climate_desert.top_block_state_id, block_state_ids::SAND);
         assert_eq!(climate_desert.biome_id, "minecraft:desert");
+
+        let desert_edge_vegetation = SurfaceMaterialSample::land(
+            RgbColor::of(126, 123, 70),
+            4,
+            12,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            18,
+            4,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "Sahara desert",
+            "minecraft:desert",
+            0.82,
+        );
+        let (edge_longitude, edge_latitude) = (-20..=35)
+            .flat_map(|longitude| (6..=19).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let patch_noise =
+                    surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
+                let fine_noise = surface_material_ecology_noise(
+                    longitude,
+                    latitude,
+                    7.5,
+                    0x9d6c63b5a8e33f21_u64 as i64,
+                );
+                let dry_score = surface_material_sahel_score(longitude, latitude)
+                    .max(surface_material_dry_savanna_score(longitude, latitude))
+                    .max(0.58);
+                dry_score < 0.62
+                    && matches!(
+                        dry_grass_biome(dry_score, 250.0, patch_noise, fine_noise).as_str(),
+                        "minecraft:plains" | "minecraft:sunflower_plains"
+                    )
+            })
+            .expect("test fixture should find a low-patch desert-edge coordinate");
+        let desert_edge = apply_test_surface_material_sample(
+            &base_land,
+            desert_edge_vegetation,
+            250.0,
+            f64::from(edge_longitude),
+            f64::from(edge_latitude),
+            0.0,
+            0.0,
+        );
+        assert_eq!(desert_edge.biome_id, "minecraft:savanna");
+        assert_eq!(desert_edge.decision_source, "intent");
     }
 
     #[test]
