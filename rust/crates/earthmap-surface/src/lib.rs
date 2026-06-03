@@ -8268,13 +8268,6 @@ pub fn generate_height_only_region(
 }
 
 pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<SurfaceRegionReport> {
-    if settings.surface_material_path.is_some()
-        && settings.texture_mode == SurfaceTextureMode::Classified
-    {
-        return Err(SurfaceError::invalid(
-            "classified surface material sampling is not ported yet",
-        ));
-    }
     fs::create_dir_all(&settings.world_dir)?;
     fs::create_dir_all(settings.world_dir.join("region"))?;
 
@@ -8771,11 +8764,6 @@ where
     F: FnMut(f64, f64) -> Result<f64>,
 {
     let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
-    if material_sampler.is_some() && texture_mode == SurfaceTextureMode::Classified {
-        return Err(SurfaceError::invalid(
-            "classified surface material sampling is not ported yet",
-        ));
-    }
     let mut elevations = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     let mut valid = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     let region_block_x = region_x.wrapping_mul(REGION_SIZE_BLOCKS);
@@ -8975,7 +8963,7 @@ fn apply_surface_region_material_sample(
         longitude,
         latitude,
         coast_factor,
-        local_relief_meters,
+        local_relief_meters * vertical_scale,
         vertical_scale,
     )?;
     match texture_mode {
@@ -8990,9 +8978,7 @@ fn apply_surface_region_material_sample(
             global_block_x,
             global_block_z,
         )),
-        SurfaceTextureMode::Classified => Err(SurfaceError::invalid(
-            "classified surface material sampling is not ported yet",
-        )),
+        SurfaceTextureMode::Classified => Ok(semantic_column),
     }
 }
 
@@ -14869,7 +14855,7 @@ mod tests {
     }
 
     #[test]
-    fn classified_surface_material_sampling_is_not_silently_ignored() {
+    fn classified_surface_material_sampling_applies_semantic_material() {
         let semantic = surface_column(
             false,
             SEA_LEVEL_Y + 12,
@@ -14878,29 +14864,103 @@ mod tests {
             block_state_ids::DIRT,
             "minecraft:plains",
         );
-        let error = apply_surface_region_material_sample(
+        let classified = apply_surface_region_material_sample(
             semantic,
-            SurfaceMaterialSample::color_only(RgbColor::of(90, 120, 70)),
+            SurfaceMaterialSample::color_only(RgbColor::of(230, 205, 160)),
             SurfaceTextureMode::Classified,
             120.0,
-            0.0,
-            0.0,
+            20.0,
+            25.0,
             0.0,
             0.0,
             0,
             0,
             DEFAULT_VERTICAL_SCALE,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(
-            error.to_string(),
-            "classified surface material sampling is not ported yet"
-        );
+        assert_eq!(classified.top_block_state_id, block_state_ids::SAND);
+        assert_eq!(classified.filler_block_state_id, block_state_ids::SAND);
+        assert_eq!(classified.biome_id, "minecraft:desert");
+        assert_eq!(classified.decision_source, "intent");
     }
 
     #[test]
-    fn generate_surface_region_rejects_classified_material_before_opening_raster() {
+    fn classified_surface_material_scales_local_relief_like_java() {
+        let semantic = surface_column(
+            false,
+            SEA_LEVEL_Y + 72,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let material = SurfaceMaterialSample::color_only(RgbColor::of(181, 96, 46));
+        let metrics = SurfaceColorMetrics::from(material.color);
+        let (longitude, latitude) = (-180..=180)
+            .flat_map(|longitude| (-45..=45).map(move |latitude| (longitude, latitude)))
+            .find(|&(longitude, latitude)| {
+                let longitude = f64::from(longitude);
+                let latitude = f64::from(latitude);
+                let dry_savanna = surface_material_dry_savanna_score(longitude, latitude);
+                surface_material_sahel_score(longitude, latitude) < 0.18
+                    && dry_savanna < 0.35
+                    && surface_material_mediterranean_score(longitude, latitude) < 0.40
+                    && surface_material_rainforest_score(longitude, latitude) < 0.35
+                    && is_exposed_dry_rock(
+                        metrics,
+                        650.0,
+                        longitude,
+                        latitude,
+                        surface_material_sahara_score(longitude, latitude),
+                        dry_savanna,
+                        240.0,
+                        0.0,
+                    )
+                    && !is_exposed_dry_rock(
+                        metrics,
+                        650.0,
+                        longitude,
+                        latitude,
+                        surface_material_sahara_score(longitude, latitude),
+                        dry_savanna,
+                        120.0,
+                        0.0,
+                    )
+            })
+            .expect("test fixture should find a vertical-scale relief highland coordinate");
+        let classified = apply_surface_region_material_sample(
+            semantic,
+            material,
+            SurfaceTextureMode::Classified,
+            650.0,
+            f64::from(longitude),
+            f64::from(latitude),
+            0.0,
+            120.0,
+            0,
+            0,
+            2.0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            classified.top_block_state_id,
+            block_state_ids::ORANGE_TERRACOTTA
+        );
+        assert_eq!(
+            classified.filler_block_state_id,
+            block_state_ids::ORANGE_TERRACOTTA
+        );
+        assert!(matches!(
+            classified.biome_id.as_str(),
+            "minecraft:badlands" | "minecraft:wooded_badlands"
+        ));
+        assert_eq!(classified.decision_source, "intent");
+    }
+
+    #[test]
+    fn generate_surface_region_no_longer_rejects_classified_material_before_opening_inputs() {
         let temp = std::env::temp_dir().join(format!(
             "earthmap-classified-material-error-test-{}-{}",
             std::process::id(),
@@ -14929,11 +14989,11 @@ mod tests {
 
         let error = generate_surface_region(&settings).unwrap_err();
 
-        assert_eq!(
-            error.to_string(),
-            "classified surface material sampling is not ported yet"
-        );
-        assert!(!temp.join("world").exists());
+        assert!(!error
+            .to_string()
+            .contains("classified surface material sampling is not ported yet"));
+        assert!(temp.join("world").exists());
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]

@@ -645,12 +645,12 @@ Bootstrap implementation status on 2026-06-03:
 - Rust surface-region material wiring bootstrap lets `SurfaceRegionSettings` carry an optional TrueMarble/EarthData
   material raster path, opens `EarthDataSurfaceMaterialSampler` for configured photo-mode region generation, applies the
   Rust photo solver to sampled material columns with Java-shaped material-sampling conditions and local-relief inputs,
-  records `features.surfaceMaterialRaster=true` when configured, and rejects classified material sampling until the
-  full semantic `EarthSurfaceMaterialClassifier` port is wired.
+  records `features.surfaceMaterialRaster=true` when configured, and initially kept classified material sampling gated
+  until the semantic `EarthSurfaceMaterialClassifier` path was wired.
 - Rust `EarthSurfaceMaterialClassifier` bootstrap now applies sampled material metadata before photo solving and ports the
   Java color-only land/water classifier baseline for representative desert dry-grass, Sahel, Congo rainforest, Atlas
-  rock, deep-ocean, shelf-water, bright-water, and missing-raster fixture cases. The full semantic intent/environment/
-  ecoregion classifier remains intentionally tracked as follow-up work before classified material mode is enabled.
+  rock, deep-ocean, shelf-water, bright-water, and missing-raster fixture cases. Broader semantic intent/environment/
+  ecoregion classifier parity remains tracked as follow-up work for fixed-region Java/Rust output parity.
 - Rust `EarthSurfaceMaterialClassifier` semantic fallback bootstrap ports Java's no-color climate/vegetation/ecoregion
   fallback colors plus bounded climate intent cases for savanna, desert, Congo rainforest, temperate steppe, and
   no-color forest/desert/savanna fixture coverage.
@@ -682,6 +682,8 @@ Bootstrap implementation status on 2026-06-03:
   vegetated `DESERT_EDGE` promotion before the hot-desert surface helper is used.
 - Rust forest-like ecoregion and temperate/cold fallback intent now mirrors Java's `TEMPERATE_FOREST` compiler branch,
   including the Java-shaped temperate biome helper.
+- Rust classified material region sampling now opens the Java-shaped semantic classifier path for material rasters and
+  skips only the photo solver pass when `textureMode=classified`.
 - Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
   remaining dry-savanna/desert-edge intent predicates, ecoregion transition, broader compiler-backed intent, and
   environment edge cases; then finish full photo solver parity and fixed-region Java/Rust payload parity for surface
