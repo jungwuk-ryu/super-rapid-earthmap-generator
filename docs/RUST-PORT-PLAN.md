@@ -642,6 +642,11 @@ Bootstrap implementation status on 2026-06-03:
   `SurfaceRegionSettings` mode, routes the no-material region sampler through matching classified/photo post-processing
   chains, and lets surface-region manifests preserve the selected mode for the upcoming fixed-region material/photo
   output wiring.
+- Rust surface-region material wiring bootstrap lets `SurfaceRegionSettings` carry an optional TrueMarble/EarthData
+  material raster path, opens `EarthDataSurfaceMaterialSampler` for configured photo-mode region generation, applies the
+  Rust photo solver to sampled material columns with Java-shaped material-sampling conditions and local-relief inputs,
+  records `features.surfaceMaterialRaster=true` when configured, and rejects classified material sampling until the
+  full semantic `EarthSurfaceMaterialClassifier` port is wired.
 - Remaining Phase 5 work: full photo solver parity and fixed-region Java/Rust payload parity for surface material/photo
   output.
 

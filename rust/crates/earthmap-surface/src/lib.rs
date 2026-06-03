@@ -219,6 +219,7 @@ pub struct SurfaceRegionSettings {
     pub chunk_status: ChunkGenerationStatus,
     pub vertical_scale: f64,
     pub texture_mode: SurfaceTextureMode,
+    pub surface_material_path: Option<PathBuf>,
 }
 
 impl SurfaceRegionSettings {
@@ -323,6 +324,7 @@ impl SurfaceRegionSettings {
             chunk_status,
             vertical_scale,
             texture_mode,
+            surface_material_path: None,
         })
     }
 }
@@ -5121,6 +5123,13 @@ pub fn generate_height_only_region(
 }
 
 pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<SurfaceRegionReport> {
+    if settings.surface_material_path.is_some()
+        && settings.texture_mode == SurfaceTextureMode::Classified
+    {
+        return Err(SurfaceError::invalid(
+            "classified surface material sampling is not ported yet",
+        ));
+    }
     fs::create_dir_all(&settings.world_dir)?;
     fs::create_dir_all(settings.world_dir.join("region"))?;
 
@@ -5128,6 +5137,11 @@ pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<Surfa
     let mapping = mapping_for(reader.metadata(), settings.scale_denominator)?;
     let cache = GeoTiffRowCache::new(&reader, settings.cache_rows)?;
     let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let surface_material_sampler = settings
+        .surface_material_path
+        .as_ref()
+        .map(EarthDataSurfaceMaterialSampler::open)
+        .transpose()?;
     let total_start = Instant::now();
 
     let mut metadata_nanos = 0;
@@ -5153,13 +5167,16 @@ pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<Surfa
     }
 
     let phase_start = Instant::now();
-    let region_surface = sample_surface_region_scaled_with_texture_mode(
+    let region_surface = sample_surface_region_scaled_with_material_sampler(
         settings.region_x,
         settings.region_z,
         &mapping,
         &sampler,
         settings.vertical_scale,
         settings.texture_mode,
+        surface_material_sampler
+            .as_ref()
+            .map(|sampler| sampler as &dyn SurfaceMaterialSampler),
     )?;
     let surface_sample_nanos = phase_start.elapsed().as_nanos();
 
@@ -5268,11 +5285,13 @@ pub fn surface_y_for_elevation_meters(elevation_meters: f64) -> i32 {
 pub const DEFAULT_VERTICAL_SCALE: f64 = 1.0;
 
 const BEACH_COAST_FACTOR: f64 = 0.985;
+const SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR: f64 = 0.985;
 const SHAPED_ELEVATION_METERS_PER_BLOCK: f64 = 45.0;
 const MIN_VERTICAL_SCALE: f64 = 0.25;
 const MAX_VERTICAL_SCALE: f64 = 4.0;
 const MIN_SURFACE_Y: i32 = -60;
 const MAX_SURFACE_Y: i32 = 319;
+const SURFACE_REGION_RELIEF_RADIUS: i32 = 4;
 
 pub fn classify_surface(
     elevation_meters: f64,
@@ -5559,6 +5578,26 @@ pub fn sample_surface_region_scaled_with_texture_mode(
     vertical_scale: f64,
     texture_mode: SurfaceTextureMode,
 ) -> Result<SurfaceRegionSample> {
+    sample_surface_region_scaled_with_material_sampler(
+        region_x,
+        region_z,
+        mapping,
+        sampler,
+        vertical_scale,
+        texture_mode,
+        None,
+    )
+}
+
+pub fn sample_surface_region_scaled_with_material_sampler(
+    region_x: i32,
+    region_z: i32,
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    vertical_scale: f64,
+    texture_mode: SurfaceTextureMode,
+    material_sampler: Option<&dyn SurfaceMaterialSampler>,
+) -> Result<SurfaceRegionSample> {
     sample_surface_region_with_elevation_fn(
         region_x,
         region_z,
@@ -5570,6 +5609,7 @@ pub fn sample_surface_region_scaled_with_texture_mode(
                 .map_err(Into::into)
         },
         texture_mode,
+        material_sampler,
     )
 }
 
@@ -5580,11 +5620,17 @@ fn sample_surface_region_with_elevation_fn<F>(
     vertical_scale: f64,
     mut elevation_fn: F,
     texture_mode: SurfaceTextureMode,
+    material_sampler: Option<&dyn SurfaceMaterialSampler>,
 ) -> Result<SurfaceRegionSample>
 where
     F: FnMut(f64, f64) -> Result<f64>,
 {
     let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    if material_sampler.is_some() && texture_mode == SurfaceTextureMode::Classified {
+        return Err(SurfaceError::invalid(
+            "classified surface material sampling is not ported yet",
+        ));
+    }
     let mut elevations = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     let mut valid = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     let region_block_x = region_x.wrapping_mul(REGION_SIZE_BLOCKS);
@@ -5639,14 +5685,51 @@ where
                 surface_region_smoothed_elevation(&elevations, &valid, center_x, center_z);
             let water = water_mask[sample_index];
             let coast_factor = coast_factor_extent[sample_index];
-            columns.push(classify_shaped_surface_scaled(
+            let mut column = classify_shaped_surface_scaled(
                 smoothed_elevation,
                 longitude,
                 latitude,
                 water,
                 coast_factor,
                 vertical_scale,
-            )?);
+            )?;
+            if let Some(material_sampler) = material_sampler {
+                if should_sample_surface_material(
+                    material_sampler,
+                    valid[sample_index],
+                    water,
+                    coast_factor,
+                ) {
+                    let longitude_span = 360.0 / f64::from(mapping.width_blocks);
+                    let latitude_span = (mapping.max_latitude - mapping.min_latitude)
+                        / f64::from(mapping.height_blocks);
+                    let material = sample_surface_region_material(
+                        material_sampler,
+                        texture_mode,
+                        water,
+                        longitude,
+                        latitude,
+                        longitude_span,
+                        latitude_span,
+                    )?;
+                    let local_relief_meters =
+                        surface_region_local_relief_meters(&elevations, &valid, center_x, center_z);
+                    column = apply_surface_region_material_sample(
+                        column,
+                        material,
+                        texture_mode,
+                        smoothed_elevation,
+                        longitude,
+                        latitude,
+                        coast_factor,
+                        local_relief_meters,
+                        global_block_x,
+                        global_block_z,
+                        vertical_scale,
+                    )?;
+                }
+            }
+            columns.push(column);
             coast_factors.push(coast_factor);
         }
     }
@@ -5679,6 +5762,125 @@ fn post_process_surface_region_columns(
         }
     };
     clean_coastal_surface_columns(&post_smoothed, coast_factors, width)
+}
+
+fn should_sample_surface_material(
+    material_sampler: &dyn SurfaceMaterialSampler,
+    valid: bool,
+    water: bool,
+    coast_factor: f64,
+) -> bool {
+    valid
+        && (!water
+            || material_sampler.samples_open_water()
+            || coast_factor >= SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR)
+}
+
+fn sample_surface_region_material(
+    material_sampler: &dyn SurfaceMaterialSampler,
+    texture_mode: SurfaceTextureMode,
+    water: bool,
+    longitude: f64,
+    latitude: f64,
+    longitude_span_degrees: f64,
+    latitude_span_degrees: f64,
+) -> Result<SurfaceMaterialSample> {
+    if water && material_sampler.samples_open_water() {
+        return material_sampler.sample_water(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        );
+    }
+    match texture_mode {
+        SurfaceTextureMode::Photo => material_sampler.sample_photo(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        ),
+        SurfaceTextureMode::Classified => material_sampler.sample(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_surface_region_material_sample(
+    mut semantic_column: EarthSurfaceColumn,
+    sample: SurfaceMaterialSample,
+    texture_mode: SurfaceTextureMode,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    coast_factor: f64,
+    local_relief_meters: f64,
+    global_block_x: i32,
+    global_block_z: i32,
+    vertical_scale: f64,
+) -> Result<EarthSurfaceColumn> {
+    semantic_column =
+        semantic_column.with_data_evidence_flags(surface_data_evidence::from_sample(&sample));
+    if sample.terrain_token_color.available {
+        semantic_column = semantic_column.with_terrain_token_source(sample.terrain_token_source);
+    }
+    match texture_mode {
+        SurfaceTextureMode::Photo => apply_photo_surface_material(&PhotoSurfaceInput::new(
+            semantic_column,
+            sample,
+            elevation_meters,
+            longitude,
+            latitude,
+            coast_factor,
+            local_relief_meters * vertical_scale,
+            global_block_x,
+            global_block_z,
+        )),
+        SurfaceTextureMode::Classified => Err(SurfaceError::invalid(
+            "classified surface material sampling is not ported yet",
+        )),
+    }
+}
+
+fn surface_region_local_relief_meters(
+    elevations: &[f64],
+    valid: &[bool],
+    center_x: usize,
+    center_z: usize,
+) -> f64 {
+    let center_index = surface_region_extent_index(center_x, center_z);
+    if !valid[center_index] {
+        return 0.0;
+    }
+    let mut min_elevation = elevations[center_index];
+    let mut max_elevation = elevations[center_index];
+    for dz in -SURFACE_REGION_RELIEF_RADIUS..=SURFACE_REGION_RELIEF_RADIUS {
+        for dx in -SURFACE_REGION_RELIEF_RADIUS..=SURFACE_REGION_RELIEF_RADIUS {
+            let x = center_x as i32 + dx;
+            let z = center_z as i32 + dz;
+            if x < 0
+                || x >= SURFACE_REGION_EXTENT as i32
+                || z < 0
+                || z >= SURFACE_REGION_EXTENT as i32
+            {
+                continue;
+            }
+            let x = x as usize;
+            let z = z as usize;
+            let index = surface_region_extent_index(x, z);
+            if !valid[index] {
+                continue;
+            }
+            let elevation = elevations[index];
+            min_elevation = min_elevation.min(elevation);
+            max_elevation = max_elevation.max(elevation);
+        }
+    }
+    max_elevation - min_elevation
 }
 
 pub fn smooth_surface_classes(
@@ -9161,7 +9363,7 @@ fn write_surface_region_manifest(settings: &SurfaceRegionSettings) -> Result<Pat
     values.insert("features.biomes".to_string(), "heuristic".to_string());
     values.insert(
         "features.surfaceMaterialRaster".to_string(),
-        "false".to_string(),
+        settings.surface_material_path.is_some().to_string(),
     );
     values.insert(
         "features.serverDelegation".to_string(),
@@ -9375,6 +9577,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(settings.texture_mode, SurfaceTextureMode::Photo);
+        assert!(settings.surface_material_path.is_none());
     }
 
     #[test]
@@ -9413,6 +9616,238 @@ mod tests {
         assert!(manifest.contains("generation.chunkStatus=minecraft:surface\n"));
 
         fs::remove_dir_all(world_dir).unwrap();
+    }
+
+    #[test]
+    fn surface_region_manifest_records_configured_material_raster() {
+        let world_dir = std::env::temp_dir().join(format!(
+            "earthmap-surface-material-manifest-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&world_dir);
+        let mut settings = SurfaceRegionSettings::new(
+            "height.tif",
+            &world_dir,
+            "SR EarthMap Surface",
+            0,
+            5000,
+            0,
+            0,
+            OutputFormat::LinearV2,
+            DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+        )
+        .unwrap();
+        settings.surface_material_path = Some(PathBuf::from("TifFiles/terrain/TrueMarble.vrt"));
+
+        let manifest_path = write_surface_region_manifest(&settings).unwrap();
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+
+        assert!(manifest.contains("features.surfaceMaterialRaster=true\n"));
+        assert!(manifest.contains("generation.textureMode=photo\n"));
+
+        fs::remove_dir_all(world_dir).unwrap();
+    }
+
+    #[test]
+    fn surface_region_photo_material_sample_applies_photo_solver_metadata() {
+        let semantic = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let material = SurfaceMaterialSample::with_export_token(
+            RgbColor::of(218, 184, 92),
+            RgbColor::of(255, 200, 128),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+
+        let applied = apply_surface_region_material_sample(
+            semantic,
+            material,
+            SurfaceTextureMode::Photo,
+            240.0,
+            13.0,
+            24.0,
+            0.0,
+            15.0,
+            101,
+            100,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap();
+
+        assert_eq!(applied.terrain_token_source, TerrainTokenSource::Export);
+        assert!(applied.has_data_evidence(surface_data_evidence::CLIMATE));
+        assert!(matches!(
+            applied.top_block_state_id,
+            block_state_ids::SAND
+                | block_state_ids::SANDSTONE
+                | block_state_ids::END_STONE
+                | block_state_ids::SMOOTH_SANDSTONE
+                | block_state_ids::CUT_SANDSTONE
+                | block_state_ids::CHISELED_SANDSTONE
+                | block_state_ids::YELLOW_TERRACOTTA
+        ));
+    }
+
+    #[test]
+    fn surface_region_photo_material_uses_smoothed_elevation_input() {
+        let semantic = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let material = SurfaceMaterialSample::new(
+            RgbColor::of(156, 149, 137),
+            RgbColor::of(230, 205, 160),
+            TerrainTokenSource::JavaStandardPalette,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            -1,
+            28,
+            -1,
+            150,
+            "rocky desert plateau",
+            "minecraft:desert",
+            0.95,
+        );
+
+        let low_elevation = apply_surface_region_material_sample(
+            semantic.clone(),
+            material.clone(),
+            SurfaceTextureMode::Photo,
+            650.0,
+            34.0,
+            22.0,
+            0.0,
+            0.0,
+            512,
+            512,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap();
+        let smoothed_elevation = apply_surface_region_material_sample(
+            semantic,
+            material,
+            SurfaceTextureMode::Photo,
+            900.0,
+            34.0,
+            22.0,
+            0.0,
+            0.0,
+            512,
+            512,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap();
+
+        assert_ne!(
+            low_elevation.top_block_state_id,
+            smoothed_elevation.top_block_state_id
+        );
+        assert_ne!(smoothed_elevation.top_block_state_id, block_state_ids::SAND);
+        assert_ne!(
+            smoothed_elevation.top_block_state_id,
+            block_state_ids::SANDSTONE
+        );
+    }
+
+    #[test]
+    fn classified_surface_material_sampling_is_not_silently_ignored() {
+        let semantic = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let error = apply_surface_region_material_sample(
+            semantic,
+            SurfaceMaterialSample::color_only(RgbColor::of(90, 120, 70)),
+            SurfaceTextureMode::Classified,
+            120.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "classified surface material sampling is not ported yet"
+        );
+    }
+
+    #[test]
+    fn generate_surface_region_rejects_classified_material_before_opening_raster() {
+        let temp = std::env::temp_dir().join(format!(
+            "earthmap-classified-material-error-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut settings = SurfaceRegionSettings::new_with_texture_options(
+            temp.join("missing-height.tif"),
+            temp.join("world"),
+            "SR EarthMap Surface",
+            0,
+            5000,
+            0,
+            0,
+            OutputFormat::LinearV2,
+            DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+            true,
+            ChunkGenerationStatus::Full,
+            DEFAULT_VERTICAL_SCALE,
+            SurfaceTextureMode::Classified,
+        )
+        .unwrap();
+        settings.surface_material_path = Some(temp.join("missing-TrueMarble.vrt"));
+
+        let error = generate_surface_region(&settings).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "classified surface material sampling is not ported yet"
+        );
+        assert!(!temp.join("world").exists());
     }
 
     #[test]
