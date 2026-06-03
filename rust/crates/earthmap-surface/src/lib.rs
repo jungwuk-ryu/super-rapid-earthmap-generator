@@ -787,6 +787,137 @@ impl SurfaceMaterialSampler for TrueMarbleSurfaceMaterialSampler {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SurfaceMaterialRasterStats {
+    pub source_count: usize,
+    pub open_readers: usize,
+    pub resident_tiles: u64,
+    pub tile_hits: u64,
+    pub tile_misses: u64,
+    pub tile_evictions: u64,
+    pub sample_nearest_requests: u64,
+    pub sample_averaged_requests: u64,
+}
+
+impl SurfaceMaterialRasterStats {
+    pub const EMPTY: Self = Self {
+        source_count: 0,
+        open_readers: 0,
+        resident_tiles: 0,
+        tile_hits: 0,
+        tile_misses: 0,
+        tile_evictions: 0,
+        sample_nearest_requests: 0,
+        sample_averaged_requests: 0,
+    };
+
+    pub fn minus(self, previous: Self) -> Self {
+        Self {
+            source_count: self.source_count,
+            open_readers: self.open_readers,
+            resident_tiles: self.resident_tiles.saturating_sub(previous.resident_tiles),
+            tile_hits: self.tile_hits.saturating_sub(previous.tile_hits),
+            tile_misses: self.tile_misses.saturating_sub(previous.tile_misses),
+            tile_evictions: self.tile_evictions.saturating_sub(previous.tile_evictions),
+            sample_nearest_requests: self
+                .sample_nearest_requests
+                .saturating_sub(previous.sample_nearest_requests),
+            sample_averaged_requests: self
+                .sample_averaged_requests
+                .saturating_sub(previous.sample_averaged_requests),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceQuantizedCell {
+    pub key: i64,
+    pub center_longitude: f64,
+    pub center_latitude: f64,
+}
+
+pub fn normalized_slope_permille(raw_value: f64) -> i32 {
+    if !raw_value.is_finite() || raw_value < 0.0 {
+        return SurfaceMaterialSample::UNKNOWN;
+    }
+    let ratio = if raw_value <= 1.0 {
+        raw_value
+    } else if raw_value <= 90.0 {
+        raw_value / 90.0
+    } else {
+        let percent_slope = raw_value / 100.0;
+        let rise_over_run = percent_slope / 100.0;
+        rise_over_run.atan() / (std::f64::consts::PI / 2.0)
+    };
+    java_math_round_double_to_narrowed_i32(java_clamp_unit(ratio) * 1000.0)
+}
+
+pub fn normalize_longitude(longitude: f64) -> f64 {
+    if !longitude.is_finite() {
+        return longitude;
+    }
+    let mut lon = longitude;
+    while lon < -180.0 {
+        lon += 360.0;
+    }
+    while lon >= 180.0 {
+        lon -= 360.0;
+    }
+    lon
+}
+
+pub fn material_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f64) -> f64 {
+    java_max(
+        0.012,
+        java_min(
+            0.060,
+            java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) * 2.0,
+        ),
+    )
+}
+
+pub fn photo_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f64) -> f64 {
+    java_max(
+        0.0030,
+        java_min(
+            0.050,
+            java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) * 2.75,
+        ),
+    )
+}
+
+pub fn photo_average_span_degrees(span_degrees: f64) -> f64 {
+    java_max(0.0030, java_min(0.060, span_degrees.abs() * 2.75))
+}
+
+pub fn photo_evidence_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f64) -> f64 {
+    java_max(
+        0.030,
+        java_min(
+            0.090,
+            java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) * 5.0,
+        ),
+    )
+}
+
+pub fn quantized_cell(longitude: f64, latitude: f64, cell_degrees: f64) -> SurfaceQuantizedCell {
+    let lon = normalize_longitude(longitude);
+    let lat = java_max(-90.0, java_min(90.0, latitude));
+    let lon_cell = ((lon + 180.0) / cell_degrees).floor() as i32;
+    let lat_cell = ((lat + 90.0) / cell_degrees).floor() as i32;
+    let cell_code = java_math_round_double_to_narrowed_i32(cell_degrees * 10_000.0);
+    let key = (i64::from(cell_code) << 48)
+        ^ ((i64::from(lon_cell) & 0x00ff_ffff) << 24)
+        ^ (i64::from(lat_cell) & 0x00ff_ffff);
+    let center_longitude = -180.0 + ((f64::from(lon_cell) + 0.5) * cell_degrees);
+    let center_latitude = -90.0 + ((f64::from(lat_cell) + 0.5) * cell_degrees);
+    SurfaceQuantizedCell {
+        key,
+        center_longitude,
+        center_latitude,
+    }
+}
+
 pub fn generate_height_only_region(
     settings: &HeightOnlySettings,
 ) -> Result<HeightOnlyRegionReport> {
@@ -1552,6 +1683,30 @@ fn java_math_round_double_to_narrowed_i32(value: f64) -> i32 {
     rounded as i32
 }
 
+fn java_min(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else if left <= right {
+        left
+    } else {
+        right
+    }
+}
+
+fn java_max(left: f64, right: f64) -> f64 {
+    if left.is_nan() || right.is_nan() {
+        f64::NAN
+    } else if left >= right {
+        left
+    } else {
+        right
+    }
+}
+
+fn java_clamp_unit(value: f64) -> f64 {
+    java_max(0.0, java_min(1.0, value))
+}
+
 #[cfg(test)]
 fn java_height_only_surface_y_reference(elevation_meters: f64) -> i32 {
     let ratio = elevation_meters / ELEVATION_METERS_PER_BLOCK;
@@ -2043,6 +2198,99 @@ mod tests {
 
         drop(sampler);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn earth_data_sampler_helper_math_matches_java_contract() {
+        assert_eq!(
+            normalized_slope_permille(f64::NAN),
+            SurfaceMaterialSample::UNKNOWN
+        );
+        assert_eq!(
+            normalized_slope_permille(-0.1),
+            SurfaceMaterialSample::UNKNOWN
+        );
+        assert_eq!(normalized_slope_permille(0.0), 0);
+        assert_eq!(normalized_slope_permille(0.5), 500);
+        assert_eq!(normalized_slope_permille(45.0), 500);
+        assert_eq!(normalized_slope_permille(90.0), 1000);
+        assert_eq!(normalized_slope_permille(10_000.0), 500);
+
+        assert_eq!(normalize_longitude(181.0), -179.0);
+        assert_eq!(normalize_longitude(-181.0), 179.0);
+        assert!(normalize_longitude(f64::NAN).is_nan());
+
+        assert_eq!(material_cell_degrees(0.0, 0.0), 0.012);
+        assert_eq!(material_cell_degrees(0.02, 0.01), 0.04);
+        assert_eq!(material_cell_degrees(1.0, 0.0), 0.060);
+        assert_eq!(photo_cell_degrees(0.001, 0.0), 0.0030);
+        assert_eq!(photo_cell_degrees(0.010, 0.0), 0.0275);
+        assert_eq!(photo_average_span_degrees(1.0), 0.060);
+        assert_eq!(photo_evidence_cell_degrees(0.001, 0.0), 0.030);
+        assert_eq!(photo_evidence_cell_degrees(0.010, 0.0), 0.050);
+        assert_eq!(photo_evidence_cell_degrees(1.0, 0.0), 0.090);
+
+        let cell = quantized_cell(181.0, 91.0, 0.5);
+        assert_eq!(cell.center_longitude, -178.75);
+        assert_eq!(cell.center_latitude, 90.25);
+        assert_eq!(cell.key, (5_000_i64 << 48) ^ (2_i64 << 24) ^ 360_i64);
+
+        let nan_cell = quantized_cell(f64::NAN, f64::NAN, 0.5);
+        assert_eq!(nan_cell.key, 5_000_i64 << 48);
+        assert_eq!(nan_cell.center_longitude, -179.75);
+        assert_eq!(nan_cell.center_latitude, -89.75);
+    }
+
+    #[test]
+    fn surface_material_raster_stats_minus_matches_java_saturating_delta() {
+        assert_eq!(
+            SurfaceMaterialRasterStats::EMPTY,
+            SurfaceMaterialRasterStats {
+                source_count: 0,
+                open_readers: 0,
+                resident_tiles: 0,
+                tile_hits: 0,
+                tile_misses: 0,
+                tile_evictions: 0,
+                sample_nearest_requests: 0,
+                sample_averaged_requests: 0,
+            }
+        );
+
+        let current = SurfaceMaterialRasterStats {
+            source_count: 3,
+            open_readers: 2,
+            resident_tiles: 10,
+            tile_hits: 12,
+            tile_misses: 4,
+            tile_evictions: 1,
+            sample_nearest_requests: 2,
+            sample_averaged_requests: 20,
+        };
+        let previous = SurfaceMaterialRasterStats {
+            source_count: 99,
+            open_readers: 88,
+            resident_tiles: 12,
+            tile_hits: 2,
+            tile_misses: 5,
+            tile_evictions: 1,
+            sample_nearest_requests: 7,
+            sample_averaged_requests: 8,
+        };
+
+        assert_eq!(
+            current.minus(previous),
+            SurfaceMaterialRasterStats {
+                source_count: 3,
+                open_readers: 2,
+                resident_tiles: 0,
+                tile_hits: 10,
+                tile_misses: 0,
+                tile_evictions: 0,
+                sample_nearest_requests: 0,
+                sample_averaged_requests: 12,
+            }
+        );
     }
 
     #[test]
