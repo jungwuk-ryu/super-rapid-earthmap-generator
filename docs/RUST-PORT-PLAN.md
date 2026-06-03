@@ -52,9 +52,10 @@ inspect-linear-statuses
 
 Rust may add diagnostic commands, but existing command names, required arguments, output file names, CSV headers, and
 manifest keys must stay stable unless a separate compatibility decision is recorded in `docs/DECISIONS.md`.
-The `generate-survival-*` names are Java compatibility command names for vanilla-delegated terrain, manifest,
+The `generate-survival-*` names are legacy Java compatibility command names for vanilla-delegated terrain, manifest,
 finalization, and evidence workflows. They are not approval to add Rust-side direct generation of ores, caves,
-structures, strongholds, End portals, loot, or spawners.
+structures, strongholds, End portals, loot, or spawners, and there is intentionally no Rust "Survival And Gameplay"
+generation phase.
 
 ## Baseline Evidence
 
@@ -122,7 +123,7 @@ rust/
     earthmap-surface/
     earthmap-minecraft/
     earthmap-region/
-    earthmap-gameplay/
+    earthmap-gameplay/     # manifest, evidence, and validator compatibility only
     earthmap-quality/
     earthmap-cli/
     earthmap-parity/
@@ -145,7 +146,7 @@ net.earthmap.geo        -> earthmap-geo
 net.earthmap.terrain    -> earthmap-surface
 net.earthmap.minecraft  -> earthmap-minecraft
 net.earthmap.region     -> earthmap-region
-net.earthmap.gameplay   -> earthmap-gameplay
+net.earthmap.gameplay   -> earthmap-gameplay, limited to manifests, evidence appliers, validators, and scanners
 net.earthmap.quality    -> earthmap-quality
 net.earthmap.cli        -> earthmap-cli
 tests and validators    -> earthmap-parity
@@ -556,9 +557,9 @@ Acceptance:
 
 ### Vanilla-Delegated Survival Scope
 
-Direct gameplay population is not a Rust port phase. Production Java output is centered on `generate-vanilla-delegated-*`
-commands: EarthMap writes Earth-shaped terrain chunks and metadata, then vanilla Minecraft/DivineMC continues chunk
-generation when chunks are loaded or force-loaded.
+Direct gameplay population was removed from the Rust phase plan. Production Java output is centered on
+`generate-vanilla-delegated-*` commands: EarthMap writes Earth-shaped terrain chunks and metadata, then vanilla
+Minecraft/DivineMC continues chunk generation when chunks are loaded or force-loaded.
 
 Therefore Rust must not introduce direct generators for vanilla-owned gameplay features such as ores, caves,
 vegetation, strongholds, End portals, loot chests, or spawners as part of Java-output parity. The Rust port should
@@ -566,7 +567,8 @@ preserve Java's delegated chunk status, manifest flags, world metadata, finaliza
 scanners/validators that inspect server-produced results.
 
 Legacy Java classes or reports around ores/progression are compatibility evidence only unless a separate decision
-reinstates direct generation. They are not a required output-generation phase for this Rust port.
+reinstates direct generation. They are not a required output-generation phase for this Rust port, and no dedicated
+"Survival And Gameplay" implementation phase should be reintroduced without that decision.
 
 ## Phase 6: Quality And Visual Evidence Tools
 
