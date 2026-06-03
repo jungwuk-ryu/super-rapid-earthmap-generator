@@ -607,6 +607,33 @@ impl SurfaceMaterialSample {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EcoregionSample {
+    pub name: String,
+    pub biome_id: String,
+}
+
+impl EcoregionSample {
+    pub fn new(name: impl Into<String>, biome_id: impl Into<String>) -> Self {
+        Self {
+            name: name.into().trim().to_string(),
+            biome_id: biome_id.into().trim().to_string(),
+        }
+    }
+
+    pub fn unknown() -> Self {
+        Self::new("", "")
+    }
+
+    pub fn available(&self) -> bool {
+        !self.name.is_empty()
+    }
+
+    pub fn has_biome(&self) -> bool {
+        !self.biome_id.is_empty()
+    }
+}
+
 pub mod surface_data_evidence {
     use super::SurfaceMaterialSample;
 
@@ -804,14 +831,17 @@ pub struct EarthDataSurfaceMaterialSampler {
     ocean_temperature: Option<GeoTiffSingleBandReader>,
     bathymetry: Option<GeoTiffFloat32Reader>,
     slope: Option<GeoTiffSingleBandReader>,
-    material_cache: Mutex<BoundedSurfaceMaterialCache>,
-    ocean_cache: Mutex<BoundedSurfaceMaterialCache>,
+    ecoregions: Option<Box<dyn EcoregionSampler>>,
+    material_cache: Mutex<BoundedAccessCache<SurfaceMaterialSample>>,
+    ocean_cache: Mutex<BoundedAccessCache<SurfaceMaterialSample>>,
+    ecoregion_cache: Mutex<BoundedAccessCache<EcoregionEvidence>>,
 }
 
 impl EarthDataSurfaceMaterialSampler {
     const DEFAULT_CACHE_BLOCKS: usize = 256;
     const MATERIAL_CACHE_ENTRIES: usize = 262_144;
     const OCEAN_CACHE_ENTRIES: usize = 262_144;
+    const ECOREGION_CACHE_ENTRIES: usize = 262_144;
 
     pub fn open(true_marble_path: impl AsRef<Path>) -> Result<Self> {
         let true_marble_path = true_marble_path.as_ref();
@@ -851,11 +881,20 @@ impl EarthDataSurfaceMaterialSampler {
             ocean_temperature: open_surface_raster(tif_root.as_deref(), "ocean_temp_infill.tif")?,
             bathymetry: open_surface_float_raster(tif_root.as_deref(), "bathymetry.tif")?,
             slope: open_surface_raster(tif_root.as_deref(), "slope.tif")?,
-            material_cache: Mutex::new(BoundedSurfaceMaterialCache::new(
-                Self::MATERIAL_CACHE_ENTRIES,
-            )),
-            ocean_cache: Mutex::new(BoundedSurfaceMaterialCache::new(Self::OCEAN_CACHE_ENTRIES)),
+            ecoregions: None,
+            material_cache: Mutex::new(BoundedAccessCache::new(Self::MATERIAL_CACHE_ENTRIES)),
+            ocean_cache: Mutex::new(BoundedAccessCache::new(Self::OCEAN_CACHE_ENTRIES)),
+            ecoregion_cache: Mutex::new(BoundedAccessCache::new(Self::ECOREGION_CACHE_ENTRIES)),
         })
+    }
+
+    #[cfg(test)]
+    fn with_ecoregion_sampler_for_tests(
+        mut self,
+        sampler: impl EcoregionSampler + 'static,
+    ) -> Self {
+        self.ecoregions = Some(Box::new(sampler));
+        self
     }
 
     pub fn raster_stats(&self) -> SurfaceMaterialRasterStats {
@@ -917,6 +956,12 @@ impl EarthDataSurfaceMaterialSampler {
             longitude_span_degrees,
             latitude_span_degrees,
         )?;
+        let ecoregion = self.sample_ecoregion(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )?;
         Ok(SurfaceMaterialSample::land(
             color,
             sample_rounded(self.climate.as_ref(), longitude, latitude),
@@ -931,10 +976,55 @@ impl EarthDataSurfaceMaterialSampler {
             sample_rounded(self.ocean_temperature.as_ref(), longitude, latitude),
             sample_bathymetry_meters(self.bathymetry.as_ref(), longitude, latitude),
             sample_slope_permille(self.slope.as_ref(), longitude, latitude),
-            "",
-            "",
-            0.0,
+            ecoregion.sample.name,
+            ecoregion.sample.biome_id,
+            ecoregion.confidence,
         ))
+    }
+
+    fn sample_ecoregion(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<EcoregionEvidence> {
+        if self.ecoregions.is_none() {
+            return Ok(EcoregionEvidence::unknown());
+        }
+        let cell_degrees = ecoregion_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let cell = quantized_cell(longitude, latitude, cell_degrees);
+        {
+            let mut cache = self
+                .ecoregion_cache
+                .lock()
+                .map_err(|_| SurfaceError::invalid("surface ecoregion cache lock poisoned"))?;
+            if let Some(cached) = cache.get(cell.key) {
+                return Ok(cached);
+            }
+        }
+        let sampled = self.sample_ecoregion_uncached(
+            cell.center_longitude,
+            cell.center_latitude,
+            cell_degrees,
+        );
+        let mut cache = self
+            .ecoregion_cache
+            .lock()
+            .map_err(|_| SurfaceError::invalid("surface ecoregion cache lock poisoned"))?;
+        Ok(cache.insert_or_get(cell.key, sampled))
+    }
+
+    fn sample_ecoregion_uncached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        cell_degrees: f64,
+    ) -> EcoregionEvidence {
+        let Some(ecoregions) = self.ecoregions.as_deref() else {
+            return EcoregionEvidence::unknown();
+        };
+        sample_ecoregion_evidence(ecoregions, longitude, latitude, cell_degrees)
     }
 
     fn sample_water_cached(
@@ -1045,14 +1135,14 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
 }
 
 #[derive(Debug)]
-struct BoundedSurfaceMaterialCache {
-    entries: HashMap<i64, SurfaceMaterialCacheEntry>,
+struct BoundedAccessCache<T> {
+    entries: HashMap<i64, BoundedCacheEntry<T>>,
     access_order: BTreeSet<(u64, i64)>,
     max_entries: usize,
     access_clock: u64,
 }
 
-impl BoundedSurfaceMaterialCache {
+impl<T: Clone> BoundedAccessCache<T> {
     fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(max_entries.min(4096)),
@@ -1062,40 +1152,40 @@ impl BoundedSurfaceMaterialCache {
         }
     }
 
-    fn get(&mut self, key: i64) -> Option<SurfaceMaterialSample> {
+    fn get(&mut self, key: i64) -> Option<T> {
         let stamp = self.next_access_stamp();
         let entry = self.entries.get_mut(&key)?;
         let old_stamp = entry.access_stamp;
         entry.access_stamp = stamp;
-        let sample = entry.sample.clone();
+        let value = entry.value.clone();
         self.access_order.remove(&(old_stamp, key));
         self.access_order.insert((stamp, key));
-        Some(sample)
+        Some(value)
     }
 
-    fn insert_or_get(&mut self, key: i64, sample: SurfaceMaterialSample) -> SurfaceMaterialSample {
+    fn insert_or_get(&mut self, key: i64, value: T) -> T {
         let stamp = self.next_access_stamp();
         if let Some(entry) = self.entries.get_mut(&key) {
             let old_stamp = entry.access_stamp;
             entry.access_stamp = stamp;
-            let existing = entry.sample.clone();
+            let existing = entry.value.clone();
             self.access_order.remove(&(old_stamp, key));
             self.access_order.insert((stamp, key));
             return existing;
         }
         if self.max_entries == 0 {
-            return sample;
+            return value;
         }
         self.entries.insert(
             key,
-            SurfaceMaterialCacheEntry {
-                sample: sample.clone(),
+            BoundedCacheEntry {
+                value: value.clone(),
                 access_stamp: stamp,
             },
         );
         self.access_order.insert((stamp, key));
         self.trim_to_capacity();
-        sample
+        value
     }
 
     fn next_access_stamp(&mut self) -> u64 {
@@ -1114,9 +1204,29 @@ impl BoundedSurfaceMaterialCache {
 }
 
 #[derive(Debug)]
-struct SurfaceMaterialCacheEntry {
-    sample: SurfaceMaterialSample,
+struct BoundedCacheEntry<T> {
+    value: T,
     access_stamp: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EcoregionEvidence {
+    sample: EcoregionSample,
+    confidence: f64,
+}
+
+impl EcoregionEvidence {
+    fn new(sample: EcoregionSample, confidence: f64) -> Self {
+        Self { sample, confidence }
+    }
+
+    fn unknown() -> Self {
+        Self::new(EcoregionSample::unknown(), 0.0)
+    }
+}
+
+trait EcoregionSampler: fmt::Debug + Send + Sync {
+    fn sample(&self, longitude: f64, latitude: f64) -> EcoregionSample;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1356,6 +1466,16 @@ pub fn photo_evidence_cell_degrees(longitude_span_degrees: f64, latitude_span_de
         java_min(
             0.090,
             java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) * 5.0,
+        ),
+    )
+}
+
+pub fn ecoregion_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f64) -> f64 {
+    java_max(
+        0.012,
+        java_min(
+            0.045,
+            java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) * 1.6,
         ),
     )
 }
@@ -1736,6 +1856,70 @@ fn met_terrain_distance_squared(color: RgbColor, entry: MetTerrainEntry) -> i32 
     let green = i32::from(color.green) - i32::from(entry.green);
     let blue = i32::from(color.blue) - i32::from(entry.blue);
     (red * red) + (green * green) + (blue * blue)
+}
+
+fn sample_ecoregion_evidence(
+    ecoregions: &dyn EcoregionSampler,
+    longitude: f64,
+    latitude: f64,
+    cell_degrees: f64,
+) -> EcoregionEvidence {
+    let center = ecoregions.sample(longitude, latitude);
+    if !center.has_biome() {
+        return EcoregionEvidence::unknown();
+    }
+    let offset = 0.45_f64.max(cell_degrees * 10.0);
+    let mut total = 0;
+    let mut same_family = 0;
+    let center_family = biome_family(&center.biome_id);
+    for dz in -1..=1 {
+        let sample_latitude = latitude + (f64::from(dz) * offset);
+        if sample_latitude < -90.0 || sample_latitude > 90.0 {
+            continue;
+        }
+        for dx in -1..=1 {
+            let neighbor = ecoregions.sample(longitude + (f64::from(dx) * offset), sample_latitude);
+            if !neighbor.has_biome() {
+                continue;
+            }
+            total += 1;
+            if center_family == biome_family(&neighbor.biome_id) {
+                same_family += 1;
+            }
+        }
+    }
+    let confidence = if total == 0 {
+        1.0
+    } else {
+        f64::from(same_family) / f64::from(total)
+    };
+    EcoregionEvidence::new(center, confidence)
+}
+
+fn biome_family(biome: &str) -> &str {
+    if biome.contains("desert") {
+        "desert"
+    } else if biome.contains("badlands") {
+        "badlands"
+    } else if biome.contains("savanna") {
+        "savanna"
+    } else if biome.contains("jungle") {
+        "jungle"
+    } else if biome.contains("forest") {
+        "forest"
+    } else if biome.contains("swamp") {
+        "swamp"
+    } else if biome.contains("taiga") {
+        "taiga"
+    } else if biome.contains("snow") || biome.contains("frozen") {
+        "snow"
+    } else if biome.contains("beach") {
+        "beach"
+    } else if biome.contains("plains") || biome.contains("meadow") {
+        "grassland"
+    } else {
+        biome
+    }
 }
 
 fn open_surface_raster(
@@ -3160,8 +3344,9 @@ mod tests {
         )
         .unwrap();
 
-        let sampler =
-            EarthDataSurfaceMaterialSampler::open(terrain.join("TrueMarble.vrt")).unwrap();
+        let sampler = EarthDataSurfaceMaterialSampler::open(terrain.join("TrueMarble.vrt"))
+            .unwrap()
+            .with_ecoregion_sampler_for_tests(FixtureEcoregionSampler);
         assert!(sampler.samples_open_water());
 
         let sample = sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap();
@@ -3186,9 +3371,9 @@ mod tests {
         assert_eq!(sample.ocean_temperature, 12);
         assert_eq!(sample.bathymetry_meters, -123);
         assert_eq!(sample.slope_permille, 500);
-        assert_eq!(sample.ecoregion_name, "");
-        assert_eq!(sample.ecoregion_biome_id, "");
-        assert_eq!(sample.ecoregion_confidence, 0.0);
+        assert_eq!(sample.ecoregion_name, "Center Jungle");
+        assert_eq!(sample.ecoregion_biome_id, "minecraft:jungle");
+        assert!((sample.ecoregion_confidence - (2.0 / 3.0)).abs() < 0.0001);
         assert_eq!(sampler.raster_stats().sample_averaged_requests, 1);
 
         assert_eq!(sampler.sample(1.25, 0.75, 0.0, 0.0).unwrap(), sample);
@@ -3230,7 +3415,7 @@ mod tests {
 
     #[test]
     fn bounded_surface_material_cache_evicts_by_access_order_like_java_linked_hash_map() {
-        let mut cache = BoundedSurfaceMaterialCache::new(2);
+        let mut cache = BoundedAccessCache::new(2);
         let first = SurfaceMaterialSample::color_only(RgbColor::of(1, 1, 1));
         let second = SurfaceMaterialSample::color_only(RgbColor::of(2, 2, 2));
         let third = SurfaceMaterialSample::color_only(RgbColor::of(3, 3, 3));
@@ -3243,6 +3428,40 @@ mod tests {
         assert_eq!(cache.get(2), None);
         assert_eq!(cache.get(1), Some(first));
         assert_eq!(cache.get(3), Some(third));
+    }
+
+    #[test]
+    fn ecoregion_sample_and_evidence_match_java_family_confidence_rules() {
+        let trimmed = EcoregionSample::new("  Name  ", " minecraft:forest ");
+        assert_eq!(trimmed.name, "Name");
+        assert_eq!(trimmed.biome_id, "minecraft:forest");
+        assert!(trimmed.available());
+        assert!(trimmed.has_biome());
+        assert!(!EcoregionSample::unknown().available());
+        assert!(!EcoregionSample::new("Name", "").has_biome());
+
+        assert_eq!(biome_family("minecraft:snowy_plains"), "snow");
+        assert_eq!(biome_family("minecraft:frozen_river"), "snow");
+        assert_eq!(biome_family("minecraft:meadow"), "grassland");
+        assert_eq!(
+            biome_family("minecraft:mushroom_fields"),
+            "minecraft:mushroom_fields"
+        );
+        assert_eq!(ecoregion_cell_degrees(0.0, 0.0), 0.012);
+        assert_eq!(ecoregion_cell_degrees(0.02, 0.0), 0.032);
+        assert_eq!(ecoregion_cell_degrees(1.0, 0.0), 0.045);
+
+        let evidence = sample_ecoregion_evidence(&FixtureEcoregionSampler, 0.0, 0.0, 0.012);
+        assert_eq!(evidence.sample.name, "Center Jungle");
+        assert_eq!(evidence.sample.biome_id, "minecraft:jungle");
+        assert!((evidence.confidence - (2.0 / 3.0)).abs() < 0.0001);
+
+        let nan_latitude_evidence =
+            sample_ecoregion_evidence(&FixtureEcoregionSampler, 0.0, f64::NAN, 0.012);
+        assert!((nan_latitude_evidence.confidence - (2.0 / 3.0)).abs() < 0.0001);
+
+        let unknown = sample_ecoregion_evidence(&UnknownEcoregionSampler, 0.0, 0.0, 0.012);
+        assert_eq!(unknown, EcoregionEvidence::unknown());
     }
 
     #[test]
@@ -3531,6 +3750,28 @@ mod tests {
         assert_eq!(values["features.ores"], "false");
         assert_eq!(values["features.strongholdOrEquivalent"], "false");
         assert_eq!(values["generation.format"], "LINEAR_V2");
+    }
+
+    #[derive(Debug)]
+    struct FixtureEcoregionSampler;
+
+    impl EcoregionSampler for FixtureEcoregionSampler {
+        fn sample(&self, longitude: f64, _latitude: f64) -> EcoregionSample {
+            if longitude > 0.30 && longitude < 1.0 {
+                EcoregionSample::new("Neighbor Forest", "minecraft:forest")
+            } else {
+                EcoregionSample::new("Center Jungle", "minecraft:jungle")
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct UnknownEcoregionSampler;
+
+    impl EcoregionSampler for UnknownEcoregionSampler {
+        fn sample(&self, _longitude: f64, _latitude: f64) -> EcoregionSample {
+            EcoregionSample::unknown()
+        }
     }
 
     fn synthetic_classic_rgb_tiff() -> Vec<u8> {
