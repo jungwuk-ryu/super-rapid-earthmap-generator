@@ -585,6 +585,8 @@ Bootstrap implementation status on 2026-06-03:
   evidence bit flags.
 - Rust `SurfaceMaterialSampler` and `TrueMarbleSurfaceMaterialSampler` bootstrap wraps VRT RGB averaged samples as
   Java-compatible color-only `SurfaceMaterialSample` output for synthetic VRT fixtures.
+- Rust `GeoTiffSingleBandReader` bootstrap opens uncompressed unsigned 8/16-bit single-band GeoTIFF rasters with
+  Java-compatible nearest sampling, coordinate flooring, and NoData handling for synthetic Classic TIFF fixtures.
 - Remaining Phase 5 work: port EarthData surface material raster sampling, photo solver, smoothing/coastal policies,
   OSM overlay, surface biome cell writing, and fixed-region `generate-surface-region` payload parity.
 

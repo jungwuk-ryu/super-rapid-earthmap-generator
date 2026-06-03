@@ -330,6 +330,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
         out,
         "DONE rust.phase5.trueMarbleSurfaceSamplerBootstrap - TrueMarbleSurfaceMaterialSampler wraps VrtRgbMosaicReader.sample_averaged as Java-compatible color-only SurfaceMaterialSample output for synthetic VRT fixtures."
     )?;
+    writeln!(
+        out,
+        "DONE rust.phase5.geoTiffSingleBandReaderBootstrap - GeoTiffSingleBandReader opens uncompressed unsigned 8/16-bit single-band GeoTIFF rasters with Java-compatible nearest sampling and NoData handling for synthetic Classic TIFF fixtures."
+    )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",
