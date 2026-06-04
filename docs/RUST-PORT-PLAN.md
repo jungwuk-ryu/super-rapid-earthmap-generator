@@ -23,7 +23,7 @@ the current source of truth for work status.
 | Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. |
 | Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. |
 | Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists for fixed regions. `generate-golden.ps1 -IncludeHeightOnly` promotes the default fixed region into the regeneratable corpus. |
-| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices | Commit history and the Phase 5 notes below include surface/photo/ecoregion/no-climate/snow evidence work. `generate-golden.ps1 -IncludeSurface` now promotes the no-material fixed surface region into the corpus. Remaining work is photo/material promotion evidence, quality-gate artifacts, and any deltas discovered there. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices | Commit history and the Phase 5 notes below include surface/photo/ecoregion/no-climate/snow evidence work. `generate-golden.ps1 -IncludeSurface` now promotes the no-material fixed surface region into the corpus. Remaining work is photo/material promotion evidence, starting with the known vanilla-delegated payload delta noted below. |
 | Vanilla-owned gameplay generation | Out of scope | Ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners remain vanilla-delegated. Do not add direct Rust generators for them. |
 | Phase 6: quality and visual evidence tools | Pending | Start after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
 
@@ -32,7 +32,7 @@ Current active work:
 1. Done: `rust/scripts/generate-candidates.ps1` can regenerate supported Rust candidate entries from a Java golden root.
 2. Done: `rust/scripts/generate-golden.ps1 -IncludeHeightOnly` adds fixed-region height-only MCA/Linear entries.
 3. Done: `rust/scripts/generate-golden.ps1 -IncludeSurface` adds no-material fixed-region surface MCA/Linear entries.
-4. Next: add photo/material fixed-region corpus entries once a shared Java/Rust command surface is available.
+4. Next: resolve the vanilla-delegated photo/material payload delta before adding photo/material corpus entries.
 5. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
 
 ## Non-Negotiable Rules
@@ -785,9 +785,14 @@ Bootstrap implementation status on 2026-06-03:
   matches and otherwise forcing snow evidence to `SNOW_BLOCK` while retaining dry false-snow guards and Java
   decision-source/stage metadata.
 - Phase 5 status note on 2026-06-04: the earlier semantic classifier/photo-solver backlog has largely been implemented
-  through subsequent commits. Do not treat Phase 5 as unstarted. The remaining Phase 5 promotion work is to add
-  fixed-region surface/photo corpus entries, run Java/Rust payload comparison against those entries, and record any
-  concrete deltas discovered by that corpus evidence.
+  through subsequent commits. Do not treat Phase 5 as unstarted. No-material fixed-region surface corpus entries are
+  now promoted; remaining photo/material promotion is blocked until the payload delta below is explained and fixed.
+- Known photo/material promotion blocker on 2026-06-04: a local Rust CLI prototype for
+  `generate-vanilla-delegated-region E:\HQheightmap.tif <world> 5000 0 0 linear surface surfaceRaster=auto` matched
+  Java stdout shape, manifest metadata, cache stats, and region summary, but failed chunk payload parity. Evidence:
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-101831`; `compare-golden.ps1` reported
+  `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0`. Do not add photo/material corpus entries or
+  expose the Rust vanilla-delegated command until this payload delta is explained and fixed.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
@@ -1095,5 +1100,5 @@ Full Rust replacement requires:
 5. Done: add `generate-candidates.ps1` so Rust candidate roots can be regenerated from Java oracle roots.
 6. Done: add optional height-only fixed-region entries to the regeneratable golden/candidate corpus.
 7. Done: add optional no-material surface fixed-region entries to the regeneratable golden/candidate corpus.
-8. Next: add photo/material fixed-region entries after the compatible command path is available on both Java and Rust.
+8. Next: resolve the vanilla-delegated photo/material payload delta before adding photo/material fixed-region entries.
 9. Next: expand Phase 6 quality and visual evidence tools only after the relevant corpus parity is green.
