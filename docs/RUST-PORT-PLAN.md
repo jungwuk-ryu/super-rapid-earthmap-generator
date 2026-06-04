@@ -196,6 +196,9 @@ Bootstrap implementation status on 2026-06-03:
   - `palette-stress-mca`
 - `rust/scripts/compare-golden.ps1` verifies that each bootstrap entry's saved Rust-written chunk payload manifest covers
   the same region file set currently present in the Java-oracle output, then compares every listed region payload hash.
+- `rust/scripts/compare-golden.ps1` also accepts `-CandidateRoot` so a Rust-generated candidate corpus tree can be
+  compared against the Java-oracle entry manifests without rewriting the oracle artifacts. Omitting `-CandidateRoot`
+  preserves the bootstrap self-check mode.
 - The Rust CLI includes diagnostic commands for:
   - `write-sha256-manifest`
   - `write-region-payload-manifest`
@@ -203,7 +206,7 @@ Bootstrap implementation status on 2026-06-03:
   - `compare-region-payload-manifest`
 - The Java CLI includes `generate-flat-test-world <worldDir> <mca|linear>` so flat MCA and Linear oracle fixtures can be
   generated without test-only entrypoints.
-- Remaining Phase 0 work: compare Rust-generated outputs against the Java-oracle manifests; expand the corpus to
+- Remaining Phase 0 work: generate Rust candidate outputs for every Java-oracle corpus entry; expand the corpus to
   height-only, surface, photo, water, survival, quality, and OSM entries; add metadata/compression-delta reports; and add
   CI wiring.
 
@@ -213,6 +216,7 @@ Suggested commands:
 .\scripts\test.ps1
 .\rust\scripts\generate-golden.ps1 -OutputRoot D:\earthmap\rust-port-golden\v001
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001
+.\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001 -CandidateRoot D:\earthmap\rust-port-candidates\v001
 ```
 
 ## Phase 1: Rust Skeleton And CLI Shell
