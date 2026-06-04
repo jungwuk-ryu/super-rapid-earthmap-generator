@@ -2,7 +2,12 @@
 param(
     [string]$RustRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path,
     [Parameter(Mandatory = $true)]
-    [string]$OutputRoot
+    [string]$OutputRoot,
+    [switch]$IncludeHeightOnly,
+    [string]$HeightmapPath = 'E:\HQheightmap.tif',
+    [int]$HeightOnlyScale = 5000,
+    [int]$HeightOnlyRegionX = 0,
+    [int]$HeightOnlyRegionZ = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +41,82 @@ function Invoke-JavaCorpusCommand {
     }
 }
 
+function Format-CorpusCoordinate {
+    param([int]$Value)
+    if ($Value -lt 0) {
+        return "neg$(-$Value)"
+    }
+    return "$Value"
+}
+
+function New-HeightOnlyEntry {
+    param(
+        [string]$Format,
+        [string]$Heightmap,
+        [int]$Scale,
+        [int]$RegionX,
+        [int]$RegionZ
+    )
+    $x = Format-CorpusCoordinate -Value $RegionX
+    $z = Format-CorpusCoordinate -Value $RegionZ
+    return @{
+        Name = "height-only-r${x}-r${z}-$Format"
+        Kind = 'height-only'
+        Command = 'generate-height-region'
+        Heightmap = $Heightmap
+        Scale = "$Scale"
+        RegionX = "$RegionX"
+        RegionZ = "$RegionZ"
+        Format = $Format
+    }
+}
+
+function Get-EntryValue {
+    param(
+        [hashtable]$Entry,
+        [string]$Key,
+        [string]$DefaultValue = ''
+    )
+    if ($Entry.ContainsKey($Key)) {
+        return "$($Entry[$Key])"
+    }
+    return $DefaultValue
+}
+
+function Get-CorpusCliArgs {
+    param(
+        [hashtable]$Entry,
+        [string]$WorldDir
+    )
+
+    $command = Get-EntryValue -Entry $Entry -Key 'Command'
+    $format = Get-EntryValue -Entry $Entry -Key 'Format'
+    switch ($command) {
+        'generate-flat-test-world' {
+            if ($format -eq '') {
+                throw "Corpus entry $($Entry.Name) is missing required setting: format."
+            }
+            return @($command, $WorldDir, $format)
+        }
+        'generate-palette-stress-world' {
+            return @($command, $WorldDir)
+        }
+        'generate-height-region' {
+            $heightmap = Get-EntryValue -Entry $Entry -Key 'Heightmap'
+            $scale = Get-EntryValue -Entry $Entry -Key 'Scale'
+            $regionX = Get-EntryValue -Entry $Entry -Key 'RegionX'
+            $regionZ = Get-EntryValue -Entry $Entry -Key 'RegionZ'
+            if ($heightmap -eq '' -or $scale -eq '' -or $regionX -eq '' -or $regionZ -eq '' -or $format -eq '') {
+                throw "Corpus entry $($Entry.Name) is missing one of: heightmap, scale, regionX, regionZ, format."
+            }
+            return @($command, $heightmap, $WorldDir, $scale, $regionX, $regionZ, $format)
+        }
+        default {
+            throw "Unsupported Java golden corpus command for $($Entry.Name): $command"
+        }
+    }
+}
+
 $RustRoot = (Resolve-Path $RustRoot).Path
 $ProjectRoot = (Resolve-Path (Join-Path $RustRoot '..')).Path
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
@@ -56,6 +137,14 @@ $entries = @(
     @{ Name = 'palette-stress-mca'; Command = 'generate-palette-stress-world'; Format = '' }
 )
 
+if ($IncludeHeightOnly) {
+    $HeightmapPath = (Resolve-Path -LiteralPath $HeightmapPath).Path
+    $entries += New-HeightOnlyEntry -Format 'mca' -Heightmap $HeightmapPath -Scale $HeightOnlyScale `
+        -RegionX $HeightOnlyRegionX -RegionZ $HeightOnlyRegionZ
+    $entries += New-HeightOnlyEntry -Format 'linear' -Heightmap $HeightmapPath -Scale $HeightOnlyScale `
+        -RegionX $HeightOnlyRegionX -RegionZ $HeightOnlyRegionZ
+}
+
 foreach ($entry in $entries) {
     $entryDir = Join-Path $OutputRoot $entry.Name
     $worldDir = Join-Path $entryDir 'world'
@@ -66,17 +155,18 @@ foreach ($entry in $entries) {
 
     $settings = @(
         "corpus.name=$($entry.Name)",
-        "corpus.kind=synthetic",
+        "corpus.kind=$(Get-EntryValue -Entry $entry -Key 'Kind' -DefaultValue 'synthetic')",
         "corpus.oracle=java",
         "corpus.generatedBy=rust/scripts/generate-golden.ps1",
         "command=$($entry.Command)"
     )
-    if ($entry.Format -ne '') {
-        $settings += "format=$($entry.Format)"
-        $cliArgs = @($entry.Command, $worldDir, $entry.Format)
-    } else {
-        $cliArgs = @($entry.Command, $worldDir)
+    foreach ($key in @('Format', 'Heightmap', 'Scale', 'RegionX', 'RegionZ')) {
+        $value = Get-EntryValue -Entry $entry -Key $key
+        if ($value -ne '') {
+            $settings += "$($key.Substring(0, 1).ToLowerInvariant())$($key.Substring(1))=$value"
+        }
     }
+    $cliArgs = Get-CorpusCliArgs -Entry $entry -WorldDir $worldDir
     Set-Content -Encoding ASCII -Path (Join-Path $entryDir 'settings.properties') -Value $settings
 
     Invoke-JavaCorpusCommand -EntryDir $entryDir -CliArgs $cliArgs -JavaRun $JavaRun

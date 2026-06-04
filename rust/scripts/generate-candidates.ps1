@@ -102,6 +102,9 @@ function Get-CandidateCliArgs {
             if ($heightmap -eq '' -or $scale -eq '' -or $regionX -eq '' -or $regionZ -eq '' -or $format -eq '') {
                 throw "Corpus entry $EntryName is missing one of: heightmap, scale, regionX, regionZ, format."
             }
+            if (!(Test-Path -LiteralPath $heightmap)) {
+                throw "Corpus entry $EntryName heightmap was not found: $heightmap"
+            }
             return @($command, $heightmap, $WorldDir, $scale, $regionX, $regionZ, $format)
         }
         default {

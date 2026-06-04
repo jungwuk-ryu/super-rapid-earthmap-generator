@@ -22,7 +22,7 @@ the current source of truth for work status.
 | Phase 1: Rust skeleton and CLI shell | Done | Cargo workspace, wrappers, command shell, and capability reporting are in place. |
 | Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. |
 | Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. |
-| Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists for fixed regions. Next work is to make those entries regeneratable through the corpus scripts. |
+| Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists for fixed regions. `generate-golden.ps1 -IncludeHeightOnly` promotes the default fixed region into the regeneratable corpus. |
 | Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices | Commit history and the Phase 5 notes below include surface/photo/ecoregion/no-climate/snow evidence work. Remaining work is promotion evidence: fixed-region surface/photo corpus entries, quality-gate artifacts, and any deltas discovered there. |
 | Vanilla-owned gameplay generation | Out of scope | Ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners remain vanilla-delegated. Do not add direct Rust generators for them. |
 | Phase 6: quality and visual evidence tools | Pending | Start after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
@@ -30,7 +30,7 @@ the current source of truth for work status.
 Current active work:
 
 1. Done: `rust/scripts/generate-candidates.ps1` can regenerate supported Rust candidate entries from a Java golden root.
-2. Next: add height-only fixed-region entries to `generate-golden.ps1` and `generate-candidates.ps1`.
+2. Done: `rust/scripts/generate-golden.ps1 -IncludeHeightOnly` adds fixed-region height-only MCA/Linear entries.
 3. Next: add surface/photo fixed-region corpus entries and compare them against the existing Phase 5 implementation.
 4. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
 
@@ -225,6 +225,20 @@ Bootstrap implementation status on 2026-06-03:
   preserves the bootstrap self-check mode.
 - `rust/scripts/generate-candidates.ps1` reads an existing Java-oracle golden root and regenerates the supported entries
   with the Rust CLI into a candidate root, including candidate payload and SHA-256 manifests for diagnostics.
+- `rust/scripts/generate-golden.ps1 -IncludeHeightOnly` adds default `E:\HQheightmap.tif` height-only MCA/Linear fixed
+  region entries to the Java-oracle corpus; `generate-candidates.ps1` reads those settings and regenerates matching Rust
+  candidate entries.
+- Verified locally with
+  `rust/scripts/generate-golden.ps1 -OutputRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\golden -IncludeHeightOnly`,
+  `rust/scripts/generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\golden -OutputRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\candidate`, and
+  `rust/scripts/compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\golden -CandidateRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\candidate`.
+  The default height-only fixed-region candidate files are byte-identical to the Java oracle outputs:
+
+```text
+entry,javaRegionSha256,rustRegionSha256,byteIdentical
+height-only-r0-r0-linear,4764167E5820E9A2E5BD834053C22393563FD9FC4D2D896DC06BEE1AE77B9EC0,4764167E5820E9A2E5BD834053C22393563FD9FC4D2D896DC06BEE1AE77B9EC0,true
+height-only-r0-r0-mca,083BC7F1038FA5C5776C85860EA46CB35EBED6936403974CCA1A2477A0C3C036,083BC7F1038FA5C5776C85860EA46CB35EBED6936403974CCA1A2477A0C3C036,true
+```
 - The Rust CLI implements `generate-flat-test-world <worldDir> <mca|linear>` so `flat-mca` and `flat-linear` Java
   oracle entries can now be compared against Rust-generated candidate world trees.
 - Verified locally with
@@ -266,6 +280,11 @@ Suggested commands:
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001
 .\rust\scripts\generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001 -OutputRoot D:\earthmap\rust-port-candidates\v001
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001 -CandidateRoot D:\earthmap\rust-port-candidates\v001
+
+# Extended fixed-region height-only corpus, requires E:\HQheightmap.tif unless -HeightmapPath is set.
+.\rust\scripts\generate-golden.ps1 -OutputRoot D:\earthmap\rust-port-golden\v001-height -IncludeHeightOnly
+.\rust\scripts\generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001-height -OutputRoot D:\earthmap\rust-port-candidates\v001-height
+.\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001-height -CandidateRoot D:\earthmap\rust-port-candidates\v001-height
 ```
 
 ## Phase 1: Rust Skeleton And CLI Shell
@@ -1054,6 +1073,6 @@ Full Rust replacement requires:
 3. Bootstrap done: implement MCA/Linear payload extraction and SHA-256 manifests.
 4. Done: prove synthetic flat/palette MCA/Linear candidate parity from Rust-generated chunks.
 5. Done: add `generate-candidates.ps1` so Rust candidate roots can be regenerated from Java oracle roots.
-6. Next: add height-only fixed-region entries to the regeneratable golden/candidate corpus.
+6. Done: add optional height-only fixed-region entries to the regeneratable golden/candidate corpus.
 7. Next: add surface/photo fixed-region entries and use them to promote the existing Phase 5 implementation evidence.
 8. Next: expand Phase 6 quality and visual evidence tools only after the relevant corpus parity is green.
