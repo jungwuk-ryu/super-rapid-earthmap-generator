@@ -1,6 +1,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandStatus {
     Implemented,
+    ImplementedProbeOnly,
     ImplementedShellOnly,
     NotPortedYet,
 }
@@ -30,8 +31,8 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "generate-vanilla-delegated-region",
-        status: CommandStatus::NotPortedYet,
-        note: "single vanilla-delegated region generation",
+        status: CommandStatus::ImplementedProbeOnly,
+        note: "single vanilla-delegated region parity probe; payload parity is not green",
     },
     CommandSpec {
         name: "generate-vanilla-delegated-regions-parallel",

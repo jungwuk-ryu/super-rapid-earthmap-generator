@@ -13,6 +13,7 @@ use earthmap_geo::{
 };
 use earthmap_minecraft::{
     block_state_ids,
+    chunk_generation_status::ChunkGenerationStatus,
     chunk_model::{ChunkModel, CHUNK_WIDTH},
     chunk_nbt_encoder, level_dat_template,
     nbt::{self, Tag},
@@ -20,7 +21,7 @@ use earthmap_minecraft::{
 use earthmap_region::{read_region_payloads, ChunkLocalPos, RegionError};
 use earthmap_surface::{
     classify_surface, HeightOnlySettings, OutputFormat, SurfaceRegionReport, SurfaceRegionSettings,
-    DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
+    SurfaceTextureMode, DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
 };
 
 const EXIT_OK: i32 = 0;
@@ -109,6 +110,21 @@ where
         "generate-surface-region" if args.len() == 7 => write_result(generate_surface_region(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
         )),
+        "generate-vanilla-delegated-region" if args.len() >= 7 && args.len() <= 9 => {
+            let (status_text, surface_raster_text) = vanilla_delegated_optional_args(&args);
+            write_result(generate_vanilla_delegated_region(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                status_text,
+                surface_raster_text,
+            ))
+        }
         "write-sha256-manifest" if args.len() == 3 => {
             write_result(write_sha256_manifest(stdout, stderr, &args[1], &args[2]))
         }
@@ -163,6 +179,18 @@ fn write_result(result: io::Result<i32>) -> i32 {
             1
         }
     }
+}
+
+fn vanilla_delegated_optional_args(args: &[String]) -> (&str, &str) {
+    if args.len() == 8 && args[7].contains('=') {
+        return ("surface", args[7].as_str());
+    }
+    (
+        args.get(7).map(String::as_str).unwrap_or("surface"),
+        args.get(8)
+            .map(String::as_str)
+            .unwrap_or("surfaceRaster=auto"),
+    )
 }
 
 fn print_help(out: &mut impl Write) -> io::Result<i32> {
@@ -490,6 +518,7 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
             CommandStatus::Implemented => "DONE",
+            CommandStatus::ImplementedProbeOnly => "WIP",
             CommandStatus::ImplementedShellOnly => "DONE",
             CommandStatus::NotPortedYet => "TODO",
         };
@@ -1007,6 +1036,96 @@ fn generate_surface_region_impl(
     Ok(surface_region_report_lines(&report, world_dir))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn generate_vanilla_delegated_region(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+    status_text: &str,
+    surface_raster_text: &str,
+) -> io::Result<i32> {
+    match generate_vanilla_delegated_region_impl(
+        heightmap_path,
+        world_dir,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        format_text,
+        status_text,
+        surface_raster_text,
+    ) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Vanilla-delegated region generation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_vanilla_delegated_region_impl(
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+    status_text: &str,
+    surface_raster_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let status = ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
+    if status == ChunkGenerationStatus::Full {
+        return Err("delegated generation status must be surface or carvers".to_string());
+    }
+    let surface_material_path =
+        parse_optional_surface_material_path(surface_raster_text, Path::new(heightmap_path))?
+            .ok_or_else(|| {
+                "default textureMode=photo requires a TrueMarble surface raster; use surfaceRaster=auto or pass an explicit TrueMarble.vrt path"
+                    .to_string()
+            })?;
+    let scale = parse_i32_string(scale_text)?;
+    let region_x = parse_i32_string(region_x_text)?;
+    let region_z = parse_i32_string(region_z_text)?;
+    let cache_rows = auto_shared_heightmap_cache_rows(Path::new(heightmap_path), 1)?;
+    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+        heightmap_path,
+        world_dir,
+        "SR EarthMap Vanilla Delegated",
+        0,
+        scale,
+        region_x,
+        region_z,
+        format,
+        cache_rows,
+        true,
+        status,
+        1.0,
+        SurfaceTextureMode::Photo,
+    )
+    .map_err(|error| error.to_string())?;
+    settings.surface_material_path = Some(surface_material_path.clone());
+
+    let report =
+        earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
+    Ok(vanilla_delegated_region_report_lines(
+        &report,
+        world_dir,
+        status,
+        &surface_material_path,
+    ))
+}
+
 fn surface_region_report_lines(report: &SurfaceRegionReport, world_dir: &str) -> Vec<String> {
     vec![
         "Surface region generated".to_string(),
@@ -1050,12 +1169,221 @@ fn surface_region_report_lines(report: &SurfaceRegionReport, world_dir: &str) ->
     ]
 }
 
+fn vanilla_delegated_region_report_lines(
+    report: &SurfaceRegionReport,
+    world_dir: &str,
+    status: ChunkGenerationStatus,
+    surface_material_path: &Path,
+) -> Vec<String> {
+    let mut lines = vec![
+        "Vanilla-delegated surface region generated".to_string(),
+        format!("regionX={}", report.region_x),
+        format!("regionZ={}", report.region_z),
+        format!("format={}", report.output_format.java_name()),
+        format!("scale=1:{}", report.scale_denominator),
+        format!("chunkStatus={}", status.id()),
+        format!(
+            "surfaceMaterialPath={}",
+            normalized_path_display(surface_material_path)
+        ),
+        "serverDelegation=true".to_string(),
+        "directCaves=false".to_string(),
+        "directOres=false".to_string(),
+        "directVegetation=false".to_string(),
+        "directStructures=false".to_string(),
+        "progressionStrategy=none".to_string(),
+        "directProgressionStructures=false".to_string(),
+        format!("chunkCount={}", report.chunk_count),
+        format!("landColumns={}", report.land_columns),
+        format!("waterColumns={}", report.water_columns),
+        format!("minGroundY={}", report.min_ground_y),
+        format!("maxGroundY={}", report.max_ground_y),
+        format!("regionFile={}", report.region_file.display()),
+        format!("cacheMaxRows={}", report.cache_stats.max_rows),
+        format!("cacheResidentRows={}", report.cache_stats.resident_rows),
+        format!("cacheHits={}", report.cache_stats.hits),
+        format!("cacheMisses={}", report.cache_stats.misses),
+        format!("cacheEvictions={}", report.cache_stats.evictions),
+    ];
+    lines.extend(surface_phase_report_lines(report, world_dir));
+    lines
+}
+
+fn surface_phase_report_lines(report: &SurfaceRegionReport, world_dir: &str) -> Vec<String> {
+    vec![
+        format!(
+            "phase.surfaceSampleMillis={}",
+            millis(report.surface_sample_nanos)
+        ),
+        format!(
+            "phase.chunkBuildMillis={}",
+            millis(report.chunk_build_nanos)
+        ),
+        format!("phase.nbtEncodeMillis={}", millis(report.nbt_encode_nanos)),
+        format!(
+            "phase.regionWriteMillis={}",
+            millis(report.region_write_nanos)
+        ),
+        format!("phase.previewMillis={}", millis(report.preview_nanos)),
+        format!("phase.metadataMillis={}", millis(report.metadata_nanos)),
+        format!("phase.totalInternalMillis={}", millis(report.total_nanos)),
+        format!(
+            "manifestFile={}",
+            Path::new(world_dir)
+                .join(SURVIVAL_MANIFEST_FILE_NAME)
+                .display()
+        ),
+    ]
+}
+
 fn millis(nanos: u128) -> u128 {
     nanos / 1_000_000
 }
 
 fn parse_i32_string(text: &str) -> std::result::Result<i32, String> {
     text.parse::<i32>().map_err(|error| error.to_string())
+}
+
+fn parse_optional_surface_material_path(
+    value: &str,
+    heightmap_path: &Path,
+) -> std::result::Result<Option<std::path::PathBuf>, String> {
+    let raw = value
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or(value)
+        .trim();
+    if matches_ignore_ascii_case(raw, &["none", "off", "false"]) {
+        return Ok(None);
+    }
+    if matches_ignore_ascii_case(
+        raw,
+        &["auto-if-present", "autoIfPresent", "if-present", "default"],
+    ) {
+        return Ok(auto_detect_true_marble(heightmap_path));
+    }
+    if matches_ignore_ascii_case(raw, &["auto", "true"]) {
+        return auto_detect_true_marble(heightmap_path)
+            .map(Some)
+            .ok_or_else(|| {
+                "surfaceRaster=auto could not find TifFiles/terrain/TrueMarble.vrt".to_string()
+            });
+    }
+    Ok(Some(std::path::PathBuf::from(raw)))
+}
+
+fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
+}
+
+fn auto_detect_true_marble(heightmap_path: &Path) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::<std::path::PathBuf>::new();
+    let normalized_heightmap = normalized_path(heightmap_path);
+    if let Some(parent) = normalized_heightmap.parent() {
+        candidates.push(parent.join("terrain").join("TrueMarble.vrt"));
+        if let Some(grand_parent) = parent.parent() {
+            candidates.push(
+                grand_parent
+                    .join("TifFiles")
+                    .join("terrain")
+                    .join("TrueMarble.vrt"),
+            );
+        }
+    }
+    if let Some(root) = normalized_heightmap.components().next() {
+        if let std::path::Component::Prefix(prefix) = root {
+            candidates.push(
+                std::path::PathBuf::from(prefix.as_os_str())
+                    .join(std::path::MAIN_SEPARATOR.to_string())
+                    .join("earthmap")
+                    .join("TifFiles")
+                    .join("terrain")
+                    .join("TrueMarble.vrt"),
+            );
+        } else if let std::path::Component::RootDir = root {
+            candidates.push(
+                std::path::PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+                    .join("earthmap")
+                    .join("TifFiles")
+                    .join("terrain")
+                    .join("TrueMarble.vrt"),
+            );
+        }
+    }
+    for drive in ["D:", "E:", "F:"] {
+        candidates.push(
+            std::path::PathBuf::from(drive)
+                .join(std::path::MAIN_SEPARATOR.to_string())
+                .join("earthmap")
+                .join("TifFiles")
+                .join("terrain")
+                .join("TrueMarble.vrt"),
+        );
+    }
+
+    for candidate in &candidates {
+        let normalized = normalized_path(candidate);
+        if normalized.is_file() && has_enhanced_photo_companion(&normalized) {
+            return Some(normalized);
+        }
+    }
+    for candidate in candidates {
+        let normalized = normalized_path(&candidate);
+        if normalized.is_file() {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+fn has_enhanced_photo_companion(true_marble_path: &Path) -> bool {
+    let Some(terrain) = true_marble_path.parent() else {
+        return false;
+    };
+    let Some(tif_root) = terrain.parent() else {
+        return false;
+    };
+    tif_root.join("land_shallow_topo_west.tif").is_file()
+        && tif_root.join("land_shallow_topo_east.tif").is_file()
+}
+
+fn auto_shared_heightmap_cache_rows(
+    heightmap_path: &Path,
+    threads: i32,
+) -> std::result::Result<usize, String> {
+    let minimum_rows = 512_i32.max(threads.checked_mul(128).ok_or("threads overflow")?);
+    let reader = GeoTiffHeightmapReader::open(heightmap_path).map_err(|error| error.to_string())?;
+    let row_bytes = i64::from(reader.metadata().width)
+        .checked_mul(2)
+        .ok_or_else(|| "heightmap row byte count overflow".to_string())?;
+    let budget_bytes = 512_i64 * 1024 * 1024;
+    let budget_rows = if budget_bytes <= 0 {
+        minimum_rows
+    } else {
+        (budget_bytes / row_bytes).max(1) as i32
+    };
+    Ok(usize::try_from(minimum_rows.max(budget_rows.min(1024))).expect("positive cache rows"))
+}
+
+fn normalized_path(path: &Path) -> std::path::PathBuf {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .components()
+        .collect()
+}
+
+fn normalized_path_display(path: &Path) -> String {
+    java_display_path(&normalized_path(path))
+}
+
+fn java_display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
 }
 
 fn java_double_string(value: f64) -> String {
@@ -1769,6 +2097,37 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_marks_vanilla_delegated_region_as_probe_only() {
+        let (code, out, err) = run_capture(&["capabilities"]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains(
+            "WIP rust.command.generate-vanilla-delegated-region - single vanilla-delegated region parity probe; payload parity is not green"
+        ));
+        assert!(!out.contains("DONE rust.command.generate-vanilla-delegated-region"));
+    }
+
+    #[test]
+    fn vanilla_delegated_region_single_optional_raster_defaults_status_like_java() {
+        let (code, out, err) = run_capture(&[
+            "generate-vanilla-delegated-region",
+            "missing-heightmap.tif",
+            "world",
+            "5000",
+            "0",
+            "0",
+            "linear",
+            "surfaceRaster=none",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert!(err.contains("default textureMode=photo requires a TrueMarble surface raster"));
+        assert!(!err.contains("chunk generation status"));
+    }
+
+    #[test]
     fn initial_commands_are_recognized_as_not_implemented() {
         for command in commands::INITIAL_COMMANDS
             .iter()
@@ -2305,6 +2664,145 @@ manifestFile={}\n",
                 world.join("region").join("r.0.-1.linear").display(),
                 world.join(SURVIVAL_MANIFEST_FILE_NAME).display()
             )
+        );
+    }
+
+    #[test]
+    fn vanilla_delegated_region_report_lines_match_java_stdout_shape() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("vanilla-world");
+        let material = temp
+            .path()
+            .join("TifFiles")
+            .join("terrain")
+            .join("TrueMarble.vrt");
+        fs::create_dir_all(material.parent().unwrap()).unwrap();
+        fs::write(&material, b"vrt").unwrap();
+        let report = SurfaceRegionReport {
+            region_x: 0,
+            region_z: -1,
+            output_format: OutputFormat::LinearV2,
+            scale_denominator: 5000,
+            chunk_count: 1024,
+            land_columns: 200_000,
+            water_columns: 62_144,
+            min_ground_y: 54,
+            max_ground_y: 91,
+            region_file: world.join("region").join("r.0.-1.linear"),
+            preview_tile_file: None,
+            cache_stats: earthmap_geo::GeoTiffRowCacheStats {
+                max_rows: 512,
+                resident_rows: 42,
+                hits: 123,
+                misses: 456,
+                evictions: 7,
+                prefetch_rows: 0,
+                prefetch_requests: 0,
+                prefetch_loads: 0,
+            },
+            surface_sample_nanos: 2_900_000,
+            chunk_build_nanos: 3_100_000,
+            nbt_encode_nanos: 4_200_000,
+            region_write_nanos: 5_300_000,
+            preview_nanos: 0,
+            metadata_nanos: 6_400_000,
+            total_nanos: 21_900_000,
+        };
+
+        let out = vanilla_delegated_region_report_lines(
+            &report,
+            world.to_str().unwrap(),
+            ChunkGenerationStatus::Surface,
+            &material,
+        )
+        .join("\n")
+            + "\n";
+
+        assert_eq!(
+            out,
+            format!(
+                "Vanilla-delegated surface region generated\n\
+regionX=0\n\
+regionZ=-1\n\
+format=LINEAR_V2\n\
+scale=1:5000\n\
+chunkStatus=minecraft:surface\n\
+surfaceMaterialPath={}\n\
+serverDelegation=true\n\
+directCaves=false\n\
+directOres=false\n\
+directVegetation=false\n\
+directStructures=false\n\
+progressionStrategy=none\n\
+directProgressionStructures=false\n\
+chunkCount=1024\n\
+landColumns=200000\n\
+waterColumns=62144\n\
+minGroundY=54\n\
+maxGroundY=91\n\
+regionFile={}\n\
+cacheMaxRows=512\n\
+cacheResidentRows=42\n\
+cacheHits=123\n\
+cacheMisses=456\n\
+cacheEvictions=7\n\
+phase.surfaceSampleMillis=2\n\
+phase.chunkBuildMillis=3\n\
+phase.nbtEncodeMillis=4\n\
+phase.regionWriteMillis=5\n\
+phase.previewMillis=0\n\
+phase.metadataMillis=6\n\
+phase.totalInternalMillis=21\n\
+manifestFile={}\n",
+                normalized_path_display(&material),
+                world.join("region").join("r.0.-1.linear").display(),
+                world.join(SURVIVAL_MANIFEST_FILE_NAME).display()
+            )
+        );
+    }
+
+    #[test]
+    fn surface_material_auto_detect_prefers_enhanced_true_marble_candidate() {
+        let temp = tempdir().unwrap();
+        let heightmap_dir = temp.path().join("heightmaps");
+        fs::create_dir_all(&heightmap_dir).unwrap();
+        let heightmap = heightmap_dir.join("HQheightmap.tif");
+        fs::write(&heightmap, b"height").unwrap();
+        let plain = heightmap_dir.join("terrain").join("TrueMarble.vrt");
+        fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        fs::write(&plain, b"plain").unwrap();
+        let enhanced_root = temp.path().join("TifFiles");
+        let enhanced = enhanced_root.join("terrain").join("TrueMarble.vrt");
+        fs::create_dir_all(enhanced.parent().unwrap()).unwrap();
+        fs::write(&enhanced, b"enhanced").unwrap();
+        fs::write(enhanced_root.join("land_shallow_topo_west.tif"), b"west").unwrap();
+        fs::write(enhanced_root.join("land_shallow_topo_east.tif"), b"east").unwrap();
+
+        assert_eq!(
+            parse_optional_surface_material_path("surfaceRaster=auto", &heightmap).unwrap(),
+            Some(normalized_path(&enhanced))
+        );
+        assert_eq!(
+            parse_optional_surface_material_path("none", &heightmap).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn java_display_path_strips_windows_extended_length_prefixes() {
+        assert_eq!(
+            java_display_path(Path::new(
+                r"\\?\D:\earthmap\TifFiles\terrain\TrueMarble.vrt"
+            )),
+            r"D:\earthmap\TifFiles\terrain\TrueMarble.vrt"
+        );
+        assert_eq!(
+            java_display_path(Path::new(r"\\?\UNC\server\share\TrueMarble.vrt")),
+            r"\\server\share\TrueMarble.vrt"
+        );
+        assert_eq!(
+            java_display_path(Path::new(r"D:\earthmap\TifFiles\terrain\TrueMarble.vrt")),
+            r"D:\earthmap\TifFiles\terrain\TrueMarble.vrt"
         );
     }
 

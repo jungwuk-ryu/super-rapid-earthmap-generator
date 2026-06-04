@@ -1,7 +1,7 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
-Last status audit: 2026-06-04, audited through commit `d4180c1 feat(rust): add photo region token luma profile`
+Last status audit: 2026-06-04, audited through the vanilla-delegated photo/material parity probe rerun
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -15,10 +15,13 @@ build/config.
 
 Read this checkpoint before starting any new Rust-port work.
 
-- Last confirmed implementation commit: `d4180c1 feat(rust): add photo region token luma profile`.
-- Active gate: Phase 5 vanilla-delegated photo/material payload parity rerun after the TokenLumaProfile fix.
-- Resume from: the first `Active` item in `Current active work`, currently the photo/material comparison and mismatch
-  triage gate.
+- Last confirmed parity-affecting implementation commit before the active blocker:
+  `d4180c1 feat(rust): add photo region token luma profile`.
+- Latest evidence folder:
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-tokenluma`.
+- Active gate: Phase 5 vanilla-delegated photo/material payload mismatch diagnosis after the TokenLumaProfile rerun.
+- Resume from: the first `Active` item in `Current active work`, currently the biome palette and `OCEAN_FLOOR`
+  mismatch triage for chunk `(8,0)`.
 - Do not resume from: Phase 0 bootstrap, Phase 1 CLI shell, Phase 2 binary core, Phase 3 region writers, Phase 4
   height-only raster generation, or completed Phase 5 bootstrap slices.
 - If local commits or evidence contradict this checkpoint, update this checkpoint and the status board first in the same
@@ -32,9 +35,9 @@ Read this checkpoint before starting any new Rust-port work.
   must not be restarted unless this board explicitly changes it back to active work.
 - Every future phase/status change must update this board in the same conventional atomic commit as the work that
   changed the status.
-- The current active pointer is Phase 5 photo/material corpus promotion. The PHOTO two-pass/TokenLumaProfile
-  implementation gap is addressed; next rerun the vanilla-delegated photo/material parity comparison before adding
-  corpus entries. Phase 0 is active only as an oracle/corpus harness, not as Rust implementation bootstrap work.
+- The current active pointer is Phase 5 photo/material payload mismatch diagnosis. The PHOTO two-pass/TokenLumaProfile
+  implementation gap is addressed and the vanilla-delegated comparison rerun is complete, but the payload delta remains.
+  Phase 0 is active only as an oracle/corpus harness, not as Rust implementation bootstrap work.
 
 ## Current Status Board
 
@@ -48,9 +51,10 @@ the current source of truth for work status.
 | Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. | No active work for fixed NBT/level.dat bootstrap scope. |
 | Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. | No active work for bootstrap writer parity. |
 | Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists; `generate-golden.ps1 -IncludeHeightOnly` promotes the fixed region. | No active work for the current height-only raster scope. |
-| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active gate remains | Commits through `d4180c1` include surface/photo/ecoregion/no-climate/snow evidence and PHOTO TokenLumaProfile work. | Rerun vanilla-delegated photo/material payload comparison and diagnose any remaining chunk delta before promoting photo/material corpus entries. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active blocker remains | Commits through `d4180c1` include surface/photo/ecoregion/no-climate/snow evidence and PHOTO TokenLumaProfile work. The 2026-06-04 rerun still has `matchingChunks=491`, `mismatchedChunks=533`, `firstMismatch=8,0`. | Diagnose the remaining biome palette and `OCEAN_FLOOR` delta before promoting photo/material corpus entries. |
 | Vanilla-owned gameplay generation | Out of scope | Java and Rust plans delegate ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners to vanilla. | Do not add direct Rust generators for vanilla-owned gameplay features. |
 | Phase 6: quality and visual evidence tools | Pending | Not started because Phase 5 photo/material corpus parity is not green yet. | Start only after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
+| Phase 7: performance optimization | Pending, blocked by parity | The performance plan exists, but no optimization is acceptable while Phase 5 payload parity is red. | Start only after Java/Rust corpus parity and Phase 6 quality/visual evidence are green for the same build/config. |
 
 Current active work:
 
@@ -62,9 +66,42 @@ Current active work:
 5. Done: Rust PHOTO-mode region sampling now follows Java's semantic-then-photo region pass shape, collects a
    region-wide `TokenLumaProfile` from non-water JavaStandard token samples, and passes that profile into deferred
    photo material solving.
-6. Active verification gate: rerun the vanilla-delegated photo/material payload comparison and diagnose any remaining
-   chunk delta before adding photo/material corpus entries.
-7. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
+6. Done: reran the vanilla-delegated photo/material payload comparison after the TokenLumaProfile fix. Evidence folder:
+   `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-tokenluma`.
+7. Active blocker: comparison still reports `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0`;
+   first-mismatch summaries point at biome palette simplification and one `OCEAN_FLOOR` heightmap edge delta.
+8. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
+
+## Phase 5 Remaining Checklist
+
+Phase 5 is not a restart. Most implementation slices are already ported and tested through bootstrap/parity fixtures.
+The remaining work is the active full-region photo/material parity blocker and the corpus promotion that depends on it.
+
+- Done: surface rules, material samples, TrueMarble/EarthData samplers, ecoregion/cache sources, MET image exports,
+  LandShallowTopo photo sampling, natural surface cleanup, OSM overlays, and no-material surface-region generation have
+  Rust bootstrap coverage.
+- Done: PHOTO region processing now uses Java-shaped semantic-then-photo passes and a region-wide
+  `TokenLumaProfile`.
+- Done: a probe-only Rust `generate-vanilla-delegated-region` path can generate the single Linear V2 evidence region
+  needed for mismatch diagnosis.
+- Done: the 2026-06-04 TokenLumaProfile rerun reproduced the blocker instead of clearing it:
+  `matchingChunks=491`, `mismatchedChunks=533`, `firstMismatch=8,0`.
+- Active: diagnose why Java keeps `deep_lukewarm_ocean|windswept_savanna|savanna` mixed biome palettes in chunk `(8,0)`
+  while Rust collapses several sections to simpler ocean/savanna palettes.
+- Active: explain the paired `OCEAN_FLOOR` packed-heightmap edge delta in chunk `(8,0)` and determine whether it is a
+  symptom of the same column/surface mismatch or a separate heightmap-calculation parity bug.
+- TODO: patch the smallest Rust surface/biome/heightmap path that explains the chunk `(8,0)` delta without weakening
+  existing fixture parity.
+- TODO: rerun the same Java/Rust single-region comparison; Phase 5 promotion requires `matchingChunks=1024`,
+  `mismatchedChunks=0`, `missingChunks=0`, and `extraChunks=0`.
+- TODO: after the fixed-region photo/material comparison is green, add photo/material entries to the regeneratable
+  golden/candidate corpus.
+- TODO: rerun `cargo test --workspace`, relevant ignored slow fixtures when touched, and the corpus scripts before
+  marking Phase 5 corpus parity green.
+
+Phase 5 remaining estimate: one known full-region parity blocker plus corpus promotion remains. Treat this as roughly
+three focused work packets: root-cause/fix chunk `(8,0)`, rerun/verify the fixed region, then promote the photo/material
+corpus entries. Do not advance to Phase 6 or Phase 7 while this checklist is red.
 
 ## Non-Negotiable Rules
 
@@ -823,13 +860,22 @@ Bootstrap implementation status on 2026-06-03:
   Java stdout shape, manifest metadata, cache stats, and region summary, but failed chunk payload parity. Evidence:
   `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-101831`; `compare-golden.ps1` reported
   `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0`. Do not add photo/material corpus entries or
-  expose the Rust vanilla-delegated command until this payload delta is explained and fixed.
+  mark the Rust vanilla-delegated command as production-ready until this payload delta is explained and fixed.
 - Follow-up diagnosis on 2026-06-04: `summarize-region-chunk` shows the first mismatch is concentrated in chunk biome
   palettes and one ocean-floor heightmap edge, not in chunk coordinates or status metadata. Java includes
   `minecraft:windswept_savanna` in mixed biome sections for chunk `(8,0)` while the Rust candidate has simpler
   `deep_lukewarm_ocean|savanna` palettes. The missing Rust PHOTO-mode region-wide two-pass `TokenLumaProfile` flow is
   now implemented; the next required evidence step is regenerating and comparing the vanilla-delegated photo/material
   candidate to confirm whether this was the full payload delta or only the first blocker.
+- TokenLumaProfile rerun on 2026-06-04: Rust now has a probe-only single-region
+  `generate-vanilla-delegated-region` command for parity evidence generation. Evidence:
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-tokenluma`. The Java oracle and Rust
+  candidate still report `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0` via
+  `compare-region-payload-manifest`. Diagnostics written under the probe `diagnostics` folder show chunk `(8,0)` still
+  diverges in biome palettes and one `OCEAN_FLOOR` packed-heightmap edge: Java keeps
+  `deep_lukewarm_ocean|windswept_savanna|savanna` in mixed sections while Rust collapses several sections to
+  `deep_lukewarm_ocean` or `deep_lukewarm_ocean|savanna`. Keep `rust.command.generate-vanilla-delegated-region` as
+  WIP/probe-only and do not add photo/material corpus entries until this delta is fixed.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
@@ -1137,5 +1183,7 @@ Full Rust replacement requires:
 5. Done: add `generate-candidates.ps1` so Rust candidate roots can be regenerated from Java oracle roots.
 6. Done: add optional height-only fixed-region entries to the regeneratable golden/candidate corpus.
 7. Done: add optional no-material surface fixed-region entries to the regeneratable golden/candidate corpus.
-8. Next: resolve the vanilla-delegated photo/material payload delta before adding photo/material fixed-region entries.
-9. Next: expand Phase 6 quality and visual evidence tools only after the relevant corpus parity is green.
+8. Done: rerun the vanilla-delegated photo/material payload comparison after the TokenLumaProfile fix.
+9. Active: resolve the remaining chunk `(8,0)` biome palette and `OCEAN_FLOOR` payload delta before adding
+   photo/material fixed-region entries.
+10. Next: expand Phase 6 quality and visual evidence tools only after the relevant corpus parity is green.
