@@ -30,6 +30,33 @@ const FLAT_TEST_MCA_LEVEL_NAME: &str = "SR EarthMap Flat Test";
 const FLAT_TEST_LINEAR_LEVEL_NAME: &str = "SR EarthMap Linear Flat Test";
 const FLAT_TEST_MCA_SEED: i64 = 987654321;
 const FLAT_TEST_LINEAR_SEED: i64 = 13579;
+const PALETTE_STRESS_SURFACE_Y: i32 = 64;
+const PALETTE_STRESS_Y: i32 = 65;
+const PALETTE_STRESS_SECTION_Y: i32 = 4;
+const PALETTE_STRESS_EXPECTED_SECTION_DATA_LONGS: i32 = 342;
+const PALETTE_STRESS_LEVEL_NAME: &str = "SR EarthMap Palette Stress";
+const PALETTE_STRESS_BLOCK_STATE_IDS: &[i32] = &[
+    block_state_ids::STONE,
+    block_state_ids::DIRT,
+    block_state_ids::GRASS_BLOCK,
+    block_state_ids::SAND,
+    block_state_ids::SNOW_BLOCK,
+    block_state_ids::ICE,
+    block_state_ids::DEEPSLATE,
+    block_state_ids::COAL_ORE,
+    block_state_ids::IRON_ORE,
+    block_state_ids::COPPER_ORE,
+    block_state_ids::GOLD_ORE,
+    block_state_ids::REDSTONE_ORE,
+    block_state_ids::LAPIS_ORE,
+    block_state_ids::DIAMOND_ORE,
+    block_state_ids::EMERALD_ORE,
+    block_state_ids::DEEPSLATE_COAL_ORE,
+    block_state_ids::DEEPSLATE_IRON_ORE,
+    block_state_ids::DEEPSLATE_COPPER_ORE,
+    block_state_ids::DEEPSLATE_GOLD_ORE,
+    block_state_ids::STONE_BRICKS,
+];
 
 pub fn run<I, S>(args: I) -> i32
 where
@@ -96,6 +123,9 @@ where
         "generate-flat-test-world" if args.len() == 3 => {
             write_result(generate_flat_test_world(stdout, stderr, &args[1], &args[2]))
         }
+        "generate-palette-stress-world" if args.len() == 2 => {
+            write_result(generate_palette_stress_world(stdout, stderr, &args[1]))
+        }
         "write-nbt-parity-fixtures" if args.len() == 2 => {
             write_result(write_nbt_parity_fixtures(stdout, stderr, &args[1]))
         }
@@ -161,6 +191,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         "  compare-region-payload-manifest <manifestCsv> <regionFile>"
     )?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
+    writeln!(out, "  generate-palette-stress-world <worldDir>")?;
     writeln!(out, "  write-nbt-parity-fixtures <outputDir>")?;
     writeln!(out, "  write-nbt-gzip-parity-fixtures <outputDir>")?;
     writeln!(out, "  write-region-writer-parity-fixtures <outputDir>")?;
@@ -255,6 +286,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "DONE rust.phase0.flatCandidateGenerator - generate-flat-test-world writes Rust candidate MCA/Linear flat worlds for Java-oracle corpus comparison."
+    )?;
+    writeln!(
+        out,
+        "DONE rust.phase0.paletteStressCandidateGenerator - generate-palette-stress-world writes the Rust candidate packed-palette stress world for Java-oracle corpus comparison."
     )?;
     writeln!(
         out,
@@ -1191,7 +1226,12 @@ fn generate_flat_test_world_impl(
         _ => unreachable!("format was validated above"),
     }
     .map_err(|error| error.to_string())?;
-    write_flat_test_manifest(world_dir, generator_name).map_err(|error| error.to_string())?;
+    write_exploration_only_manifest(
+        world_dir,
+        generator_name,
+        &[("generator.purpose", "format-validation")],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(region_file)
 }
 
@@ -1211,6 +1251,102 @@ fn flat_test_region_payloads() -> std::result::Result<BTreeMap<ChunkLocalPos, Ve
 
 fn flat_test_chunk(chunk_x: i32, chunk_z: i32) -> std::result::Result<ChunkModel, String> {
     let mut chunk = ChunkModel::overworld(chunk_x, chunk_z);
+    fill_flat_base_terrain(&mut chunk, FLAT_TEST_SURFACE_Y)?;
+    Ok(chunk)
+}
+
+fn generate_palette_stress_world(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    world_dir: &str,
+) -> io::Result<i32> {
+    match generate_palette_stress_world_impl(world_dir) {
+        Ok(region_file) => {
+            writeln!(out, "Palette stress world generated")?;
+            writeln!(
+                out,
+                "stressBlockCount={}",
+                PALETTE_STRESS_BLOCK_STATE_IDS.len()
+            )?;
+            writeln!(out, "stressSectionY={PALETTE_STRESS_SECTION_Y}")?;
+            writeln!(
+                out,
+                "expectedStressSectionDataLongs={PALETTE_STRESS_EXPECTED_SECTION_DATA_LONGS}"
+            )?;
+            writeln!(out, "regionFile={}", region_file.display())?;
+            writeln!(
+                out,
+                "manifestFile={}",
+                Path::new(world_dir)
+                    .join(SURVIVAL_MANIFEST_FILE_NAME)
+                    .display()
+            )?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Palette stress world generation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn generate_palette_stress_world_impl(
+    world_dir: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let world_dir = Path::new(world_dir);
+    let region_dir = world_dir.join("region");
+    std::fs::create_dir_all(&region_dir).map_err(|error| error.to_string())?;
+
+    let settings = level_dat_template::Settings::new(
+        PALETTE_STRESS_LEVEL_NAME,
+        0,
+        8,
+        PALETTE_STRESS_SURFACE_Y + 2,
+        8,
+    )
+    .map_err(|error| error.to_string())?;
+    level_dat_template::write(world_dir.join("level.dat"), &settings)
+        .map_err(|error| error.to_string())?;
+
+    let mut payloads = BTreeMap::new();
+    let chunk = palette_stress_chunk()?;
+    let bytes = chunk_nbt_encoder::encode_to_bytes(&chunk, 0).map_err(|error| error.to_string())?;
+    let pos = ChunkLocalPos::new(0, 0).map_err(|error| error.to_string())?;
+    payloads.insert(pos, bytes);
+
+    let region_file = region_dir.join("r.0.0.mca");
+    earthmap_region::write_mca_region(&region_file, &payloads, 0)
+        .map_err(|error| error.to_string())?;
+    write_exploration_only_manifest(
+        world_dir,
+        "palette-stress-world",
+        &[
+            ("generator.purpose", "packed-palette-validation"),
+            ("features.largeSectionPalette", "true"),
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(region_file)
+}
+
+fn palette_stress_chunk() -> std::result::Result<ChunkModel, String> {
+    let mut chunk = ChunkModel::overworld(0, 0);
+    fill_flat_base_terrain(&mut chunk, PALETTE_STRESS_SURFACE_Y)?;
+
+    for (index, block_state_id) in PALETTE_STRESS_BLOCK_STATE_IDS.iter().enumerate() {
+        let local_x = (index % CHUNK_WIDTH) as i32;
+        let local_z = (index / CHUNK_WIDTH) as i32;
+        chunk
+            .set_block_state_id(local_x, PALETTE_STRESS_Y, local_z, *block_state_id)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(chunk)
+}
+
+fn fill_flat_base_terrain(
+    chunk: &mut ChunkModel,
+    surface_y: i32,
+) -> std::result::Result<(), String> {
     for local_z in 0..CHUNK_WIDTH {
         for local_x in 0..CHUNK_WIDTH {
             let x = local_x as i32;
@@ -1219,34 +1355,28 @@ fn flat_test_chunk(chunk_x: i32, chunk_z: i32) -> std::result::Result<ChunkModel
                 .set_block_state_id(x, -64, z, block_state_ids::BEDROCK)
                 .map_err(|error| error.to_string())?;
             chunk
-                .fill_column(x, z, -63, FLAT_TEST_SURFACE_Y - 4, block_state_ids::STONE)
+                .fill_column(x, z, -63, surface_y - 4, block_state_ids::STONE)
                 .map_err(|error| error.to_string())?;
             chunk
-                .fill_column(
-                    x,
-                    z,
-                    FLAT_TEST_SURFACE_Y - 3,
-                    FLAT_TEST_SURFACE_Y - 1,
-                    block_state_ids::DIRT,
-                )
+                .fill_column(x, z, surface_y - 3, surface_y - 1, block_state_ids::DIRT)
                 .map_err(|error| error.to_string())?;
             chunk
-                .set_block_state_id(x, FLAT_TEST_SURFACE_Y, z, block_state_ids::GRASS_BLOCK)
+                .set_block_state_id(x, surface_y, z, block_state_ids::GRASS_BLOCK)
                 .map_err(|error| error.to_string())?;
         }
     }
-    Ok(chunk)
+    Ok(())
 }
 
-fn write_flat_test_manifest(
+fn write_exploration_only_manifest(
     world_dir: &Path,
     generator_name: &str,
+    overrides: &[(&str, &str)],
 ) -> io::Result<std::path::PathBuf> {
-    let mut values = base_flat_test_manifest(generator_name);
-    values.insert(
-        "generator.purpose".to_string(),
-        "format-validation".to_string(),
-    );
+    let mut values = base_exploration_only_manifest(generator_name);
+    for (key, value) in overrides {
+        values.insert((*key).to_string(), (*value).to_string());
+    }
     std::fs::create_dir_all(world_dir)?;
     let manifest_path = world_dir.join(SURVIVAL_MANIFEST_FILE_NAME);
     let mut file = std::fs::File::create(&manifest_path)?;
@@ -1257,7 +1387,7 @@ fn write_flat_test_manifest(
     Ok(manifest_path)
 }
 
-fn base_flat_test_manifest(generator_name: &str) -> BTreeMap<String, String> {
+fn base_exploration_only_manifest(generator_name: &str) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
     values.insert("manifest.version".to_string(), "1".to_string());
     values.insert(
@@ -1488,6 +1618,7 @@ mod tests {
         assert!(out.contains("write-region-payload-manifest <regionFile> <outputCsv>"));
         assert!(out.contains("compare-region-payload-manifest <manifestCsv> <regionFile>"));
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
+        assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));
         assert!(out.contains("write-region-writer-parity-fixtures <outputDir>"));
@@ -1556,6 +1687,59 @@ mod tests {
                 .unwrap(),
             block_state_ids::AIR
         );
+    }
+
+    #[test]
+    fn palette_stress_chunk_matches_java_fixture_shape() {
+        let chunk = palette_stress_chunk().unwrap();
+
+        assert_eq!(chunk.chunk_x(), 0);
+        assert_eq!(chunk.chunk_z(), 0);
+        assert_eq!(
+            chunk.get_block_state_id(0, -64, 0).unwrap(),
+            block_state_ids::BEDROCK
+        );
+        assert_eq!(
+            chunk.get_block_state_id(0, -63, 0).unwrap(),
+            block_state_ids::STONE
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, PALETTE_STRESS_SURFACE_Y - 4, 15)
+                .unwrap(),
+            block_state_ids::STONE
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, PALETTE_STRESS_SURFACE_Y - 3, 15)
+                .unwrap(),
+            block_state_ids::DIRT
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, PALETTE_STRESS_SURFACE_Y, 15)
+                .unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            chunk.get_block_state_id(15, PALETTE_STRESS_Y, 15).unwrap(),
+            block_state_ids::AIR
+        );
+
+        assert_eq!(PALETTE_STRESS_BLOCK_STATE_IDS.len(), 20);
+        assert_eq!(PALETTE_STRESS_SECTION_Y, 4);
+        assert_eq!(PALETTE_STRESS_EXPECTED_SECTION_DATA_LONGS, 342);
+        for (index, block_state_id) in PALETTE_STRESS_BLOCK_STATE_IDS.iter().enumerate() {
+            let local_x = (index % CHUNK_WIDTH) as i32;
+            let local_z = (index / CHUNK_WIDTH) as i32;
+            assert_eq!(
+                chunk
+                    .get_block_state_id(local_x, PALETTE_STRESS_Y, local_z)
+                    .unwrap(),
+                *block_state_id,
+                "stress block index={index}"
+            );
+        }
     }
 
     #[test]

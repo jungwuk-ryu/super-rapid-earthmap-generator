@@ -210,6 +210,15 @@ entry,javaRegionSha256,rustRegionSha256,byteIdentical
 flat-mca,33E4BE37E86E0524AEC290A6DBED9C95FCC80F2B6B42B5221D53DD2DD6A5E5A6,33E4BE37E86E0524AEC290A6DBED9C95FCC80F2B6B42B5221D53DD2DD6A5E5A6,true
 flat-linear,B80C7CFE14288EEE0255DE384536811A89622B6448804FF900CF86DAD80AE5AB,B80C7CFE14288EEE0255DE384536811A89622B6448804FF900CF86DAD80AE5AB,true
 ```
+- The Rust CLI implements `generate-palette-stress-world <worldDir>` as a diagnostic packed-palette encoding fixture,
+  not as Rust-side ore or structure generation. Verified locally with
+  `rust/scripts/compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\palette-candidate-smoke-20260604-091949\golden -CandidateRoot D:\earthmap\rust-port-golden\palette-candidate-smoke-20260604-091949\candidate`.
+  The Rust-generated palette-stress MCA candidate region file is byte-identical to the Java oracle output:
+
+```text
+entry,javaRegionSha256,rustRegionSha256,byteIdentical
+palette-stress-mca,83645DC0C7E0F6BE63AF5A36F2EB6F1B585FAC0F93A7A2DCB70200527123AF7F,83645DC0C7E0F6BE63AF5A36F2EB6F1B585FAC0F93A7A2DCB70200527123AF7F,true
+```
 - The Rust CLI includes diagnostic commands for:
   - `write-sha256-manifest`
   - `write-region-payload-manifest`
@@ -217,9 +226,11 @@ flat-linear,B80C7CFE14288EEE0255DE384536811A89622B6448804FF900CF86DAD80AE5AB,B80
   - `compare-region-payload-manifest`
 - The Java CLI includes `generate-flat-test-world <worldDir> <mca|linear>` so flat MCA and Linear oracle fixtures can be
   generated without test-only entrypoints.
-- Remaining Phase 0 work: generate Rust candidate outputs for the remaining Java-oracle corpus entries beyond flat
-  MCA/Linear; expand the corpus to height-only, surface, photo, water, survival, quality, and OSM entries; add
-  metadata/compression-delta reports; and add CI wiring.
+- The Java CLI includes `generate-palette-stress-world <worldDir>` so packed-palette oracle fixtures can be generated
+  without test-only entrypoints.
+- Remaining Phase 0 work: generate Rust candidate outputs for Java-oracle corpus entries beyond the synthetic
+  flat/palette bootstrap; expand the corpus to height-only, surface, photo, water, vanilla-delegated evidence, quality,
+  and OSM entries; add metadata/compression-delta reports; and add CI wiring.
 
 Suggested commands:
 
@@ -1013,7 +1024,7 @@ Full Rust replacement requires:
 1. Done: create `rust/` workspace and wrapper scripts.
 2. Bootstrap done: implement Java synthetic golden corpus generation.
 3. Bootstrap done: implement MCA/Linear payload extraction and SHA-256 manifests.
-4. Next: expand Phase 0 golden corpus coverage beyond synthetic flat/palette fixtures.
-5. Next: add Phase 2 gzip comparison/delta reporting.
-6. Next: prove synthetic chunk, MCA, and Linear parity from Rust-generated chunks.
-7. Only then start raster and surface logic.
+4. Done: prove synthetic flat/palette MCA/Linear candidate parity from Rust-generated chunks.
+5. Next: expand Phase 0 golden corpus coverage beyond synthetic flat/palette fixtures.
+6. Next: add Phase 2 gzip comparison/delta reporting.
+7. Next: keep extending raster and surface parity behind golden corpus checks.
