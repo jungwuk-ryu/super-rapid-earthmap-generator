@@ -7,7 +7,12 @@ param(
     [string]$HeightmapPath = 'E:\HQheightmap.tif',
     [int]$HeightOnlyScale = 5000,
     [int]$HeightOnlyRegionX = 0,
-    [int]$HeightOnlyRegionZ = 0
+    [int]$HeightOnlyRegionZ = 0,
+    [switch]$IncludeSurface,
+    [string]$SurfaceHeightmapPath = 'E:\HQheightmap.tif',
+    [int]$SurfaceScale = 5000,
+    [int]$SurfaceRegionX = 0,
+    [int]$SurfaceRegionZ = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +76,28 @@ function New-HeightOnlyEntry {
     }
 }
 
+function New-SurfaceEntry {
+    param(
+        [string]$Format,
+        [string]$Heightmap,
+        [int]$Scale,
+        [int]$RegionX,
+        [int]$RegionZ
+    )
+    $x = Format-CorpusCoordinate -Value $RegionX
+    $z = Format-CorpusCoordinate -Value $RegionZ
+    return @{
+        Name = "surface-r${x}-r${z}-$Format"
+        Kind = 'surface'
+        Command = 'generate-surface-region'
+        Heightmap = $Heightmap
+        Scale = "$Scale"
+        RegionX = "$RegionX"
+        RegionZ = "$RegionZ"
+        Format = $Format
+    }
+}
+
 function Get-EntryValue {
     param(
         [hashtable]$Entry,
@@ -102,6 +129,16 @@ function Get-CorpusCliArgs {
             return @($command, $WorldDir)
         }
         'generate-height-region' {
+            $heightmap = Get-EntryValue -Entry $Entry -Key 'Heightmap'
+            $scale = Get-EntryValue -Entry $Entry -Key 'Scale'
+            $regionX = Get-EntryValue -Entry $Entry -Key 'RegionX'
+            $regionZ = Get-EntryValue -Entry $Entry -Key 'RegionZ'
+            if ($heightmap -eq '' -or $scale -eq '' -or $regionX -eq '' -or $regionZ -eq '' -or $format -eq '') {
+                throw "Corpus entry $($Entry.Name) is missing one of: heightmap, scale, regionX, regionZ, format."
+            }
+            return @($command, $heightmap, $WorldDir, $scale, $regionX, $regionZ, $format)
+        }
+        'generate-surface-region' {
             $heightmap = Get-EntryValue -Entry $Entry -Key 'Heightmap'
             $scale = Get-EntryValue -Entry $Entry -Key 'Scale'
             $regionX = Get-EntryValue -Entry $Entry -Key 'RegionX'
@@ -143,6 +180,14 @@ if ($IncludeHeightOnly) {
         -RegionX $HeightOnlyRegionX -RegionZ $HeightOnlyRegionZ
     $entries += New-HeightOnlyEntry -Format 'linear' -Heightmap $HeightmapPath -Scale $HeightOnlyScale `
         -RegionX $HeightOnlyRegionX -RegionZ $HeightOnlyRegionZ
+}
+
+if ($IncludeSurface) {
+    $SurfaceHeightmapPath = (Resolve-Path -LiteralPath $SurfaceHeightmapPath).Path
+    $entries += New-SurfaceEntry -Format 'mca' -Heightmap $SurfaceHeightmapPath -Scale $SurfaceScale `
+        -RegionX $SurfaceRegionX -RegionZ $SurfaceRegionZ
+    $entries += New-SurfaceEntry -Format 'linear' -Heightmap $SurfaceHeightmapPath -Scale $SurfaceScale `
+        -RegionX $SurfaceRegionX -RegionZ $SurfaceRegionZ
 }
 
 foreach ($entry in $entries) {

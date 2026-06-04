@@ -107,6 +107,19 @@ function Get-CandidateCliArgs {
             }
             return @($command, $heightmap, $WorldDir, $scale, $regionX, $regionZ, $format)
         }
+        'generate-surface-region' {
+            $heightmap = Get-Setting -Settings $Settings -Key 'heightmap'
+            $scale = Get-Setting -Settings $Settings -Key 'scale'
+            $regionX = Get-Setting -Settings $Settings -Key 'regionX'
+            $regionZ = Get-Setting -Settings $Settings -Key 'regionZ'
+            if ($heightmap -eq '' -or $scale -eq '' -or $regionX -eq '' -or $regionZ -eq '' -or $format -eq '') {
+                throw "Corpus entry $EntryName is missing one of: heightmap, scale, regionX, regionZ, format."
+            }
+            if (!(Test-Path -LiteralPath $heightmap)) {
+                throw "Corpus entry $EntryName heightmap was not found: $heightmap"
+            }
+            return @($command, $heightmap, $WorldDir, $scale, $regionX, $regionZ, $format)
+        }
         default {
             throw "Unsupported Rust candidate corpus command for ${EntryName}: $command"
         }
