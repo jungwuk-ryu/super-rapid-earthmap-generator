@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -14,9 +14,11 @@ use earthmap_geo::{
 use earthmap_minecraft::{
     block_state_ids,
     chunk_generation_status::ChunkGenerationStatus,
-    chunk_model::{ChunkModel, CHUNK_WIDTH},
+    chunk_model::{ChunkModel, CHUNK_WIDTH, SECTION_BIOME_CELL_COUNT, SECTION_BLOCK_COUNT},
     chunk_nbt_encoder, level_dat_template,
     nbt::{self, Tag},
+    packed_long_array::PackedLongArray,
+    section_palette::bits_per_entry_for_palette_size,
 };
 use earthmap_region::{read_region_payloads, ChunkLocalPos, RegionError};
 use earthmap_surface::{
@@ -140,6 +142,18 @@ where
         "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
             stdout, stderr, &args[1], &args[2], &args[3],
         )),
+        "compare-region-chunk-details" if args.len() == 5 || args.len() == 7 => {
+            write_result(compare_region_chunk_details(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                args.get(5).map(String::as_str),
+                args.get(6).map(String::as_str),
+            ))
+        }
         "generate-flat-test-world" if args.len() == 3 => {
             write_result(generate_flat_test_world(stdout, stderr, &args[1], &args[2]))
         }
@@ -225,6 +239,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"
+    )?;
+    writeln!(
+        out,
+        "  compare-region-chunk-details <expectedRegionFile> <actualRegionFile> <expectedLocalChunkX> <expectedLocalChunkZ> [actualLocalChunkX actualLocalChunkZ]"
     )?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
     writeln!(out, "  generate-palette-stress-world <worldDir>")?;
@@ -1631,6 +1649,370 @@ fn summarize_region_chunk_impl(
     Ok(lines)
 }
 
+fn compare_region_chunk_details(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    expected_region: &str,
+    actual_region: &str,
+    expected_local_chunk_x: &str,
+    expected_local_chunk_z: &str,
+    actual_local_chunk_x: Option<&str>,
+    actual_local_chunk_z: Option<&str>,
+) -> io::Result<i32> {
+    match compare_region_chunk_details_impl(
+        expected_region,
+        actual_region,
+        expected_local_chunk_x,
+        expected_local_chunk_z,
+        actual_local_chunk_x,
+        actual_local_chunk_z,
+    ) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Region chunk detail comparison failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn compare_region_chunk_details_impl(
+    expected_region: &str,
+    actual_region: &str,
+    expected_local_chunk_x: &str,
+    expected_local_chunk_z: &str,
+    actual_local_chunk_x: Option<&str>,
+    actual_local_chunk_z: Option<&str>,
+) -> std::result::Result<Vec<String>, String> {
+    let expected_local_x = parse_local_chunk_coord(expected_local_chunk_x, "expectedLocalChunkX")?;
+    let expected_local_z = parse_local_chunk_coord(expected_local_chunk_z, "expectedLocalChunkZ")?;
+    let actual_local_x = parse_local_chunk_coord(
+        actual_local_chunk_x.unwrap_or(expected_local_chunk_x),
+        "actualLocalChunkX",
+    )?;
+    let actual_local_z = parse_local_chunk_coord(
+        actual_local_chunk_z.unwrap_or(expected_local_chunk_z),
+        "actualLocalChunkZ",
+    )?;
+    let expected =
+        decode_region_chunk_details(expected_region, expected_local_x, expected_local_z)?;
+    let actual = decode_region_chunk_details(actual_region, actual_local_x, actual_local_z)?;
+    let mut lines = vec![
+        "regionChunkDetails=valid".to_string(),
+        format!("expectedLocalChunkX={expected_local_x}"),
+        format!("expectedLocalChunkZ={expected_local_z}"),
+        format!("actualLocalChunkX={actual_local_x}"),
+        format!("actualLocalChunkZ={actual_local_z}"),
+    ];
+    lines.extend(compare_heightmap_values(
+        &expected,
+        &actual,
+        "OCEAN_FLOOR",
+        "heightmap.OCEAN_FLOOR",
+        24,
+    ));
+    lines.extend(compare_biome_cells(&expected, &actual, 48));
+    lines.extend(compare_block_cells(&expected, &actual, 48));
+    Ok(lines)
+}
+
+#[derive(Clone, Debug)]
+struct DecodedChunkDetails {
+    heightmaps: BTreeMap<String, Vec<i32>>,
+    sections: BTreeMap<i8, DecodedSectionDetails>,
+}
+
+#[derive(Clone, Debug)]
+struct DecodedSectionDetails {
+    block_palette: Vec<String>,
+    block_values: Vec<usize>,
+    biome_palette: Vec<String>,
+    biome_values: Vec<usize>,
+}
+
+fn decode_region_chunk_details(
+    region: &str,
+    local_x: u8,
+    local_z: u8,
+) -> std::result::Result<DecodedChunkDetails, String> {
+    let payloads = read_region_payloads(region).map_err(|error| error.to_string())?;
+    let pos = ChunkLocalPos::new(local_x, local_z).map_err(|error| error.to_string())?;
+    let payload = payloads
+        .chunks
+        .get(&pos)
+        .ok_or_else(|| format!("missing chunk payload at {local_x},{local_z}"))?;
+    let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
+    let Tag::Compound(root) = named.tag() else {
+        return Err("chunk NBT root must be a compound".to_string());
+    };
+
+    let mut heightmaps = BTreeMap::new();
+    if let Ok(heightmap_tags) = root.get_compound("Heightmaps") {
+        let min_y = ChunkModel::overworld(0, 0).dimension().min_y();
+        for (name, tag) in heightmap_tags.entries() {
+            if let Tag::LongArray(values) = tag {
+                let storage_values = decode_packed_indices_from_words(256, 9, values, "heightmap")?;
+                heightmaps.insert(
+                    name.clone(),
+                    storage_values
+                        .into_iter()
+                        .map(|value| min_y + value as i32)
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    let sections_tag = root
+        .get_list("sections")
+        .map_err(|error| error.to_string())?;
+    let mut sections = BTreeMap::new();
+    for section_tag in sections_tag.values() {
+        let Tag::Compound(section) = section_tag else {
+            return Err("section list must contain compounds".to_string());
+        };
+        let y = section.get_byte("Y").map_err(|error| error.to_string())?;
+        let block_states = section
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?;
+        let block_palette = block_state_palette_names(block_states)?;
+        let block_values =
+            decode_palette_values(block_states, block_palette.len(), SECTION_BLOCK_COUNT)?;
+        let biomes = section
+            .get_compound("biomes")
+            .map_err(|error| error.to_string())?;
+        let biome_palette = biome_palette_names(biomes)?;
+        let biome_values =
+            decode_biome_palette_values(biomes, biome_palette.len(), SECTION_BIOME_CELL_COUNT)?;
+        sections.insert(
+            y,
+            DecodedSectionDetails {
+                block_palette,
+                block_values,
+                biome_palette,
+                biome_values,
+            },
+        );
+    }
+
+    Ok(DecodedChunkDetails {
+        heightmaps,
+        sections,
+    })
+}
+
+fn decode_palette_values(
+    compound: &earthmap_minecraft::nbt::Compound,
+    palette_size: usize,
+    value_count: usize,
+) -> std::result::Result<Vec<usize>, String> {
+    let bits_per_entry =
+        bits_per_entry_for_palette_size(palette_size).map_err(|error| error.to_string())?;
+    if bits_per_entry == 0 {
+        return Ok(vec![0; value_count]);
+    }
+    let data = compound
+        .get_long_array("data")
+        .map_err(|error| error.to_string())?;
+    decode_packed_indices_from_words(value_count, bits_per_entry, &data, "palette data")
+}
+
+fn decode_biome_palette_values(
+    compound: &earthmap_minecraft::nbt::Compound,
+    palette_size: usize,
+    value_count: usize,
+) -> std::result::Result<Vec<usize>, String> {
+    let bits_per_entry = biome_bits_per_entry(palette_size)?;
+    if bits_per_entry == 0 {
+        return Ok(vec![0; value_count]);
+    }
+    let data = compound
+        .get_long_array("data")
+        .map_err(|error| error.to_string())?;
+    decode_packed_indices_from_words(value_count, bits_per_entry, &data, "biome data")
+}
+
+fn biome_bits_per_entry(palette_size: usize) -> std::result::Result<u8, String> {
+    if palette_size == 0 {
+        return Err("paletteSize must be positive: 0".to_string());
+    }
+    if palette_size == 1 {
+        return Ok(0);
+    }
+    Ok((usize::BITS - (palette_size - 1).leading_zeros()) as u8)
+}
+
+fn decode_packed_indices_from_words(
+    value_count: usize,
+    bits_per_value: u8,
+    words: &[i64],
+    label: &str,
+) -> std::result::Result<Vec<usize>, String> {
+    let data = words.iter().map(|word| *word as u64).collect::<Vec<_>>();
+    let packed = PackedLongArray::from_words(value_count, bits_per_value, data)
+        .map_err(|error| error.to_string())?;
+    let mut values = Vec::with_capacity(value_count);
+    for index in 0..value_count {
+        let value = packed.get(index).map_err(|error| error.to_string())?;
+        if value < 0 {
+            return Err(format!(
+                "{label} contains negative value at {index}: {value}"
+            ));
+        }
+        values.push(value as usize);
+    }
+    Ok(values)
+}
+
+fn compare_heightmap_values(
+    expected: &DecodedChunkDetails,
+    actual: &DecodedChunkDetails,
+    name: &str,
+    prefix: &str,
+    limit: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(expected_values) = expected.heightmaps.get(name) else {
+        lines.push(format!("{prefix}.missingExpected=true"));
+        return lines;
+    };
+    let Some(actual_values) = actual.heightmaps.get(name) else {
+        lines.push(format!("{prefix}.missingActual=true"));
+        return lines;
+    };
+    let mut diff_count = 0usize;
+    for local_z in 0..CHUNK_WIDTH {
+        for local_x in 0..CHUNK_WIDTH {
+            let index = (local_z * CHUNK_WIDTH) + local_x;
+            if expected_values.get(index) != actual_values.get(index) {
+                diff_count += 1;
+                if diff_count <= limit {
+                    lines.push(format!(
+                        "{prefix}.diff.{diff_count}=localX={local_x},localZ={local_z},expectedTopYExclusive={},actualTopYExclusive={}",
+                        expected_values.get(index).copied().unwrap_or_default(),
+                        actual_values.get(index).copied().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+    }
+    lines.insert(0, format!("{prefix}.diffCount={diff_count}"));
+    lines
+}
+
+fn compare_biome_cells(
+    expected: &DecodedChunkDetails,
+    actual: &DecodedChunkDetails,
+    limit: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut diff_count = 0usize;
+    let section_ys = expected
+        .sections
+        .keys()
+        .chain(actual.sections.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for section_y in section_ys {
+        let Some(expected_section) = expected.sections.get(&section_y) else {
+            lines.push(format!(
+                "biomeCell.section.{section_y}.missingExpected=true"
+            ));
+            diff_count += SECTION_BIOME_CELL_COUNT;
+            continue;
+        };
+        let Some(actual_section) = actual.sections.get(&section_y) else {
+            lines.push(format!("biomeCell.section.{section_y}.missingActual=true"));
+            diff_count += SECTION_BIOME_CELL_COUNT;
+            continue;
+        };
+        for index in 0..SECTION_BIOME_CELL_COUNT {
+            let expected_name = palette_name_at(
+                &expected_section.biome_palette,
+                expected_section.biome_values.get(index).copied(),
+            );
+            let actual_name = palette_name_at(
+                &actual_section.biome_palette,
+                actual_section.biome_values.get(index).copied(),
+            );
+            if expected_name != actual_name {
+                diff_count += 1;
+                if diff_count <= limit {
+                    let cell_x = index & 3;
+                    let cell_z = (index >> 2) & 3;
+                    let cell_y = (index >> 4) & 3;
+                    lines.push(format!(
+                        "biomeCell.diff.{diff_count}=sectionY={section_y},cellX={cell_x},cellY={cell_y},cellZ={cell_z},expected={expected_name},actual={actual_name}"
+                    ));
+                }
+            }
+        }
+    }
+    lines.insert(0, format!("biomeCell.diffCount={diff_count}"));
+    lines
+}
+
+fn compare_block_cells(
+    expected: &DecodedChunkDetails,
+    actual: &DecodedChunkDetails,
+    limit: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut diff_count = 0usize;
+    let section_ys = expected
+        .sections
+        .keys()
+        .chain(actual.sections.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for section_y in section_ys {
+        let Some(expected_section) = expected.sections.get(&section_y) else {
+            lines.push(format!("block.section.{section_y}.missingExpected=true"));
+            diff_count += SECTION_BLOCK_COUNT;
+            continue;
+        };
+        let Some(actual_section) = actual.sections.get(&section_y) else {
+            lines.push(format!("block.section.{section_y}.missingActual=true"));
+            diff_count += SECTION_BLOCK_COUNT;
+            continue;
+        };
+        for index in 0..SECTION_BLOCK_COUNT {
+            let expected_name = palette_name_at(
+                &expected_section.block_palette,
+                expected_section.block_values.get(index).copied(),
+            );
+            let actual_name = palette_name_at(
+                &actual_section.block_palette,
+                actual_section.block_values.get(index).copied(),
+            );
+            if expected_name != actual_name {
+                diff_count += 1;
+                if diff_count <= limit {
+                    let local_x = index & 15;
+                    let local_z = (index >> 4) & 15;
+                    let local_y = (index >> 8) & 15;
+                    lines.push(format!(
+                        "block.diff.{diff_count}=sectionY={section_y},localX={local_x},localY={local_y},localZ={local_z},expected={expected_name},actual={actual_name}"
+                    ));
+                }
+            }
+        }
+    }
+    lines.insert(0, format!("block.diffCount={diff_count}"));
+    lines
+}
+
+fn palette_name_at(palette: &[String], index: Option<usize>) -> String {
+    index
+        .and_then(|index| palette.get(index))
+        .cloned()
+        .unwrap_or_else(|| "<invalid>".to_string())
+}
+
 fn block_state_palette_names(
     compound: &earthmap_minecraft::nbt::Compound,
 ) -> std::result::Result<Vec<String>, String> {
@@ -2180,6 +2562,9 @@ mod tests {
         assert!(out.contains("write-region-payload-manifest <regionFile> <outputCsv>"));
         assert!(out.contains("compare-region-payload-manifest <manifestCsv> <regionFile>"));
         assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
+        assert!(
+            out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
+        );
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
@@ -2272,6 +2657,71 @@ mod tests {
         assert!(out.contains(
             "section.3.blockPalette=minecraft:stone|minecraft:dirt|minecraft:grass_block\n"
         ));
+    }
+
+    #[test]
+    fn compare_region_chunk_details_reports_no_flat_fixture_diffs() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat");
+        generate_flat_test_world_impl(world.to_str().unwrap(), "linear").unwrap();
+        let region = world.join("region").join("r.0.0.linear");
+
+        let (code, out, err) = run_capture(&[
+            "compare-region-chunk-details",
+            region.to_str().unwrap(),
+            region.to_str().unwrap(),
+            "0",
+            "0",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("regionChunkDetails=valid\n"));
+        assert!(out.contains("heightmap.OCEAN_FLOOR.diffCount=0\n"));
+        assert!(out.contains("biomeCell.diffCount=0\n"));
+        assert!(out.contains("block.diffCount=0\n"));
+    }
+
+    #[test]
+    fn compare_region_chunk_details_counts_asymmetric_section_sets() {
+        let mut expected_sections = BTreeMap::new();
+        expected_sections.insert(
+            0,
+            decoded_test_section("minecraft:stone", "minecraft:plains"),
+        );
+        let expected = DecodedChunkDetails {
+            heightmaps: BTreeMap::new(),
+            sections: expected_sections,
+        };
+
+        let mut actual_sections = BTreeMap::new();
+        actual_sections.insert(1, decoded_test_section("minecraft:dirt", "minecraft:ocean"));
+        let actual = DecodedChunkDetails {
+            heightmaps: BTreeMap::new(),
+            sections: actual_sections,
+        };
+
+        let biome = compare_biome_cells(&expected, &actual, 48);
+        assert!(biome.contains(&format!(
+            "biomeCell.diffCount={}",
+            SECTION_BIOME_CELL_COUNT * 2
+        )));
+        assert!(biome.contains(&"biomeCell.section.0.missingActual=true".to_string()));
+        assert!(biome.contains(&"biomeCell.section.1.missingExpected=true".to_string()));
+
+        let block = compare_block_cells(&expected, &actual, 48);
+        assert!(block.contains(&format!("block.diffCount={}", SECTION_BLOCK_COUNT * 2)));
+        assert!(block.contains(&"block.section.0.missingActual=true".to_string()));
+        assert!(block.contains(&"block.section.1.missingExpected=true".to_string()));
+    }
+
+    fn decoded_test_section(block: &str, biome: &str) -> DecodedSectionDetails {
+        DecodedSectionDetails {
+            block_palette: vec![block.to_string()],
+            block_values: vec![0; SECTION_BLOCK_COUNT],
+            biome_palette: vec![biome.to_string()],
+            biome_values: vec![0; SECTION_BIOME_CELL_COUNT],
+        }
     }
 
     #[test]

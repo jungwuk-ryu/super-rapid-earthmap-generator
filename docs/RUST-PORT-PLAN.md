@@ -68,9 +68,13 @@ Current active work:
    photo material solving.
 6. Done: reran the vanilla-delegated photo/material payload comparison after the TokenLumaProfile fix. Evidence folder:
    `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-tokenluma`.
-7. Active blocker: comparison still reports `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0`;
-   first-mismatch summaries point at biome palette simplification and one `OCEAN_FLOOR` heightmap edge delta.
-8. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
+7. Done: `compare-region-chunk-details` decodes Java/Rust chunk heightmap, biome-cell, and block-cell values for
+   first-mismatch triage, including asymmetric section-set differences. Sub-agent closure review found no remaining
+   actionable issue.
+8. Active blocker: comparison still reports `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0`.
+   Detailed chunk `(8,0)` diagnostics show this is a full column/material mismatch, not only a palette-label issue:
+   `heightmap.OCEAN_FLOOR.diffCount=121`, `biomeCell.diffCount=39`, and `block.diffCount=3101`.
+9. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
 
 ## Phase 5 Remaining Checklist
 
@@ -82,26 +86,32 @@ The remaining work is the active full-region photo/material parity blocker and t
   Rust bootstrap coverage.
 - Done: PHOTO region processing now uses Java-shaped semantic-then-photo passes and a region-wide
   `TokenLumaProfile`.
-- Done: a probe-only Rust `generate-vanilla-delegated-region` path can generate the single Linear V2 evidence region
-  needed for mismatch diagnosis.
-- Done: the 2026-06-04 TokenLumaProfile rerun reproduced the blocker instead of clearing it:
+- [x] Add a probe-only Rust `generate-vanilla-delegated-region` path that can generate the single Linear V2 evidence
+  region needed for mismatch diagnosis.
+- [x] Rerun the 2026-06-04 TokenLumaProfile comparison and record the still-red result:
   `matchingChunks=491`, `mismatchedChunks=533`, `firstMismatch=8,0`.
-- Active: diagnose why Java keeps `deep_lukewarm_ocean|windswept_savanna|savanna` mixed biome palettes in chunk `(8,0)`
-  while Rust collapses several sections to simpler ocean/savanna palettes.
-- Active: explain the paired `OCEAN_FLOOR` packed-heightmap edge delta in chunk `(8,0)` and determine whether it is a
-  symptom of the same column/surface mismatch or a separate heightmap-calculation parity bug.
-- TODO: patch the smallest Rust surface/biome/heightmap path that explains the chunk `(8,0)` delta without weakening
-  existing fixture parity.
-- TODO: rerun the same Java/Rust single-region comparison; Phase 5 promotion requires `matchingChunks=1024`,
+- [x] Add local detailed chunk comparison output for chunk `(8,0)`: `heightmap.OCEAN_FLOOR.diffCount=121`,
+  `biomeCell.diffCount=39`, and `block.diffCount=3101`.
+- [x] Review the detailed chunk comparison diagnostic with sub-agents and close the asymmetric-section false-negative
+  finding before atomic commit.
+- [ ] Root-cause the column/material path that makes Java's chunk `(8,0)` lower/deeper in many ocean/coast columns while
+  Rust writes shallower/higher block columns.
+- [ ] Confirm whether the biome palette difference
+  `deep_lukewarm_ocean|windswept_savanna|savanna` versus simpler Rust ocean/savanna palettes is a symptom of the same
+  column/material mismatch or a second biome-cell writer mismatch.
+- [ ] Patch the smallest Rust surface/material/biome/heightmap path that explains the chunk `(8,0)` delta without
+  weakening existing fixture parity.
+- [ ] Rerun the same Java/Rust single-region comparison; Phase 5 promotion requires `matchingChunks=1024`,
   `mismatchedChunks=0`, `missingChunks=0`, and `extraChunks=0`.
-- TODO: after the fixed-region photo/material comparison is green, add photo/material entries to the regeneratable
+- [ ] After the fixed-region photo/material comparison is green, add photo/material entries to the regeneratable
   golden/candidate corpus.
-- TODO: rerun `cargo test --workspace`, relevant ignored slow fixtures when touched, and the corpus scripts before
-  marking Phase 5 corpus parity green.
+- [ ] Rerun `cargo test --workspace`, relevant ignored slow fixtures when touched, and the corpus scripts before marking
+  Phase 5 corpus parity green.
 
 Phase 5 remaining estimate: one known full-region parity blocker plus corpus promotion remains. Treat this as roughly
-three focused work packets: root-cause/fix chunk `(8,0)`, rerun/verify the fixed region, then promote the photo/material
-corpus entries. Do not advance to Phase 6 or Phase 7 while this checklist is red.
+three focused work packets: root-cause/fix the chunk `(8,0)` column/material mismatch, rerun/verify the fixed region,
+then promote the photo/material corpus entries. The blocker is narrower than a full Phase 5 restart, but it still blocks
+Phase 6 and Phase 7 because the output payload is red.
 
 ## Non-Negotiable Rules
 
