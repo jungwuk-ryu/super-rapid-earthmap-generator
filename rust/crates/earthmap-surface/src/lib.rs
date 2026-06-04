@@ -353,6 +353,29 @@ pub struct SurfaceRegionReport {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceRegionColumnTrace {
+    pub local_x: usize,
+    pub local_z: usize,
+    pub global_block_x: i32,
+    pub global_block_z: i32,
+    pub map_x: i32,
+    pub map_z: i32,
+    pub longitude: f64,
+    pub latitude: f64,
+    pub raw_elevation_meters: f64,
+    pub smoothed_elevation_meters: f64,
+    pub local_relief_meters: f64,
+    pub initial_water: bool,
+    pub valid: bool,
+    pub coast_factor: f64,
+    pub material_sample: Option<SurfaceMaterialSample>,
+    pub base_column: EarthSurfaceColumn,
+    pub semantic_column: Option<EarthSurfaceColumn>,
+    pub photo_column: Option<EarthSurfaceColumn>,
+    pub final_column: EarthSurfaceColumn,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceChunkBuild {
     pub chunk: ChunkModel,
     pub land_columns: i32,
@@ -3153,7 +3176,8 @@ fn surface_material_bathymetry_ground_surface_y(
         2,
         123,
     );
-    depth_blocks = coastal_shelf_adjusted_depth_blocks(depth_blocks, coast_factor, vertical_scale);
+    depth_blocks =
+        coastal_bathymetry_shelf_adjusted_depth_blocks(depth_blocks, coast_factor, vertical_scale);
     clamp_i32(SEA_LEVEL_Y - depth_blocks, MIN_SURFACE_Y, SEA_LEVEL_Y - 1)
 }
 
@@ -9174,6 +9198,292 @@ pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<Surfa
     })
 }
 
+pub fn trace_surface_region_columns(
+    settings: &SurfaceRegionSettings,
+    local_columns: &[(usize, usize)],
+) -> Result<Vec<SurfaceRegionColumnTrace>> {
+    if local_columns.is_empty() {
+        return Err(SurfaceError::invalid(
+            "at least one local region column is required",
+        ));
+    }
+    let mut selected = HashMap::with_capacity(local_columns.len());
+    for (request_index, &(local_x, local_z)) in local_columns.iter().enumerate() {
+        if local_x >= SURFACE_REGION_WIDTH || local_z >= SURFACE_REGION_WIDTH {
+            return Err(SurfaceError::invalid(format!(
+                "local region column outside region: {local_x},{local_z}"
+            )));
+        }
+        let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+        if selected.insert(column_index, request_index).is_some() {
+            return Err(SurfaceError::invalid(format!(
+                "duplicate local region column: {local_x},{local_z}"
+            )));
+        }
+    }
+
+    let reader = GeoTiffHeightmapReader::open(&settings.heightmap_path)?;
+    let mapping = mapping_for(reader.metadata(), settings.scale_denominator)?;
+    let cache = GeoTiffRowCache::new(&reader, settings.cache_rows)?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let surface_material_sampler = settings
+        .surface_material_path
+        .as_ref()
+        .map(EarthDataSurfaceMaterialSampler::open)
+        .transpose()?;
+    let material_sampler = surface_material_sampler
+        .as_ref()
+        .map(|sampler| sampler as &dyn SurfaceMaterialSampler);
+
+    let region_block_x = settings.region_x.wrapping_mul(REGION_SIZE_BLOCKS);
+    let region_block_z = settings.region_z.wrapping_mul(REGION_SIZE_BLOCKS);
+    let mut elevations = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    let mut valid = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    for z in 0..SURFACE_REGION_EXTENT {
+        for x in 0..SURFACE_REGION_EXTENT {
+            let global_block_x = region_block_x
+                .wrapping_add(x as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+            let global_block_z = region_block_z
+                .wrapping_add(z as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let index = surface_region_extent_index(x, z);
+            if !surface_chunk_map_position_valid(&mapping, map_x, map_z) {
+                continue;
+            }
+            let longitude = mapping.longitude_for_block_x(map_x)?;
+            let latitude = mapping.latitude_for_block_z(map_z)?;
+            elevations[index] = sampler.bilinear_meters(longitude, latitude)?;
+            valid[index] = true;
+        }
+    }
+
+    let water_mask = surface_region_water_decision_mask(&elevations, &valid);
+    let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
+    let mut columns = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
+    let mut coast_factors = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
+    let collect_photo_materials =
+        settings.texture_mode == SurfaceTextureMode::Photo && material_sampler.is_some();
+    let mut photo_material_columns = if collect_photo_materials {
+        Some(vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_smoothed_elevations = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_longitudes = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_latitudes = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_local_relief_meters = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_global_block_x = if collect_photo_materials {
+        Some(vec![0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_global_block_z = if collect_photo_materials {
+        Some(vec![0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_token_luma_profile = if collect_photo_materials {
+        Some(PhotoSurfaceTokenLumaProfile::default())
+    } else {
+        None
+    };
+    let mut traces = vec![None; local_columns.len()];
+
+    for local_z in 0..SURFACE_REGION_WIDTH {
+        for local_x in 0..SURFACE_REGION_WIDTH {
+            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+            let center_x = local_x + SURFACE_REGION_COAST_RADIUS;
+            let center_z = local_z + SURFACE_REGION_COAST_RADIUS;
+            let global_block_x = region_block_x.wrapping_add(local_x as i32);
+            let global_block_z = region_block_z.wrapping_add(local_z as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
+                0.0
+            } else {
+                mapping.longitude_for_block_x(map_x)?
+            };
+            let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
+                0.0
+            } else {
+                mapping.latitude_for_block_z(map_z)?
+            };
+            let sample_index = surface_region_extent_index(center_x, center_z);
+            let raw_elevation = elevations[sample_index];
+            let smoothed_elevation =
+                surface_region_smoothed_elevation(&elevations, &valid, center_x, center_z);
+            let local_relief_meters =
+                surface_region_local_relief_meters(&elevations, &valid, center_x, center_z);
+            let water = water_mask[sample_index];
+            let coast_factor = coast_factor_extent[sample_index];
+            let base_column = classify_shaped_surface_scaled(
+                smoothed_elevation,
+                longitude,
+                latitude,
+                water,
+                coast_factor,
+                settings.vertical_scale,
+            )?;
+            let mut column = base_column.clone();
+            let mut material_sample = None;
+            let mut semantic_column = None;
+            if let Some(material_sampler) = material_sampler {
+                if should_sample_surface_material(
+                    material_sampler,
+                    valid[sample_index],
+                    water,
+                    coast_factor,
+                ) {
+                    let longitude_span = 360.0 / f64::from(mapping.width_blocks);
+                    let latitude_span = (mapping.max_latitude - mapping.min_latitude)
+                        / f64::from(mapping.height_blocks);
+                    let material = sample_surface_region_material(
+                        material_sampler,
+                        settings.texture_mode,
+                        water,
+                        longitude,
+                        latitude,
+                        longitude_span,
+                        latitude_span,
+                    )?;
+                    column = apply_surface_region_semantic_material_sample(
+                        column,
+                        &material,
+                        smoothed_elevation,
+                        longitude,
+                        latitude,
+                        coast_factor,
+                        local_relief_meters,
+                        settings.vertical_scale,
+                    )?;
+                    semantic_column = Some(column.clone());
+                    if let Some(token_luma_profile) = photo_token_luma_profile.as_mut() {
+                        if !column.water {
+                            token_luma_profile.add(&material);
+                        }
+                    }
+                    if let Some(photo_material_columns) = photo_material_columns.as_mut() {
+                        photo_material_columns[column_index] = Some(material.clone());
+                    }
+                    if let Some(photo_smoothed_elevations) = photo_smoothed_elevations.as_mut() {
+                        photo_smoothed_elevations[column_index] = smoothed_elevation;
+                    }
+                    if let Some(photo_longitudes) = photo_longitudes.as_mut() {
+                        photo_longitudes[column_index] = longitude;
+                    }
+                    if let Some(photo_latitudes) = photo_latitudes.as_mut() {
+                        photo_latitudes[column_index] = latitude;
+                    }
+                    if let Some(photo_local_relief_meters) = photo_local_relief_meters.as_mut() {
+                        photo_local_relief_meters[column_index] = local_relief_meters;
+                    }
+                    if let Some(photo_global_block_x) = photo_global_block_x.as_mut() {
+                        photo_global_block_x[column_index] = global_block_x;
+                    }
+                    if let Some(photo_global_block_z) = photo_global_block_z.as_mut() {
+                        photo_global_block_z[column_index] = global_block_z;
+                    }
+                    material_sample = Some(material);
+                }
+            }
+            if let Some(&request_index) = selected.get(&column_index) {
+                traces[request_index] = Some(SurfaceRegionColumnTrace {
+                    local_x,
+                    local_z,
+                    global_block_x,
+                    global_block_z,
+                    map_x,
+                    map_z,
+                    longitude,
+                    latitude,
+                    raw_elevation_meters: raw_elevation,
+                    smoothed_elevation_meters: smoothed_elevation,
+                    local_relief_meters,
+                    initial_water: water,
+                    valid: valid[sample_index],
+                    coast_factor,
+                    material_sample,
+                    base_column,
+                    semantic_column,
+                    photo_column: None,
+                    final_column: column.clone(),
+                });
+            }
+            columns.push(column);
+            coast_factors.push(coast_factor);
+        }
+    }
+
+    if let Some(photo_material_columns) = photo_material_columns {
+        let photo_token_luma_profile = photo_token_luma_profile.map(Arc::new);
+        let photo_smoothed_elevations = photo_smoothed_elevations.expect("photo elevations");
+        let photo_longitudes = photo_longitudes.expect("photo longitudes");
+        let photo_latitudes = photo_latitudes.expect("photo latitudes");
+        let photo_local_relief_meters = photo_local_relief_meters.expect("photo local relief");
+        let photo_global_block_x = photo_global_block_x.expect("photo global block x");
+        let photo_global_block_z = photo_global_block_z.expect("photo global block z");
+        for (column_index, material) in photo_material_columns.into_iter().enumerate() {
+            if let Some(material) = material {
+                columns[column_index] = apply_surface_region_photo_material_sample(
+                    columns[column_index].clone(),
+                    material,
+                    photo_smoothed_elevations[column_index],
+                    photo_longitudes[column_index],
+                    photo_latitudes[column_index],
+                    coast_factors[column_index],
+                    photo_local_relief_meters[column_index],
+                    photo_global_block_x[column_index],
+                    photo_global_block_z[column_index],
+                    settings.vertical_scale,
+                    photo_token_luma_profile.as_ref(),
+                )?;
+                if let Some(&request_index) = selected.get(&column_index) {
+                    if let Some(trace) = traces[request_index].as_mut() {
+                        trace.photo_column = Some(columns[column_index].clone());
+                        trace.final_column = columns[column_index].clone();
+                    }
+                }
+            }
+        }
+    }
+
+    let cleaned = post_process_surface_region_columns(
+        &columns,
+        &coast_factors,
+        SURFACE_REGION_WIDTH,
+        settings.texture_mode,
+    )?;
+    for (&column_index, &request_index) in &selected {
+        if let Some(trace) = traces[request_index].as_mut() {
+            trace.final_column = cleaned[column_index].clone();
+        }
+    }
+
+    traces
+        .into_iter()
+        .map(|trace| trace.ok_or_else(|| SurfaceError::invalid("missing requested column trace")))
+        .collect()
+}
+
 fn surface_chunk_status_for(
     build: &SurfaceChunkBuild,
     requested_status: ChunkGenerationStatus,
@@ -13203,6 +13513,32 @@ fn coastal_shelf_adjusted_depth_blocks(
     )
 }
 
+fn coastal_bathymetry_shelf_adjusted_depth_blocks(
+    depth_blocks: i32,
+    coast_factor: f64,
+    vertical_scale: f64,
+) -> i32 {
+    let near_shore = clamp_unit((coast_factor - 0.94) / 0.06);
+    if near_shore <= 0.0 {
+        return depth_blocks;
+    }
+    let shelf_scale = vertical_scale.sqrt();
+    let minimum_depth = if depth_blocks >= 10 { 3 } else { 2 };
+    let shelf_depth = java_math_round_double_to_narrowed_i32(
+        (f64::from(minimum_depth) + ((1.0 - near_shore).powf(1.20) * 7.0)) * shelf_scale,
+    );
+    let shelf_pull = near_shore.powf(1.80);
+    clamp_i32(
+        java_math_round_double_to_narrowed_i32(lerp(
+            f64::from(depth_blocks),
+            f64::from(shelf_depth),
+            shelf_pull,
+        )),
+        1,
+        123,
+    )
+}
+
 fn fractal_value_noise(x: f64, z: f64, octaves: i32, seed: i64) -> f64 {
     let mut value = 0.0;
     let mut amplitude = 1.0;
@@ -15716,6 +16052,59 @@ mod tests {
         );
         assert_eq!(missing.top_block_state_id, block_state_ids::GRAVEL);
         assert_eq!(missing.decision_source, "water");
+    }
+
+    #[test]
+    fn bathymetry_shelf_adjustment_uses_java_specific_threshold() {
+        assert_eq!(
+            coastal_bathymetry_shelf_adjusted_depth_blocks(123, 0.890625, DEFAULT_VERTICAL_SCALE),
+            123
+        );
+        assert_eq!(
+            coastal_shelf_adjusted_depth_blocks(123, 0.890625, DEFAULT_VERTICAL_SCALE),
+            121
+        );
+
+        let base = surface_column(
+            true,
+            29,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            "minecraft:deep_lukewarm_ocean",
+        );
+        let sample = SurfaceMaterialSample::new(
+            RgbColor::of(1, 1, 21),
+            RgbColor::of(0, 0, 0),
+            TerrainTokenSource::JavaStandardPalette,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            54_790,
+            -3_018,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+        let applied = apply_test_surface_material_sample(
+            &base,
+            sample,
+            0.0,
+            5.883967560823464,
+            -0.02239432817833631,
+            0.890625,
+            0.0,
+        );
+
+        assert_eq!(applied.ground_surface_y, MIN_SURFACE_Y);
+        assert_eq!(applied.decision_source, "water");
     }
 
     #[test]

@@ -22,8 +22,9 @@ use earthmap_minecraft::{
 };
 use earthmap_region::{read_region_payloads, ChunkLocalPos, RegionError};
 use earthmap_surface::{
-    classify_surface, HeightOnlySettings, OutputFormat, SurfaceRegionReport, SurfaceRegionSettings,
-    SurfaceTextureMode, DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
+    classify_surface, EarthSurfaceColumn, HeightOnlySettings, OutputFormat, SurfaceMaterialSample,
+    SurfaceRegionColumnTrace, SurfaceRegionReport, SurfaceRegionSettings, SurfaceTextureMode,
+    DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
 };
 
 const EXIT_OK: i32 = 0;
@@ -125,6 +126,19 @@ where
                 &args[6],
                 status_text,
                 surface_raster_text,
+            ))
+        }
+        "trace-surface-region-column" if args.len() == 7 || args.len() == 8 => {
+            write_result(trace_surface_region_column(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                args.get(7).map(String::as_str),
             ))
         }
         "write-sha256-manifest" if args.len() == 3 => {
@@ -243,6 +257,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  compare-region-chunk-details <expectedRegionFile> <actualRegionFile> <expectedLocalChunkX> <expectedLocalChunkZ> [actualLocalChunkX actualLocalChunkZ]"
+    )?;
+    writeln!(
+        out,
+        "  trace-surface-region-column <heightmap> <scale> <regionX> <regionZ> <localX> <localZ> [surfaceRaster=auto|path]"
     )?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
     writeln!(out, "  generate-palette-stress-world <worldDir>")?;
@@ -1142,6 +1160,231 @@ fn generate_vanilla_delegated_region_impl(
         status,
         &surface_material_path,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_surface_region_column(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    local_x_text: &str,
+    local_z_text: &str,
+    surface_raster_text: Option<&str>,
+) -> io::Result<i32> {
+    match trace_surface_region_column_impl(
+        heightmap_path,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        local_x_text,
+        local_z_text,
+        surface_raster_text.unwrap_or("surfaceRaster=auto"),
+    ) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Surface region column trace failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn trace_surface_region_column_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    local_x_text: &str,
+    local_z_text: &str,
+    surface_raster_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let scale = parse_i32_string(scale_text)?;
+    let region_x = parse_i32_string(region_x_text)?;
+    let region_z = parse_i32_string(region_z_text)?;
+    let local_x = parse_region_local_block_coord(local_x_text, "localX")?;
+    let local_z = parse_region_local_block_coord(local_z_text, "localZ")?;
+    let surface_material_path =
+        parse_optional_surface_material_path(surface_raster_text, Path::new(heightmap_path))?
+            .ok_or_else(|| {
+                "textureMode=photo trace requires a TrueMarble surface raster; use surfaceRaster=auto or pass an explicit TrueMarble.vrt path"
+                    .to_string()
+            })?;
+    let cache_rows = auto_shared_heightmap_cache_rows(Path::new(heightmap_path), 1)?;
+    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+        heightmap_path,
+        ".",
+        "SR EarthMap Trace",
+        0,
+        scale,
+        region_x,
+        region_z,
+        OutputFormat::LinearV2,
+        cache_rows,
+        false,
+        ChunkGenerationStatus::Surface,
+        1.0,
+        SurfaceTextureMode::Photo,
+    )
+    .map_err(|error| error.to_string())?;
+    settings.surface_material_path = Some(surface_material_path.clone());
+    let traces = earthmap_surface::trace_surface_region_columns(
+        &settings,
+        &[(local_x as usize, local_z as usize)],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(surface_region_column_trace_lines(
+        &traces[0],
+        &surface_material_path,
+    ))
+}
+
+fn parse_region_local_block_coord(text: &str, name: &str) -> std::result::Result<u16, String> {
+    let value = parse_i32_string(text)?;
+    if !(0..512).contains(&value) {
+        return Err(format!("{name} must be between 0 and 511: {value}"));
+    }
+    Ok(value as u16)
+}
+
+fn surface_region_column_trace_lines(
+    trace: &SurfaceRegionColumnTrace,
+    surface_material_path: &Path,
+) -> Vec<String> {
+    let mut lines = vec![
+        "surfaceRegionColumnTrace=valid".to_string(),
+        format!("localX={}", trace.local_x),
+        format!("localZ={}", trace.local_z),
+        format!("globalBlockX={}", trace.global_block_x),
+        format!("globalBlockZ={}", trace.global_block_z),
+        format!("mapX={}", trace.map_x),
+        format!("mapZ={}", trace.map_z),
+        format!("longitude={}", java_double_string(trace.longitude)),
+        format!("latitude={}", java_double_string(trace.latitude)),
+        format!(
+            "rawElevationMeters={}",
+            java_double_string(trace.raw_elevation_meters)
+        ),
+        format!(
+            "smoothedElevationMeters={}",
+            java_double_string(trace.smoothed_elevation_meters)
+        ),
+        format!(
+            "localReliefMeters={}",
+            java_double_string(trace.local_relief_meters)
+        ),
+        format!("valid={}", trace.valid),
+        format!("initialWater={}", trace.initial_water),
+        format!("coastFactor={}", java_double_string(trace.coast_factor)),
+        format!(
+            "surfaceMaterialPath={}",
+            normalized_path_display(surface_material_path)
+        ),
+    ];
+    lines.extend(surface_material_trace_lines(
+        "material",
+        &trace.material_sample,
+    ));
+    lines.extend(surface_column_trace_lines("base", Some(&trace.base_column)));
+    lines.extend(surface_column_trace_lines(
+        "semantic",
+        trace.semantic_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        "photo",
+        trace.photo_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        "final",
+        Some(&trace.final_column),
+    ));
+    lines
+}
+
+fn surface_material_trace_lines(
+    prefix: &str,
+    sample: &Option<SurfaceMaterialSample>,
+) -> Vec<String> {
+    let Some(sample) = sample else {
+        return vec![format!("{prefix}.present=false")];
+    };
+    vec![
+        format!("{prefix}.present=true"),
+        format!("{prefix}.color={}", rgb_trace_value(sample.color)),
+        format!(
+            "{prefix}.terrainTokenColor={}",
+            rgb_trace_value(sample.terrain_token_color)
+        ),
+        format!(
+            "{prefix}.terrainTokenSource={:?}",
+            sample.terrain_token_source
+        ),
+        format!("{prefix}.climateClass={}", sample.climate_class),
+        format!(
+            "{prefix}.evergreenBroadleafTrees={}",
+            sample.evergreen_broadleaf_trees
+        ),
+        format!(
+            "{prefix}.deciduousBroadleafTrees={}",
+            sample.deciduous_broadleaf_trees
+        ),
+        format!("{prefix}.needleleafTrees={}", sample.needleleaf_trees),
+        format!("{prefix}.mixedTrees={}", sample.mixed_trees),
+        format!(
+            "{prefix}.herbaceousVegetation={}",
+            sample.herbaceous_vegetation
+        ),
+        format!("{prefix}.shrubs={}", sample.shrubs),
+        format!("{prefix}.snowCover={}", sample.snow_cover),
+        format!("{prefix}.swampCover={}", sample.swamp_cover),
+        format!("{prefix}.oceanTemperature={}", sample.ocean_temperature),
+        format!("{prefix}.bathymetryMeters={}", sample.bathymetry_meters),
+        format!("{prefix}.slopePermille={}", sample.slope_permille),
+        format!("{prefix}.ecoregionName={}", sample.ecoregion_name),
+        format!("{prefix}.ecoregionBiomeId={}", sample.ecoregion_biome_id),
+        format!(
+            "{prefix}.ecoregionConfidence={}",
+            java_double_string(sample.ecoregion_confidence)
+        ),
+    ]
+}
+
+fn surface_column_trace_lines(prefix: &str, column: Option<&EarthSurfaceColumn>) -> Vec<String> {
+    let Some(column) = column else {
+        return vec![format!("{prefix}.present=false")];
+    };
+    vec![
+        format!("{prefix}.present=true"),
+        format!("{prefix}.water={}", column.water),
+        format!("{prefix}.groundSurfaceY={}", column.ground_surface_y),
+        format!("{prefix}.waterSurfaceY={}", column.water_surface_y),
+        format!("{prefix}.topBlockStateId={}", column.top_block_state_id),
+        format!(
+            "{prefix}.fillerBlockStateId={}",
+            column.filler_block_state_id
+        ),
+        format!("{prefix}.biomeId={}", column.biome_id),
+        format!("{prefix}.decisionSource={}", column.decision_source),
+        format!(
+            "{prefix}.terrainTokenSource={:?}",
+            column.terrain_token_source
+        ),
+        format!("{prefix}.dataEvidenceFlags={}", column.data_evidence_flags),
+    ]
+}
+
+fn rgb_trace_value(color: earthmap_geo::RgbColor) -> String {
+    if color.available {
+        format!("#{:02X}{:02X}{:02X}", color.red, color.green, color.blue)
+    } else {
+        "unavailable".to_string()
+    }
 }
 
 fn surface_region_report_lines(report: &SurfaceRegionReport, world_dir: &str) -> Vec<String> {
@@ -2439,6 +2682,8 @@ fn region_writer_fixture_payloads() -> earthmap_region::Result<BTreeMap<ChunkLoc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use earthmap_geo::RgbColor;
+    use earthmap_surface::TerrainTokenSource;
     use std::fs;
 
     use tempfile::tempdir;
@@ -2510,6 +2755,94 @@ mod tests {
     }
 
     #[test]
+    fn trace_surface_region_column_rejects_out_of_range_local_coords_before_io() {
+        let (code, out, err) = run_capture(&[
+            "trace-surface-region-column",
+            "missing-heightmap.tif",
+            "5000",
+            "0",
+            "0",
+            "512",
+            "0",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert!(err.contains("localX must be between 0 and 511: 512"));
+    }
+
+    #[test]
+    fn surface_region_column_trace_lines_include_stable_success_fields() {
+        let base_column = EarthSurfaceColumn::new(
+            false,
+            70,
+            63,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:savanna",
+            "height-rule",
+        );
+        let semantic_column = base_column
+            .with_decision_source("semantic")
+            .with_terrain_token_source(TerrainTokenSource::JavaStandardPalette)
+            .with_data_evidence_flags(7);
+        let photo_column = semantic_column.with_decision_source("photo");
+        let final_column = photo_column.with_biome_id("minecraft:windswept_savanna");
+        let trace = SurfaceRegionColumnTrace {
+            local_x: 140,
+            local_z: 3,
+            global_block_x: 140,
+            global_block_z: 3,
+            map_x: 4147,
+            map_z: 1873,
+            longitude: 1.25,
+            latitude: -2.5,
+            raw_elevation_meters: 12.0,
+            smoothed_elevation_meters: 11.5,
+            local_relief_meters: 0.75,
+            initial_water: false,
+            valid: true,
+            coast_factor: 1.0,
+            material_sample: Some(SurfaceMaterialSample::new(
+                RgbColor::of(10, 20, 30),
+                RgbColor::of(40, 50, 60),
+                TerrainTokenSource::JavaStandardPalette,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                1234,
+                -56,
+                78,
+                "Test Ecoregion",
+                "minecraft:savanna",
+                0.5,
+            )),
+            base_column,
+            semantic_column: Some(semantic_column),
+            photo_column: Some(photo_column),
+            final_column,
+        };
+
+        let lines = surface_region_column_trace_lines(&trace, Path::new("surface.vrt"));
+
+        assert!(lines.contains(&"surfaceRegionColumnTrace=valid".to_string()));
+        assert!(lines.contains(&"localX=140".to_string()));
+        assert!(lines.contains(&"longitude=1.25".to_string()));
+        assert!(lines.contains(&"material.color=#0A141E".to_string()));
+        assert!(lines.contains(&"material.terrainTokenColor=#28323C".to_string()));
+        assert!(lines.contains(&"material.terrainTokenSource=JavaStandardPalette".to_string()));
+        assert!(lines.contains(&"semantic.present=true".to_string()));
+        assert!(lines.contains(&"photo.decisionSource=photo".to_string()));
+        assert!(lines.contains(&"final.biomeId=minecraft:windswept_savanna".to_string(),));
+    }
+
+    #[test]
     fn initial_commands_are_recognized_as_not_implemented() {
         for command in commands::INITIAL_COMMANDS
             .iter()
@@ -2565,6 +2898,7 @@ mod tests {
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
         );
+        assert!(out.contains("trace-surface-region-column <heightmap> <scale> <regionX> <regionZ>"));
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));

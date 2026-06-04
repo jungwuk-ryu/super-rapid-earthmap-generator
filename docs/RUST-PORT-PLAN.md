@@ -1,7 +1,7 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
-Last status audit: 2026-06-04, audited through the vanilla-delegated photo/material parity probe rerun
+Last status audit: 2026-06-04, audited through the bathymetry shelf parity fix rerun
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -15,13 +15,16 @@ build/config.
 
 Read this checkpoint before starting any new Rust-port work.
 
-- Last confirmed parity-affecting implementation commit before the active blocker:
-  `d4180c1 feat(rust): add photo region token luma profile`.
+- Last committed baseline before the current bathymetry shelf fix and active biome-cell blocker:
+  `de0a922 feat(rust): add chunk detail parity diagnostics`.
 - Latest evidence folder:
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-bathymetry-shelf`.
+- Previous evidence folder retained for comparison:
   `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-tokenluma`.
-- Active gate: Phase 5 vanilla-delegated photo/material payload mismatch diagnosis after the TokenLumaProfile rerun.
-- Resume from: the first `Active` item in `Current active work`, currently the biome palette and `OCEAN_FLOOR`
-  mismatch triage for chunk `(8,0)`.
+- Active gate: Phase 5 vanilla-delegated photo/material payload mismatch diagnosis after the bathymetry-specific shelf
+  parity fix.
+- Resume from: the first `Active` item in `Current active work`, currently the biome-cell representative selection
+  mismatch for chunk `(8,0)`: Java writes `minecraft:windswept_savanna`, Rust writes `minecraft:savanna`.
 - Do not resume from: Phase 0 bootstrap, Phase 1 CLI shell, Phase 2 binary core, Phase 3 region writers, Phase 4
   height-only raster generation, or completed Phase 5 bootstrap slices.
 - If local commits or evidence contradict this checkpoint, update this checkpoint and the status board first in the same
@@ -36,7 +39,8 @@ Read this checkpoint before starting any new Rust-port work.
 - Every future phase/status change must update this board in the same conventional atomic commit as the work that
   changed the status.
 - The current active pointer is Phase 5 photo/material payload mismatch diagnosis. The PHOTO two-pass/TokenLumaProfile
-  implementation gap is addressed and the vanilla-delegated comparison rerun is complete, but the payload delta remains.
+  implementation gap is addressed, and the bathymetry-specific shelf mismatch that affected chunk `(8,0)` block and
+  `OCEAN_FLOOR` output is fixed. The payload delta remains because the first mismatch is now biome-cell-only.
   Phase 0 is active only as an oracle/corpus harness, not as Rust implementation bootstrap work.
 
 ## Current Status Board
@@ -51,10 +55,10 @@ the current source of truth for work status.
 | Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. | No active work for fixed NBT/level.dat bootstrap scope. |
 | Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. | No active work for bootstrap writer parity. |
 | Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists; `generate-golden.ps1 -IncludeHeightOnly` promotes the fixed region. | No active work for the current height-only raster scope. |
-| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active blocker remains | Commits through `d4180c1` include surface/photo/ecoregion/no-climate/snow evidence and PHOTO TokenLumaProfile work. The 2026-06-04 rerun still has `matchingChunks=491`, `mismatchedChunks=533`, `firstMismatch=8,0`. | Diagnose the remaining biome palette and `OCEAN_FLOOR` delta before promoting photo/material corpus entries. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active biome-cell blocker remains | Commits through `de0a922` include surface/photo/ecoregion/no-climate/snow evidence, PHOTO TokenLumaProfile work, and chunk detail diagnostics. The 2026-06-04 bathymetry shelf rerun improved the single-region comparison to `matchingChunks=527`, `mismatchedChunks=497`, `firstMismatch=8,0`. Chunk `(8,0)` now has `heightmap.OCEAN_FLOOR.diffCount=0` and `block.diffCount=0`; the remaining first mismatch is `biomeCell.diffCount=29`, expected `minecraft:windswept_savanna`, actual `minecraft:savanna`. | Diagnose the remaining biome-cell representative selection path before promoting photo/material corpus entries. |
 | Vanilla-owned gameplay generation | Out of scope | Java and Rust plans delegate ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners to vanilla. | Do not add direct Rust generators for vanilla-owned gameplay features. |
 | Phase 6: quality and visual evidence tools | Pending | Not started because Phase 5 photo/material corpus parity is not green yet. | Start only after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
-| Phase 7: performance optimization | Pending, blocked by parity | The performance plan exists, but no optimization is acceptable while Phase 5 payload parity is red. | Start only after Java/Rust corpus parity and Phase 6 quality/visual evidence are green for the same build/config. |
+| Phase 7: performance optimization | Pending, explicitly tracked but blocked by parity | The performance plan exists in this document, but no optimization is acceptable while Phase 5 payload parity is red. | Start only after Java/Rust corpus parity and Phase 6 quality/visual evidence are green for the same build/config. |
 
 Current active work:
 
@@ -71,10 +75,20 @@ Current active work:
 7. Done: `compare-region-chunk-details` decodes Java/Rust chunk heightmap, biome-cell, and block-cell values for
    first-mismatch triage, including asymmetric section-set differences. Sub-agent closure review found no remaining
    actionable issue.
-8. Active blocker: comparison still reports `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0`.
-   Detailed chunk `(8,0)` diagnostics show this is a full column/material mismatch, not only a palette-label issue:
-   `heightmap.OCEAN_FLOOR.diffCount=121`, `biomeCell.diffCount=39`, and `block.diffCount=3101`.
-9. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
+8. Done: `trace-surface-region-column` can run the full PHOTO region path and print Java-style column diagnostics for
+   selected region-local columns. The first probed blocker column `(131,0)` showed Rust was applying the ordinary
+   coastal shelf adjustment to bathymetry, while Java uses the stricter bathymetry-specific shelf function.
+9. Done: Rust bathymetry material classification now mirrors Java's `coastalBathymetryShelfAdjustedDepthBlocks` path.
+   The rerun evidence folder is
+   `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-bathymetry-shelf`.
+10. Done: the bathymetry shelf rerun improved the single-region comparison from `matchingChunks=491`,
+    `mismatchedChunks=533` to `matchingChunks=527`, `mismatchedChunks=497`. For chunk `(8,0)`,
+    `heightmap.OCEAN_FLOOR.diffCount=0` and `block.diffCount=0`.
+11. Active blocker: chunk `(8,0)` still has `biomeCell.diffCount=29`; all listed diffs are
+    expected `minecraft:windswept_savanna`, actual `minecraft:savanna` in biome cell `cellX=3`, `cellZ=0`.
+12. Next: trace the full 4x4 input column set for that biome cell, then patch the smallest Rust biome-cell writer,
+    render-color, or biome-classification path that explains Java's representative biome choice.
+13. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
 
 ## Phase 5 Remaining Checklist
 
@@ -94,13 +108,21 @@ The remaining work is the active full-region photo/material parity blocker and t
   `biomeCell.diffCount=39`, and `block.diffCount=3101`.
 - [x] Review the detailed chunk comparison diagnostic with sub-agents and close the asymmetric-section false-negative
   finding before atomic commit.
-- [ ] Root-cause the column/material path that makes Java's chunk `(8,0)` lower/deeper in many ocean/coast columns while
-  Rust writes shallower/higher block columns.
-- [ ] Confirm whether the biome palette difference
-  `deep_lukewarm_ocean|windswept_savanna|savanna` versus simpler Rust ocean/savanna palettes is a symptom of the same
-  column/material mismatch or a second biome-cell writer mismatch.
-- [ ] Patch the smallest Rust surface/material/biome/heightmap path that explains the chunk `(8,0)` delta without
-  weakening existing fixture parity.
+- [x] Root-cause the column/material path that made Java's chunk `(8,0)` lower/deeper in many ocean/coast columns while
+  Rust wrote shallower/higher block columns: Java uses a bathymetry-specific shelf threshold for material bathymetry,
+  separate from the ordinary coastal shelf adjustment.
+- [x] Patch the smallest Rust bathymetry path that explains the chunk `(8,0)` height/block delta without weakening
+  existing fixture parity.
+- [x] Rerun the same Java/Rust single-region comparison after the bathymetry shelf patch and record the improved but
+  still-red result: `matchingChunks=527`, `mismatchedChunks=497`, `missingChunks=0`, `extraChunks=0`,
+  `firstMismatch=8,0`.
+- [x] Confirm that the first mismatch is now no longer a column height/block mismatch:
+  `heightmap.OCEAN_FLOOR.diffCount=0`, `block.diffCount=0`, and `biomeCell.diffCount=29` for chunk `(8,0)`.
+- [ ] Root-cause the remaining biome palette/cell difference:
+  expected `minecraft:windswept_savanna`, actual `minecraft:savanna` for chunk `(8,0)`, biome cell `cellX=3`,
+  `cellZ=0`.
+- [ ] Patch the smallest Rust biome-cell writer, render-color, or biome-classification path that explains the remaining
+  chunk `(8,0)` delta without weakening existing fixture parity.
 - [ ] Rerun the same Java/Rust single-region comparison; Phase 5 promotion requires `matchingChunks=1024`,
   `mismatchedChunks=0`, `missingChunks=0`, and `extraChunks=0`.
 - [ ] After the fixed-region photo/material comparison is green, add photo/material entries to the regeneratable
@@ -108,10 +130,11 @@ The remaining work is the active full-region photo/material parity blocker and t
 - [ ] Rerun `cargo test --workspace`, relevant ignored slow fixtures when touched, and the corpus scripts before marking
   Phase 5 corpus parity green.
 
-Phase 5 remaining estimate: one known full-region parity blocker plus corpus promotion remains. Treat this as roughly
-three focused work packets: root-cause/fix the chunk `(8,0)` column/material mismatch, rerun/verify the fixed region,
-then promote the photo/material corpus entries. The blocker is narrower than a full Phase 5 restart, but it still blocks
-Phase 6 and Phase 7 because the output payload is red.
+Phase 5 remaining estimate: the known first-mismatch blocker has narrowed from a full column/material mismatch to a
+biome-cell representative selection mismatch. Treat this as roughly two to three focused work packets: root-cause/fix
+the `windswept_savanna` versus `savanna` biome-cell choice, rerun/verify the fixed region, then promote the
+photo/material corpus entries. The blocker is much narrower than a full Phase 5 restart, but it still blocks Phase 6
+and Phase 7 because the full-region output payload is red.
 
 ## Non-Negotiable Rules
 
@@ -875,8 +898,8 @@ Bootstrap implementation status on 2026-06-03:
   palettes and one ocean-floor heightmap edge, not in chunk coordinates or status metadata. Java includes
   `minecraft:windswept_savanna` in mixed biome sections for chunk `(8,0)` while the Rust candidate has simpler
   `deep_lukewarm_ocean|savanna` palettes. The missing Rust PHOTO-mode region-wide two-pass `TokenLumaProfile` flow is
-  now implemented; the next required evidence step is regenerating and comparing the vanilla-delegated photo/material
-  candidate to confirm whether this was the full payload delta or only the first blocker.
+  now implemented; the later TokenLumaProfile and bathymetry shelf reruns below confirmed this was not the full payload
+  delta.
 - TokenLumaProfile rerun on 2026-06-04: Rust now has a probe-only single-region
   `generate-vanilla-delegated-region` command for parity evidence generation. Evidence:
   `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-tokenluma`. The Java oracle and Rust
@@ -886,6 +909,13 @@ Bootstrap implementation status on 2026-06-03:
   `deep_lukewarm_ocean|windswept_savanna|savanna` in mixed sections while Rust collapses several sections to
   `deep_lukewarm_ocean` or `deep_lukewarm_ocean|savanna`. Keep `rust.command.generate-vanilla-delegated-region` as
   WIP/probe-only and do not add photo/material corpus entries until this delta is fixed.
+- Bathymetry shelf follow-up on 2026-06-04: `trace-surface-region-column` narrowed one blocker column `(131,0)` to
+  Rust using the ordinary coastal shelf adjustment for bathymetry where Java uses
+  `coastalBathymetryShelfAdjustedDepthBlocks`. After porting that bathymetry-specific shelf path, the rerun evidence
+  folder `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-bathymetry-shelf` improved
+  payload parity to `matchingChunks=527`, `mismatchedChunks=497`, `firstMismatch=8,0`. Chunk `(8,0)` now reports
+  `heightmap.OCEAN_FLOOR.diffCount=0` and `block.diffCount=0`; the remaining first mismatch is
+  `biomeCell.diffCount=29`, expected `minecraft:windswept_savanna`, actual `minecraft:savanna`.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
@@ -1194,6 +1224,7 @@ Full Rust replacement requires:
 6. Done: add optional height-only fixed-region entries to the regeneratable golden/candidate corpus.
 7. Done: add optional no-material surface fixed-region entries to the regeneratable golden/candidate corpus.
 8. Done: rerun the vanilla-delegated photo/material payload comparison after the TokenLumaProfile fix.
-9. Active: resolve the remaining chunk `(8,0)` biome palette and `OCEAN_FLOOR` payload delta before adding
-   photo/material fixed-region entries.
+9. Active: resolve the remaining chunk `(8,0)` biome-cell representative mismatch before adding photo/material
+   fixed-region entries. The earlier `OCEAN_FLOOR` and block payload delta for this chunk is fixed in the latest
+   bathymetry shelf rerun.
 10. Next: expand Phase 6 quality and visual evidence tools only after the relevant corpus parity is green.
