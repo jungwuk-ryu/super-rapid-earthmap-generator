@@ -1,6 +1,7 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
+Last status audit: 2026-06-04, after commit `4a55b98 feat(rust): generate golden candidates from oracle`
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -9,6 +10,29 @@ hard gate before any optimization is accepted.
 Current project state: active prototype, production readiness NO-GO. A Rust build does not change the release gate:
 full Earth or nation-war generation remains blocked until `docs/QUALITY-GATES.md` passes for the same candidate
 build/config.
+
+## Current Status Board
+
+Read this board before choosing the next task. The phase sections below are detailed history and scope; this board is
+the current source of truth for work status.
+
+| Track | Status | Current meaning |
+| --- | --- | --- |
+| Phase 0: oracle and corpus harness | Active, not a restart | Synthetic golden corpus, candidate-root comparison, and Rust candidate generation for `flat-mca`, `flat-linear`, and `palette-stress-mca` are done. Continue by expanding the corpus; do not restart Rust implementation from Phase 0. |
+| Phase 1: Rust skeleton and CLI shell | Done | Cargo workspace, wrappers, command shell, and capability reporting are in place. |
+| Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. |
+| Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. |
+| Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists for fixed regions. Next work is to make those entries regeneratable through the corpus scripts. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices | Commit history and the Phase 5 notes below include surface/photo/ecoregion/no-climate/snow evidence work. Remaining work is promotion evidence: fixed-region surface/photo corpus entries, quality-gate artifacts, and any deltas discovered there. |
+| Vanilla-owned gameplay generation | Out of scope | Ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners remain vanilla-delegated. Do not add direct Rust generators for them. |
+| Phase 6: quality and visual evidence tools | Pending | Start after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
+
+Current active work:
+
+1. Done: `rust/scripts/generate-candidates.ps1` can regenerate supported Rust candidate entries from a Java golden root.
+2. Next: add height-only fixed-region entries to `generate-golden.ps1` and `generate-candidates.ps1`.
+3. Next: add surface/photo fixed-region corpus entries and compare them against the existing Phase 5 implementation.
+4. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
 
 ## Non-Negotiable Rules
 
@@ -721,9 +745,10 @@ Bootstrap implementation status on 2026-06-03:
 - Rust photo solver snow-evidence handling now mirrors Java's non-token ecology constraint, preserving calcite nearest
   matches and otherwise forcing snow evidence to `SNOW_BLOCK` while retaining dry false-snow guards and Java
   decision-source/stage metadata.
-- Remaining Phase 5 work: complete the remaining semantic `EarthSurfaceMaterialClassifier` branches, especially
-  remaining dry-savanna/desert-edge intent predicates and broader compiler-backed intent; then finish full photo
-  solver parity and fixed-region Java/Rust payload parity for surface material/photo output.
+- Phase 5 status note on 2026-06-04: the earlier semantic classifier/photo-solver backlog has largely been implemented
+  through subsequent commits. Do not treat Phase 5 as unstarted. The remaining Phase 5 promotion work is to add
+  fixed-region surface/photo corpus entries, run Java/Rust payload comparison against those entries, and record any
+  concrete deltas discovered by that corpus evidence.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
@@ -1028,6 +1053,7 @@ Full Rust replacement requires:
 2. Bootstrap done: implement Java synthetic golden corpus generation.
 3. Bootstrap done: implement MCA/Linear payload extraction and SHA-256 manifests.
 4. Done: prove synthetic flat/palette MCA/Linear candidate parity from Rust-generated chunks.
-5. Next: expand Phase 0 golden corpus coverage beyond synthetic flat/palette fixtures.
-6. Next: add Phase 2 gzip comparison/delta reporting.
-7. Next: keep extending raster and surface parity behind golden corpus checks.
+5. Done: add `generate-candidates.ps1` so Rust candidate roots can be regenerated from Java oracle roots.
+6. Next: add height-only fixed-region entries to the regeneratable golden/candidate corpus.
+7. Next: add surface/photo fixed-region entries and use them to promote the existing Phase 5 implementation evidence.
+8. Next: expand Phase 6 quality and visual evidence tools only after the relevant corpus parity is green.
