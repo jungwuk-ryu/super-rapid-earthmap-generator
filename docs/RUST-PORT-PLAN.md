@@ -199,6 +199,8 @@ Bootstrap implementation status on 2026-06-03:
 - `rust/scripts/compare-golden.ps1` also accepts `-CandidateRoot` so a Rust-generated candidate corpus tree can be
   compared against the Java-oracle entry manifests without rewriting the oracle artifacts. Omitting `-CandidateRoot`
   preserves the bootstrap self-check mode.
+- `rust/scripts/generate-candidates.ps1` reads an existing Java-oracle golden root and regenerates the supported entries
+  with the Rust CLI into a candidate root, including candidate payload and SHA-256 manifests for diagnostics.
 - The Rust CLI implements `generate-flat-test-world <worldDir> <mca|linear>` so `flat-mca` and `flat-linear` Java
   oracle entries can now be compared against Rust-generated candidate world trees.
 - Verified locally with
@@ -238,6 +240,7 @@ Suggested commands:
 .\scripts\test.ps1
 .\rust\scripts\generate-golden.ps1 -OutputRoot D:\earthmap\rust-port-golden\v001
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001
+.\rust\scripts\generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001 -OutputRoot D:\earthmap\rust-port-candidates\v001
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001 -CandidateRoot D:\earthmap\rust-port-candidates\v001
 ```
 

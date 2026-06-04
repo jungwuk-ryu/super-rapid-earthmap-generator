@@ -68,7 +68,8 @@ foreach ($entry in $entries) {
         "corpus.name=$($entry.Name)",
         "corpus.kind=synthetic",
         "corpus.oracle=java",
-        "corpus.generatedBy=rust/scripts/generate-golden.ps1"
+        "corpus.generatedBy=rust/scripts/generate-golden.ps1",
+        "command=$($entry.Command)"
     )
     if ($entry.Format -ne '') {
         $settings += "format=$($entry.Format)"
