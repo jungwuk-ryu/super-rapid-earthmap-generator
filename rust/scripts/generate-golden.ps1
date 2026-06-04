@@ -4,12 +4,12 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputRoot,
     [switch]$IncludeHeightOnly,
-    [string]$HeightmapPath = 'E:\HQheightmap.tif',
+    [string]$HeightmapPath = 'C:\earth_map_resources\HQheightmap.tif',
     [int]$HeightOnlyScale = 5000,
     [int]$HeightOnlyRegionX = 0,
     [int]$HeightOnlyRegionZ = 0,
     [switch]$IncludeSurface,
-    [string]$SurfaceHeightmapPath = 'E:\HQheightmap.tif',
+    [string]$SurfaceHeightmapPath = 'C:\earth_map_resources\HQheightmap.tif',
     [int]$SurfaceScale = 5000,
     [int]$SurfaceRegionX = 0,
     [int]$SurfaceRegionZ = 0

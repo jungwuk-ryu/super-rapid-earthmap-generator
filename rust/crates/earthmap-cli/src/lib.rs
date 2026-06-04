@@ -31,6 +31,7 @@ use earthmap_surface::{
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
+const DEFAULT_HEIGHTMAP_PATH: &str = r"C:\earth_map_resources\HQheightmap.tif";
 const FLAT_TEST_REGION_CHUNKS: u8 = 32;
 const FLAT_TEST_SURFACE_Y: i32 = 63;
 const FLAT_TEST_MCA_LEVEL_NAME: &str = "SR EarthMap Flat Test";
@@ -97,11 +98,30 @@ where
     }
 
     match args[0].as_str() {
+        "inspect-heightmap" if args.len() == 1 => {
+            write_result(inspect_heightmap(stdout, stderr, DEFAULT_HEIGHTMAP_PATH))
+        }
         "inspect-heightmap" if args.len() == 2 => {
             write_result(inspect_heightmap(stdout, stderr, &args[1]))
         }
+        "locate-heightmap-point" if args.len() == 4 => write_result(locate_heightmap_point(
+            stdout,
+            stderr,
+            DEFAULT_HEIGHTMAP_PATH,
+            &args[1],
+            &args[2],
+            &args[3],
+        )),
         "locate-heightmap-point" if args.len() == 5 => write_result(locate_heightmap_point(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4],
+        )),
+        "classify-surface-point" if args.len() == 4 => write_result(classify_surface_point(
+            stdout,
+            stderr,
+            DEFAULT_HEIGHTMAP_PATH,
+            &args[1],
+            &args[2],
+            &args[3],
         )),
         "classify-surface-point" if args.len() == 5 => write_result(classify_surface_point(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4],
@@ -112,50 +132,74 @@ where
         "generate-height-region" if args.len() == 7 => write_result(generate_height_region(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
         )),
+        "generate-height-region" if args.len() == 6 => write_result(generate_height_region(
+            stdout,
+            stderr,
+            DEFAULT_HEIGHTMAP_PATH,
+            &args[1],
+            &args[2],
+            &args[3],
+            &args[4],
+            &args[5],
+        )),
         "generate-surface-region" if args.len() == 7 => write_result(generate_surface_region(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
         )),
-        "generate-vanilla-delegated-region" if args.len() >= 7 && args.len() <= 9 => {
-            let (status_text, surface_raster_text) = vanilla_delegated_optional_args(&args);
+        "generate-surface-region" if args.len() == 6 => write_result(generate_surface_region(
+            stdout,
+            stderr,
+            DEFAULT_HEIGHTMAP_PATH,
+            &args[1],
+            &args[2],
+            &args[3],
+            &args[4],
+            &args[5],
+        )),
+        "generate-vanilla-delegated-region"
+            if (6..=9).contains(&args.len()) && vanilla_delegated_args(&args).is_some() =>
+        {
+            let parsed = vanilla_delegated_args(&args).expect("validated vanilla delegated args");
             write_result(generate_vanilla_delegated_region(
                 stdout,
                 stderr,
-                &args[1],
-                &args[2],
-                &args[3],
-                &args[4],
-                &args[5],
-                &args[6],
-                status_text,
-                surface_raster_text,
+                parsed.heightmap_path,
+                parsed.world_dir,
+                parsed.scale,
+                parsed.region_x,
+                parsed.region_z,
+                parsed.format,
+                parsed.status,
+                parsed.surface_raster,
             ))
         }
-        "trace-surface-region-column" if args.len() == 7 || args.len() == 8 => {
+        "trace-surface-region-column" if (6..=8).contains(&args.len()) => {
+            let parsed = trace_column_args(&args);
             write_result(trace_surface_region_column(
                 stdout,
                 stderr,
-                &args[1],
-                &args[2],
-                &args[3],
-                &args[4],
-                &args[5],
-                &args[6],
-                args.get(7).map(String::as_str),
+                parsed.heightmap_path,
+                parsed.scale,
+                parsed.region_x,
+                parsed.region_z,
+                parsed.local_x,
+                parsed.local_z,
+                parsed.surface_raster,
             ))
         }
-        "trace-surface-region-cell" if args.len() == 9 || args.len() == 10 => {
+        "trace-surface-region-cell" if (8..=10).contains(&args.len()) => {
+            let parsed = trace_cell_args(&args);
             write_result(trace_surface_region_cell(
                 stdout,
                 stderr,
-                &args[1],
-                &args[2],
-                &args[3],
-                &args[4],
-                &args[5],
-                &args[6],
-                &args[7],
-                &args[8],
-                args.get(9).map(String::as_str),
+                parsed.heightmap_path,
+                parsed.scale,
+                parsed.region_x,
+                parsed.region_z,
+                parsed.chunk_local_x,
+                parsed.chunk_local_z,
+                parsed.cell_x,
+                parsed.cell_z,
+                parsed.surface_raster,
             ))
         }
         "write-sha256-manifest" if args.len() == 3 => {
@@ -226,16 +270,144 @@ fn write_result(result: io::Result<i32>) -> i32 {
     }
 }
 
-fn vanilla_delegated_optional_args(args: &[String]) -> (&str, &str) {
-    if args.len() == 8 && args[7].contains('=') {
-        return ("surface", args[7].as_str());
+struct VanillaDelegatedArgs<'a> {
+    heightmap_path: &'a str,
+    world_dir: &'a str,
+    scale: &'a str,
+    region_x: &'a str,
+    region_z: &'a str,
+    format: &'a str,
+    status: &'a str,
+    surface_raster: &'a str,
+}
+
+fn vanilla_delegated_args(args: &[String]) -> Option<VanillaDelegatedArgs<'_>> {
+    let uses_default_heightmap = args.get(5).is_some_and(|arg| is_output_format_text(arg));
+    if uses_default_heightmap {
+        let (status, surface_raster) = optional_status_and_surface_raster(args, 6);
+        return Some(VanillaDelegatedArgs {
+            heightmap_path: DEFAULT_HEIGHTMAP_PATH,
+            world_dir: args[1].as_str(),
+            scale: args[2].as_str(),
+            region_x: args[3].as_str(),
+            region_z: args[4].as_str(),
+            format: args[5].as_str(),
+            status,
+            surface_raster,
+        });
+    }
+    if !args.get(6).is_some_and(|arg| is_output_format_text(arg)) {
+        return None;
+    }
+    let (status, surface_raster) = optional_status_and_surface_raster(args, 7);
+    Some(VanillaDelegatedArgs {
+        heightmap_path: args[1].as_str(),
+        world_dir: args[2].as_str(),
+        scale: args[3].as_str(),
+        region_x: args[4].as_str(),
+        region_z: args[5].as_str(),
+        format: args[6].as_str(),
+        status,
+        surface_raster,
+    })
+}
+
+fn optional_status_and_surface_raster(args: &[String], first_optional: usize) -> (&str, &str) {
+    if args.len() == first_optional + 1
+        && args
+            .get(first_optional)
+            .is_some_and(|arg| arg.contains('='))
+    {
+        return ("surface", args[first_optional].as_str());
     }
     (
-        args.get(7).map(String::as_str).unwrap_or("surface"),
-        args.get(8)
+        args.get(first_optional)
+            .map(String::as_str)
+            .unwrap_or("surface"),
+        args.get(first_optional + 1)
             .map(String::as_str)
             .unwrap_or("surfaceRaster=auto"),
     )
+}
+
+struct TraceColumnArgs<'a> {
+    heightmap_path: &'a str,
+    scale: &'a str,
+    region_x: &'a str,
+    region_z: &'a str,
+    local_x: &'a str,
+    local_z: &'a str,
+    surface_raster: Option<&'a str>,
+}
+
+fn trace_column_args(args: &[String]) -> TraceColumnArgs<'_> {
+    let uses_default_heightmap = args.len() == 6
+        || (args.len() == 7
+            && args.get(6).is_some_and(|arg| arg.contains('='))
+            && args.get(1).is_some_and(|arg| parse_i32_string(arg).is_ok()));
+    if uses_default_heightmap {
+        return TraceColumnArgs {
+            heightmap_path: DEFAULT_HEIGHTMAP_PATH,
+            scale: args[1].as_str(),
+            region_x: args[2].as_str(),
+            region_z: args[3].as_str(),
+            local_x: args[4].as_str(),
+            local_z: args[5].as_str(),
+            surface_raster: args.get(6).map(String::as_str),
+        };
+    }
+    TraceColumnArgs {
+        heightmap_path: args[1].as_str(),
+        scale: args[2].as_str(),
+        region_x: args[3].as_str(),
+        region_z: args[4].as_str(),
+        local_x: args[5].as_str(),
+        local_z: args[6].as_str(),
+        surface_raster: args.get(7).map(String::as_str),
+    }
+}
+
+struct TraceCellArgs<'a> {
+    heightmap_path: &'a str,
+    scale: &'a str,
+    region_x: &'a str,
+    region_z: &'a str,
+    chunk_local_x: &'a str,
+    chunk_local_z: &'a str,
+    cell_x: &'a str,
+    cell_z: &'a str,
+    surface_raster: Option<&'a str>,
+}
+
+fn trace_cell_args(args: &[String]) -> TraceCellArgs<'_> {
+    let uses_default_heightmap = args.len() == 8
+        || (args.len() == 9
+            && args.get(8).is_some_and(|arg| arg.contains('='))
+            && args.get(1).is_some_and(|arg| parse_i32_string(arg).is_ok()));
+    if uses_default_heightmap {
+        return TraceCellArgs {
+            heightmap_path: DEFAULT_HEIGHTMAP_PATH,
+            scale: args[1].as_str(),
+            region_x: args[2].as_str(),
+            region_z: args[3].as_str(),
+            chunk_local_x: args[4].as_str(),
+            chunk_local_z: args[5].as_str(),
+            cell_x: args[6].as_str(),
+            cell_z: args[7].as_str(),
+            surface_raster: args.get(8).map(String::as_str),
+        };
+    }
+    TraceCellArgs {
+        heightmap_path: args[1].as_str(),
+        scale: args[2].as_str(),
+        region_x: args[3].as_str(),
+        region_z: args[4].as_str(),
+        chunk_local_x: args[5].as_str(),
+        chunk_local_z: args[6].as_str(),
+        cell_x: args[7].as_str(),
+        cell_z: args[8].as_str(),
+        surface_raster: args.get(9).map(String::as_str),
+    }
 }
 
 fn print_help(out: &mut impl Write) -> io::Result<i32> {
@@ -243,7 +415,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out)?;
     writeln!(
         out,
-        "Status: Rust port Phase 1 CLI shell. Java remains the oracle and fallback."
+        "Status: Rust port active prototype. Java remains the oracle and fallback; see docs/RUST-PORT-PLAN.md."
     )?;
     writeln!(out)?;
     writeln!(out, "Commands:")?;
@@ -275,27 +447,28 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         out,
         "  compare-region-chunk-details <expectedRegionFile> <actualRegionFile> <expectedLocalChunkX> <expectedLocalChunkZ> [actualLocalChunkX actualLocalChunkZ]"
     )?;
+    writeln!(out, "  default heightmap: {DEFAULT_HEIGHTMAP_PATH}")?;
     writeln!(
         out,
-        "  trace-surface-region-column <heightmap> <scale> <regionX> <regionZ> <localX> <localZ> [surfaceRaster=auto|path]"
+        "  trace-surface-region-column [heightmap] <scale> <regionX> <regionZ> <localX> <localZ> [surfaceRaster=auto|path]"
     )?;
     writeln!(
         out,
-        "  trace-surface-region-cell <heightmap> <scale> <regionX> <regionZ> <chunkLocalX> <chunkLocalZ> <cellX> <cellZ> [surfaceRaster=auto|path]"
+        "  trace-surface-region-cell [heightmap] <scale> <regionX> <regionZ> <chunkLocalX> <chunkLocalZ> <cellX> <cellZ> [surfaceRaster=auto|path]"
     )?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
     writeln!(out, "  generate-palette-stress-world <worldDir>")?;
     writeln!(out, "  write-nbt-parity-fixtures <outputDir>")?;
     writeln!(out, "  write-nbt-gzip-parity-fixtures <outputDir>")?;
     writeln!(out, "  write-region-writer-parity-fixtures <outputDir>")?;
-    writeln!(out, "  inspect-heightmap <path>")?;
+    writeln!(out, "  inspect-heightmap [path]")?;
     writeln!(
         out,
-        "  locate-heightmap-point <heightmap> <scale> <longitude> <latitude>"
+        "  locate-heightmap-point [heightmap] <scale> <longitude> <latitude>"
     )?;
     writeln!(
         out,
-        "  classify-surface-point <heightmap> <scale> <longitude> <latitude>"
+        "  classify-surface-point [heightmap] <scale> <longitude> <latitude>"
     )?;
     writeln!(out, "  sample-vrt-rgb <terrainVrt> <longitude> <latitude>")?;
     for name in commands::INITIAL_COMMANDS
@@ -462,15 +635,15 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "DONE rust.phase4.realHeightmapSmoke - E:\\HQheightmap.tif inspect-heightmap and locate-heightmap-point stdout match the Java oracle."
+        "DONE rust.phase4.realHeightmapSmoke - C:\\earth_map_resources\\HQheightmap.tif inspect-heightmap and locate-heightmap-point stdout match the Java oracle."
     )?;
     writeln!(
         out,
-        "DONE rust.phase4.heightOnlyRegionByteParity - Java/Rust height-only r.0.0 and r.-1.-1 MCA/Linear region bytes, payload manifests, normalized stdout, and exploration-only survival manifests match for E:\\HQheightmap.tif at 1:5000."
+        "DONE rust.phase4.heightOnlyRegionByteParity - Java/Rust height-only r.0.0 and r.-1.-1 MCA/Linear region bytes, payload manifests, normalized stdout, and exploration-only survival manifests match for C:\\earth_map_resources\\HQheightmap.tif at 1:5000."
     )?;
     writeln!(
         out,
-        "DONE rust.phase5.earthSurfaceRulesBootstrap - EarthSurfaceRules classify/classifyShaped/normalizeForChunk contracts and classify-surface-point diagnostic match Java fixture cases and E:\\HQheightmap.tif smoke points."
+        "DONE rust.phase5.earthSurfaceRulesBootstrap - EarthSurfaceRules classify/classifyShaped/normalizeForChunk contracts and classify-surface-point diagnostic match Java fixture cases and C:\\earth_map_resources\\HQheightmap.tif smoke points."
     )?;
     writeln!(
         out,
@@ -1742,6 +1915,10 @@ fn millis(nanos: u128) -> u128 {
 
 fn parse_i32_string(text: &str) -> std::result::Result<i32, String> {
     text.parse::<i32>().map_err(|error| error.to_string())
+}
+
+fn is_output_format_text(text: &str) -> bool {
+    matches_ignore_ascii_case(text, &["mca", "linear"])
 }
 
 fn parse_optional_surface_material_path(
@@ -3226,17 +3403,170 @@ mod tests {
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
         );
-        assert!(out.contains("trace-surface-region-column <heightmap> <scale> <regionX> <regionZ>"));
-        assert!(out.contains("trace-surface-region-cell <heightmap> <scale> <regionX> <regionZ>"));
+        assert!(out.contains("default heightmap: C:\\earth_map_resources\\HQheightmap.tif"));
+        assert!(out.contains("trace-surface-region-column [heightmap] <scale> <regionX> <regionZ>"));
+        assert!(out.contains("trace-surface-region-cell [heightmap] <scale> <regionX> <regionZ>"));
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));
         assert!(out.contains("write-region-writer-parity-fixtures <outputDir>"));
-        assert!(out.contains("inspect-heightmap <path>"));
-        assert!(out.contains("locate-heightmap-point <heightmap> <scale> <longitude> <latitude>"));
-        assert!(out.contains("classify-surface-point <heightmap> <scale> <longitude> <latitude>"));
+        assert!(out.contains("inspect-heightmap [path]"));
+        assert!(out.contains("locate-heightmap-point [heightmap] <scale> <longitude> <latitude>"));
+        assert!(out.contains("classify-surface-point [heightmap] <scale> <longitude> <latitude>"));
         assert!(out.contains("sample-vrt-rgb <terrainVrt> <longitude> <latitude>"));
+    }
+
+    #[test]
+    fn vanilla_delegated_args_use_default_heightmap_when_omitted() {
+        let args = [
+            "generate-vanilla-delegated-region",
+            "D:\\world",
+            "147760",
+            "0",
+            "0",
+            "linear",
+            "full",
+            "surfaceRaster=D:\\surface.vrt",
+        ]
+        .map(String::from);
+
+        let parsed = vanilla_delegated_args(&args).unwrap();
+
+        assert_eq!(parsed.heightmap_path, DEFAULT_HEIGHTMAP_PATH);
+        assert_eq!(parsed.world_dir, "D:\\world");
+        assert_eq!(parsed.scale, "147760");
+        assert_eq!(parsed.status, "full");
+        assert_eq!(parsed.surface_raster, "surfaceRaster=D:\\surface.vrt");
+    }
+
+    #[test]
+    fn vanilla_delegated_args_keep_explicit_heightmap_compatible() {
+        let args = [
+            "generate-vanilla-delegated-region",
+            "E:\\HQheightmap.tif",
+            "D:\\world",
+            "147760",
+            "0",
+            "0",
+            "linear",
+            "surfaceRaster=D:\\surface.vrt",
+        ]
+        .map(String::from);
+
+        let parsed = vanilla_delegated_args(&args).unwrap();
+
+        assert_eq!(parsed.heightmap_path, "E:\\HQheightmap.tif");
+        assert_eq!(parsed.world_dir, "D:\\world");
+        assert_eq!(parsed.scale, "147760");
+        assert_eq!(parsed.status, "surface");
+        assert_eq!(parsed.surface_raster, "surfaceRaster=D:\\surface.vrt");
+    }
+
+    #[test]
+    fn surface_trace_args_use_default_heightmap_when_omitted() {
+        let column_args = [
+            "trace-surface-region-column",
+            "147760",
+            "0",
+            "0",
+            "146",
+            "2",
+            "surfaceRaster=D:\\surface.vrt",
+        ]
+        .map(String::from);
+        let cell_args = [
+            "trace-surface-region-cell",
+            "147760",
+            "0",
+            "0",
+            "8",
+            "0",
+            "3",
+            "0",
+            "surfaceRaster=D:\\surface.vrt",
+        ]
+        .map(String::from);
+
+        let parsed_column = trace_column_args(&column_args);
+        let parsed_cell = trace_cell_args(&cell_args);
+
+        assert_eq!(parsed_column.heightmap_path, DEFAULT_HEIGHTMAP_PATH);
+        assert_eq!(parsed_column.scale, "147760");
+        assert_eq!(
+            parsed_column.surface_raster,
+            Some("surfaceRaster=D:\\surface.vrt")
+        );
+        assert_eq!(parsed_cell.heightmap_path, DEFAULT_HEIGHTMAP_PATH);
+        assert_eq!(parsed_cell.chunk_local_x, "8");
+        assert_eq!(
+            parsed_cell.surface_raster,
+            Some("surfaceRaster=D:\\surface.vrt")
+        );
+    }
+
+    #[test]
+    fn optional_heightmap_args_keep_numeric_explicit_paths_compatible() {
+        let delegated_args = [
+            "generate-vanilla-delegated-region",
+            "heightmaps\\5000",
+            "5000",
+            "147760",
+            "0",
+            "0",
+            "linear",
+        ]
+        .map(String::from);
+        let column_args = [
+            "trace-surface-region-column",
+            "5000",
+            "147760",
+            "0",
+            "0",
+            "146",
+            "2",
+        ]
+        .map(String::from);
+        let cell_args = [
+            "trace-surface-region-cell",
+            "5000",
+            "147760",
+            "0",
+            "0",
+            "8",
+            "0",
+            "3",
+            "0",
+        ]
+        .map(String::from);
+
+        let parsed_delegated = vanilla_delegated_args(&delegated_args).unwrap();
+        let parsed_column = trace_column_args(&column_args);
+        let parsed_cell = trace_cell_args(&cell_args);
+
+        assert_eq!(parsed_delegated.heightmap_path, "heightmaps\\5000");
+        assert_eq!(parsed_delegated.world_dir, "5000");
+        assert_eq!(parsed_delegated.scale, "147760");
+        assert_eq!(parsed_column.heightmap_path, "5000");
+        assert_eq!(parsed_column.scale, "147760");
+        assert_eq!(parsed_cell.heightmap_path, "5000");
+        assert_eq!(parsed_cell.scale, "147760");
+    }
+
+    #[test]
+    fn vanilla_delegated_args_reject_invalid_six_token_explicit_shape_without_panic() {
+        let (code, out, err) = run_capture(&[
+            "generate-vanilla-delegated-region",
+            "heightmaps\\5000",
+            "world",
+            "5000",
+            "0",
+            "0",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert_eq!(err, "Unknown command. Use --help.\n");
     }
 
     #[test]

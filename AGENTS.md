@@ -10,6 +10,8 @@ These instructions apply to the Java project rooted at this directory.
 - Preserve Java output compatibility unless the task explicitly changes behavior.
 - Do not revert or overwrite unrelated dirty worktree changes.
 - Stage files explicitly. Never rely on broad staging commands when unrelated changes are present.
+- Use `C:\earth_map_resources\HQheightmap.tif` as the standard local HeightMap path for CLI examples,
+  parity probes, and verification runs unless a test fixture or user request explicitly names another file.
 
 ## Verification
 

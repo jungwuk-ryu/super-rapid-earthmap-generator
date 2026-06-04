@@ -21,6 +21,7 @@ use earthmap_minecraft::{chunk_nbt_encoder, level_dat_template, MinecraftError};
 use earthmap_region::{ChunkLocalPos, RegionError};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use rayon::prelude::*;
 
 pub const MODULE_STATUS: &str = "phase5-surface-bootstrap";
 
@@ -4986,7 +4987,7 @@ pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDeci
         let biome = if block_state_id == block_state_ids::SNOW_BLOCK {
             "minecraft:snowy_plains".to_string()
         } else {
-            photo_solver_biome(&input.semantic_column, &input.sample)
+            photo_solver_biome_for_top(input, block_state_id, source)
         };
         let filler = if block_state_id == input.semantic_column.top_block_state_id {
             input.semantic_column.filler_block_state_id
@@ -5011,7 +5012,7 @@ pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDeci
         ));
     }
     let block_state_id = java_standard_tan_carrier_top(input, source, entry.block_state_id);
-    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    let biome = photo_solver_biome_for_top(input, block_state_id, source);
     let filler = if block_state_id == input.semantic_column.top_block_state_id {
         input.semantic_column.filler_block_state_id
     } else {
@@ -5043,6 +5044,107 @@ fn photo_solver_biome(
         return sample.ecoregion_biome_id.clone();
     }
     semantic_column.biome_id.clone()
+}
+
+fn photo_solver_biome_for_top(input: &PhotoSurfaceInput, top: i32, source: RgbColor) -> String {
+    if is_tinted_vegetation_block(top) {
+        return photo_solver_tinted_vegetation_biome(input, top, source);
+    }
+    photo_solver_biome(&input.semantic_column, &input.sample)
+}
+
+fn photo_solver_tinted_vegetation_biome(
+    input: &PhotoSurfaceInput,
+    top: i32,
+    source: RgbColor,
+) -> String {
+    let fallback = if input.semantic_column.biome_id.trim().is_empty() {
+        "minecraft:plains"
+    } else {
+        input.semantic_column.biome_id.as_str()
+    };
+    photo_solver_grass_biomes(
+        fallback,
+        &input.sample,
+        input.elevation_meters,
+        input.latitude,
+        input.local_relief_meters,
+    )
+    .into_iter()
+    .filter(|biome| !biome.trim().is_empty())
+    .min_by(|left, right| {
+        photo_weighted_render_distance(source, top, left)
+            .partial_cmp(&photo_weighted_render_distance(source, top, right))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+    .unwrap_or_else(|| fallback.to_string())
+}
+
+fn photo_solver_grass_biomes(
+    fallback: &str,
+    sample: &SurfaceMaterialSample,
+    elevation_meters: f64,
+    latitude: f64,
+    local_relief_meters: f64,
+) -> Vec<String> {
+    let base = if fallback.trim().is_empty() {
+        "minecraft:plains"
+    } else {
+        fallback
+    };
+    let evidence = if sample.ecoregion_biome_id.trim().is_empty() {
+        base
+    } else {
+        sample.ecoregion_biome_id.as_str()
+    };
+    let preferred = if is_wet_surface_biome(base)
+        || is_wet_surface_biome(evidence)
+        || sample.swamp_cover_ratio() >= 0.12
+    {
+        "minecraft:swamp"
+    } else if is_photo_solver_forest_biome(base)
+        || is_photo_solver_forest_biome(evidence)
+        || is_tropical_rain_climate(sample.climate_class)
+    {
+        if photo_solver_tropical(latitude, sample) {
+            "minecraft:jungle"
+        } else {
+            "minecraft:forest"
+        }
+    } else if is_dry_vegetation_biome(base)
+        || is_dry_vegetation_biome(evidence)
+        || is_tropical_savanna_climate(sample.climate_class)
+        || is_steppe_climate(sample.climate_class)
+    {
+        if local_relief_meters >= 100.0 || elevation_meters >= 750.0 {
+            "minecraft:windswept_savanna"
+        } else {
+            "minecraft:savanna"
+        }
+    } else if latitude.abs() >= 50.0 || elevation_meters >= 1_500.0 {
+        "minecraft:taiga"
+    } else {
+        base
+    };
+    let mut candidates = Vec::with_capacity(PHOTO_GRASS_RENDER_BIOMES.len() + 2);
+    candidates.push(preferred.to_string());
+    candidates.push(base.to_string());
+    candidates.extend(
+        PHOTO_GRASS_RENDER_BIOMES
+            .iter()
+            .map(|biome| biome.to_string()),
+    );
+    candidates
+}
+
+fn is_photo_solver_forest_biome(biome: &str) -> bool {
+    is_forest_surface_biome(biome) || is_jungle_surface_biome(biome)
+}
+
+fn photo_solver_tropical(latitude: f64, sample: &SurfaceMaterialSample) -> bool {
+    latitude.abs() <= 24.0
+        || is_tropical_rain_climate(sample.climate_class)
+        || is_tropical_savanna_climate(sample.climate_class)
 }
 
 fn solve_authoritative_arid_token_surface(
@@ -5131,7 +5233,7 @@ fn solve_java_standard_vegetation_token_surface(
         if !is_tinted_vegetation_block(baseline.block_state_id) {
             return None;
         }
-        let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+        let biome = photo_solver_biome_for_top(input, baseline.block_state_id, source);
         let tinted_distance =
             photo_weighted_render_distance(source, baseline.block_state_id, &biome);
         let top = nearest_photo_static_carrier(source, STATIC_CARRIER_BLOCKS)
@@ -5159,7 +5261,121 @@ fn solve_java_standard_vegetation_token_surface(
             "java standard gray olive static carrier",
         ));
     }
-    None
+    let solve = java_standard_vegetation_palette_solve(input, source, token)?;
+    Some(photo_surface_decision_from_solve(
+        input,
+        solve,
+        "photo-palette",
+        "palette-token-solver",
+        source,
+        "authoritative java standard vegetation token",
+    ))
+}
+
+#[derive(Clone, Debug)]
+struct PhotoSurfaceSolve {
+    top_block_state_id: i32,
+    biome_id: String,
+    score: f64,
+}
+
+fn java_standard_vegetation_palette_solve(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    token: MetTerrainMatch,
+) -> Option<PhotoSurfaceSolve> {
+    let token_color = input.sample.terrain_token_color;
+    if !token_color.available || !source.available || source.is_near_black() {
+        return None;
+    }
+    let target = photo_blend(
+        source,
+        token_color,
+        java_standard_render_anchor_weight(source, token_color, token),
+    );
+    let mut best: Option<PhotoSurfaceSolve> = None;
+    for &top in PHOTO_SOLVER_CANDIDATE_BLOCKS {
+        if is_tinted_vegetation_block(top) {
+            for biome in photo_solver_grass_biomes(
+                &input.semantic_column.biome_id,
+                &input.sample,
+                input.elevation_meters,
+                input.latitude,
+                input.local_relief_meters,
+            ) {
+                if biome.trim().is_empty() {
+                    continue;
+                }
+                let candidate =
+                    java_standard_palette_candidate(input, source, target, token, top, biome);
+                if best
+                    .as_ref()
+                    .is_none_or(|current| candidate.score < current.score)
+                {
+                    best = Some(candidate);
+                }
+            }
+        } else {
+            let biome =
+                compatible_biome_for_palette_non_grass(&input.semantic_column.biome_id, top);
+            let candidate =
+                java_standard_palette_candidate(input, source, target, token, top, biome);
+            if best
+                .as_ref()
+                .is_none_or(|current| candidate.score < current.score)
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    let baseline = best?;
+    direct_java_standard_vegetation_recipe_solve(input, source, token, &baseline).or(Some(baseline))
+}
+
+fn java_standard_palette_candidate(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    target: RgbColor,
+    token: MetTerrainMatch,
+    top: i32,
+    biome: String,
+) -> PhotoSurfaceSolve {
+    let render_rgb = render_surface_color(top, Some(&biome));
+    let score = photo_ciede2000_color_rgb(target, render_rgb)
+        + java_standard_source_render_preservation_score(source, render_rgb)
+        + java_standard_palette_candidate_bias(input, source, token, top);
+    PhotoSurfaceSolve {
+        top_block_state_id: top,
+        biome_id: biome,
+        score,
+    }
+}
+
+fn photo_surface_decision_from_solve(
+    input: &PhotoSurfaceInput,
+    solve: PhotoSurfaceSolve,
+    recipe_id: &str,
+    stage_id: &str,
+    source: RgbColor,
+    reason: &str,
+) -> PhotoSurfaceDecision {
+    let filler = if solve.top_block_state_id == input.semantic_column.top_block_state_id {
+        input.semantic_column.filler_block_state_id
+    } else {
+        smoother_filler_for(solve.top_block_state_id)
+    };
+    PhotoSurfaceDecision::new(
+        solve.top_block_state_id,
+        filler,
+        solve.biome_id.clone(),
+        render_surface_color(solve.top_block_state_id, Some(&solve.biome_id)),
+        recipe_id,
+        stage_id,
+        format!(
+            "sourceRgb={},{},{};{};top={};biome={}",
+            source.red, source.green, source.blue, reason, solve.top_block_state_id, solve.biome_id
+        ),
+    )
 }
 
 fn photo_surface_decision_for_top(
@@ -5170,7 +5386,7 @@ fn photo_surface_decision_for_top(
     source: RgbColor,
     reason: &str,
 ) -> PhotoSurfaceDecision {
-    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    let biome = photo_solver_biome_for_top(input, top, source);
     let filler = if top == input.semantic_column.top_block_state_id {
         input.semantic_column.filler_block_state_id
     } else {
@@ -5511,6 +5727,571 @@ fn photo_solver_texture_cell_hash(cell_x: i32, cell_z: i32, salt_a: i32, salt_b:
     )
 }
 
+fn java_standard_render_anchor_weight(
+    source_color: RgbColor,
+    token_color: RgbColor,
+    token: MetTerrainMatch,
+) -> f64 {
+    if !source_color.available || !token_color.available {
+        return 0.0;
+    }
+    if photo_rgb_distance_squared(source_color, token_color) > 14_400 {
+        return 0.05;
+    }
+    if is_cross_crop_provisional_token(token) {
+        return 0.35;
+    }
+    0.75
+}
+
+fn java_standard_source_render_preservation_score(source: RgbColor, render_rgb: i32) -> f64 {
+    let ciede = photo_ciede2000_color_rgb(source, render_rgb) * 0.16;
+    let luma_gap = (photo_luma(source) - photo_luma_rgb(render_rgb)).abs();
+    ciede + (luma_gap - 8.0).max(0.0) * 0.045
+}
+
+fn java_standard_palette_candidate_bias(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    token: MetTerrainMatch,
+    top: i32,
+) -> f64 {
+    let mut bias = 0.0;
+    let snow_context = photo_solver_snow_evidence(input, source);
+    if !snow_context && top == block_state_ids::SNOW_BLOCK {
+        bias += 120.0;
+    }
+    if token.kind == MetTerrainKind::Snow && !snow_context {
+        let token_rgb = rgb(
+            i32::from(token.red),
+            i32::from(token.green),
+            i32::from(token.blue),
+        );
+        if top == block_state_ids::SNOW_BLOCK {
+            bias += 90.0;
+        }
+        if top == block_state_ids::QUARTZ_BLOCK {
+            bias += if token_rgb == 0xFAFFFA { -5.0 } else { 18.0 };
+        }
+        if matches!(
+            top,
+            block_state_ids::END_STONE
+                | block_state_ids::CALCITE
+                | block_state_ids::BONE_BLOCK
+                | block_state_ids::SMOOTH_SANDSTONE
+                | block_state_ids::CUT_SANDSTONE
+                | block_state_ids::CHISELED_SANDSTONE
+        ) {
+            bias -= 8.0;
+        }
+    }
+    if photo_solver_dark_standard_shadow(input) {
+        if matches!(
+            top,
+            block_state_ids::BLACK_TERRACOTTA
+                | block_state_ids::DEEPSLATE
+                | block_state_ids::GRAY_TERRACOTTA
+        ) {
+            bias -= 7.5;
+        }
+        if is_tinted_vegetation_block(top) {
+            bias += 18.0;
+        }
+        if matches!(
+            top,
+            block_state_ids::MUD | block_state_ids::MOSS_BLOCK | block_state_ids::PODZOL
+        ) {
+            bias += 5.0;
+        }
+    }
+    if is_photo_solver_coastal_sand_halo_candidate(top, input) {
+        bias += 5.5;
+    }
+    bias
+}
+
+fn direct_java_standard_vegetation_recipe_solve(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    token: MetTerrainMatch,
+    baseline: &PhotoSurfaceSolve,
+) -> Option<PhotoSurfaceSolve> {
+    if !matches!(token.kind, MetTerrainKind::Vegetated | MetTerrainKind::Wet)
+        || !source.available
+        || source.is_near_black()
+        || !input.sample.terrain_token_color.available
+        || photo_solver_snow_evidence(input, source)
+        || photo_solver_gray_olive_standard_target(source)
+    {
+        return None;
+    }
+    let source_metrics = SurfaceColorMetrics::from(source);
+    if !photo_solver_source_looks_clearly_green(source_metrics)
+        && !photo_solver_dark_standard_shadow(input)
+    {
+        return None;
+    }
+    let target =
+        if source_metrics.saturation <= 0.16 && (0.35..=0.72).contains(&source_metrics.value) {
+            source
+        } else {
+            photo_blend(source, input.sample.terrain_token_color, 0.30)
+        };
+    if token_rgb(token) == 0xA79267
+        && photo_luma(source) + 12.0 < photo_luma(input.sample.terrain_token_color)
+    {
+        return java_standard_dry_grass_texture_candidate(
+            input,
+            source,
+            input.sample.terrain_token_color,
+        );
+    }
+    let blocks = if token.kind == MetTerrainKind::Wet {
+        PALETTE_WET_CANDIDATES
+    } else {
+        PALETTE_VEGETATED_CANDIDATES
+    };
+    let mut best: Option<PhotoSurfaceSolve> = None;
+    for &top in blocks {
+        if top == block_state_ids::SNOW_BLOCK {
+            continue;
+        }
+        if is_tinted_vegetation_block(top) {
+            for biome in photo_solver_grass_biomes(
+                &input.semantic_column.biome_id,
+                &input.sample,
+                input.elevation_meters,
+                input.latitude,
+                input.local_relief_meters,
+            ) {
+                if biome.trim().is_empty() {
+                    continue;
+                }
+                let candidate = token_recipe_candidate(target, top, biome);
+                if best
+                    .as_ref()
+                    .is_none_or(|current| candidate.score < current.score)
+                {
+                    best = Some(candidate);
+                }
+            }
+        } else {
+            let biome =
+                compatible_biome_for_palette_non_grass(&input.semantic_column.biome_id, top);
+            let candidate = token_recipe_candidate(target, top, biome);
+            if best
+                .as_ref()
+                .is_none_or(|current| candidate.score < current.score)
+            {
+                best = Some(candidate);
+            }
+        }
+    }
+    let candidate = best?;
+    accept_direct_java_standard_remap(
+        baseline,
+        &candidate,
+        source,
+        input.sample.terrain_token_color,
+        token,
+    )
+    .then_some(candidate)
+}
+
+fn java_standard_dry_grass_texture_candidate(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    standard: RgbColor,
+) -> Option<PhotoSurfaceSolve> {
+    DRY_GRASS_TEXTURE_CANDIDATES
+        .iter()
+        .copied()
+        .map(|top| {
+            let biome =
+                compatible_biome_for_palette_non_grass(&input.semantic_column.biome_id, top);
+            let render_rgb = render_surface_color(top, Some(&biome));
+            PhotoSurfaceSolve {
+                top_block_state_id: top,
+                biome_id: biome,
+                score: source_primary_score(
+                    render_rgb,
+                    rgb(
+                        i32::from(source.red),
+                        i32::from(source.green),
+                        i32::from(source.blue),
+                    ),
+                    rgb(
+                        i32::from(standard.red),
+                        i32::from(standard.green),
+                        i32::from(standard.blue),
+                    ),
+                ),
+            }
+        })
+        .min_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.top_block_state_id.cmp(&right.top_block_state_id))
+        })
+}
+
+fn token_recipe_candidate(target: RgbColor, top: i32, biome: String) -> PhotoSurfaceSolve {
+    let render_rgb = render_surface_color(top, Some(&biome));
+    PhotoSurfaceSolve {
+        top_block_state_id: top,
+        biome_id: biome,
+        score: photo_ciede2000_color_rgb(target, render_rgb),
+    }
+}
+
+fn accept_direct_java_standard_remap(
+    baseline: &PhotoSurfaceSolve,
+    candidate: &PhotoSurfaceSolve,
+    source: RgbColor,
+    standard: RgbColor,
+    token: MetTerrainMatch,
+) -> bool {
+    if same_photo_surface_solve(baseline, candidate) {
+        return false;
+    }
+    let source_rgb = rgb(
+        i32::from(source.red),
+        i32::from(source.green),
+        i32::from(source.blue),
+    );
+    let standard_rgb = rgb(
+        i32::from(standard.red),
+        i32::from(standard.green),
+        i32::from(standard.blue),
+    );
+    let baseline_rgb = render_surface_color(baseline.top_block_state_id, Some(&baseline.biome_id));
+    let candidate_rgb =
+        render_surface_color(candidate.top_block_state_id, Some(&candidate.biome_id));
+    let baseline_score = source_primary_score(baseline_rgb, source_rgb, standard_rgb);
+    let candidate_score = source_primary_score(candidate_rgb, source_rgb, standard_rgb);
+    let primary_gain = baseline_score - candidate_score;
+    let standard_regression = photo_ciede2000_rgb_rgb(candidate_rgb, standard_rgb)
+        - photo_ciede2000_rgb_rgb(baseline_rgb, standard_rgb);
+    if standard_regression <= 1.15 && primary_gain >= 0.12 {
+        return true;
+    }
+    if matches!(token.kind, MetTerrainKind::Sand | MetTerrainKind::RedSand)
+        && standard_regression <= 2.35
+        && primary_gain >= 0.95
+    {
+        return true;
+    }
+    standard_regression <= 3.50 && primary_gain >= 1.80
+}
+
+fn same_photo_surface_solve(left: &PhotoSurfaceSolve, right: &PhotoSurfaceSolve) -> bool {
+    left.top_block_state_id == right.top_block_state_id && left.biome_id == right.biome_id
+}
+
+fn source_primary_score(actual_rgb: i32, source_rgb: i32, standard_rgb: i32) -> f64 {
+    let source_distance = photo_ciede2000_rgb_rgb(actual_rgb, source_rgb);
+    let standard_distance = photo_ciede2000_rgb_rgb(actual_rgb, standard_rgb);
+    let luma_penalty = (photo_luma_rgb(actual_rgb) - photo_luma_rgb(source_rgb)).abs() * 0.01;
+    (source_distance * 0.70) + (standard_distance * 0.30) + luma_penalty
+}
+
+fn photo_solver_source_looks_clearly_green(metrics: SurfaceColorMetrics) -> bool {
+    (photo_solver_green_like_metrics(metrics)
+        || photo_solver_olive_vegetation_like_metrics(metrics))
+        && metrics.value >= 0.18
+        && metrics.saturation >= 0.22
+}
+
+fn photo_solver_green_like_metrics(metrics: SurfaceColorMetrics) -> bool {
+    (58.0..=170.0).contains(&metrics.hue)
+        && metrics.green >= metrics.red * 0.88
+        && metrics.green >= metrics.blue * 1.02
+}
+
+fn photo_solver_olive_vegetation_like_metrics(metrics: SurfaceColorMetrics) -> bool {
+    (42.0..=105.0).contains(&metrics.hue)
+        && metrics.saturation >= 0.12
+        && (0.24..=0.64).contains(&metrics.value)
+        && metrics.green >= metrics.red * 0.72
+        && metrics.green >= metrics.blue * 0.82
+}
+
+fn compatible_biome_for_palette_non_grass(biome: &str, top: i32) -> String {
+    let fallback = if biome.trim().is_empty() {
+        "minecraft:plains"
+    } else {
+        biome
+    };
+    if top == block_state_ids::SNOW_BLOCK {
+        return "minecraft:snowy_plains".to_string();
+    }
+    if top == block_state_ids::SAND || is_photo_solver_pale_sand_carrier(top) {
+        return if fallback.contains("beach") {
+            "minecraft:beach".to_string()
+        } else {
+            fallback.to_string()
+        };
+    }
+    if top == block_state_ids::RED_SAND || is_photo_solver_red_sandstone_carrier(top) {
+        return if fallback.contains("badlands") {
+            fallback.to_string()
+        } else {
+            "minecraft:badlands".to_string()
+        };
+    }
+    fallback.to_string()
+}
+
+fn is_photo_solver_coastal_sand_halo_candidate(top: i32, input: &PhotoSurfaceInput) -> bool {
+    is_photo_solver_sand_like_carrier(top)
+        && input.coast_factor >= 0.70
+        && !is_photo_solver_naturally_sandy_biome(&input.semantic_column.biome_id)
+}
+
+fn is_photo_solver_naturally_sandy_biome(biome: &str) -> bool {
+    let lower = biome.to_ascii_lowercase();
+    lower.contains("desert") || lower.contains("badlands")
+}
+
+fn is_photo_solver_sand_like_carrier(top: i32) -> bool {
+    matches!(
+        top,
+        block_state_ids::SAND
+            | block_state_ids::RED_SAND
+            | block_state_ids::SANDSTONE
+            | block_state_ids::SMOOTH_SANDSTONE
+            | block_state_ids::CUT_SANDSTONE
+            | block_state_ids::CHISELED_SANDSTONE
+            | block_state_ids::SMOOTH_RED_SANDSTONE
+            | block_state_ids::CUT_RED_SANDSTONE
+            | block_state_ids::CHISELED_RED_SANDSTONE
+    )
+}
+
+fn is_photo_solver_pale_sand_carrier(top: i32) -> bool {
+    matches!(
+        top,
+        block_state_ids::SANDSTONE
+            | block_state_ids::END_STONE
+            | block_state_ids::END_STONE_BRICKS
+            | block_state_ids::SMOOTH_SANDSTONE
+            | block_state_ids::CUT_SANDSTONE
+            | block_state_ids::CHISELED_SANDSTONE
+    )
+}
+
+fn is_photo_solver_red_sandstone_carrier(top: i32) -> bool {
+    matches!(
+        top,
+        block_state_ids::SMOOTH_RED_SANDSTONE
+            | block_state_ids::CUT_RED_SANDSTONE
+            | block_state_ids::CHISELED_RED_SANDSTONE
+    )
+}
+
+fn is_cross_crop_provisional_token(token: MetTerrainMatch) -> bool {
+    if !token.confident() {
+        return false;
+    }
+    matches!(
+        token_rgb(token),
+        0x329632
+            | 0x648C6E
+            | 0xFFC880
+            | 0x9BA06E
+            | 0xFFFFBE
+            | 0x003200
+            | 0x958667
+            | 0xFFC840
+            | 0xE6CDA0
+            | 0x323C1E
+    )
+}
+
+fn token_rgb(token: MetTerrainMatch) -> i32 {
+    rgb(
+        i32::from(token.red),
+        i32::from(token.green),
+        i32::from(token.blue),
+    )
+}
+
+fn photo_blend(source: RgbColor, anchor: RgbColor, anchor_weight: f64) -> RgbColor {
+    let t = anchor_weight.clamp(0.0, 1.0);
+    RgbColor::of(
+        clamp_surface_material_color(java_math_round_double_to_narrowed_i32(
+            f64::from(source.red) * (1.0 - t) + f64::from(anchor.red) * t,
+        )),
+        clamp_surface_material_color(java_math_round_double_to_narrowed_i32(
+            f64::from(source.green) * (1.0 - t) + f64::from(anchor.green) * t,
+        )),
+        clamp_surface_material_color(java_math_round_double_to_narrowed_i32(
+            f64::from(source.blue) * (1.0 - t) + f64::from(anchor.blue) * t,
+        )),
+    )
+}
+
+fn photo_rgb_distance_squared(left: RgbColor, right: RgbColor) -> i32 {
+    let red = i32::from(left.red) - i32::from(right.red);
+    let green = i32::from(left.green) - i32::from(right.green);
+    let blue = i32::from(left.blue) - i32::from(right.blue);
+    (red * red) + (green * green) + (blue * blue)
+}
+
+fn photo_ciede2000_color_rgb(left: RgbColor, right_rgb: i32) -> f64 {
+    photo_ciede2000(
+        photo_rgb_to_lab(
+            i32::from(left.red),
+            i32::from(left.green),
+            i32::from(left.blue),
+        ),
+        photo_rgb_to_lab(
+            (right_rgb >> 16) & 0xff,
+            (right_rgb >> 8) & 0xff,
+            right_rgb & 0xff,
+        ),
+    )
+}
+
+fn photo_ciede2000_rgb_rgb(left_rgb: i32, right_rgb: i32) -> f64 {
+    photo_ciede2000(
+        photo_rgb_to_lab(
+            (left_rgb >> 16) & 0xff,
+            (left_rgb >> 8) & 0xff,
+            left_rgb & 0xff,
+        ),
+        photo_rgb_to_lab(
+            (right_rgb >> 16) & 0xff,
+            (right_rgb >> 8) & 0xff,
+            right_rgb & 0xff,
+        ),
+    )
+}
+
+fn photo_ciede2000(left: [f64; 3], right: [f64; 3]) -> f64 {
+    let left_c = left[1].hypot(left[2]);
+    let right_c = right[1].hypot(right[2]);
+    let average_c = (left_c + right_c) * 0.5;
+    let average_c7 = average_c.powf(7.0);
+    let g = 0.5 * (1.0 - (average_c7 / (average_c7 + 25.0_f64.powf(7.0))).sqrt());
+    let left_a_prime = (1.0 + g) * left[1];
+    let right_a_prime = (1.0 + g) * right[1];
+    let left_c_prime = left_a_prime.hypot(left[2]);
+    let right_c_prime = right_a_prime.hypot(right[2]);
+    let left_h_prime = photo_hue_degrees(left_a_prime, left[2]);
+    let right_h_prime = photo_hue_degrees(right_a_prime, right[2]);
+
+    let delta_l_prime = right[0] - left[0];
+    let delta_c_prime = right_c_prime - left_c_prime;
+    let delta_h_prime =
+        photo_delta_hue_prime(left_c_prime, right_c_prime, left_h_prime, right_h_prime);
+    let delta_h =
+        2.0 * (left_c_prime * right_c_prime).sqrt() * (delta_h_prime * 0.5).to_radians().sin();
+
+    let average_l_prime = (left[0] + right[0]) * 0.5;
+    let average_c_prime = (left_c_prime + right_c_prime) * 0.5;
+    let average_h_prime =
+        photo_average_hue_prime(left_c_prime, right_c_prime, left_h_prime, right_h_prime);
+    let t = 1.0 - 0.17 * (average_h_prime - 30.0).to_radians().cos()
+        + 0.24 * (2.0 * average_h_prime).to_radians().cos()
+        + 0.32 * (3.0 * average_h_prime + 6.0).to_radians().cos()
+        - 0.20 * (4.0 * average_h_prime - 63.0).to_radians().cos();
+    let delta_theta = 30.0 * (-((average_h_prime - 275.0) / 25.0).powi(2)).exp();
+    let average_c_prime7 = average_c_prime.powf(7.0);
+    let r_c = 2.0 * (average_c_prime7 / (average_c_prime7 + 25.0_f64.powf(7.0))).sqrt();
+    let l_offset = average_l_prime - 50.0;
+    let s_l = 1.0 + (0.015 * l_offset * l_offset) / (20.0 + l_offset * l_offset).sqrt();
+    let s_c = 1.0 + 0.045 * average_c_prime;
+    let s_h = 1.0 + 0.015 * average_c_prime * t;
+    let r_t = -(2.0 * delta_theta).to_radians().sin() * r_c;
+    let l_term = delta_l_prime / s_l;
+    let c_term = delta_c_prime / s_c;
+    let h_term = delta_h / s_h;
+    (l_term * l_term + c_term * c_term + h_term * h_term + r_t * c_term * h_term).sqrt()
+}
+
+fn photo_hue_degrees(a: f64, b: f64) -> f64 {
+    if a == 0.0 && b == 0.0 {
+        return 0.0;
+    }
+    let hue = b.atan2(a).to_degrees();
+    if hue >= 0.0 {
+        hue
+    } else {
+        hue + 360.0
+    }
+}
+
+fn photo_delta_hue_prime(
+    left_c_prime: f64,
+    right_c_prime: f64,
+    left_h_prime: f64,
+    right_h_prime: f64,
+) -> f64 {
+    if left_c_prime * right_c_prime == 0.0 {
+        return 0.0;
+    }
+    let delta = right_h_prime - left_h_prime;
+    if delta.abs() <= 180.0 {
+        return delta;
+    }
+    if delta > 180.0 {
+        delta - 360.0
+    } else {
+        delta + 360.0
+    }
+}
+
+fn photo_average_hue_prime(
+    left_c_prime: f64,
+    right_c_prime: f64,
+    left_h_prime: f64,
+    right_h_prime: f64,
+) -> f64 {
+    if left_c_prime * right_c_prime == 0.0 {
+        return left_h_prime + right_h_prime;
+    }
+    let difference = (left_h_prime - right_h_prime).abs();
+    if difference <= 180.0 {
+        return (left_h_prime + right_h_prime) * 0.5;
+    }
+    if left_h_prime + right_h_prime < 360.0 {
+        (left_h_prime + right_h_prime + 360.0) * 0.5
+    } else {
+        (left_h_prime + right_h_prime - 360.0) * 0.5
+    }
+}
+
+fn photo_rgb_to_lab(red: i32, green: i32, blue: i32) -> [f64; 3] {
+    let r = photo_pivot_rgb(f64::from(red) / 255.0);
+    let g = photo_pivot_rgb(f64::from(green) / 255.0);
+    let b = photo_pivot_rgb(f64::from(blue) / 255.0);
+    let x = ((r * 0.4124) + (g * 0.3576) + (b * 0.1805)) / 0.95047;
+    let y = ((r * 0.2126) + (g * 0.7152) + (b * 0.0722)) / 1.00000;
+    let z = ((r * 0.0193) + (g * 0.1192) + (b * 0.9505)) / 1.08883;
+    let fx = photo_pivot_xyz(x);
+    let fy = photo_pivot_xyz(y);
+    let fz = photo_pivot_xyz(z);
+    [(116.0 * fy) - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+fn photo_pivot_rgb(value: f64) -> f64 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn photo_pivot_xyz(value: f64) -> f64 {
+    if value > 0.008856 {
+        value.cbrt()
+    } else {
+        (7.787 * value) + (16.0 / 116.0)
+    }
+}
+
 fn fine_photo_solver_hash(x: i32, z: i32) -> f64 {
     let mut hash = 0x9e3779b97f4a7c15_u64;
     hash ^= (x as i64 as u64).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -5702,6 +6483,122 @@ const PALETTE_ROCK_CANDIDATES: [i32; 18] = [
     block_state_ids::CHISELED_RED_SANDSTONE,
 ];
 
+const PHOTO_GRASS_RENDER_BIOMES: [&str; 16] = [
+    "minecraft:dark_forest",
+    "minecraft:jungle",
+    "minecraft:bamboo_jungle",
+    "minecraft:sparse_jungle",
+    "minecraft:forest",
+    "minecraft:flower_forest",
+    "minecraft:taiga",
+    "minecraft:swamp",
+    "minecraft:plains",
+    "minecraft:sunflower_plains",
+    "minecraft:meadow",
+    "minecraft:savanna",
+    "minecraft:savanna_plateau",
+    "minecraft:windswept_savanna",
+    "minecraft:snowy_plains",
+    "minecraft:beach",
+];
+
+const PHOTO_SOLVER_CANDIDATE_BLOCKS: &[i32] = &[
+    block_state_ids::GRASS_BLOCK,
+    block_state_ids::OAK_LEAVES,
+    block_state_ids::JUNGLE_LEAVES,
+    block_state_ids::DARK_OAK_LEAVES,
+    block_state_ids::SPRUCE_LEAVES,
+    block_state_ids::MOSS_BLOCK,
+    block_state_ids::PODZOL,
+    block_state_ids::COARSE_DIRT,
+    block_state_ids::DIRT,
+    block_state_ids::ROOTED_DIRT,
+    block_state_ids::MYCELIUM,
+    block_state_ids::MUD,
+    block_state_ids::PACKED_MUD,
+    block_state_ids::GREEN_TERRACOTTA,
+    block_state_ids::LIME_TERRACOTTA,
+    block_state_ids::GRAY_TERRACOTTA,
+    block_state_ids::BLACK_TERRACOTTA,
+    block_state_ids::SAND,
+    block_state_ids::SANDSTONE,
+    block_state_ids::YELLOW_TERRACOTTA,
+    block_state_ids::WHITE_TERRACOTTA,
+    block_state_ids::LIGHT_GRAY_TERRACOTTA,
+    block_state_ids::BONE_BLOCK,
+    block_state_ids::CALCITE,
+    block_state_ids::QUARTZ_BLOCK,
+    block_state_ids::END_STONE,
+    block_state_ids::END_STONE_BRICKS,
+    block_state_ids::SMOOTH_SANDSTONE,
+    block_state_ids::CUT_SANDSTONE,
+    block_state_ids::CHISELED_SANDSTONE,
+    block_state_ids::GRAVEL,
+    block_state_ids::TERRACOTTA,
+    block_state_ids::RED_SAND,
+    block_state_ids::ORANGE_TERRACOTTA,
+    block_state_ids::RED_TERRACOTTA,
+    block_state_ids::BROWN_TERRACOTTA,
+    block_state_ids::GRANITE,
+    block_state_ids::SMOOTH_RED_SANDSTONE,
+    block_state_ids::CUT_RED_SANDSTONE,
+    block_state_ids::CHISELED_RED_SANDSTONE,
+    block_state_ids::MUD_BRICKS,
+    block_state_ids::DRIPSTONE_BLOCK,
+    block_state_ids::STONE,
+    block_state_ids::TUFF,
+    block_state_ids::DEEPSLATE,
+    block_state_ids::ANDESITE,
+    block_state_ids::DIORITE,
+    block_state_ids::CYAN_TERRACOTTA,
+    block_state_ids::SNOW_BLOCK,
+    block_state_ids::CLAY,
+];
+
+const PALETTE_VEGETATED_CANDIDATES: &[i32] = &[
+    block_state_ids::GRASS_BLOCK,
+    block_state_ids::OAK_LEAVES,
+    block_state_ids::JUNGLE_LEAVES,
+    block_state_ids::DARK_OAK_LEAVES,
+    block_state_ids::SPRUCE_LEAVES,
+    block_state_ids::MOSS_BLOCK,
+    block_state_ids::PODZOL,
+    block_state_ids::COARSE_DIRT,
+    block_state_ids::ROOTED_DIRT,
+    block_state_ids::MYCELIUM,
+    block_state_ids::MUD,
+    block_state_ids::PACKED_MUD,
+    block_state_ids::GREEN_TERRACOTTA,
+    block_state_ids::LIME_TERRACOTTA,
+    block_state_ids::GRAY_TERRACOTTA,
+    block_state_ids::BLACK_TERRACOTTA,
+];
+
+const PALETTE_WET_CANDIDATES: &[i32] = &[
+    block_state_ids::MUD,
+    block_state_ids::CLAY,
+    block_state_ids::MOSS_BLOCK,
+    block_state_ids::GRASS_BLOCK,
+    block_state_ids::OAK_LEAVES,
+    block_state_ids::JUNGLE_LEAVES,
+    block_state_ids::DARK_OAK_LEAVES,
+    block_state_ids::SPRUCE_LEAVES,
+    block_state_ids::PACKED_MUD,
+    block_state_ids::BLACK_TERRACOTTA,
+    block_state_ids::DEEPSLATE,
+];
+
+const DRY_GRASS_TEXTURE_CANDIDATES: &[i32] = &[
+    block_state_ids::COARSE_DIRT,
+    block_state_ids::ROOTED_DIRT,
+    block_state_ids::PACKED_MUD,
+    block_state_ids::PODZOL,
+    block_state_ids::MOSS_BLOCK,
+    block_state_ids::MYCELIUM,
+    block_state_ids::GREEN_TERRACOTTA,
+    block_state_ids::LIME_TERRACOTTA,
+];
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EcoregionSample {
     pub name: String,
@@ -5833,7 +6730,7 @@ pub mod surface_data_evidence {
     }
 }
 
-pub trait SurfaceMaterialSampler {
+pub trait SurfaceMaterialSampler: Send + Sync {
     fn sample(
         &self,
         longitude: f64,
@@ -9114,15 +10011,23 @@ pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<Surfa
     )?;
     let surface_sample_nanos = phase_start.elapsed().as_nanos();
 
-    let mut chunks = BTreeMap::new();
-    let mut land_columns = 0;
-    let mut water_columns = 0;
-    let mut min_ground_y = i32::MAX;
-    let mut max_ground_y = i32::MIN;
-    let mut chunk_build_nanos = 0;
-    let mut nbt_encode_nanos = 0;
-    for local_chunk_z in 0..REGION_CHUNKS {
-        for local_chunk_x in 0..REGION_CHUNKS {
+    struct SurfaceChunkPayloadBuild {
+        local_chunk_x: i32,
+        local_chunk_z: i32,
+        land_columns: i32,
+        water_columns: i32,
+        min_ground_y: i32,
+        max_ground_y: i32,
+        chunk_build_nanos: u128,
+        nbt_encode_nanos: u128,
+        payload: Vec<u8>,
+    }
+
+    let mut chunk_payloads = (0..(REGION_CHUNKS * REGION_CHUNKS))
+        .into_par_iter()
+        .map(|chunk_index| -> Result<SurfaceChunkPayloadBuild> {
+            let local_chunk_x = chunk_index % REGION_CHUNKS;
+            let local_chunk_z = chunk_index / REGION_CHUNKS;
             let chunk_x = settings
                 .region_x
                 .wrapping_mul(REGION_CHUNKS)
@@ -9135,23 +10040,47 @@ pub fn generate_surface_region(settings: &SurfaceRegionSettings) -> Result<Surfa
 
             let phase_start = Instant::now();
             let build = build_surface_chunk(chunk_x, chunk_z, sample.columns())?;
-            chunk_build_nanos += phase_start.elapsed().as_nanos();
-
-            land_columns += build.land_columns;
-            water_columns += build.water_columns;
-            min_ground_y = min_ground_y.min(build.min_ground_y);
-            max_ground_y = max_ground_y.max(build.max_ground_y);
+            let chunk_build_nanos = phase_start.elapsed().as_nanos();
 
             let phase_start = Instant::now();
             let status = surface_chunk_status_for(&build, settings.chunk_status);
             let payload = chunk_nbt_encoder::encode_to_bytes_with_status(&build.chunk, 0, status)?;
-            nbt_encode_nanos += phase_start.elapsed().as_nanos();
+            let nbt_encode_nanos = phase_start.elapsed().as_nanos();
 
-            chunks.insert(
-                ChunkLocalPos::new(local_chunk_x as u8, local_chunk_z as u8)?,
+            Ok(SurfaceChunkPayloadBuild {
+                local_chunk_x,
+                local_chunk_z,
+                land_columns: build.land_columns,
+                water_columns: build.water_columns,
+                min_ground_y: build.min_ground_y,
+                max_ground_y: build.max_ground_y,
+                chunk_build_nanos,
+                nbt_encode_nanos,
                 payload,
-            );
-        }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    chunk_payloads.sort_by_key(|chunk| (chunk.local_chunk_z, chunk.local_chunk_x));
+
+    let mut chunks = BTreeMap::new();
+    let mut land_columns = 0;
+    let mut water_columns = 0;
+    let mut min_ground_y = i32::MAX;
+    let mut max_ground_y = i32::MIN;
+    let mut chunk_build_nanos = 0;
+    let mut nbt_encode_nanos = 0;
+    for chunk in chunk_payloads {
+        land_columns += chunk.land_columns;
+        water_columns += chunk.water_columns;
+        min_ground_y = min_ground_y.min(chunk.min_ground_y);
+        max_ground_y = max_ground_y.max(chunk.max_ground_y);
+        chunk_build_nanos += chunk.chunk_build_nanos;
+        nbt_encode_nanos += chunk.nbt_encode_nanos;
+
+        chunks.insert(
+            ChunkLocalPos::new(chunk.local_chunk_x as u8, chunk.local_chunk_z as u8)?,
+            chunk.payload,
+        );
     }
 
     let region_file = region_file(
@@ -9875,53 +10804,26 @@ where
 
     let water_mask = surface_region_water_decision_mask(&elevations, &valid);
     let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
-    let mut columns = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
-    let mut coast_factors = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
     let collect_photo_materials =
         texture_mode == SurfaceTextureMode::Photo && material_sampler.is_some();
-    let mut photo_material_columns = if collect_photo_materials {
-        Some(vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
-    } else {
-        None
-    };
-    let mut photo_smoothed_elevations = if collect_photo_materials {
-        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
-    } else {
-        None
-    };
-    let mut photo_longitudes = if collect_photo_materials {
-        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
-    } else {
-        None
-    };
-    let mut photo_latitudes = if collect_photo_materials {
-        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
-    } else {
-        None
-    };
-    let mut photo_local_relief_meters = if collect_photo_materials {
-        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
-    } else {
-        None
-    };
-    let mut photo_global_block_x = if collect_photo_materials {
-        Some(vec![0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
-    } else {
-        None
-    };
-    let mut photo_global_block_z = if collect_photo_materials {
-        Some(vec![0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
-    } else {
-        None
-    };
-    let mut photo_token_luma_profile = if collect_photo_materials {
-        Some(PhotoSurfaceTokenLumaProfile::default())
-    } else {
-        None
-    };
-    for local_z in 0..SURFACE_REGION_WIDTH {
-        for local_x in 0..SURFACE_REGION_WIDTH {
-            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+
+    struct SurfaceColumnSampleBuild {
+        column: EarthSurfaceColumn,
+        coast_factor: f64,
+        material: Option<SurfaceMaterialSample>,
+        smoothed_elevation: f64,
+        longitude: f64,
+        latitude: f64,
+        local_relief_meters: f64,
+        global_block_x: i32,
+        global_block_z: i32,
+    }
+
+    let column_builds = (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+        .into_par_iter()
+        .map(|column_index| -> Result<SurfaceColumnSampleBuild> {
+            let local_z = column_index / SURFACE_REGION_WIDTH;
+            let local_x = column_index % SURFACE_REGION_WIDTH;
             let center_x = local_x + SURFACE_REGION_COAST_RADIUS;
             let center_z = local_z + SURFACE_REGION_COAST_RADIUS;
             let global_block_x = region_block_x.wrapping_add(local_x as i32);
@@ -9951,6 +10853,8 @@ where
                 coast_factor,
                 vertical_scale,
             )?;
+            let mut material = None;
+            let mut local_relief_meters = 0.0;
             if let Some(material_sampler) = material_sampler {
                 if should_sample_surface_material(
                     material_sampler,
@@ -9961,7 +10865,7 @@ where
                     let longitude_span = 360.0 / f64::from(mapping.width_blocks);
                     let latitude_span = (mapping.max_latitude - mapping.min_latitude)
                         / f64::from(mapping.height_blocks);
-                    let material = sample_surface_region_material(
+                    let sampled_material = sample_surface_region_material(
                         material_sampler,
                         texture_mode,
                         water,
@@ -9970,11 +10874,11 @@ where
                         longitude_span,
                         latitude_span,
                     )?;
-                    let local_relief_meters =
+                    local_relief_meters =
                         surface_region_local_relief_meters(&elevations, &valid, center_x, center_z);
                     column = apply_surface_region_semantic_material_sample(
                         column,
-                        &material,
+                        &sampled_material,
                         smoothed_elevation,
                         longitude,
                         latitude,
@@ -9982,65 +10886,65 @@ where
                         local_relief_meters,
                         vertical_scale,
                     )?;
-                    if let Some(token_luma_profile) = photo_token_luma_profile.as_mut() {
-                        if !column.water {
-                            token_luma_profile.add(&material);
-                        }
-                    }
-                    if let Some(photo_material_columns) = photo_material_columns.as_mut() {
-                        photo_material_columns[column_index] = Some(material);
-                    }
-                    if let Some(photo_smoothed_elevations) = photo_smoothed_elevations.as_mut() {
-                        photo_smoothed_elevations[column_index] = smoothed_elevation;
-                    }
-                    if let Some(photo_longitudes) = photo_longitudes.as_mut() {
-                        photo_longitudes[column_index] = longitude;
-                    }
-                    if let Some(photo_latitudes) = photo_latitudes.as_mut() {
-                        photo_latitudes[column_index] = latitude;
-                    }
-                    if let Some(photo_local_relief_meters) = photo_local_relief_meters.as_mut() {
-                        photo_local_relief_meters[column_index] = local_relief_meters;
-                    }
-                    if let Some(photo_global_block_x) = photo_global_block_x.as_mut() {
-                        photo_global_block_x[column_index] = global_block_x;
-                    }
-                    if let Some(photo_global_block_z) = photo_global_block_z.as_mut() {
-                        photo_global_block_z[column_index] = global_block_z;
-                    }
+                    material = Some(sampled_material);
                 }
             }
-            columns.push(column);
-            coast_factors.push(coast_factor);
-        }
-    }
 
-    if let Some(photo_material_columns) = photo_material_columns {
-        let photo_token_luma_profile = photo_token_luma_profile.map(Arc::new);
-        let photo_smoothed_elevations = photo_smoothed_elevations.expect("photo elevations");
-        let photo_longitudes = photo_longitudes.expect("photo longitudes");
-        let photo_latitudes = photo_latitudes.expect("photo latitudes");
-        let photo_local_relief_meters = photo_local_relief_meters.expect("photo local relief");
-        let photo_global_block_x = photo_global_block_x.expect("photo global block x");
-        let photo_global_block_z = photo_global_block_z.expect("photo global block z");
-        for (column_index, material) in photo_material_columns.into_iter().enumerate() {
-            if let Some(material) = material {
-                columns[column_index] = apply_surface_region_photo_material_sample(
-                    columns[column_index].clone(),
-                    material,
-                    photo_smoothed_elevations[column_index],
-                    photo_longitudes[column_index],
-                    photo_latitudes[column_index],
-                    coast_factors[column_index],
-                    photo_local_relief_meters[column_index],
-                    photo_global_block_x[column_index],
-                    photo_global_block_z[column_index],
-                    vertical_scale,
-                    photo_token_luma_profile.as_ref(),
-                )?;
+            Ok(SurfaceColumnSampleBuild {
+                column,
+                coast_factor,
+                material,
+                smoothed_elevation,
+                longitude,
+                latitude,
+                local_relief_meters,
+                global_block_x,
+                global_block_z,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let coast_factors = column_builds
+        .iter()
+        .map(|build| build.coast_factor)
+        .collect::<Vec<_>>();
+
+    let columns = if collect_photo_materials {
+        let mut photo_token_luma_profile = PhotoSurfaceTokenLumaProfile::default();
+        for build in &column_builds {
+            if let Some(material) = build.material.as_ref() {
+                if !build.column.water {
+                    photo_token_luma_profile.add(material);
+                }
             }
         }
-    }
+        let photo_token_luma_profile = Arc::new(photo_token_luma_profile);
+        column_builds
+            .into_par_iter()
+            .map(|build| -> Result<EarthSurfaceColumn> {
+                if let Some(material) = build.material {
+                    return apply_surface_region_photo_material_sample(
+                        build.column,
+                        material,
+                        build.smoothed_elevation,
+                        build.longitude,
+                        build.latitude,
+                        build.coast_factor,
+                        build.local_relief_meters,
+                        build.global_block_x,
+                        build.global_block_z,
+                        vertical_scale,
+                        Some(&photo_token_luma_profile),
+                    );
+                }
+                Ok(build.column)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        column_builds
+            .into_iter()
+            .map(|build| build.column)
+            .collect::<Vec<_>>()
+    };
 
     let cleaned = post_process_surface_region_columns(
         &columns,
@@ -18817,6 +19721,100 @@ mod tests {
             block_state_ids::GRASS_BLOCK,
             block_state_ids::DIRT,
             "minecraft:jungle",
+        );
+
+        let high_relief_windswept_grass = photo_surface_decision_for_top(
+            &PhotoSurfaceInput::new(
+                savanna.clone(),
+                SurfaceMaterialSample::land(
+                    RgbColor::of(135, 141, 75),
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    SurfaceMaterialSample::UNKNOWN,
+                    "",
+                    "",
+                    0.0,
+                ),
+                12.0,
+                6.4,
+                -0.02,
+                0.95,
+                180.0,
+                143,
+                0,
+            ),
+            block_state_ids::GRASS_BLOCK,
+            "photo-texture",
+            "source-render-solver",
+            RgbColor::of(135, 141, 75),
+            "high relief dry grass render biome",
+        );
+        assert_eq!(
+            high_relief_windswept_grass.biome_id,
+            "minecraft:windswept_savanna"
+        );
+
+        let java_standard_gray_photo_seed = apply_photo_surface_material(&PhotoSurfaceInput::new(
+            surface_column(
+                false,
+                SEA_LEVEL_Y,
+                i32::MIN,
+                block_state_ids::STONE,
+                block_state_ids::STONE,
+                "minecraft:savanna",
+            )
+            .with_decision_source("material-rule")
+            .with_terrain_token_source(TerrainTokenSource::JavaStandardPalette)
+            .with_data_evidence_flags(192),
+            SurfaceMaterialSample::new(
+                RgbColor::of(136, 137, 137),
+                RgbColor::of(140, 150, 110),
+                TerrainTokenSource::JavaStandardPalette,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                SurfaceMaterialSample::UNKNOWN,
+                54_487,
+                -2_437,
+                SurfaceMaterialSample::UNKNOWN,
+                "",
+                "",
+                0.0,
+            ),
+            2.0927068140875886,
+            6.557704304429194,
+            -0.11223383026673162,
+            0.96875,
+            37.23935019238658,
+            146,
+            2,
+        ))
+        .unwrap();
+        assert_eq!(
+            java_standard_gray_photo_seed.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            java_standard_gray_photo_seed.biome_id,
+            "minecraft:windswept_savanna"
+        );
+        assert_eq!(
+            java_standard_gray_photo_seed.decision_source,
+            "photo-palette"
         );
 
         let black_standard_shadow = apply_photo_surface_material(&PhotoSurfaceInput::new(

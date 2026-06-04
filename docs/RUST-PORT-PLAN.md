@@ -1,7 +1,8 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
-Last status audit: 2026-06-04, audited through the bathymetry shelf parity fix rerun and biome-cell trace diagnostic
+Last status audit: 2026-06-04, audited through the JavaStandard vegetation palette solver rerun, default HeightMap path
+switch, and deterministic Rayon verification-time parallelism
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -16,17 +17,18 @@ build/config.
 Read this checkpoint before starting any new Rust-port work.
 
 - Latest committed baseline before the current biome-cell trace/classification blocker:
-  `ada544e fix(rust): match java bathymetry shelf parity`.
+  `868bd60 feat(rust): trace surface biome cell inputs`.
 - Latest evidence folder:
-  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-bathymetry-shelf`.
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-default-heightmap-parallel`.
 - Previous evidence folder retained for comparison:
-  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-tokenluma`.
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-biome-palette-solver`.
+- Standard local HeightMap path for Rust CLI examples, smoke probes, and parity reruns:
+  `C:\earth_map_resources\HQheightmap.tif`.
 - Active gate: Phase 5 vanilla-delegated photo/material payload mismatch diagnosis after the bathymetry-specific shelf
-  parity fix and the 4x4 biome-cell input trace.
-- Resume from: the first `Active` item in `Current active work`, currently the photo/tinted-grass biome classification
-  path feeding chunk `(8,0)`, cell `(3,0)`: Java writes `minecraft:windswept_savanna`, Rust's traced 4x4 cell
-  input counts list `minecraft:deep_lukewarm_ocean`, `minecraft:warm_ocean`, and `minecraft:savanna`, with no
-  `minecraft:windswept_savanna`.
+  fix, the 4x4 biome-cell input trace, and the JavaStandard vegetation palette solver patch.
+- Resume from: the first `Active` item in `Current active work`, currently chunk `(12,0)`, the first remaining payload
+  mismatch after the `(8,0)` biome-cell blocker was fixed. Do not resume from the older `(8,0)` blocker unless a fresh
+  comparison moves the first mismatch back there.
 - Do not resume from: Phase 0 bootstrap, Phase 1 CLI shell, Phase 2 binary core, Phase 3 region writers, Phase 4
   height-only raster generation, or completed Phase 5 bootstrap slices.
 - If local commits or evidence contradict this checkpoint, update this checkpoint and the status board first in the same
@@ -41,10 +43,10 @@ Read this checkpoint before starting any new Rust-port work.
 - Every future phase/status change must update this board in the same conventional atomic commit as the work that
   changed the status.
 - The current active pointer is Phase 5 photo/material payload mismatch diagnosis. The PHOTO two-pass/TokenLumaProfile
-  implementation gap is addressed, and the bathymetry-specific shelf mismatch that affected chunk `(8,0)` block and
-  `OCEAN_FLOOR` output is fixed. The payload delta remains because the first mismatch is now biome-cell-only. The
-  latest 4x4 trace shows Rust never produces `minecraft:windswept_savanna` for the mismatched cell inputs, so the
-  active target is the Java/Rust photo biome classification path before biome-cell representative writing.
+  implementation gap is addressed, the bathymetry-specific shelf mismatch that affected chunk `(8,0)` block and
+  `OCEAN_FLOOR` output is fixed, and the JavaStandard vegetation palette path now produces the Java-matching
+  `minecraft:windswept_savanna` input for the previously blocking chunk `(8,0)`, cell `(3,0)`. The active target is
+  now the next first mismatch, chunk `(12,0)`.
   Phase 0 is active only as an oracle/corpus harness, not as Rust implementation bootstrap work.
 
 ## Current Status Board
@@ -58,11 +60,11 @@ the current source of truth for work status.
 | Phase 1: Rust skeleton and CLI shell | Done | Cargo workspace, wrappers, command shell, and capability reporting are already in the Rust tree. | No restart. Only add missing compatibility commands when a later phase needs them. |
 | Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. | No active work for fixed NBT/level.dat bootstrap scope. |
 | Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. | No active work for bootstrap writer parity. |
-| Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists; `generate-golden.ps1 -IncludeHeightOnly` promotes the fixed region. | No active work for the current height-only raster scope. |
-| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active biome-cell blocker remains | Commits through `ada544e` include surface/photo/ecoregion/no-climate/snow evidence, PHOTO TokenLumaProfile work, chunk detail diagnostics, and the bathymetry shelf parity fix. The 2026-06-04 bathymetry shelf rerun improved the single-region comparison to `matchingChunks=527`, `mismatchedChunks=497`, `firstMismatch=8,0`. Chunk `(8,0)` now has `heightmap.OCEAN_FLOOR.diffCount=0` and `block.diffCount=0`; the remaining first mismatch is `biomeCell.diffCount=29`, expected `minecraft:windswept_savanna`, actual `minecraft:savanna`. A 4x4 trace of chunk `(8,0)`, cell `(3,0)` lists Rust final input counts as `deep_lukewarm_ocean=8`, `warm_ocean=4`, and `savanna=4`; it has no `windswept_savanna` count entry. | Patch the Java/Rust photo biome classification path, likely the tinted grass/source-render biome selection, before promoting photo/material corpus entries. |
+| Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real height-only MCA/Linear parity evidence exists; `generate-golden.ps1 -IncludeHeightOnly` promotes the fixed region. Current Rust CLI probes use the standard local HeightMap path `C:\earth_map_resources\HQheightmap.tif`; older `E:\HQheightmap.tif` references are historical evidence paths. | No active work for the current height-only raster scope. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active next mismatch remains | Commits through `868bd60` plus the current JavaStandard vegetation palette solver work include surface/photo/ecoregion/no-climate/snow evidence, PHOTO TokenLumaProfile work, chunk detail diagnostics, the bathymetry shelf parity fix, and the 4x4 biome-cell trace. The JavaStandard vegetation palette solver fixes the previous chunk `(8,0)`, cell `(3,0)` blocker: trace column `(146,2)` now writes `topBlockStateId=4`, `biomeId=minecraft:windswept_savanna`, `decisionSource=photo-palette`, and the 4x4 cell counts now match Java (`deep_lukewarm_ocean=8`, `warm_ocean=4`, `savanna=1`, `windswept_savanna=3`). The latest single-region comparison is still red but improved to `matchingChunks=531`, `mismatchedChunks=493`, `firstMismatch=12,0`. | Diagnose chunk `(12,0)` before promoting photo/material corpus entries. |
 | Vanilla-owned gameplay generation | Out of scope | Java and Rust plans delegate ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners to vanilla. | Do not add direct Rust generators for vanilla-owned gameplay features. |
 | Phase 6: quality and visual evidence tools | Pending | Not started because Phase 5 photo/material corpus parity is not green yet. | Start only after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
-| Phase 7: performance optimization | Pending, explicitly tracked but blocked by parity | The performance plan exists in this document, but no optimization is acceptable while Phase 5 payload parity is red. | Start only after Java/Rust corpus parity and Phase 6 quality/visual evidence are green for the same build/config. |
+| Phase 7: performance optimization | Pending, explicitly tracked but blocked by parity | The performance plan exists in this document. A narrow deterministic Rayon change was made early only to reduce verification time; it preserved the previous Rust region SHA-256/payload manifest exactly and does not promote Phase 7. | Start full optimization only after Java/Rust corpus parity and Phase 6 quality/visual evidence are green for the same build/config. |
 
 Current active work:
 
@@ -94,13 +96,26 @@ Current active work:
     `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-bathymetry-shelf\diagnostics\rust-trace-cell-chunk8-0-cell3-0.txt`.
     It lists Rust final input counts as `deep_lukewarm_ocean=8`, `warm_ocean=4`, and `savanna=4`, with no
     `windswept_savanna` count entry.
-13. Active blocker: chunk `(8,0)` still has `biomeCell.diffCount=29`; all listed diffs are
-    expected `minecraft:windswept_savanna`, actual `minecraft:savanna` in biome cell `cellX=3`, `cellZ=0`.
-14. Active next: patch the smallest Rust photo biome classification path, likely Java's source-render/tinted grass
-    biome selection, that explains why Java emits `minecraft:windswept_savanna` while Rust currently emits only
-    `minecraft:savanna` for the land inputs.
-15. Next: rerun the same Java/Rust single-region comparison after the biome-classification patch.
-16. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
+13. Done: the JavaStandard vegetation palette solver now matches the Java oracle for the previous blocker seed column
+    `(146,2)`: Rust writes `photo.topBlockStateId=4`, `photo.biomeId=minecraft:windswept_savanna`, and
+    `photo.decisionSource=photo-palette`.
+14. Done: the rerun 4x4 trace for chunk `(8,0)`, cell `(3,0)` now matches Java final biome counts:
+    `deep_lukewarm_ocean=8`, `warm_ocean=4`, `savanna=1`, and `windswept_savanna=3`.
+15. Done: reran the single-region comparison after the JavaStandard vegetation palette solver patch. Evidence folder:
+    `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-biome-palette-solver`; result:
+    `matchingChunks=531`, `mismatchedChunks=493`, `missingChunks=0`, `extraChunks=0`, `firstMismatch=12,0`.
+16. Done: Rust CLI diagnostic/generation commands now accept omitted heightmap arguments for supported forms and resolve
+    them to the standard local HeightMap path `C:\earth_map_resources\HQheightmap.tif`.
+17. Done: deterministic Rayon parallelism now covers surface column material/photo sampling plus chunk build/NBT
+    encoding for verification-time runs. Release evidence folder:
+    `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-default-heightmap-parallel`; the
+    generated region SHA-256 and payload manifest are identical to the prior Rust candidate. The release evidence run
+    reported `phase.totalInternalMillis=100890` versus the prior candidate's `phase.totalInternalMillis=359668`; treat
+    this as verification-loop evidence, not an isolated benchmark.
+18. Active blocker: chunk `(12,0)` is now the first remaining payload mismatch.
+19. Active next: diagnose chunk `(12,0)` with `compare-region-chunk-details`, targeted trace commands, and Java oracle
+    snippets before promoting photo/material corpus entries.
+20. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
 
 ## Phase 5 Remaining Checklist
 
@@ -135,12 +150,18 @@ The remaining work is the active full-region photo/material parity blocker and t
 - [x] Run the 4x4 trace for chunk `(8,0)`, cell `(3,0)`, and record the narrowed diagnosis:
   Rust final input counts are `deep_lukewarm_ocean=8`, `warm_ocean=4`, and `savanna=4`, with no
   `windswept_savanna` count entry.
-- [ ] Root-cause the remaining photo biome-classification difference:
+- [x] Root-cause the previous photo biome-classification difference:
   expected `minecraft:windswept_savanna`, actual `minecraft:savanna` for chunk `(8,0)`, biome cell `cellX=3`,
-  `cellZ=0`. The current lead is Java's source-render/tinted grass biome selection, because Rust's cell inputs never
-  include `minecraft:windswept_savanna`.
-- [ ] Patch the smallest Rust photo biome-classification path that explains the remaining
+  `cellZ=0`. The mismatch was in the JavaStandard vegetation palette/source-render path feeding the photo solver.
+- [x] Patch the smallest Rust photo biome-classification path that explains the previous
   chunk `(8,0)` delta without weakening existing fixture parity.
+- [x] Rerun the same Java/Rust single-region comparison after the JavaStandard vegetation palette solver patch and
+  record the improved but still-red result: `matchingChunks=531`, `mismatchedChunks=493`, `missingChunks=0`,
+  `extraChunks=0`, `firstMismatch=12,0`.
+- [x] Confirm the deterministic Rayon verification-time parallelism does not change Rust output: the new
+  `vanilla-delegated-linear-probe-20260604-rustcli-default-heightmap-parallel` region SHA-256 and payload manifest are
+  identical to the previous Rust candidate.
+- [ ] Root-cause the next first mismatch, chunk `(12,0)`, using chunk detail comparison and targeted trace diagnostics.
 - [ ] Rerun the same Java/Rust single-region comparison; Phase 5 promotion requires `matchingChunks=1024`,
   `mismatchedChunks=0`, `missingChunks=0`, and `extraChunks=0`.
 - [ ] After the fixed-region photo/material comparison is green, add photo/material entries to the regeneratable
@@ -148,11 +169,10 @@ The remaining work is the active full-region photo/material parity blocker and t
 - [ ] Rerun `cargo test --workspace`, relevant ignored slow fixtures when touched, and the corpus scripts before marking
   Phase 5 corpus parity green.
 
-Phase 5 remaining estimate: the known first-mismatch blocker has narrowed from a full column/material mismatch to a
-biome-cell representative selection mismatch. Treat this as roughly two to three focused work packets: root-cause/fix
-the `windswept_savanna` versus `savanna` biome-cell choice, rerun/verify the fixed region, then promote the
-photo/material corpus entries. The blocker is much narrower than a full Phase 5 restart, but it still blocks Phase 6
-and Phase 7 because the full-region output payload is red.
+Phase 5 remaining estimate: the known first-mismatch blocker moved from chunk `(8,0)` to chunk `(12,0)` after the
+JavaStandard vegetation palette solver fix. Treat the remaining work as a new focused mismatch packet: diagnose/fix
+chunk `(12,0)`, rerun/verify the fixed region, then promote the photo/material corpus entries. This is not a Phase 5
+restart, but it still blocks Phase 6 and full Phase 7 because the full-region output payload is red.
 
 ## Non-Negotiable Rules
 
@@ -161,7 +181,9 @@ and Phase 7 because the full-region output payload is red.
 - MCA and Linear outputs must be byte-identical whenever the compression stream can be matched.
 - If a compression library difference prevents byte-identical region files, the Rust path must still prove identical
   uncompressed chunk payloads and must document the compression delta before promotion.
-- No optimization may land unless the parity corpus stays green.
+- No optimization may land unless all currently green parity fixtures stay green. If a narrow verification-time
+  optimization is accepted before the active red payload gate is fixed, it must prove byte-identical output against the
+  previous Rust candidate and must not promote Phase 7.
 - Quality gates must not be weakened, skipped, or replaced by speed metrics.
 - Generated worlds, logs, previews, and golden artifacts must be written outside source-controlled paths unless they are
   intentionally small test fixtures.
@@ -345,12 +367,12 @@ Bootstrap implementation status on 2026-06-03:
   preserves the bootstrap self-check mode.
 - `rust/scripts/generate-candidates.ps1` reads an existing Java-oracle golden root and regenerates the supported entries
   with the Rust CLI into a candidate root, including candidate payload and SHA-256 manifests for diagnostics.
-- `rust/scripts/generate-golden.ps1 -IncludeHeightOnly` adds default `E:\HQheightmap.tif` height-only MCA/Linear fixed
-  region entries to the Java-oracle corpus; `generate-candidates.ps1` reads those settings and regenerates matching Rust
-  candidate entries.
-- `rust/scripts/generate-golden.ps1 -IncludeSurface` adds default `E:\HQheightmap.tif` no-material surface MCA/Linear
-  fixed-region entries to the Java-oracle corpus; `generate-candidates.ps1` reads those settings and regenerates
-  matching Rust candidate entries.
+- `rust/scripts/generate-golden.ps1 -IncludeHeightOnly` adds default `C:\earth_map_resources\HQheightmap.tif`
+  height-only MCA/Linear fixed region entries to the Java-oracle corpus; `generate-candidates.ps1` reads those settings
+  and regenerates matching Rust candidate entries.
+- `rust/scripts/generate-golden.ps1 -IncludeSurface` adds default `C:\earth_map_resources\HQheightmap.tif` no-material
+  surface MCA/Linear fixed-region entries to the Java-oracle corpus; `generate-candidates.ps1` reads those settings and
+  regenerates matching Rust candidate entries.
 - Verified locally with
   `rust/scripts/generate-golden.ps1 -OutputRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\golden -IncludeHeightOnly`,
   `rust/scripts/generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\golden -OutputRoot D:\earthmap\rust-port-golden\height-corpus-smoke-20260604-094746\candidate`, and
@@ -415,12 +437,12 @@ Suggested commands:
 .\rust\scripts\generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001 -OutputRoot D:\earthmap\rust-port-candidates\v001
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001 -CandidateRoot D:\earthmap\rust-port-candidates\v001
 
-# Extended fixed-region height-only corpus, requires E:\HQheightmap.tif unless -HeightmapPath is set.
+# Extended fixed-region height-only corpus, uses C:\earth_map_resources\HQheightmap.tif unless -HeightmapPath is set.
 .\rust\scripts\generate-golden.ps1 -OutputRoot D:\earthmap\rust-port-golden\v001-height -IncludeHeightOnly
 .\rust\scripts\generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001-height -OutputRoot D:\earthmap\rust-port-candidates\v001-height
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001-height -CandidateRoot D:\earthmap\rust-port-candidates\v001-height
 
-# Extended fixed-region no-material surface corpus, requires E:\HQheightmap.tif unless -SurfaceHeightmapPath is set.
+# Extended fixed-region no-material surface corpus, uses C:\earth_map_resources\HQheightmap.tif unless -SurfaceHeightmapPath is set.
 .\rust\scripts\generate-golden.ps1 -OutputRoot D:\earthmap\rust-port-golden\v001-surface -IncludeSurface
 .\rust\scripts\generate-candidates.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001-surface -OutputRoot D:\earthmap\rust-port-candidates\v001-surface
 .\rust\scripts\compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\v001-surface -CandidateRoot D:\earthmap\rust-port-candidates\v001-surface
@@ -934,6 +956,25 @@ Bootstrap implementation status on 2026-06-03:
   payload parity to `matchingChunks=527`, `mismatchedChunks=497`, `firstMismatch=8,0`. Chunk `(8,0)` now reports
   `heightmap.OCEAN_FLOOR.diffCount=0` and `block.diffCount=0`; the remaining first mismatch is
   `biomeCell.diffCount=29`, expected `minecraft:windswept_savanna`, actual `minecraft:savanna`.
+- JavaStandard vegetation palette follow-up on 2026-06-04: the 4x4 trace for chunk `(8,0)`, cell `(3,0)` showed Rust
+  never emitted `minecraft:windswept_savanna` for the land inputs that Java classified as dry high-relief grass. The
+  Rust photo solver now mirrors the JavaStandard vegetation/source-render palette path for that seed. Trace column
+  `(146,2)` now writes `photo.topBlockStateId=4`, `photo.biomeId=minecraft:windswept_savanna`, and
+  `photo.decisionSource=photo-palette`; the cell counts now match Java (`deep_lukewarm_ocean=8`, `warm_ocean=4`,
+  `savanna=1`, `windswept_savanna=3`). The single-region comparison improved to `matchingChunks=531`,
+  `mismatchedChunks=493`, and `firstMismatch=12,0`. Evidence:
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-biome-palette-solver`.
+- Verification-time parallelism follow-up on 2026-06-04: Rust now uses deterministic Rayon fan-out for surface column
+  material/photo sampling and surface chunk build/NBT encoding. This was accepted before full Phase 7 only to shorten
+  Phase 5 verification runs. The standard HeightMap path for the CLI evidence run was
+  `C:\earth_map_resources\HQheightmap.tif`. The release rerun evidence folder
+  `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-default-heightmap-parallel` produced
+  the same region SHA-256 and identical payload manifest as the prior Rust candidate; Java comparison remains
+  `matchingChunks=531`, `mismatchedChunks=493`, `firstMismatch=12,0`. Internal timing improved from
+  `phase.surfaceSampleMillis=331235`, `phase.chunkBuildMillis=3310`, `phase.nbtEncodeMillis=24836`,
+  `phase.totalInternalMillis=359668` to `phase.surfaceSampleMillis=100452`, `phase.chunkBuildMillis=749`,
+  `phase.nbtEncodeMillis=3344`, `phase.totalInternalMillis=100890`. These are evidence-run timings, not an isolated
+  parallelism-only benchmark.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
@@ -971,7 +1012,17 @@ Acceptance:
 
 ## Phase 7: Performance Optimization
 
-Only start after Phase 5 parity is green for surface output.
+Only start full optimization after Phase 5 parity is green for surface output.
+
+Pre-Phase7 verification-time exception already accepted:
+
+- Deterministic Rayon fan-out is allowed for surface column material/photo sampling and surface chunk build/NBT encoding
+  because it preserves byte-identical Rust output and shortens red-gate verification loops.
+- This exception does not approve output-changing fast paths, compression backend swaps, unordered reductions, SIMD
+  approximations, or broader Phase 7 promotion while Phase 5 payload parity is red.
+- Evidence from `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-default-heightmap-parallel`:
+  previous and new Rust `r.0.0.linear` SHA-256 values match exactly, payload manifests have no diff, and Java comparison
+  remains `matchingChunks=531`, `mismatchedChunks=493`, `firstMismatch=12,0`.
 
 Optimization targets:
 
