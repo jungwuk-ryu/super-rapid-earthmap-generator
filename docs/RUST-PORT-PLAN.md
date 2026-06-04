@@ -1,7 +1,7 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
-Last status audit: 2026-06-04, audited through the Phase 5 PHOTO two-pass/TokenLumaProfile update
+Last status audit: 2026-06-04, audited through commit `d4180c1 feat(rust): add photo region token luma profile`
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -10,6 +10,19 @@ hard gate before any optimization is accepted.
 Current project state: active prototype, production readiness NO-GO. A Rust build does not change the release gate:
 full Earth or nation-war generation remains blocked until `docs/QUALITY-GATES.md` passes for the same candidate
 build/config.
+
+## Resume Checkpoint
+
+Read this checkpoint before starting any new Rust-port work.
+
+- Last confirmed implementation commit: `d4180c1 feat(rust): add photo region token luma profile`.
+- Active gate: Phase 5 vanilla-delegated photo/material payload parity rerun after the TokenLumaProfile fix.
+- Resume from: the first `Active` item in `Current active work`, currently the photo/material comparison and mismatch
+  triage gate.
+- Do not resume from: Phase 0 bootstrap, Phase 1 CLI shell, Phase 2 binary core, Phase 3 region writers, Phase 4
+  height-only raster generation, or completed Phase 5 bootstrap slices.
+- If local commits or evidence contradict this checkpoint, update this checkpoint and the status board first in the same
+  conventional atomic commit as the work that changed the status.
 
 ## Status Tracking Rules
 
@@ -28,16 +41,16 @@ build/config.
 Read this board before choosing the next task. The phase sections below are detailed history and scope; this board is
 the current source of truth for work status.
 
-| Track | Status | Current meaning |
-| --- | --- | --- |
-| Phase 0: oracle and corpus harness | Active, not a restart | Synthetic golden corpus, candidate-root comparison, and Rust candidate generation for `flat-mca`, `flat-linear`, and `palette-stress-mca` are done. Continue by expanding the corpus; do not restart Rust implementation from Phase 0. |
-| Phase 1: Rust skeleton and CLI shell | Done | Cargo workspace, wrappers, command shell, and capability reporting are in place. |
-| Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. |
-| Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. |
-| Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists for fixed regions. `generate-golden.ps1 -IncludeHeightOnly` promotes the default fixed region into the regeneratable corpus. |
-| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices | Commit history and the Phase 5 notes below include surface/photo/ecoregion/no-climate/snow evidence work. `generate-golden.ps1 -IncludeSurface` now promotes the no-material fixed surface region into the corpus. Rust PHOTO region sampling now uses Java-shaped semantic-then-photo passes with a region-wide token luma profile; next rerun the vanilla-delegated photo/material comparison before promoting corpus entries. |
-| Vanilla-owned gameplay generation | Out of scope | Ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners remain vanilla-delegated. Do not add direct Rust generators for them. |
-| Phase 6: quality and visual evidence tools | Pending | Start after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
+| Track | Status | Evidence anchor | Next action |
+| --- | --- | --- | --- |
+| Phase 0: oracle and corpus harness | Active, not a restart | `4a55b98`, `59a8277`, `6fb2e76`, `8df39c2` added golden/candidate corpus tooling and entries. | Expand the corpus only after the active Phase 5 gate is green. Do not restart Rust implementation from Phase 0. |
+| Phase 1: Rust skeleton and CLI shell | Done | Cargo workspace, wrappers, command shell, and capability reporting are already in the Rust tree. | No restart. Only add missing compatibility commands when a later phase needs them. |
+| Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. | No active work for fixed NBT/level.dat bootstrap scope. |
+| Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. | No active work for bootstrap writer parity. |
+| Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists; `generate-golden.ps1 -IncludeHeightOnly` promotes the fixed region. | No active work for the current height-only raster scope. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active gate remains | Commits through `d4180c1` include surface/photo/ecoregion/no-climate/snow evidence and PHOTO TokenLumaProfile work. | Rerun vanilla-delegated photo/material payload comparison and diagnose any remaining chunk delta before promoting photo/material corpus entries. |
+| Vanilla-owned gameplay generation | Out of scope | Java and Rust plans delegate ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners to vanilla. | Do not add direct Rust generators for vanilla-owned gameplay features. |
+| Phase 6: quality and visual evidence tools | Pending | Not started because Phase 5 photo/material corpus parity is not green yet. | Start only after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
 
 Current active work:
 
