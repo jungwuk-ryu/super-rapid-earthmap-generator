@@ -1658,6 +1658,30 @@ fn surface_region_column_trace_lines(
         trace.photo_column.as_ref(),
     ));
     lines.extend(surface_column_trace_lines(
+        "postCell",
+        trace.post_cell_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        "postStabilized",
+        trace.post_stabilized_column.as_ref(),
+    ));
+    lines.extend(surface_component_trace_lines(
+        "postFirstComponentTrace",
+        &trace.post_first_component_trace,
+    ));
+    lines.extend(surface_column_trace_lines(
+        "postSmoothed",
+        trace.post_smoothed_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        "postComponent",
+        trace.post_component_column.as_ref(),
+    ));
+    lines.extend(surface_component_trace_lines(
+        "postComponentTrace",
+        &trace.post_component_trace,
+    ));
+    lines.extend(surface_column_trace_lines(
         "final",
         Some(&trace.final_column),
     ));
@@ -1713,10 +1737,53 @@ fn surface_region_column_trace_lines_with_prefix(
         trace.photo_column.as_ref(),
     ));
     lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.postCell"),
+        trace.post_cell_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.postStabilized"),
+        trace.post_stabilized_column.as_ref(),
+    ));
+    lines.extend(surface_component_trace_lines(
+        &format!("{prefix}.postFirstComponentTrace"),
+        &trace.post_first_component_trace,
+    ));
+    lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.postSmoothed"),
+        trace.post_smoothed_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.postComponent"),
+        trace.post_component_column.as_ref(),
+    ));
+    lines.extend(surface_component_trace_lines(
+        &format!("{prefix}.postComponentTrace"),
+        &trace.post_component_trace,
+    ));
+    lines.extend(surface_column_trace_lines(
         &format!("{prefix}.final"),
         Some(&trace.final_column),
     ));
     lines
+}
+
+fn surface_component_trace_lines(
+    prefix: &str,
+    trace: &Option<earthmap_surface::SurfaceBiomeComponentTrace>,
+) -> Vec<String> {
+    let Some(trace) = trace else {
+        return vec![format!("{prefix}.present=false")];
+    };
+    vec![
+        format!("{prefix}.present=true"),
+        format!("{prefix}.family={}", trace.family),
+        format!("{prefix}.size={}", trace.size),
+        format!(
+            "{prefix}.neighborMajorityBiome={}",
+            trace.neighbor_majority_biome.as_deref().unwrap_or("")
+        ),
+        format!("{prefix}.action={}", trace.action),
+    ]
 }
 
 fn surface_material_trace_lines(
@@ -3261,6 +3328,12 @@ mod tests {
             base_column,
             semantic_column: Some(semantic_column),
             photo_column: Some(photo_column),
+            post_cell_column: None,
+            post_stabilized_column: None,
+            post_first_component_trace: None,
+            post_smoothed_column: None,
+            post_component_column: None,
+            post_component_trace: None,
             final_column,
         };
 
@@ -3274,6 +3347,12 @@ mod tests {
         assert!(lines.contains(&"material.terrainTokenSource=JavaStandardPalette".to_string()));
         assert!(lines.contains(&"semantic.present=true".to_string()));
         assert!(lines.contains(&"photo.decisionSource=photo".to_string()));
+        assert!(lines.contains(&"postCell.present=false".to_string()));
+        assert!(lines.contains(&"postStabilized.present=false".to_string()));
+        assert!(lines.contains(&"postFirstComponentTrace.present=false".to_string()));
+        assert!(lines.contains(&"postSmoothed.present=false".to_string()));
+        assert!(lines.contains(&"postComponent.present=false".to_string()));
+        assert!(lines.contains(&"postComponentTrace.present=false".to_string()));
         assert!(lines.contains(&"final.biomeId=minecraft:windswept_savanna".to_string(),));
     }
 
@@ -3343,6 +3422,12 @@ mod tests {
             base_column,
             semantic_column: Some(semantic_column),
             photo_column: Some(photo_column),
+            post_cell_column: None,
+            post_stabilized_column: None,
+            post_first_component_trace: None,
+            post_smoothed_column: None,
+            post_component_column: None,
+            post_component_trace: None,
             final_column,
         }
     }

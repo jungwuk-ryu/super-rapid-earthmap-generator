@@ -373,7 +373,21 @@ pub struct SurfaceRegionColumnTrace {
     pub base_column: EarthSurfaceColumn,
     pub semantic_column: Option<EarthSurfaceColumn>,
     pub photo_column: Option<EarthSurfaceColumn>,
+    pub post_cell_column: Option<EarthSurfaceColumn>,
+    pub post_stabilized_column: Option<EarthSurfaceColumn>,
+    pub post_first_component_trace: Option<SurfaceBiomeComponentTrace>,
+    pub post_smoothed_column: Option<EarthSurfaceColumn>,
+    pub post_component_column: Option<EarthSurfaceColumn>,
+    pub post_component_trace: Option<SurfaceBiomeComponentTrace>,
     pub final_column: EarthSurfaceColumn,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceBiomeComponentTrace {
+    pub family: String,
+    pub size: usize,
+    pub neighbor_majority_biome: Option<String>,
+    pub action: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -10354,6 +10368,12 @@ pub fn trace_surface_region_columns(
                     base_column,
                     semantic_column,
                     photo_column: None,
+                    post_cell_column: None,
+                    post_stabilized_column: None,
+                    post_first_component_trace: None,
+                    post_smoothed_column: None,
+                    post_component_column: None,
+                    post_component_trace: None,
                     final_column: column.clone(),
                 });
             }
@@ -10395,14 +10415,60 @@ pub fn trace_surface_region_columns(
         }
     }
 
-    let cleaned = post_process_surface_region_columns(
-        &columns,
-        &coast_factors,
-        SURFACE_REGION_WIDTH,
-        settings.texture_mode,
-    )?;
+    let (post_cell, stabilized, smoothed, post_smoothed, preserve_surface) = match settings
+        .texture_mode
+    {
+        SurfaceTextureMode::Photo => {
+            let post_cell = stabilize_surface_biome_cells(&columns, SURFACE_REGION_WIDTH, true);
+            let stabilized = stabilize_small_surface_biome_family_components(
+                &post_cell,
+                SURFACE_REGION_WIDTH,
+                true,
+            );
+            let smoothed = smooth_photo_textures(&stabilized, SURFACE_REGION_WIDTH)?;
+            let post_smoothed = stabilize_small_surface_biome_family_components(
+                &smoothed,
+                SURFACE_REGION_WIDTH,
+                true,
+            );
+            (post_cell, stabilized, smoothed, post_smoothed, true)
+        }
+        SurfaceTextureMode::Classified => {
+            let post_cell = stabilize_surface_biome_cells(&columns, SURFACE_REGION_WIDTH, false);
+            let stabilized = stabilize_small_surface_biome_family_components(
+                &post_cell,
+                SURFACE_REGION_WIDTH,
+                false,
+            );
+            let smoothed = smooth_surface_classes(&stabilized, SURFACE_REGION_WIDTH)?;
+            let post_smoothed = stabilize_small_surface_biome_family_components(
+                &smoothed,
+                SURFACE_REGION_WIDTH,
+                false,
+            );
+            (post_cell, stabilized, smoothed, post_smoothed, false)
+        }
+    };
+    let cleaned =
+        clean_coastal_surface_columns(&post_smoothed, &coast_factors, SURFACE_REGION_WIDTH)?;
     for (&column_index, &request_index) in &selected {
         if let Some(trace) = traces[request_index].as_mut() {
+            trace.post_cell_column = Some(post_cell[column_index].clone());
+            trace.post_stabilized_column = Some(stabilized[column_index].clone());
+            trace.post_first_component_trace = Some(surface_biome_component_trace(
+                &post_cell,
+                SURFACE_REGION_WIDTH,
+                column_index,
+                preserve_surface,
+            ));
+            trace.post_smoothed_column = Some(smoothed[column_index].clone());
+            trace.post_component_column = Some(post_smoothed[column_index].clone());
+            trace.post_component_trace = Some(surface_biome_component_trace(
+                &smoothed,
+                SURFACE_REGION_WIDTH,
+                column_index,
+                preserve_surface,
+            ));
             trace.final_column = cleaned[column_index].clone();
         }
     }
@@ -13820,6 +13886,124 @@ fn stabilize_small_surface_biome_family_components(
         }
     }
     result
+}
+
+fn surface_biome_component_trace(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+    seed_index: usize,
+    preserve_surface: bool,
+) -> SurfaceBiomeComponentTrace {
+    let height = columns.len() / width;
+    let seed = &columns[seed_index];
+    if seed.water {
+        return SurfaceBiomeComponentTrace {
+            family: String::new(),
+            size: 0,
+            neighbor_majority_biome: None,
+            action: "skip-water".to_string(),
+        };
+    }
+    if is_protected_intent_biome(&seed.biome_id) {
+        return SurfaceBiomeComponentTrace {
+            family: intent_biome_family(&seed.biome_id),
+            size: 0,
+            neighbor_majority_biome: None,
+            action: "skip-protected-biome".to_string(),
+        };
+    }
+    if preserve_surface && is_render_locked_photo_biome(seed) {
+        return SurfaceBiomeComponentTrace {
+            family: intent_biome_family(&seed.biome_id),
+            size: 0,
+            neighbor_majority_biome: None,
+            action: "skip-render-locked".to_string(),
+        };
+    }
+    let family = intent_biome_family(&seed.biome_id);
+    let mut visited = vec![false; columns.len()];
+    let mut in_component = vec![false; columns.len()];
+    let mut component = Vec::<usize>::new();
+    let mut queue = VecDeque::<usize>::new();
+    visited[seed_index] = true;
+    in_component[seed_index] = true;
+    queue.push_back(seed_index);
+    while let Some(current) = queue.pop_front() {
+        component.push(current);
+        let x = current % width;
+        let z = current / width;
+        enqueue_same_intent_family(
+            columns,
+            &mut visited,
+            &mut in_component,
+            &mut queue,
+            current.wrapping_sub(width),
+            z > 0,
+            &family,
+            preserve_surface,
+        );
+        enqueue_same_intent_family(
+            columns,
+            &mut visited,
+            &mut in_component,
+            &mut queue,
+            current + width,
+            z < height - 1,
+            &family,
+            preserve_surface,
+        );
+        enqueue_same_intent_family(
+            columns,
+            &mut visited,
+            &mut in_component,
+            &mut queue,
+            current.wrapping_sub(1),
+            x > 0,
+            &family,
+            preserve_surface,
+        );
+        enqueue_same_intent_family(
+            columns,
+            &mut visited,
+            &mut in_component,
+            &mut queue,
+            current + 1,
+            x < width - 1,
+            &family,
+            preserve_surface,
+        );
+    }
+    let neighbor_majority_biome =
+        neighboring_intent_majority_biome(columns, width, height, &component, &in_component);
+    let production_seed = component
+        .iter()
+        .copied()
+        .min()
+        .map(|index| &columns[index])
+        .unwrap_or(seed);
+    let production_family = intent_biome_family(&production_seed.biome_id);
+    let action = if component.len() > SMALL_BIOME_COMPONENT_MAX {
+        "skip-large-component"
+    } else if neighbor_majority_biome.is_none() {
+        "skip-no-neighbor-majority"
+    } else {
+        let replacement_biome = neighbor_majority_biome.as_deref().unwrap_or_default();
+        if replacement_biome == production_seed.biome_id {
+            "skip-already-majority"
+        } else if component.len() > 16
+            && is_arid_transition_pair(&production_family, &intent_biome_family(replacement_biome))
+        {
+            "skip-arid-transition-pair"
+        } else {
+            "replace"
+        }
+    };
+    SurfaceBiomeComponentTrace {
+        family,
+        size: component.len(),
+        neighbor_majority_biome,
+        action: action.to_string(),
+    }
 }
 
 fn enqueue_same_intent_family(
@@ -18672,6 +18856,66 @@ mod tests {
         assert_eq!(tied_center.biome_id, "minecraft:desert");
         assert_eq!(tied_center.top_block_state_id, block_state_ids::SAND);
         assert_eq!(tied_center.decision_source, "intent-stabilized-component");
+
+        let mut mixed_family_component = filled_surface_columns(3, 3, water_surface_column());
+        mixed_family_component[surface_class_index(1, 0, 3)] = photo_palette_surface_column(
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:forest",
+        );
+        mixed_family_component[surface_class_index(2, 0, 3)] = photo_palette_surface_column(
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:forest",
+        );
+        mixed_family_component[surface_class_index(1, 1, 3)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:forest",
+        );
+        mixed_family_component[surface_class_index(2, 1, 3)] = surface_column(
+            false,
+            SEA_LEVEL_Y + 4,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:dark_forest",
+        );
+        mixed_family_component[surface_class_index(1, 2, 3)] = photo_palette_surface_column(
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:forest",
+        );
+        mixed_family_component[surface_class_index(2, 2, 3)] = photo_palette_surface_column(
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:forest",
+        );
+        let mixed_trace = surface_biome_component_trace(
+            &mixed_family_component,
+            3,
+            surface_class_index(2, 1, 3),
+            true,
+        );
+        assert_eq!(mixed_trace.family, "forest");
+        assert_eq!(mixed_trace.size, 2);
+        assert_eq!(
+            mixed_trace.neighbor_majority_biome.as_deref(),
+            Some("minecraft:forest")
+        );
+        assert_eq!(mixed_trace.action, "skip-already-majority");
+        let mixed_smoothed = stabilize_small_surface_biome_components_preserving_surfaces(
+            &mixed_family_component,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            mixed_smoothed[surface_class_index(2, 1, 3)].biome_id,
+            "minecraft:dark_forest"
+        );
 
         let mut swamp = filled_surface_columns(
             8,

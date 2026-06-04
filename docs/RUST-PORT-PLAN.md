@@ -2,7 +2,7 @@
 
 Date: 2026-06-03
 Last status audit: 2026-06-04, audited through the JavaStandard vegetation palette solver rerun, default HeightMap path
-switch, and deterministic Rayon verification-time parallelism
+switch, deterministic Rayon verification-time parallelism, and chunk `(12,0)` component-stage diagnostics
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -16,8 +16,8 @@ build/config.
 
 Read this checkpoint before starting any new Rust-port work.
 
-- Latest committed baseline before the current biome-cell trace/classification blocker:
-  `868bd60 feat(rust): trace surface biome cell inputs`.
+- Latest accepted output/evidence baseline before the current chunk `(12,0)` component/postprocess blocker:
+  `63404a2 feat(rust): accelerate phase5 verification path`.
 - Latest evidence folder:
   `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-default-heightmap-parallel`.
 - Previous evidence folder retained for comparison:
@@ -25,7 +25,8 @@ Read this checkpoint before starting any new Rust-port work.
 - Standard local HeightMap path for Rust CLI examples, smoke probes, and parity reruns:
   `C:\earth_map_resources\HQheightmap.tif`.
 - Active gate: Phase 5 vanilla-delegated photo/material payload mismatch diagnosis after the bathymetry-specific shelf
-  fix, the 4x4 biome-cell input trace, and the JavaStandard vegetation palette solver patch.
+  fix, the 4x4 biome-cell input trace, the JavaStandard vegetation palette solver patch, and the deterministic
+  verification-time Rayon fan-out.
 - Resume from: the first `Active` item in `Current active work`, currently chunk `(12,0)`, the first remaining payload
   mismatch after the `(8,0)` biome-cell blocker was fixed. Do not resume from the older `(8,0)` blocker unless a fresh
   comparison moves the first mismatch back there.
@@ -61,7 +62,7 @@ the current source of truth for work status.
 | Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. | No active work for fixed NBT/level.dat bootstrap scope. |
 | Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. | No active work for bootstrap writer parity. |
 | Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real height-only MCA/Linear parity evidence exists; `generate-golden.ps1 -IncludeHeightOnly` promotes the fixed region. Current Rust CLI probes use the standard local HeightMap path `C:\earth_map_resources\HQheightmap.tif`; older `E:\HQheightmap.tif` references are historical evidence paths. | No active work for the current height-only raster scope. |
-| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active next mismatch remains | Commits through `868bd60` plus the current JavaStandard vegetation palette solver work include surface/photo/ecoregion/no-climate/snow evidence, PHOTO TokenLumaProfile work, chunk detail diagnostics, the bathymetry shelf parity fix, and the 4x4 biome-cell trace. The JavaStandard vegetation palette solver fixes the previous chunk `(8,0)`, cell `(3,0)` blocker: trace column `(146,2)` now writes `topBlockStateId=4`, `biomeId=minecraft:windswept_savanna`, `decisionSource=photo-palette`, and the 4x4 cell counts now match Java (`deep_lukewarm_ocean=8`, `warm_ocean=4`, `savanna=1`, `windswept_savanna=3`). The latest single-region comparison is still red but improved to `matchingChunks=531`, `mismatchedChunks=493`, `firstMismatch=12,0`. | Diagnose chunk `(12,0)` before promoting photo/material corpus entries. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices; active next mismatch remains | Output-parity evidence through `63404a2` includes surface/photo/ecoregion/no-climate/snow evidence, PHOTO TokenLumaProfile work, chunk detail diagnostics, the bathymetry shelf parity fix, the 4x4 biome-cell trace, the JavaStandard vegetation palette solver fix for chunk `(8,0)`, the standard CLI HeightMap default, and deterministic verification-time Rayon fan-out. The latest accepted single-region comparison is still red: `matchingChunks=531`, `mismatchedChunks=493`, `missingChunks=0`, `extraChunks=0`, `firstMismatch=12,0`. | Diagnose chunk `(12,0)` component/postprocess parity before promoting photo/material corpus entries. |
 | Vanilla-owned gameplay generation | Out of scope | Java and Rust plans delegate ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners to vanilla. | Do not add direct Rust generators for vanilla-owned gameplay features. |
 | Phase 6: quality and visual evidence tools | Pending | Not started because Phase 5 photo/material corpus parity is not green yet. | Start only after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
 | Phase 7: performance optimization | Pending, explicitly tracked but blocked by parity | The performance plan exists in this document. A narrow deterministic Rayon change was made early only to reduce verification time; it preserved the previous Rust region SHA-256/payload manifest exactly and does not promote Phase 7. | Start full optimization only after Java/Rust corpus parity and Phase 6 quality/visual evidence are green for the same build/config. |
@@ -112,10 +113,24 @@ Current active work:
     generated region SHA-256 and payload manifest are identical to the prior Rust candidate. The release evidence run
     reported `phase.totalInternalMillis=100890` versus the prior candidate's `phase.totalInternalMillis=359668`; treat
     this as verification-loop evidence, not an isolated benchmark.
-18. Active blocker: chunk `(12,0)` is now the first remaining payload mismatch.
-19. Active next: diagnose chunk `(12,0)` with `compare-region-chunk-details`, targeted trace commands, and Java oracle
-    snippets before promoting photo/material corpus entries.
-20. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
+18. Done: chunk `(12,0)` detail comparison for the accepted baseline shows this is no longer a heightmap issue:
+    `heightmap.OCEAN_FLOOR.diffCount=0`, `biomeCell.diffCount=44`, and `block.diffCount=6`. The block deltas are
+    moss/grass surface-policy fallout from biome differences.
+19. Done: `trace-surface-region-column` and `trace-surface-region-cell` now expose post-cell, first component,
+    smoother, second component, and final column states plus component size/neighbor/action diagnostics.
+20. Done: targeted chunk `(12,0)` traces show Rust over-preserves a large forest/jungle/savanna postprocess shape:
+    selected components report neighbor majority `minecraft:dark_forest` but exceed `SMALL_BIOME_COMPONENT_MAX=64`,
+    so the Java-expected dark-forest absorption is not applied.
+21. Done but not adopted: a narrow experiment that forced the dark JavaStandard shadow fast path to keep semantic
+    non-grass biome values matched a single Java solver probe, but worsened region-level parity. The experiment folder
+    `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-rustcli-dark-shadow-fix` compared against
+    Java with `biomeCell.diffCount=376` for chunk `(12,0)` and compared against the accepted Rust baseline with
+    `biomeCell.diffCount=332`, so that functional change must not be used.
+22. Active blocker: chunk `(12,0)` is still the first remaining accepted-baseline payload mismatch.
+23. Active next: compare Java and Rust pre/post component region inputs around chunk `(12,0)` and identify why Java's
+    forest/dark-forest component remains small enough or differently seeded while Rust's corresponding component is
+    too large to replace.
+24. Next: only after photo/material corpus parity is green, expand Phase 6 quality and visual evidence tooling.
 
 ## Phase 5 Remaining Checklist
 
@@ -161,7 +176,20 @@ The remaining work is the active full-region photo/material parity blocker and t
 - [x] Confirm the deterministic Rayon verification-time parallelism does not change Rust output: the new
   `vanilla-delegated-linear-probe-20260604-rustcli-default-heightmap-parallel` region SHA-256 and payload manifest are
   identical to the previous Rust candidate.
-- [ ] Root-cause the next first mismatch, chunk `(12,0)`, using chunk detail comparison and targeted trace diagnostics.
+- [x] Run chunk `(12,0)` detail comparison for the accepted baseline and record the current mismatch shape:
+  `heightmap.OCEAN_FLOOR.diffCount=0`, `biomeCell.diffCount=44`, and `block.diffCount=6`.
+- [x] Extend Rust trace diagnostics so selected columns show `postCell`, `postStabilized`,
+  `postFirstComponentTrace`, `postSmoothed`, `postComponent`, `postComponentTrace`, and `final` stages.
+- [x] Probe chunk `(12,0)`, cells `(2,0)` and `(3,0)`, and record that Rust component traces see
+  `neighborMajorityBiome=minecraft:dark_forest` but skip replacement when the component is larger than
+  `SMALL_BIOME_COMPONENT_MAX=64`.
+- [x] Test the tempting dark JavaStandard shadow semantic-biome adjustment and reject it: it matched a single Java
+  direct-solver probe but worsened chunk `(12,0)` region parity to `biomeCell.diffCount=376` versus Java and
+  introduced `biomeCell.diffCount=332` versus the accepted Rust baseline.
+- [ ] Root-cause why Java and Rust build different pre/post component shapes around chunk `(12,0)`, especially the
+  forest/dark-forest/savanna boundary that controls whether `dark_forest` absorbs the local component.
+- [ ] Patch only the smallest confirmed Rust input or postprocess parity gap for chunk `(12,0)`; do not change
+  component size thresholds or dark-shadow biome behavior based on the rejected experiment alone.
 - [ ] Rerun the same Java/Rust single-region comparison; Phase 5 promotion requires `matchingChunks=1024`,
   `mismatchedChunks=0`, `missingChunks=0`, and `extraChunks=0`.
 - [ ] After the fixed-region photo/material comparison is green, add photo/material entries to the regeneratable
@@ -173,6 +201,42 @@ Phase 5 remaining estimate: the known first-mismatch blocker moved from chunk `(
 JavaStandard vegetation palette solver fix. Treat the remaining work as a new focused mismatch packet: diagnose/fix
 chunk `(12,0)`, rerun/verify the fixed region, then promote the photo/material corpus entries. This is not a Phase 5
 restart, but it still blocks Phase 6 and full Phase 7 because the full-region output payload is red.
+
+## Phase 5 To Phase 7 Remaining Work
+
+This is the forward task list. Do not restart earlier completed phases.
+
+Phase 5 remaining:
+
+- [ ] Compare Java and Rust component-stage inputs around chunk `(12,0)` at region scale, not only single-column
+  direct solver probes.
+- [ ] Explain why Java's dark-forest replacement applies in the same local area while Rust reports component sizes
+  larger than `SMALL_BIOME_COMPONENT_MAX=64`.
+- [ ] Patch the smallest confirmed parity gap in Rust photo/material input shaping or biome postprocessing.
+- [ ] Regenerate the single Java/Rust Linear V2 region and require `matchingChunks=1024`, `mismatchedChunks=0`,
+  `missingChunks=0`, and `extraChunks=0`.
+- [ ] Promote fixed photo/material entries into the regeneratable golden/candidate corpus.
+- [ ] Run focused Rust tests, relevant Java oracle commands, `cargo test --workspace`, and corpus scripts before
+  marking Phase 5 green.
+
+Phase 6 remaining:
+
+- [ ] Start only after Phase 5 corpus-backed photo/material parity is green.
+- [ ] Add or port visual evidence commands for the fixed photo/material regions.
+- [ ] Add acceptance reports that connect generated chunks, preview/topdown outputs, and documented quality gates.
+- [ ] Keep vanilla-owned gameplay generation delegated; do not add ore, cave, structure, stronghold, End portal, loot,
+  or spawner generation to Rust.
+
+Phase 7 remaining:
+
+- [ ] Start full optimization only after Phase 5 and Phase 6 are green for the same build/config.
+- [ ] Benchmark the accepted parity build as the baseline before further optimization.
+- [ ] Expand deterministic parallelism beyond the current verification-time Rayon fan-out only when byte-identical
+  payload parity is preserved.
+- [ ] Profile heightmap row-cache behavior, surface material sampling, chunk build, NBT encode, and region write costs.
+- [ ] Add repeatable benchmark scripts and document CPU/thread settings, input paths, and output SHA-256/payload
+  manifest evidence.
+- [ ] Reject optimizations that change Java/Rust output parity, even if they improve runtime.
 
 ## Non-Negotiable Rules
 
