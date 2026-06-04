@@ -1,7 +1,7 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
-Last status audit: 2026-06-04, audited through commit `06a85ab docs: record photo material parity blocker`
+Last status audit: 2026-06-04, audited through commit `3411049 feat(rust): summarize region chunk diagnostics`
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -43,8 +43,12 @@ Current active work:
 1. Done: `rust/scripts/generate-candidates.ps1` can regenerate supported Rust candidate entries from a Java golden root.
 2. Done: `rust/scripts/generate-golden.ps1 -IncludeHeightOnly` adds fixed-region height-only MCA/Linear entries.
 3. Done: `rust/scripts/generate-golden.ps1 -IncludeSurface` adds no-material fixed-region surface MCA/Linear entries.
-4. Next: resolve the vanilla-delegated photo/material payload delta before adding photo/material corpus entries.
-5. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
+4. Done: `summarize-region-chunk` can compare Java/Rust region chunk root fields, heightmap edges, and section
+   block/biome palette summaries for mismatch triage.
+5. Active blocker: resolve the vanilla-delegated photo/material payload delta before adding photo/material corpus
+   entries. Current leading cause is Rust PHOTO-mode region sampling not yet matching Java's two-pass
+   semantic-then-photo flow with the region-wide `TokenLumaProfile`.
+6. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
 
 ## Non-Negotiable Rules
 
@@ -804,6 +808,11 @@ Bootstrap implementation status on 2026-06-03:
   `D:\earthmap\rust-port-golden\vanilla-delegated-linear-probe-20260604-101831`; `compare-golden.ps1` reported
   `matchingChunks=491`, `mismatchedChunks=533`, and `firstMismatch=8,0`. Do not add photo/material corpus entries or
   expose the Rust vanilla-delegated command until this payload delta is explained and fixed.
+- Follow-up diagnosis on 2026-06-04: `summarize-region-chunk` shows the first mismatch is concentrated in chunk biome
+  palettes and one ocean-floor heightmap edge, not in chunk coordinates or status metadata. Java includes
+  `minecraft:windswept_savanna` in mixed biome sections for chunk `(8,0)` while the Rust candidate has simpler
+  `deep_lukewarm_ocean|savanna` palettes. The current leading cause is Rust PHOTO-mode region sampling missing Java's
+  region-wide two-pass `TokenLumaProfile` flow before photo material solving.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 
