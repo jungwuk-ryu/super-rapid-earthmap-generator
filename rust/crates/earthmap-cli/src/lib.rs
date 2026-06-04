@@ -14,7 +14,9 @@ use earthmap_geo::{
 use earthmap_minecraft::{
     block_state_ids,
     chunk_generation_status::ChunkGenerationStatus,
-    chunk_model::{ChunkModel, CHUNK_WIDTH, SECTION_BIOME_CELL_COUNT, SECTION_BLOCK_COUNT},
+    chunk_model::{
+        ChunkModel, BIOME_CELL_WIDTH, CHUNK_WIDTH, SECTION_BIOME_CELL_COUNT, SECTION_BLOCK_COUNT,
+    },
     chunk_nbt_encoder, level_dat_template,
     nbt::{self, Tag},
     packed_long_array::PackedLongArray,
@@ -141,6 +143,21 @@ where
                 args.get(7).map(String::as_str),
             ))
         }
+        "trace-surface-region-cell" if args.len() == 9 || args.len() == 10 => {
+            write_result(trace_surface_region_cell(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7],
+                &args[8],
+                args.get(9).map(String::as_str),
+            ))
+        }
         "write-sha256-manifest" if args.len() == 3 => {
             write_result(write_sha256_manifest(stdout, stderr, &args[1], &args[2]))
         }
@@ -261,6 +278,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  trace-surface-region-column <heightmap> <scale> <regionX> <regionZ> <localX> <localZ> [surfaceRaster=auto|path]"
+    )?;
+    writeln!(
+        out,
+        "  trace-surface-region-cell <heightmap> <scale> <regionX> <regionZ> <chunkLocalX> <chunkLocalZ> <cellX> <cellZ> [surfaceRaster=auto|path]"
     )?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
     writeln!(out, "  generate-palette-stress-world <worldDir>")?;
@@ -1205,11 +1226,119 @@ fn trace_surface_region_column_impl(
     local_z_text: &str,
     surface_raster_text: &str,
 ) -> std::result::Result<Vec<String>, String> {
+    let local_x = parse_region_local_block_coord(local_x_text, "localX")?;
+    let local_z = parse_region_local_block_coord(local_z_text, "localZ")?;
+    let (settings, surface_material_path) = surface_region_trace_settings(
+        heightmap_path,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        surface_raster_text,
+    )?;
+    let traces = earthmap_surface::trace_surface_region_columns(
+        &settings,
+        &[(local_x as usize, local_z as usize)],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(surface_region_column_trace_lines(
+        &traces[0],
+        &surface_material_path,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_surface_region_cell(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    chunk_local_x_text: &str,
+    chunk_local_z_text: &str,
+    cell_x_text: &str,
+    cell_z_text: &str,
+    surface_raster_text: Option<&str>,
+) -> io::Result<i32> {
+    match trace_surface_region_cell_impl(
+        heightmap_path,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        chunk_local_x_text,
+        chunk_local_z_text,
+        cell_x_text,
+        cell_z_text,
+        surface_raster_text.unwrap_or("surfaceRaster=auto"),
+    ) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Surface region cell trace failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_surface_region_cell_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    chunk_local_x_text: &str,
+    chunk_local_z_text: &str,
+    cell_x_text: &str,
+    cell_z_text: &str,
+    surface_raster_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let chunk_local_x = parse_region_local_chunk_coord(chunk_local_x_text, "chunkLocalX")?;
+    let chunk_local_z = parse_region_local_chunk_coord(chunk_local_z_text, "chunkLocalZ")?;
+    let cell_x = parse_chunk_biome_cell_coord(cell_x_text, "cellX")?;
+    let cell_z = parse_chunk_biome_cell_coord(cell_z_text, "cellZ")?;
+    let (settings, surface_material_path) = surface_region_trace_settings(
+        heightmap_path,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        surface_raster_text,
+    )?;
+    let origin_x =
+        (usize::from(chunk_local_x) * CHUNK_WIDTH) + (usize::from(cell_x) * BIOME_CELL_WIDTH);
+    let origin_z =
+        (usize::from(chunk_local_z) * CHUNK_WIDTH) + (usize::from(cell_z) * BIOME_CELL_WIDTH);
+    let mut local_columns = Vec::with_capacity(BIOME_CELL_WIDTH * BIOME_CELL_WIDTH);
+    for dz in 0..BIOME_CELL_WIDTH {
+        for dx in 0..BIOME_CELL_WIDTH {
+            local_columns.push((origin_x + dx, origin_z + dz));
+        }
+    }
+    let traces = earthmap_surface::trace_surface_region_columns(&settings, &local_columns)
+        .map_err(|error| error.to_string())?;
+    Ok(surface_region_cell_trace_lines(
+        chunk_local_x,
+        chunk_local_z,
+        cell_x,
+        cell_z,
+        &traces,
+        &surface_material_path,
+    ))
+}
+
+fn surface_region_trace_settings(
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    surface_raster_text: &str,
+) -> std::result::Result<(SurfaceRegionSettings, std::path::PathBuf), String> {
     let scale = parse_i32_string(scale_text)?;
     let region_x = parse_i32_string(region_x_text)?;
     let region_z = parse_i32_string(region_z_text)?;
-    let local_x = parse_region_local_block_coord(local_x_text, "localX")?;
-    let local_z = parse_region_local_block_coord(local_z_text, "localZ")?;
     let surface_material_path =
         parse_optional_surface_material_path(surface_raster_text, Path::new(heightmap_path))?
             .ok_or_else(|| {
@@ -1234,15 +1363,7 @@ fn trace_surface_region_column_impl(
     )
     .map_err(|error| error.to_string())?;
     settings.surface_material_path = Some(surface_material_path.clone());
-    let traces = earthmap_surface::trace_surface_region_columns(
-        &settings,
-        &[(local_x as usize, local_z as usize)],
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(surface_region_column_trace_lines(
-        &traces[0],
-        &surface_material_path,
-    ))
+    Ok((settings, surface_material_path))
 }
 
 fn parse_region_local_block_coord(text: &str, name: &str) -> std::result::Result<u16, String> {
@@ -1251,6 +1372,69 @@ fn parse_region_local_block_coord(text: &str, name: &str) -> std::result::Result
         return Err(format!("{name} must be between 0 and 511: {value}"));
     }
     Ok(value as u16)
+}
+
+fn parse_region_local_chunk_coord(text: &str, name: &str) -> std::result::Result<u8, String> {
+    let value = parse_i32_string(text)?;
+    if !(0..32).contains(&value) {
+        return Err(format!("{name} must be between 0 and 31: {value}"));
+    }
+    Ok(value as u8)
+}
+
+fn parse_chunk_biome_cell_coord(text: &str, name: &str) -> std::result::Result<u8, String> {
+    let value = parse_i32_string(text)?;
+    if !(0..4).contains(&value) {
+        return Err(format!("{name} must be between 0 and 3: {value}"));
+    }
+    Ok(value as u8)
+}
+
+fn surface_region_cell_trace_lines(
+    chunk_local_x: u8,
+    chunk_local_z: u8,
+    cell_x: u8,
+    cell_z: u8,
+    traces: &[SurfaceRegionColumnTrace],
+    surface_material_path: &Path,
+) -> Vec<String> {
+    let origin_x =
+        (usize::from(chunk_local_x) * CHUNK_WIDTH) + (usize::from(cell_x) * BIOME_CELL_WIDTH);
+    let origin_z =
+        (usize::from(chunk_local_z) * CHUNK_WIDTH) + (usize::from(cell_z) * BIOME_CELL_WIDTH);
+    let mut final_biome_counts = BTreeMap::<String, usize>::new();
+    for trace in traces {
+        *final_biome_counts
+            .entry(trace.final_column.biome_id.clone())
+            .or_insert(0) += 1;
+    }
+
+    let mut lines = vec![
+        "surfaceRegionCellTrace=valid".to_string(),
+        format!("chunkLocalX={chunk_local_x}"),
+        format!("chunkLocalZ={chunk_local_z}"),
+        format!("cellX={cell_x}"),
+        format!("cellZ={cell_z}"),
+        format!("regionLocalOriginX={origin_x}"),
+        format!("regionLocalOriginZ={origin_z}"),
+        format!("columnCount={}", traces.len()),
+        format!(
+            "surfaceMaterialPath={}",
+            normalized_path_display(surface_material_path)
+        ),
+    ];
+    for (index, (biome, count)) in final_biome_counts.iter().enumerate() {
+        let entry = index + 1;
+        lines.push(format!("finalBiomeCount.{entry}.biomeId={biome}"));
+        lines.push(format!("finalBiomeCount.{entry}.count={count}"));
+    }
+    for (index, trace) in traces.iter().enumerate() {
+        lines.extend(surface_region_column_trace_lines_with_prefix(
+            &format!("column.{}", index + 1),
+            trace,
+        ));
+    }
+    lines
 }
 
 fn surface_region_column_trace_lines(
@@ -1302,6 +1486,61 @@ fn surface_region_column_trace_lines(
     ));
     lines.extend(surface_column_trace_lines(
         "final",
+        Some(&trace.final_column),
+    ));
+    lines
+}
+
+fn surface_region_column_trace_lines_with_prefix(
+    prefix: &str,
+    trace: &SurfaceRegionColumnTrace,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("{prefix}.localX={}", trace.local_x),
+        format!("{prefix}.localZ={}", trace.local_z),
+        format!("{prefix}.globalBlockX={}", trace.global_block_x),
+        format!("{prefix}.globalBlockZ={}", trace.global_block_z),
+        format!("{prefix}.mapX={}", trace.map_x),
+        format!("{prefix}.mapZ={}", trace.map_z),
+        format!("{prefix}.longitude={}", java_double_string(trace.longitude)),
+        format!("{prefix}.latitude={}", java_double_string(trace.latitude)),
+        format!(
+            "{prefix}.rawElevationMeters={}",
+            java_double_string(trace.raw_elevation_meters)
+        ),
+        format!(
+            "{prefix}.smoothedElevationMeters={}",
+            java_double_string(trace.smoothed_elevation_meters)
+        ),
+        format!(
+            "{prefix}.localReliefMeters={}",
+            java_double_string(trace.local_relief_meters)
+        ),
+        format!("{prefix}.valid={}", trace.valid),
+        format!("{prefix}.initialWater={}", trace.initial_water),
+        format!(
+            "{prefix}.coastFactor={}",
+            java_double_string(trace.coast_factor)
+        ),
+    ];
+    lines.extend(surface_material_trace_lines(
+        &format!("{prefix}.material"),
+        &trace.material_sample,
+    ));
+    lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.base"),
+        Some(&trace.base_column),
+    ));
+    lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.semantic"),
+        trace.semantic_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.photo"),
+        trace.photo_column.as_ref(),
+    ));
+    lines.extend(surface_column_trace_lines(
+        &format!("{prefix}.final"),
         Some(&trace.final_column),
     ));
     lines
@@ -2772,6 +3011,25 @@ mod tests {
     }
 
     #[test]
+    fn trace_surface_region_cell_rejects_out_of_range_cell_coords_before_io() {
+        let (code, out, err) = run_capture(&[
+            "trace-surface-region-cell",
+            "missing-heightmap.tif",
+            "5000",
+            "0",
+            "0",
+            "8",
+            "0",
+            "4",
+            "0",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert!(err.contains("cellX must be between 0 and 3: 4"));
+    }
+
+    #[test]
     fn surface_region_column_trace_lines_include_stable_success_fields() {
         let base_column = EarthSurfaceColumn::new(
             false,
@@ -2843,6 +3101,76 @@ mod tests {
     }
 
     #[test]
+    fn surface_region_cell_trace_lines_include_counts_and_prefixed_columns() {
+        let first = surface_trace_fixture_column(
+            140,
+            0,
+            "minecraft:savanna",
+            "minecraft:windswept_savanna",
+        );
+        let second = surface_trace_fixture_column(141, 0, "minecraft:savanna", "minecraft:savanna");
+
+        let lines =
+            surface_region_cell_trace_lines(8, 0, 3, 0, &[first, second], Path::new("surface.vrt"));
+
+        assert!(lines.contains(&"surfaceRegionCellTrace=valid".to_string()));
+        assert!(lines.contains(&"regionLocalOriginX=140".to_string()));
+        assert!(lines.contains(&"regionLocalOriginZ=0".to_string()));
+        assert!(lines.contains(&"columnCount=2".to_string()));
+        assert!(lines.contains(&"finalBiomeCount.1.biomeId=minecraft:savanna".to_string()));
+        assert!(lines.contains(&"finalBiomeCount.1.count=1".to_string()));
+        assert!(
+            lines.contains(&"finalBiomeCount.2.biomeId=minecraft:windswept_savanna".to_string(),)
+        );
+        assert!(lines.contains(&"column.1.localX=140".to_string()));
+        assert!(lines.contains(&"column.1.final.biomeId=minecraft:windswept_savanna".to_string(),));
+        assert!(lines.contains(&"column.2.final.biomeId=minecraft:savanna".to_string()));
+    }
+
+    fn surface_trace_fixture_column(
+        local_x: usize,
+        local_z: usize,
+        base_biome: &str,
+        final_biome: &str,
+    ) -> SurfaceRegionColumnTrace {
+        let base_column = EarthSurfaceColumn::new(
+            false,
+            70,
+            63,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            base_biome,
+            "height-rule",
+        );
+        let semantic_column = base_column
+            .with_decision_source("semantic")
+            .with_terrain_token_source(TerrainTokenSource::JavaStandardPalette);
+        let photo_column = semantic_column.with_decision_source("photo");
+        let final_column = photo_column.with_biome_id(final_biome);
+        SurfaceRegionColumnTrace {
+            local_x,
+            local_z,
+            global_block_x: local_x as i32,
+            global_block_z: local_z as i32,
+            map_x: local_x as i32 + 4000,
+            map_z: local_z as i32 + 1800,
+            longitude: 1.25,
+            latitude: -2.5,
+            raw_elevation_meters: 12.0,
+            smoothed_elevation_meters: 11.5,
+            local_relief_meters: 0.75,
+            initial_water: false,
+            valid: true,
+            coast_factor: 1.0,
+            material_sample: None,
+            base_column,
+            semantic_column: Some(semantic_column),
+            photo_column: Some(photo_column),
+            final_column,
+        }
+    }
+
+    #[test]
     fn initial_commands_are_recognized_as_not_implemented() {
         for command in commands::INITIAL_COMMANDS
             .iter()
@@ -2899,6 +3227,7 @@ mod tests {
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
         );
         assert!(out.contains("trace-surface-region-column <heightmap> <scale> <regionX> <regionZ>"));
+        assert!(out.contains("trace-surface-region-cell <heightmap> <scale> <regionX> <regionZ>"));
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
