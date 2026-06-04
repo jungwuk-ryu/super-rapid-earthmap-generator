@@ -15,8 +15,9 @@ use earthmap_minecraft::{
     block_state_ids,
     chunk_model::{ChunkModel, CHUNK_WIDTH},
     chunk_nbt_encoder, level_dat_template,
+    nbt::{self, Tag},
 };
-use earthmap_region::{ChunkLocalPos, RegionError};
+use earthmap_region::{read_region_payloads, ChunkLocalPos, RegionError};
 use earthmap_surface::{
     classify_surface, HeightOnlySettings, OutputFormat, SurfaceRegionReport, SurfaceRegionSettings,
     DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
@@ -120,6 +121,9 @@ where
         "compare-region-payload-manifest" if args.len() == 3 => write_result(
             compare_region_payload_manifest(stdout, stderr, &args[1], &args[2]),
         ),
+        "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
+            stdout, stderr, &args[1], &args[2], &args[3],
+        )),
         "generate-flat-test-world" if args.len() == 3 => {
             write_result(generate_flat_test_world(stdout, stderr, &args[1], &args[2]))
         }
@@ -189,6 +193,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  compare-region-payload-manifest <manifestCsv> <regionFile>"
+    )?;
+    writeln!(
+        out,
+        "  summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"
     )?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
     writeln!(out, "  generate-palette-stress-world <worldDir>")?;
@@ -1162,6 +1170,201 @@ fn compare_region_payload_manifest(
     }
 }
 
+fn summarize_region_chunk(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+    local_chunk_x: &str,
+    local_chunk_z: &str,
+) -> io::Result<i32> {
+    match summarize_region_chunk_impl(region, local_chunk_x, local_chunk_z) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Region chunk summary failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn summarize_region_chunk_impl(
+    region: &str,
+    local_chunk_x: &str,
+    local_chunk_z: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let local_x = parse_local_chunk_coord(local_chunk_x, "localChunkX")?;
+    let local_z = parse_local_chunk_coord(local_chunk_z, "localChunkZ")?;
+    let payloads = read_region_payloads(region).map_err(|error| error.to_string())?;
+    let pos = ChunkLocalPos::new(local_x, local_z).map_err(|error| error.to_string())?;
+    let payload = payloads
+        .chunks
+        .get(&pos)
+        .ok_or_else(|| format!("missing chunk payload at {local_x},{local_z}"))?;
+    let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
+    let Tag::Compound(root) = named.tag() else {
+        return Err("chunk NBT root must be a compound".to_string());
+    };
+
+    let mut lines = vec![
+        "regionChunkSummary=valid".to_string(),
+        format!("format={}", payloads.format.as_manifest_value()),
+        format!("regionX={}", payloads.region_x),
+        format!("regionZ={}", payloads.region_z),
+        format!("localChunkX={local_x}"),
+        format!("localChunkZ={local_z}"),
+        format!("payloadBytes={}", payload.len()),
+        format!(
+            "xPos={}",
+            root.get_int("xPos").map_err(|error| error.to_string())?
+        ),
+        format!(
+            "yPos={}",
+            root.get_int("yPos").map_err(|error| error.to_string())?
+        ),
+        format!(
+            "zPos={}",
+            root.get_int("zPos").map_err(|error| error.to_string())?
+        ),
+        format!(
+            "status={}",
+            root.get_string("Status")
+                .map_err(|error| error.to_string())?
+        ),
+        format!(
+            "isLightOn={}",
+            root.get_byte("isLightOn")
+                .map_err(|error| error.to_string())?
+        ),
+    ];
+
+    if let Ok(heightmaps) = root.get_compound("Heightmaps") {
+        for (name, tag) in heightmaps.entries() {
+            if let Tag::LongArray(values) = tag {
+                lines.push(format!("heightmap.{name}.longs={}", values.len()));
+                lines.push(format!(
+                    "heightmap.{name}.first={}",
+                    values.first().copied().unwrap_or_default()
+                ));
+                lines.push(format!(
+                    "heightmap.{name}.last={}",
+                    values.last().copied().unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    let sections = root
+        .get_list("sections")
+        .map_err(|error| error.to_string())?;
+    lines.push(format!("sectionCount={}", sections.values().len()));
+    for section_tag in sections.values() {
+        let Tag::Compound(section) = section_tag else {
+            return Err("section list must contain compounds".to_string());
+        };
+        let y = section.get_byte("Y").map_err(|error| error.to_string())?;
+        let block_states = section
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?;
+        let block_palette = block_state_palette_names(block_states)?;
+        lines.push(format!(
+            "section.{y}.blockPaletteSize={}",
+            block_palette.len()
+        ));
+        lines.push(format!(
+            "section.{y}.blockPalette={}",
+            block_palette.join("|")
+        ));
+        lines.push(format!(
+            "section.{y}.blockDataLongs={}",
+            long_array_len(block_states, "data")?
+        ));
+        let biomes = section
+            .get_compound("biomes")
+            .map_err(|error| error.to_string())?;
+        let biome_palette = biome_palette_names(biomes)?;
+        lines.push(format!(
+            "section.{y}.biomePaletteSize={}",
+            biome_palette.len()
+        ));
+        lines.push(format!(
+            "section.{y}.biomePalette={}",
+            biome_palette.join("|")
+        ));
+        lines.push(format!(
+            "section.{y}.biomeDataLongs={}",
+            long_array_len(biomes, "data")?
+        ));
+    }
+
+    Ok(lines)
+}
+
+fn block_state_palette_names(
+    compound: &earthmap_minecraft::nbt::Compound,
+) -> std::result::Result<Vec<String>, String> {
+    let palette = compound
+        .get_list("palette")
+        .map_err(|error| error.to_string())?;
+    let mut names = Vec::with_capacity(palette.values().len());
+    for value in palette.values() {
+        let Tag::Compound(block) = value else {
+            return Err("block state palette must contain compounds".to_string());
+        };
+        names.push(
+            block
+                .get_string("Name")
+                .map_err(|error| error.to_string())?
+                .to_string(),
+        );
+    }
+    Ok(names)
+}
+
+fn biome_palette_names(
+    compound: &earthmap_minecraft::nbt::Compound,
+) -> std::result::Result<Vec<String>, String> {
+    let palette = compound
+        .get_list("palette")
+        .map_err(|error| error.to_string())?;
+    let mut names = Vec::with_capacity(palette.values().len());
+    for value in palette.values() {
+        let Tag::String(name) = value else {
+            return Err("biome palette must contain strings".to_string());
+        };
+        names.push(name.clone());
+    }
+    Ok(names)
+}
+
+fn long_array_len(
+    compound: &earthmap_minecraft::nbt::Compound,
+    name: &str,
+) -> std::result::Result<usize, String> {
+    if !compound.contains(name) {
+        return Ok(0);
+    }
+    match compound.get(name) {
+        Ok(Tag::LongArray(values)) => Ok(values.len()),
+        Ok(tag) => Err(format!(
+            "{name} must be a long array when present, found tag type {}",
+            tag.type_id()
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn parse_local_chunk_coord(text: &str, name: &str) -> std::result::Result<u8, String> {
+    let value = text.parse::<u8>().map_err(|error| error.to_string())?;
+    if value >= 32 {
+        return Err(format!("{name} must be between 0 and 31"));
+    }
+    Ok(value)
+}
+
 fn generate_flat_test_world(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -1617,6 +1820,7 @@ mod tests {
         assert!(out.contains("write-sha256-manifest <root> <outputFile>"));
         assert!(out.contains("write-region-payload-manifest <regionFile> <outputCsv>"));
         assert!(out.contains("compare-region-payload-manifest <manifestCsv> <regionFile>"));
+        assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
@@ -1687,6 +1891,43 @@ mod tests {
                 .unwrap(),
             block_state_ids::AIR
         );
+    }
+
+    #[test]
+    fn summarize_region_chunk_reports_flat_fixture_palettes() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat");
+        generate_flat_test_world_impl(world.to_str().unwrap(), "linear").unwrap();
+        let region = world.join("region").join("r.0.0.linear");
+
+        let (code, out, err) =
+            run_capture(&["summarize-region-chunk", region.to_str().unwrap(), "0", "0"]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("regionChunkSummary=valid\n"));
+        assert!(out.contains("format=linear\n"));
+        assert!(out.contains("localChunkX=0\n"));
+        assert!(out.contains("localChunkZ=0\n"));
+        assert!(out.contains("status=minecraft:full\n"));
+        assert!(out.contains(
+            "section.3.blockPalette=minecraft:stone|minecraft:dirt|minecraft:grass_block\n"
+        ));
+    }
+
+    #[test]
+    fn summarize_region_chunk_rejects_malformed_palette_data_type() {
+        let mut missing = nbt::Compound::new();
+        assert_eq!(long_array_len(&missing, "data").unwrap(), 0);
+
+        missing.put_long_array("data", vec![1, 2, 3]).unwrap();
+        assert_eq!(long_array_len(&missing, "data").unwrap(), 3);
+
+        let mut malformed = nbt::Compound::new();
+        malformed.put_int("data", 7).unwrap();
+        let error = long_array_len(&malformed, "data").unwrap_err();
+
+        assert!(error.contains("data must be a long array"));
     }
 
     #[test]
