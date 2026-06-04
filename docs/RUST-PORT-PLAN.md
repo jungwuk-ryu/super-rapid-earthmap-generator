@@ -1,7 +1,7 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
-Last status audit: 2026-06-04, after commit `4a55b98 feat(rust): generate golden candidates from oracle`
+Last status audit: 2026-06-04, audited through commit `06a85ab docs: record photo material parity blocker`
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -10,6 +10,17 @@ hard gate before any optimization is accepted.
 Current project state: active prototype, production readiness NO-GO. A Rust build does not change the release gate:
 full Earth or nation-war generation remains blocked until `docs/QUALITY-GATES.md` passes for the same candidate
 build/config.
+
+## Status Tracking Rules
+
+- This board is the current-status source of truth. The phase sections below are detailed history, not a restart queue.
+- Before resuming work, read this board and recent commits first; do not infer that lower phase numbers are unstarted.
+- A phase marked `Done`, `Done for current bootstrap scope`, or `Implemented through tracked bootstrap/parity slices`
+  must not be restarted unless this board explicitly changes it back to active work.
+- Every future phase/status change must update this board in the same conventional atomic commit as the work that
+  changed the status.
+- The current active pointer is Phase 5 photo/material corpus promotion, blocked on the vanilla-delegated payload delta.
+  Phase 0 is active only as an oracle/corpus harness, not as Rust implementation bootstrap work.
 
 ## Current Status Board
 
