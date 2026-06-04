@@ -1,7 +1,7 @@
 # Rust Port Execution Plan
 
 Date: 2026-06-03
-Last status audit: 2026-06-04, audited through commit `3411049 feat(rust): summarize region chunk diagnostics`
+Last status audit: 2026-06-04, audited through the Phase 5 PHOTO two-pass/TokenLumaProfile update
 
 Goal: Port Super-Rapid EarthMap Generator from Java to Rust while keeping Java as the correctness oracle until the Rust
 implementation proves identical output. The Rust implementation must target maximum throughput, but output parity is a
@@ -19,8 +19,9 @@ build/config.
   must not be restarted unless this board explicitly changes it back to active work.
 - Every future phase/status change must update this board in the same conventional atomic commit as the work that
   changed the status.
-- The current active pointer is Phase 5 photo/material corpus promotion, blocked on the vanilla-delegated payload delta.
-  Phase 0 is active only as an oracle/corpus harness, not as Rust implementation bootstrap work.
+- The current active pointer is Phase 5 photo/material corpus promotion. The PHOTO two-pass/TokenLumaProfile
+  implementation gap is addressed; next rerun the vanilla-delegated photo/material parity comparison before adding
+  corpus entries. Phase 0 is active only as an oracle/corpus harness, not as Rust implementation bootstrap work.
 
 ## Current Status Board
 
@@ -34,7 +35,7 @@ the current source of truth for work status.
 | Phase 2: Minecraft binary core | Done for current bootstrap scope | NBT, chunk model, level.dat, heightmaps, section palettes, and gzip/delta fixture evidence are implemented. |
 | Phase 3: region writers | Done for current bootstrap scope | MCA and Linear V2 writer/reader parity fixtures are implemented. |
 | Phase 4: GeoTIFF/VRT and height-only regions | Done for current bootstrap scope | Real `E:\HQheightmap.tif` height-only MCA/Linear parity evidence exists for fixed regions. `generate-golden.ps1 -IncludeHeightOnly` promotes the default fixed region into the regeneratable corpus. |
-| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices | Commit history and the Phase 5 notes below include surface/photo/ecoregion/no-climate/snow evidence work. `generate-golden.ps1 -IncludeSurface` now promotes the no-material fixed surface region into the corpus. Remaining work is photo/material promotion evidence, starting with the known vanilla-delegated payload delta noted below. |
+| Phase 5: surface rules, photo solver, OSM, natural surfaces | Implemented through tracked bootstrap/parity slices | Commit history and the Phase 5 notes below include surface/photo/ecoregion/no-climate/snow evidence work. `generate-golden.ps1 -IncludeSurface` now promotes the no-material fixed surface region into the corpus. Rust PHOTO region sampling now uses Java-shaped semantic-then-photo passes with a region-wide token luma profile; next rerun the vanilla-delegated photo/material comparison before promoting corpus entries. |
 | Vanilla-owned gameplay generation | Out of scope | Ores, caves, vegetation, structures, strongholds, End portals, loot, and spawners remain vanilla-delegated. Do not add direct Rust generators for them. |
 | Phase 6: quality and visual evidence tools | Pending | Start after corpus-backed Phase 5 output parity is green for the relevant fixed regions. |
 
@@ -45,10 +46,12 @@ Current active work:
 3. Done: `rust/scripts/generate-golden.ps1 -IncludeSurface` adds no-material fixed-region surface MCA/Linear entries.
 4. Done: `summarize-region-chunk` can compare Java/Rust region chunk root fields, heightmap edges, and section
    block/biome palette summaries for mismatch triage.
-5. Active blocker: resolve the vanilla-delegated photo/material payload delta before adding photo/material corpus
-   entries. Current leading cause is Rust PHOTO-mode region sampling not yet matching Java's two-pass
-   semantic-then-photo flow with the region-wide `TokenLumaProfile`.
-6. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
+5. Done: Rust PHOTO-mode region sampling now follows Java's semantic-then-photo region pass shape, collects a
+   region-wide `TokenLumaProfile` from non-water JavaStandard token samples, and passes that profile into deferred
+   photo material solving.
+6. Active verification gate: rerun the vanilla-delegated photo/material payload comparison and diagnose any remaining
+   chunk delta before adding photo/material corpus entries.
+7. Next: only after corpus parity, expand Phase 6 quality/visual evidence tooling.
 
 ## Non-Negotiable Rules
 
@@ -811,8 +814,9 @@ Bootstrap implementation status on 2026-06-03:
 - Follow-up diagnosis on 2026-06-04: `summarize-region-chunk` shows the first mismatch is concentrated in chunk biome
   palettes and one ocean-floor heightmap edge, not in chunk coordinates or status metadata. Java includes
   `minecraft:windswept_savanna` in mixed biome sections for chunk `(8,0)` while the Rust candidate has simpler
-  `deep_lukewarm_ocean|savanna` palettes. The current leading cause is Rust PHOTO-mode region sampling missing Java's
-  region-wide two-pass `TokenLumaProfile` flow before photo material solving.
+  `deep_lukewarm_ocean|savanna` palettes. The missing Rust PHOTO-mode region-wide two-pass `TokenLumaProfile` flow is
+  now implemented; the next required evidence step is regenerating and comparing the vanilla-delegated photo/material
+  candidate to confirm whether this was the full payload delta or only the first blocker.
 
 ### Non-Phase: Vanilla-Delegated Survival Scope
 

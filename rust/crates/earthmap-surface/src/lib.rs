@@ -4741,6 +4741,7 @@ pub struct PhotoSurfaceInput {
     pub local_relief_meters: f64,
     pub global_block_x: i32,
     pub global_block_z: i32,
+    pub token_luma_profile: Option<Arc<PhotoSurfaceTokenLumaProfile>>,
 }
 
 impl PhotoSurfaceInput {
@@ -4766,7 +4767,99 @@ impl PhotoSurfaceInput {
             local_relief_meters,
             global_block_x,
             global_block_z,
+            token_luma_profile: None,
         }
+    }
+
+    pub fn with_token_luma_profile(mut self, profile: Arc<PhotoSurfaceTokenLumaProfile>) -> Self {
+        self.token_luma_profile = Some(profile);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PhotoSurfaceTokenLumaProfile {
+    ranges: HashMap<i32, PhotoSurfaceTokenLumaRange>,
+}
+
+impl PhotoSurfaceTokenLumaProfile {
+    const MIN_PROFILE_SAMPLES: usize = 32;
+
+    pub fn add(&mut self, sample: &SurfaceMaterialSample) {
+        if sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette
+            || !sample.color.available
+            || sample.color.is_near_black()
+            || !sample.terrain_token_color.available
+        {
+            return;
+        }
+        let token = MetTerrainVocabulary::exact(sample.terrain_token_color);
+        if !source_ranked_cross_crop_token(token) {
+            return;
+        }
+        self.ranges
+            .entry(met_terrain_match_rgb(token))
+            .or_default()
+            .add(sample.color);
+    }
+
+    pub fn normalized_luma(&self, token: MetTerrainMatch, source: RgbColor) -> Option<f64> {
+        let range = self.ranges.get(&met_terrain_match_rgb(token))?;
+        if range.count < Self::MIN_PROFILE_SAMPLES || range.max <= range.min + 1.0e-9 {
+            return None;
+        }
+        Some(((photo_luma(source) - range.min) / (range.max - range.min)).clamp(0.0, 1.0))
+    }
+
+    pub fn mean_source(&self, token: MetTerrainMatch) -> Option<RgbColor> {
+        let range = self.ranges.get(&met_terrain_match_rgb(token))?;
+        if range.count < Self::MIN_PROFILE_SAMPLES {
+            return None;
+        }
+        Some(range.mean_rgb())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PhotoSurfaceTokenLumaRange {
+    count: usize,
+    min: f64,
+    max: f64,
+    red_sum: u64,
+    green_sum: u64,
+    blue_sum: u64,
+}
+
+impl Default for PhotoSurfaceTokenLumaRange {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            red_sum: 0,
+            green_sum: 0,
+            blue_sum: 0,
+        }
+    }
+}
+
+impl PhotoSurfaceTokenLumaRange {
+    fn add(&mut self, color: RgbColor) {
+        self.count += 1;
+        self.red_sum += u64::from(color.red);
+        self.green_sum += u64::from(color.green);
+        self.blue_sum += u64::from(color.blue);
+        let luma = photo_luma(color);
+        self.min = self.min.min(luma);
+        self.max = self.max.max(luma);
+    }
+
+    fn mean_rgb(&self) -> RgbColor {
+        RgbColor::of(
+            ((self.red_sum as f64) / (self.count as f64)).round() as u8,
+            ((self.green_sum as f64) / (self.count as f64)).round() as u8,
+            ((self.blue_sum as f64) / (self.count as f64)).round() as u8,
+        )
     }
 }
 
@@ -4964,7 +5057,7 @@ fn solve_authoritative_arid_token_surface(
     if token.kind == MetTerrainKind::Snow && !photo_solver_dry_context(input, source) {
         return None;
     }
-    let top = ordered_arid_token_top(input, source, token.kind);
+    let top = ordered_arid_token_top(input, source, token);
     Some(photo_surface_decision_for_top(
         input,
         top,
@@ -5076,14 +5169,14 @@ fn photo_surface_decision_for_top(
 fn ordered_arid_token_top(
     input: &PhotoSurfaceInput,
     source: RgbColor,
-    token_kind: MetTerrainKind,
+    token: MetTerrainMatch,
 ) -> i32 {
     let candidates = if input.sample.terrain_token_source == TerrainTokenSource::JavaStandardPalette
-        && matches!(token_kind, MetTerrainKind::Sand | MetTerrainKind::RedSand)
+        && matches!(token.kind, MetTerrainKind::Sand | MetTerrainKind::RedSand)
         && photo_solver_gray_rock_source_for_sand_token(input, source)
     {
         &PALETTE_ROCK_CANDIDATES[..]
-    } else if token_kind == MetTerrainKind::RedSand {
+    } else if token.kind == MetTerrainKind::RedSand {
         &PALETTE_RED_SAND_CANDIDATES[..]
     } else {
         &PALETTE_SAND_CANDIDATES[..]
@@ -5121,11 +5214,101 @@ fn ordered_arid_token_top(
     if second == first {
         return first;
     }
-    if ordered_dither_threshold(input.global_block_x, input.global_block_z) < 5 {
+    let right_slots = cross_crop_arid_right_slots(input, source, token, first, second, &biome);
+    if ordered_dither_threshold(input.global_block_x, input.global_block_z) < right_slots {
         second
     } else {
         first
     }
+}
+
+fn cross_crop_arid_right_slots(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    token: MetTerrainMatch,
+    first: i32,
+    second: i32,
+    biome: &str,
+) -> i32 {
+    const ORDERED_DITHER_SLOTS: i32 = 16;
+    const DEFAULT_RIGHT_SLOTS: i32 = 5;
+    if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette
+        || !source_ranked_cross_crop_token(token)
+    {
+        return DEFAULT_RIGHT_SLOTS;
+    }
+    let source_rank = learned_cross_crop_source_luma_rank(input, source, token);
+    let mut slot_nudge = ((source_rank - 0.5) * 10.0).round() as i32;
+    let left_luma = photo_luma_rgb(render_surface_color(first, Some(biome)));
+    let right_luma = photo_luma_rgb(render_surface_color(second, Some(biome)));
+    if right_luma < left_luma {
+        slot_nudge = -slot_nudge;
+    }
+    (DEFAULT_RIGHT_SLOTS + slot_nudge).clamp(1, ORDERED_DITHER_SLOTS - 1)
+}
+
+fn source_ranked_cross_crop_token(token: MetTerrainMatch) -> bool {
+    matches!(
+        met_terrain_match_rgb(token),
+        0x003200 | 0x323C1E | 0x958667 | 0x9BA06E | 0xE6CDA0 | 0xFFC840 | 0xFFC880 | 0xFFFFBE
+    )
+}
+
+fn learned_cross_crop_source_luma_rank(
+    input: &PhotoSurfaceInput,
+    source: RgbColor,
+    token: MetTerrainMatch,
+) -> f64 {
+    if let Some(profile) = input.token_luma_profile.as_deref() {
+        if let Some(rank) = profile.normalized_luma(token, source) {
+            return rank;
+        }
+    }
+    if let Some((min_luma, max_luma)) = learned_cross_crop_source_luma_range(token) {
+        return ((photo_luma(source) - min_luma) / (max_luma - min_luma)).clamp(0.0, 1.0);
+    }
+    token_source_luma_rank(source, token.color())
+}
+
+fn learned_cross_crop_source_luma_range(token: MetTerrainMatch) -> Option<(f64, f64)> {
+    match met_terrain_match_rgb(token) {
+        0x003200 => Some((25.30, 54.46)),
+        0x323C1E => Some((35.35, 84.47)),
+        0x958667 => Some((123.38, 144.88)),
+        0x9BA06E => Some((147.24, 184.72)),
+        0xE6CDA0 => Some((181.89, 234.50)),
+        0xFFC840 => Some((195.02, 208.90)),
+        0xFFC880 => Some((173.70, 221.04)),
+        0xFFFFBE => Some((220.64, 243.17)),
+        _ => None,
+    }
+}
+
+fn token_source_luma_rank(source: RgbColor, standard: RgbColor) -> f64 {
+    let standard_luma = photo_luma(standard);
+    let source_luma = photo_luma(source);
+    let (lower, upper) = if standard_luma >= 190.0 {
+        ((standard_luma - 86.0).max(0.0), 255.0)
+    } else if standard.green >= standard.red && standard.green >= standard.blue {
+        (
+            (standard_luma - 70.0).max(0.0),
+            (standard_luma + 92.0).min(255.0),
+        )
+    } else {
+        (
+            (standard_luma - 62.0).max(0.0),
+            (standard_luma + 74.0).min(255.0),
+        )
+    };
+    if upper <= lower + 1.0 {
+        0.5
+    } else {
+        ((source_luma - lower) / (upper - lower)).clamp(0.0, 1.0)
+    }
+}
+
+fn met_terrain_match_rgb(token: MetTerrainMatch) -> i32 {
+    (i32::from(token.red) << 16) | (i32::from(token.green) << 8) | i32::from(token.blue)
 }
 
 fn java_standard_tan_carrier_top(
@@ -5342,6 +5525,12 @@ fn photo_luma(color: RgbColor) -> f64 {
     (f64::from(color.red) * 0.2126)
         + (f64::from(color.green) * 0.7152)
         + (f64::from(color.blue) * 0.0722)
+}
+
+fn photo_luma_rgb(rgb: i32) -> f64 {
+    (f64::from((rgb >> 16) & 0xff) * 0.2126)
+        + (f64::from((rgb >> 8) & 0xff) * 0.7152)
+        + (f64::from(rgb & 0xff) * 0.0722)
 }
 
 fn arid_token_candidate_bias(source: RgbColor, top: i32, input: &PhotoSurfaceInput) -> f64 {
@@ -9378,8 +9567,51 @@ where
     let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
     let mut columns = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
     let mut coast_factors = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
+    let collect_photo_materials =
+        texture_mode == SurfaceTextureMode::Photo && material_sampler.is_some();
+    let mut photo_material_columns = if collect_photo_materials {
+        Some(vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_smoothed_elevations = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_longitudes = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_latitudes = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_local_relief_meters = if collect_photo_materials {
+        Some(vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_global_block_x = if collect_photo_materials {
+        Some(vec![0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_global_block_z = if collect_photo_materials {
+        Some(vec![0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH])
+    } else {
+        None
+    };
+    let mut photo_token_luma_profile = if collect_photo_materials {
+        Some(PhotoSurfaceTokenLumaProfile::default())
+    } else {
+        None
+    };
     for local_z in 0..SURFACE_REGION_WIDTH {
         for local_x in 0..SURFACE_REGION_WIDTH {
+            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
             let center_x = local_x + SURFACE_REGION_COAST_RADIUS;
             let center_z = local_z + SURFACE_REGION_COAST_RADIUS;
             let global_block_x = region_block_x.wrapping_add(local_x as i32);
@@ -9430,23 +9662,73 @@ where
                     )?;
                     let local_relief_meters =
                         surface_region_local_relief_meters(&elevations, &valid, center_x, center_z);
-                    column = apply_surface_region_material_sample(
+                    column = apply_surface_region_semantic_material_sample(
                         column,
-                        material,
-                        texture_mode,
+                        &material,
                         smoothed_elevation,
                         longitude,
                         latitude,
                         coast_factor,
                         local_relief_meters,
-                        global_block_x,
-                        global_block_z,
                         vertical_scale,
                     )?;
+                    if let Some(token_luma_profile) = photo_token_luma_profile.as_mut() {
+                        if !column.water {
+                            token_luma_profile.add(&material);
+                        }
+                    }
+                    if let Some(photo_material_columns) = photo_material_columns.as_mut() {
+                        photo_material_columns[column_index] = Some(material);
+                    }
+                    if let Some(photo_smoothed_elevations) = photo_smoothed_elevations.as_mut() {
+                        photo_smoothed_elevations[column_index] = smoothed_elevation;
+                    }
+                    if let Some(photo_longitudes) = photo_longitudes.as_mut() {
+                        photo_longitudes[column_index] = longitude;
+                    }
+                    if let Some(photo_latitudes) = photo_latitudes.as_mut() {
+                        photo_latitudes[column_index] = latitude;
+                    }
+                    if let Some(photo_local_relief_meters) = photo_local_relief_meters.as_mut() {
+                        photo_local_relief_meters[column_index] = local_relief_meters;
+                    }
+                    if let Some(photo_global_block_x) = photo_global_block_x.as_mut() {
+                        photo_global_block_x[column_index] = global_block_x;
+                    }
+                    if let Some(photo_global_block_z) = photo_global_block_z.as_mut() {
+                        photo_global_block_z[column_index] = global_block_z;
+                    }
                 }
             }
             columns.push(column);
             coast_factors.push(coast_factor);
+        }
+    }
+
+    if let Some(photo_material_columns) = photo_material_columns {
+        let photo_token_luma_profile = photo_token_luma_profile.map(Arc::new);
+        let photo_smoothed_elevations = photo_smoothed_elevations.expect("photo elevations");
+        let photo_longitudes = photo_longitudes.expect("photo longitudes");
+        let photo_latitudes = photo_latitudes.expect("photo latitudes");
+        let photo_local_relief_meters = photo_local_relief_meters.expect("photo local relief");
+        let photo_global_block_x = photo_global_block_x.expect("photo global block x");
+        let photo_global_block_z = photo_global_block_z.expect("photo global block z");
+        for (column_index, material) in photo_material_columns.into_iter().enumerate() {
+            if let Some(material) = material {
+                columns[column_index] = apply_surface_region_photo_material_sample(
+                    columns[column_index].clone(),
+                    material,
+                    photo_smoothed_elevations[column_index],
+                    photo_longitudes[column_index],
+                    photo_latitudes[column_index],
+                    coast_factors[column_index],
+                    photo_local_relief_meters[column_index],
+                    photo_global_block_x[column_index],
+                    photo_global_block_z[column_index],
+                    vertical_scale,
+                    photo_token_luma_profile.as_ref(),
+                )?;
+            }
         }
     }
 
@@ -9526,6 +9808,61 @@ fn sample_surface_region_material(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn apply_surface_region_semantic_material_sample(
+    semantic_column: EarthSurfaceColumn,
+    sample: &SurfaceMaterialSample,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    coast_factor: f64,
+    local_relief_meters: f64,
+    vertical_scale: f64,
+) -> Result<EarthSurfaceColumn> {
+    apply_surface_material(
+        &semantic_column,
+        sample,
+        elevation_meters,
+        longitude,
+        latitude,
+        coast_factor,
+        local_relief_meters * vertical_scale,
+        vertical_scale,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_surface_region_photo_material_sample(
+    semantic_column: EarthSurfaceColumn,
+    sample: SurfaceMaterialSample,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    coast_factor: f64,
+    local_relief_meters: f64,
+    global_block_x: i32,
+    global_block_z: i32,
+    vertical_scale: f64,
+    token_luma_profile: Option<&Arc<PhotoSurfaceTokenLumaProfile>>,
+) -> Result<EarthSurfaceColumn> {
+    let mut input = PhotoSurfaceInput::new(
+        semantic_column,
+        sample,
+        elevation_meters,
+        longitude,
+        latitude,
+        coast_factor,
+        local_relief_meters * vertical_scale,
+        global_block_x,
+        global_block_z,
+    );
+    if let Some(profile) = token_luma_profile {
+        input = input.with_token_luma_profile(Arc::clone(profile));
+    }
+    apply_photo_surface_material(&input)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn apply_surface_region_material_sample(
     semantic_column: EarthSurfaceColumn,
     sample: SurfaceMaterialSample,
@@ -9539,28 +9876,30 @@ fn apply_surface_region_material_sample(
     global_block_z: i32,
     vertical_scale: f64,
 ) -> Result<EarthSurfaceColumn> {
-    let semantic_column = apply_surface_material(
-        &semantic_column,
+    let semantic_column = apply_surface_region_semantic_material_sample(
+        semantic_column,
         &sample,
         elevation_meters,
         longitude,
         latitude,
         coast_factor,
-        local_relief_meters * vertical_scale,
+        local_relief_meters,
         vertical_scale,
     )?;
     match texture_mode {
-        SurfaceTextureMode::Photo => apply_photo_surface_material(&PhotoSurfaceInput::new(
+        SurfaceTextureMode::Photo => apply_surface_region_photo_material_sample(
             semantic_column,
             sample,
             elevation_meters,
             longitude,
             latitude,
             coast_factor,
-            local_relief_meters * vertical_scale,
+            local_relief_meters,
             global_block_x,
             global_block_z,
-        )),
+            vertical_scale,
+            None,
+        ),
         SurfaceTextureMode::Classified => Ok(semantic_column),
     }
 }
@@ -15530,6 +15869,80 @@ mod tests {
     }
 
     #[test]
+    fn surface_region_photo_material_helpers_split_java_two_pass_flow() {
+        let semantic = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let material = SurfaceMaterialSample::with_export_token(
+            RgbColor::of(218, 184, 92),
+            RgbColor::of(255, 200, 128),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        );
+
+        let semantic_only = apply_surface_region_semantic_material_sample(
+            semantic.clone(),
+            &material,
+            240.0,
+            13.0,
+            24.0,
+            0.0,
+            15.0,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap();
+        let photo_pass = apply_surface_region_photo_material_sample(
+            semantic_only.clone(),
+            material.clone(),
+            240.0,
+            13.0,
+            24.0,
+            0.0,
+            15.0,
+            101,
+            100,
+            DEFAULT_VERTICAL_SCALE,
+            None,
+        )
+        .unwrap();
+        let combined = apply_surface_region_material_sample(
+            semantic,
+            material,
+            SurfaceTextureMode::Photo,
+            240.0,
+            13.0,
+            24.0,
+            0.0,
+            15.0,
+            101,
+            100,
+            DEFAULT_VERTICAL_SCALE,
+        )
+        .unwrap();
+
+        assert_eq!(photo_pass, combined);
+        assert_ne!(semantic_only, combined);
+    }
+
+    #[test]
     fn surface_region_photo_material_uses_smoothed_elevation_input() {
         let semantic = surface_column(
             false,
@@ -17786,6 +18199,216 @@ mod tests {
             }
         }
         assert!(saw_second_dither_top);
+    }
+
+    #[test]
+    fn photo_region_token_luma_profile_changes_java_standard_arid_dither() {
+        let plains = surface_column(
+            false,
+            SEA_LEVEL_Y + 12,
+            i32::MIN,
+            block_state_ids::GRASS_BLOCK,
+            block_state_ids::DIRT,
+            "minecraft:plains",
+        );
+        let token_color = RgbColor::of(230, 205, 160);
+        let token = MetTerrainVocabulary::exact(token_color);
+        assert!(source_ranked_cross_crop_token(token));
+        let mut profile = PhotoSurfaceTokenLumaProfile::default();
+        for offset in 0..32 {
+            profile.add(&SurfaceMaterialSample::new(
+                RgbColor::of(95 + offset, 82 + offset, 54 + offset),
+                token_color,
+                TerrainTokenSource::JavaStandardPalette,
+                13,
+                0,
+                0,
+                0,
+                0,
+                4,
+                2,
+                0,
+                0,
+                30,
+                -1,
+                12,
+                "Saharan desert profile fixture",
+                "minecraft:desert",
+                1.0,
+            ));
+        }
+        let source = RgbColor::of(242, 216, 160);
+        assert_eq!(profile.normalized_luma(token, source), Some(1.0));
+        assert!(profile.mean_source(token).is_some());
+        let profile = Arc::new(profile);
+        let material = SurfaceMaterialSample::new(
+            source,
+            token_color,
+            TerrainTokenSource::JavaStandardPalette,
+            13,
+            0,
+            0,
+            0,
+            0,
+            4,
+            2,
+            0,
+            0,
+            30,
+            -1,
+            12,
+            "Saharan desert",
+            "minecraft:desert",
+            1.0,
+        );
+
+        let mut saw_profile_dependent_top = false;
+        for z in 0..4 {
+            for x in 0..4 {
+                let baseline = apply_photo_surface_material(&PhotoSurfaceInput::new(
+                    plains.clone(),
+                    material.clone(),
+                    350.0,
+                    13.0,
+                    24.0,
+                    0.0,
+                    20.0,
+                    x,
+                    z,
+                ))
+                .unwrap();
+                let profiled = apply_photo_surface_material(
+                    &PhotoSurfaceInput::new(
+                        plains.clone(),
+                        material.clone(),
+                        350.0,
+                        13.0,
+                        24.0,
+                        0.0,
+                        20.0,
+                        x,
+                        z,
+                    )
+                    .with_token_luma_profile(Arc::clone(&profile)),
+                )
+                .unwrap();
+                assert_eq!(baseline.decision_source, "photo-palette");
+                assert_eq!(profiled.decision_source, "photo-palette");
+                saw_profile_dependent_top |=
+                    baseline.top_block_state_id != profiled.top_block_state_id;
+            }
+        }
+        assert!(saw_profile_dependent_top);
+    }
+
+    #[derive(Debug)]
+    struct RegionTokenProfileMaterialSampler {
+        varied_profile: bool,
+    }
+
+    impl RegionTokenProfileMaterialSampler {
+        fn material_for(&self, longitude: f64) -> SurfaceMaterialSample {
+            let source = if self.varied_profile && longitude < 5.0 {
+                let offset = ((longitude.max(0.0) / 5.0) * 31.0).round() as u8;
+                RgbColor::of(
+                    86 + offset.min(31),
+                    82 + offset.min(31),
+                    78 + offset.min(31),
+                )
+            } else {
+                RgbColor::of(156, 149, 137)
+            };
+            SurfaceMaterialSample::new(
+                source,
+                RgbColor::of(230, 205, 160),
+                TerrainTokenSource::JavaStandardPalette,
+                13,
+                0,
+                0,
+                0,
+                0,
+                4,
+                2,
+                0,
+                0,
+                30,
+                -1,
+                150,
+                "rocky desert plateau",
+                "minecraft:desert",
+                1.0,
+            )
+        }
+    }
+
+    impl SurfaceMaterialSampler for RegionTokenProfileMaterialSampler {
+        fn sample(
+            &self,
+            longitude: f64,
+            _latitude: f64,
+            _longitude_span_degrees: f64,
+            _latitude_span_degrees: f64,
+        ) -> Result<SurfaceMaterialSample> {
+            Ok(self.material_for(longitude))
+        }
+
+        fn sample_photo(
+            &self,
+            longitude: f64,
+            _latitude: f64,
+            _longitude_span_degrees: f64,
+            _latitude_span_degrees: f64,
+        ) -> Result<SurfaceMaterialSample> {
+            Ok(self.material_for(longitude))
+        }
+    }
+
+    #[test]
+    #[ignore = "slow full-region profile wiring fixture"]
+    fn surface_region_photo_pass_uses_collected_token_luma_profile() {
+        let mapping = EarthScaleMapping::for_denominator(15_000, -90.0, 90.0).unwrap();
+        let uniform = sample_surface_region_with_elevation_fn(
+            0,
+            0,
+            &mapping,
+            DEFAULT_VERTICAL_SCALE,
+            |_longitude, _latitude| Ok(900.0),
+            SurfaceTextureMode::Photo,
+            Some(&RegionTokenProfileMaterialSampler {
+                varied_profile: false,
+            }),
+        )
+        .unwrap();
+        let profiled = sample_surface_region_with_elevation_fn(
+            0,
+            0,
+            &mapping,
+            DEFAULT_VERTICAL_SCALE,
+            |_longitude, _latitude| Ok(900.0),
+            SurfaceTextureMode::Photo,
+            Some(&RegionTokenProfileMaterialSampler {
+                varied_profile: true,
+            }),
+        )
+        .unwrap();
+
+        let comparison_min_longitude = mapping
+            .longitude_for_block_x(mapping.width_blocks / 2 + 128)
+            .unwrap();
+        assert!(comparison_min_longitude >= 5.0);
+        let mut saw_profile_dependent_region_top = false;
+        for z in 0..16 {
+            for x in 128..256 {
+                let uniform_column = uniform.column(x, z).unwrap();
+                let profiled_column = profiled.column(x, z).unwrap();
+                assert!(uniform_column.decision_source.starts_with("photo-palette"));
+                assert!(profiled_column.decision_source.starts_with("photo-palette"));
+                if uniform_column.top_block_state_id != profiled_column.top_block_state_id {
+                    saw_profile_dependent_region_top = true;
+                }
+            }
+        }
+        assert!(saw_profile_dependent_region_top);
     }
 
     #[test]
