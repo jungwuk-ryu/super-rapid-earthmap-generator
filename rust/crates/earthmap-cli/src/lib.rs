@@ -11,6 +11,11 @@ use earthmap_geo::{
     EarthScaleMapping, GeoTiffHeightmapReader, GeoTiffMetadata, GeoTiffRowCache,
     HeightmapScalarSampler, VrtRgbMosaicReader,
 };
+use earthmap_minecraft::{
+    block_state_ids,
+    chunk_model::{ChunkModel, CHUNK_WIDTH},
+    chunk_nbt_encoder, level_dat_template,
+};
 use earthmap_region::{ChunkLocalPos, RegionError};
 use earthmap_surface::{
     classify_surface, HeightOnlySettings, OutputFormat, SurfaceRegionReport, SurfaceRegionSettings,
@@ -19,6 +24,12 @@ use earthmap_surface::{
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
+const FLAT_TEST_REGION_CHUNKS: u8 = 32;
+const FLAT_TEST_SURFACE_Y: i32 = 63;
+const FLAT_TEST_MCA_LEVEL_NAME: &str = "SR EarthMap Flat Test";
+const FLAT_TEST_LINEAR_LEVEL_NAME: &str = "SR EarthMap Linear Flat Test";
+const FLAT_TEST_MCA_SEED: i64 = 987654321;
+const FLAT_TEST_LINEAR_SEED: i64 = 13579;
 
 pub fn run<I, S>(args: I) -> i32
 where
@@ -82,6 +93,9 @@ where
         "compare-region-payload-manifest" if args.len() == 3 => write_result(
             compare_region_payload_manifest(stdout, stderr, &args[1], &args[2]),
         ),
+        "generate-flat-test-world" if args.len() == 3 => {
+            write_result(generate_flat_test_world(stdout, stderr, &args[1], &args[2]))
+        }
         "write-nbt-parity-fixtures" if args.len() == 2 => {
             write_result(write_nbt_parity_fixtures(stdout, stderr, &args[1]))
         }
@@ -146,6 +160,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         out,
         "  compare-region-payload-manifest <manifestCsv> <regionFile>"
     )?;
+    writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
     writeln!(out, "  write-nbt-parity-fixtures <outputDir>")?;
     writeln!(out, "  write-nbt-gzip-parity-fixtures <outputDir>")?;
     writeln!(out, "  write-region-writer-parity-fixtures <outputDir>")?;
@@ -236,6 +251,10 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "DONE rust.phase0.bootstrapPayloadManifestCheck - Bootstrap payload manifests can be checked against generated region files."
+    )?;
+    writeln!(
+        out,
+        "DONE rust.phase0.flatCandidateGenerator - generate-flat-test-world writes Rust candidate MCA/Linear flat worlds for Java-oracle corpus comparison."
     )?;
     writeln!(
         out,
@@ -1108,6 +1127,188 @@ fn compare_region_payload_manifest(
     }
 }
 
+fn generate_flat_test_world(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    world_dir: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    let normalized_format = format_text.to_ascii_lowercase();
+    match generate_flat_test_world_impl(world_dir, &normalized_format) {
+        Ok(region_file) => {
+            writeln!(out, "Flat test world generated")?;
+            writeln!(out, "format={normalized_format}")?;
+            writeln!(out, "regionFile={}", region_file.display())?;
+            writeln!(
+                out,
+                "manifestFile={}",
+                Path::new(world_dir)
+                    .join(SURVIVAL_MANIFEST_FILE_NAME)
+                    .display()
+            )?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Flat test world generation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn generate_flat_test_world_impl(
+    world_dir: &str,
+    normalized_format: &str,
+) -> std::result::Result<std::path::PathBuf, String> {
+    let world_dir = Path::new(world_dir);
+    let (level_name, seed, generator_name, region_name) = match normalized_format {
+        "mca" => (
+            FLAT_TEST_MCA_LEVEL_NAME,
+            FLAT_TEST_MCA_SEED,
+            "flat-test-mca",
+            "r.0.0.mca",
+        ),
+        "linear" => (
+            FLAT_TEST_LINEAR_LEVEL_NAME,
+            FLAT_TEST_LINEAR_SEED,
+            "flat-test-linear-v2",
+            "r.0.0.linear",
+        ),
+        _ => return Err("format must be mca or linear".to_string()),
+    };
+    let region_dir = world_dir.join("region");
+    std::fs::create_dir_all(&region_dir).map_err(|error| error.to_string())?;
+    let settings =
+        level_dat_template::Settings::new(level_name, seed, 8, FLAT_TEST_SURFACE_Y + 2, 8)
+            .map_err(|error| error.to_string())?;
+    level_dat_template::write(world_dir.join("level.dat"), &settings)
+        .map_err(|error| error.to_string())?;
+
+    let payloads = flat_test_region_payloads()?;
+    let region_file = region_dir.join(region_name);
+    match normalized_format {
+        "mca" => earthmap_region::write_mca_region(&region_file, &payloads, 0),
+        "linear" => earthmap_region::write_linear_v2_region(&region_file, &payloads, 0),
+        _ => unreachable!("format was validated above"),
+    }
+    .map_err(|error| error.to_string())?;
+    write_flat_test_manifest(world_dir, generator_name).map_err(|error| error.to_string())?;
+    Ok(region_file)
+}
+
+fn flat_test_region_payloads() -> std::result::Result<BTreeMap<ChunkLocalPos, Vec<u8>>, String> {
+    let mut payloads = BTreeMap::new();
+    for chunk_z in 0..FLAT_TEST_REGION_CHUNKS {
+        for chunk_x in 0..FLAT_TEST_REGION_CHUNKS {
+            let chunk = flat_test_chunk(i32::from(chunk_x), i32::from(chunk_z))?;
+            let bytes =
+                chunk_nbt_encoder::encode_to_bytes(&chunk, 0).map_err(|error| error.to_string())?;
+            let pos = ChunkLocalPos::new(chunk_x, chunk_z).map_err(|error| error.to_string())?;
+            payloads.insert(pos, bytes);
+        }
+    }
+    Ok(payloads)
+}
+
+fn flat_test_chunk(chunk_x: i32, chunk_z: i32) -> std::result::Result<ChunkModel, String> {
+    let mut chunk = ChunkModel::overworld(chunk_x, chunk_z);
+    for local_z in 0..CHUNK_WIDTH {
+        for local_x in 0..CHUNK_WIDTH {
+            let x = local_x as i32;
+            let z = local_z as i32;
+            chunk
+                .set_block_state_id(x, -64, z, block_state_ids::BEDROCK)
+                .map_err(|error| error.to_string())?;
+            chunk
+                .fill_column(x, z, -63, FLAT_TEST_SURFACE_Y - 4, block_state_ids::STONE)
+                .map_err(|error| error.to_string())?;
+            chunk
+                .fill_column(
+                    x,
+                    z,
+                    FLAT_TEST_SURFACE_Y - 3,
+                    FLAT_TEST_SURFACE_Y - 1,
+                    block_state_ids::DIRT,
+                )
+                .map_err(|error| error.to_string())?;
+            chunk
+                .set_block_state_id(x, FLAT_TEST_SURFACE_Y, z, block_state_ids::GRASS_BLOCK)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(chunk)
+}
+
+fn write_flat_test_manifest(
+    world_dir: &Path,
+    generator_name: &str,
+) -> io::Result<std::path::PathBuf> {
+    let mut values = base_flat_test_manifest(generator_name);
+    values.insert(
+        "generator.purpose".to_string(),
+        "format-validation".to_string(),
+    );
+    std::fs::create_dir_all(world_dir)?;
+    let manifest_path = world_dir.join(SURVIVAL_MANIFEST_FILE_NAME);
+    let mut file = std::fs::File::create(&manifest_path)?;
+    writeln!(file, "# SR EarthMap survival manifest")?;
+    for (key, value) in values {
+        writeln!(file, "{key}={}", escape_manifest_value(&value))?;
+    }
+    Ok(manifest_path)
+}
+
+fn base_flat_test_manifest(generator_name: &str) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    values.insert("manifest.version".to_string(), "1".to_string());
+    values.insert(
+        "minecraft.version".to_string(),
+        build_info::MINECRAFT_TARGET.to_string(),
+    );
+    values.insert("gameplay.claim".to_string(), "exploration-only".to_string());
+    values.insert("generator.name".to_string(), generator_name.to_string());
+    values.insert(
+        "generator.targetGameplayObjective".to_string(),
+        build_info::GAMEPLAY_PROFILE.to_string(),
+    );
+    values.insert(
+        "generator.currentGameplayClaim".to_string(),
+        "exploration-only".to_string(),
+    );
+    values.insert("delegated.lighting".to_string(), "true".to_string());
+    values.insert(
+        "delegated.vanillaDimensions".to_string(),
+        "true".to_string(),
+    );
+    for key in REQUIRED_SURVIVAL_BOOLEAN_KEYS {
+        values.insert((*key).to_string(), "false".to_string());
+    }
+    values
+}
+
+fn escape_manifest_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n")
+}
+
+const REQUIRED_SURVIVAL_BOOLEAN_KEYS: &[&str] = &[
+    "evidence.serverBootSaveReboot",
+    "evidence.spawnToEnd",
+    "features.caves",
+    "features.caveConnectivity",
+    "features.ores",
+    "features.strongholdOrEquivalent",
+    "features.endPortal",
+    "features.netherProgression",
+    "features.lootTables",
+    "features.spawners",
+    "reports.oreHistogram",
+    "reports.caveConnectivity",
+    "reports.structureMetadata",
+    "reports.resourceFairness",
+];
+
 fn write_nbt_parity_fixtures(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -1286,6 +1487,7 @@ mod tests {
         assert!(out.contains("write-sha256-manifest <root> <outputFile>"));
         assert!(out.contains("write-region-payload-manifest <regionFile> <outputCsv>"));
         assert!(out.contains("compare-region-payload-manifest <manifestCsv> <regionFile>"));
+        assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));
         assert!(out.contains("write-region-writer-parity-fixtures <outputDir>"));
@@ -1293,6 +1495,67 @@ mod tests {
         assert!(out.contains("locate-heightmap-point <heightmap> <scale> <longitude> <latitude>"));
         assert!(out.contains("classify-surface-point <heightmap> <scale> <longitude> <latitude>"));
         assert!(out.contains("sample-vrt-rgb <terrainVrt> <longitude> <latitude>"));
+    }
+
+    #[test]
+    fn generate_flat_test_world_rejects_unknown_format_like_java() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat");
+        let (code, out, err) =
+            run_capture(&["generate-flat-test-world", world.to_str().unwrap(), "zip"]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert_eq!(
+            err,
+            "Flat test world generation failed: format must be mca or linear\n"
+        );
+    }
+
+    #[test]
+    fn flat_test_chunk_matches_java_column_shape() {
+        let chunk = flat_test_chunk(3, 5).unwrap();
+
+        assert_eq!(chunk.chunk_x(), 3);
+        assert_eq!(chunk.chunk_z(), 5);
+        assert_eq!(
+            chunk.get_block_state_id(0, -64, 0).unwrap(),
+            block_state_ids::BEDROCK
+        );
+        assert_eq!(
+            chunk.get_block_state_id(0, -63, 0).unwrap(),
+            block_state_ids::STONE
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, FLAT_TEST_SURFACE_Y - 4, 15)
+                .unwrap(),
+            block_state_ids::STONE
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, FLAT_TEST_SURFACE_Y - 3, 15)
+                .unwrap(),
+            block_state_ids::DIRT
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, FLAT_TEST_SURFACE_Y - 1, 15)
+                .unwrap(),
+            block_state_ids::DIRT
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, FLAT_TEST_SURFACE_Y, 15)
+                .unwrap(),
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(
+            chunk
+                .get_block_state_id(15, FLAT_TEST_SURFACE_Y + 1, 15)
+                .unwrap(),
+            block_state_ids::AIR
+        );
     }
 
     #[test]

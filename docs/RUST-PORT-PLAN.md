@@ -199,6 +199,17 @@ Bootstrap implementation status on 2026-06-03:
 - `rust/scripts/compare-golden.ps1` also accepts `-CandidateRoot` so a Rust-generated candidate corpus tree can be
   compared against the Java-oracle entry manifests without rewriting the oracle artifacts. Omitting `-CandidateRoot`
   preserves the bootstrap self-check mode.
+- The Rust CLI implements `generate-flat-test-world <worldDir> <mca|linear>` so `flat-mca` and `flat-linear` Java
+  oracle entries can now be compared against Rust-generated candidate world trees.
+- Verified locally with
+  `rust/scripts/compare-golden.ps1 -GoldenRoot D:\earthmap\rust-port-golden\flat-candidate-smoke-20260604-090856\golden -CandidateRoot D:\earthmap\rust-port-golden\flat-candidate-smoke-20260604-090856\candidate`.
+  The Rust-generated flat MCA and Linear candidate region files are byte-identical to the Java oracle outputs:
+
+```text
+entry,javaRegionSha256,rustRegionSha256,byteIdentical
+flat-mca,33E4BE37E86E0524AEC290A6DBED9C95FCC80F2B6B42B5221D53DD2DD6A5E5A6,33E4BE37E86E0524AEC290A6DBED9C95FCC80F2B6B42B5221D53DD2DD6A5E5A6,true
+flat-linear,B80C7CFE14288EEE0255DE384536811A89622B6448804FF900CF86DAD80AE5AB,B80C7CFE14288EEE0255DE384536811A89622B6448804FF900CF86DAD80AE5AB,true
+```
 - The Rust CLI includes diagnostic commands for:
   - `write-sha256-manifest`
   - `write-region-payload-manifest`
@@ -206,9 +217,9 @@ Bootstrap implementation status on 2026-06-03:
   - `compare-region-payload-manifest`
 - The Java CLI includes `generate-flat-test-world <worldDir> <mca|linear>` so flat MCA and Linear oracle fixtures can be
   generated without test-only entrypoints.
-- Remaining Phase 0 work: generate Rust candidate outputs for every Java-oracle corpus entry; expand the corpus to
-  height-only, surface, photo, water, survival, quality, and OSM entries; add metadata/compression-delta reports; and add
-  CI wiring.
+- Remaining Phase 0 work: generate Rust candidate outputs for the remaining Java-oracle corpus entries beyond flat
+  MCA/Linear; expand the corpus to height-only, surface, photo, water, survival, quality, and OSM entries; add
+  metadata/compression-delta reports; and add CI wiring.
 
 Suggested commands:
 
