@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 crossbeam-channel.workspace = true
 earthmap-cli = { path = "../earthmap-cli" }
+earthmap-geo = { path = "../earthmap-geo" }
 eframe.workspace = true
 mimalloc.workspace = true
+rfd.workspace = true
 
 [[bin]]
 name = "earthmap-gui"

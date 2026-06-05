@@ -20,11 +20,29 @@ Rust GUI:
 
 ```powershell
 cargo run --manifest-path rust/Cargo.toml -p earthmap-gui --bin earthmap-gui
-cargo run --manifest-path rust/Cargo.toml -p earthmap-gui --bin earthmap-gui -- --cli version
+cargo run --manifest-path rust/Cargo.toml -p earthmap-gui --bin earthmap-gui -- --cli --version
 ```
 
 The GUI launches `earthmap-rs` as a separate generator process and reads progress from stdout. Keep preview rendering
 out of the GUI path; generation speed must remain governed by the CLI process.
+
+GUI data setup:
+
+- Select the HeightMap GeoTIFF. This controls terrain height, coast shape, water/land, and ocean depth.
+- Select the `TifFiles` root. The GUI fills `terrain\TrueMarble.vrt` from that root.
+- Keep the satellite raster as `TrueMarble.vrt` for photo-like terrain. Clearing it uses `surfaceRaster=auto`.
+- Optional companion rasters are discovered relative to the same `TifFiles` root when present:
+  `climate.tif`, `vegetation\*.tif`, `ocean_temp_infill.tif`, `bathymetry.tif`, and `slope.tif`.
+
+GUI area setup:
+
+- Choose **Whole Earth** to generate the full mapped Earth. At scale `1000`, this resolves to roughly `80 x 40`
+  Minecraft regions and should be run to a fast disk.
+- Choose **Preset area** for common regions such as Australia, Korea, Europe, Japan, or the contiguous United States.
+- Choose **Latitude/longitude box** to enter west/east/north/south decimal degrees.
+- Choose **Advanced region grid** only when you already know the Minecraft region coordinates.
+- Scale denominator `1000` means roughly one Minecraft block per kilometer at the equator. Smaller values generate
+  larger worlds; larger values generate smaller worlds.
 
 Fast filtered test:
 
