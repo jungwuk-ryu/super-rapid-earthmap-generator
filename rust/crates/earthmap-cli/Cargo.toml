@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 earthmap-core = { path = "../earthmap-core" }
+earthmap-gameplay = { path = "../earthmap-gameplay" }
 earthmap-geo = { path = "../earthmap-geo" }
 earthmap-minecraft = { path = "../earthmap-minecraft" }
 earthmap-parity = { path = "../earthmap-parity" }

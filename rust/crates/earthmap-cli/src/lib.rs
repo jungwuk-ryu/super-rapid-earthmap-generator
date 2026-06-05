@@ -525,6 +525,24 @@ where
                 args.get(7).map(String::as_str),
             ))
         }
+        "validate-survival-manifest" if args.len() == 2 => {
+            write_result(validate_survival_manifest(stdout, stderr, &args[1]))
+        }
+        "apply-survival-evidence" if args.len() == 7 => write_result(apply_survival_evidence(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+        )),
+        "validate-cave-density" if args.len() == 5 => write_result(validate_cave_density(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4],
+        )),
+        "validate-cave-connectivity" if args.len() == 5 => write_result(
+            validate_cave_connectivity(stdout, stderr, &args[1], &args[2], &args[3], &args[4]),
+        ),
+        "validate-ore-histogram-synthetic" if args.len() == 1 => {
+            write_result(validate_ore_histogram_synthetic(stdout, stderr))
+        }
+        "validate-underground-fluid-synthetic" if args.len() == 1 => {
+            write_result(validate_underground_fluid_synthetic(stdout, stderr))
+        }
         "trace-surface-region-column" if (6..=8).contains(&args.len()) => {
             let parsed = trace_column_args(&args);
             write_result(trace_surface_region_column(
@@ -2715,6 +2733,21 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         out,
         "  write-vanilla-finalization-commands <outputCommands> <startRegionX> <startRegionZ> <cols> <rows> [windowChunks] [waitMs]"
     )?;
+    writeln!(out, "  validate-survival-manifest <path>")?;
+    writeln!(
+        out,
+        "  apply-survival-evidence <sourceManifest> <outputManifest> <bootLog> <rebootLog> <spawnToEndLog> <claim>"
+    )?;
+    writeln!(
+        out,
+        "  validate-cave-density <seed> <minBlockX> <minBlockZ> <sizeBlocks>"
+    )?;
+    writeln!(
+        out,
+        "  validate-cave-connectivity <seed> <minBlockX> <minBlockZ> <sizeBlocks>"
+    )?;
+    writeln!(out, "  validate-ore-histogram-synthetic")?;
+    writeln!(out, "  validate-underground-fluid-synthetic")?;
     writeln!(out, "  benchmark-region-writers <outputDir> [iterations=3]")?;
     writeln!(out, "  playability-smoke <worldDir> <outputJson>")?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
@@ -3734,6 +3767,263 @@ fn append_forceload_window(
         "forceload remove {min_block_x} {min_block_z} {max_block_x} {max_block_z}\n"
     ));
     commands.push_str("@wait-ms 500\n");
+}
+
+fn validate_survival_manifest(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+) -> io::Result<i32> {
+    match earthmap_gameplay::validate_survival_manifest(Path::new(path)) {
+        Ok(report) => {
+            writeln!(out, "Survival manifest validated")?;
+            write_survival_gate_report(out, &report)?;
+            Ok(if report.manifest_valid {
+                EXIT_OK
+            } else {
+                EXIT_USAGE
+            })
+        }
+        Err(error) => {
+            writeln!(err, "Survival manifest validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_survival_evidence(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    source_manifest: &str,
+    output_manifest: &str,
+    boot_log: &str,
+    reboot_log: &str,
+    spawn_to_end_log: &str,
+    claim: &str,
+) -> io::Result<i32> {
+    match earthmap_gameplay::apply_survival_evidence(
+        Path::new(source_manifest),
+        Path::new(output_manifest),
+        Path::new(boot_log),
+        Path::new(reboot_log),
+        Path::new(spawn_to_end_log),
+        claim,
+    ) {
+        Ok(report) => {
+            writeln!(out, "Survival evidence applied")?;
+            writeln!(out, "manifestFile={}", report.manifest_path.display())?;
+            write_survival_gate_report(out, &report.gate_report)?;
+            Ok(
+                if report.gate_report.manifest_valid
+                    && report.gate_report.missing_requirements.is_empty()
+                {
+                    EXIT_OK
+                } else {
+                    EXIT_USAGE
+                },
+            )
+        }
+        Err(error) => {
+            writeln!(err, "Survival evidence application failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn write_survival_gate_report(
+    out: &mut impl Write,
+    report: &earthmap_gameplay::SurvivalGateReport,
+) -> io::Result<()> {
+    writeln!(out, "manifestValid={}", report.manifest_valid)?;
+    writeln!(
+        out,
+        "survivalCompleteAllowed={}",
+        report.survival_complete_allowed
+    )?;
+    writeln!(out, "claim={}", report.claim)?;
+    writeln!(
+        out,
+        "missingRequirements={}",
+        report.missing_requirements.len()
+    )?;
+    for missing in &report.missing_requirements {
+        writeln!(out, "missing={missing}")?;
+    }
+    Ok(())
+}
+
+fn validate_cave_density(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    seed_text: &str,
+    min_block_x_text: &str,
+    min_block_z_text: &str,
+    size_blocks_text: &str,
+) -> io::Result<i32> {
+    match parse_cave_args(
+        seed_text,
+        min_block_x_text,
+        min_block_z_text,
+        size_blocks_text,
+    )
+    .and_then(|(seed, min_block_x, min_block_z, size_blocks)| {
+        earthmap_gameplay::validate_cave_density(seed, min_block_x, min_block_z, size_blocks)
+    }) {
+        Ok(report) => {
+            writeln!(out, "Cave density validated")?;
+            writeln!(out, "seed={}", report.seed)?;
+            writeln!(out, "minBlockX={}", report.min_block_x)?;
+            writeln!(out, "minBlockZ={}", report.min_block_z)?;
+            writeln!(out, "sizeBlocks={}", report.size_blocks)?;
+            writeln!(out, "minY={}", report.min_y)?;
+            writeln!(out, "maxY={}", report.max_y)?;
+            writeln!(out, "sampledBlocks={}", report.sampled_blocks)?;
+            writeln!(out, "caveCandidateBlocks={}", report.cave_candidate_blocks)?;
+            writeln!(out, "caveRatio={}", java_double_string(report.cave_ratio))?;
+            writeln!(out, "minDensity={}", java_double_string(report.min_density))?;
+            writeln!(out, "maxDensity={}", java_double_string(report.max_density))?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Cave density validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn validate_cave_connectivity(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    seed_text: &str,
+    min_block_x_text: &str,
+    min_block_z_text: &str,
+    size_blocks_text: &str,
+) -> io::Result<i32> {
+    match parse_cave_args(
+        seed_text,
+        min_block_x_text,
+        min_block_z_text,
+        size_blocks_text,
+    )
+    .and_then(|(seed, min_block_x, min_block_z, size_blocks)| {
+        earthmap_gameplay::validate_cave_connectivity(seed, min_block_x, min_block_z, size_blocks)
+    }) {
+        Ok(report) => {
+            writeln!(out, "Cave connectivity validated")?;
+            writeln!(out, "seed={}", report.seed)?;
+            writeln!(out, "minBlockX={}", report.min_block_x)?;
+            writeln!(out, "minBlockZ={}", report.min_block_z)?;
+            writeln!(out, "sizeBlocks={}", report.size_blocks)?;
+            writeln!(out, "minY={}", report.min_y)?;
+            writeln!(out, "maxY={}", report.max_y)?;
+            writeln!(out, "caveCandidateBlocks={}", report.cave_candidate_blocks)?;
+            writeln!(out, "componentCount={}", report.component_count)?;
+            writeln!(
+                out,
+                "largestComponentBlocks={}",
+                report.largest_component_blocks
+            )?;
+            writeln!(
+                out,
+                "largestComponentRatio={}",
+                java_double_string(report.largest_component_ratio)
+            )?;
+            writeln!(
+                out,
+                "entranceCandidateConnected={}",
+                report.entrance_candidate_connected
+            )?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Cave connectivity validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn parse_cave_args(
+    seed_text: &str,
+    min_block_x_text: &str,
+    min_block_z_text: &str,
+    size_blocks_text: &str,
+) -> std::result::Result<(i64, i32, i32, i32), String> {
+    Ok((
+        seed_text
+            .parse::<i64>()
+            .map_err(|error| error.to_string())?,
+        parse_i32_string(min_block_x_text)?,
+        parse_i32_string(min_block_z_text)?,
+        parse_i32_string(size_blocks_text)?,
+    ))
+}
+
+fn validate_ore_histogram_synthetic(out: &mut impl Write, err: &mut impl Write) -> io::Result<i32> {
+    match earthmap_gameplay::validate_ore_histogram_synthetic() {
+        Ok(report) => {
+            write_ore_histogram_report(out, &report)?;
+            Ok(if report.survival_critical_complete() {
+                EXIT_OK
+            } else {
+                EXIT_USAGE
+            })
+        }
+        Err(error) => {
+            writeln!(err, "Ore histogram validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn write_ore_histogram_report(
+    out: &mut impl Write,
+    report: &earthmap_gameplay::OreHistogramReport,
+) -> io::Result<()> {
+    writeln!(out, "Ore histogram validated")?;
+    writeln!(out, "chunkCount={}", report.chunk_count)?;
+    writeln!(out, "sampledBlocks={}", report.sampled_blocks)?;
+    writeln!(out, "totalOreBlocks={}", report.total_ore_blocks)?;
+    writeln!(
+        out,
+        "survivalCriticalComplete={}",
+        report.survival_critical_complete()
+    )?;
+    for kind in earthmap_gameplay::OreKind::ALL {
+        writeln!(
+            out,
+            "ore.{}={}",
+            kind.id(),
+            report.counts.get(&kind).copied().unwrap_or(0)
+        )?;
+    }
+    for kind in report.missing_survival_critical_ores.keys() {
+        writeln!(out, "missingOre={}", kind.id())?;
+    }
+    Ok(())
+}
+
+fn validate_underground_fluid_synthetic(
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> io::Result<i32> {
+    match earthmap_gameplay::validate_underground_fluid_synthetic() {
+        Ok(report) => {
+            writeln!(out, "Underground fluid validated")?;
+            writeln!(out, "waterBlocks={}", report.water_blocks)?;
+            writeln!(out, "lavaBlocks={}", report.lava_blocks)?;
+            writeln!(out, "totalFluidBlocks={}", report.total_fluid_blocks())?;
+            Ok(if report.water_blocks > 0 && report.lava_blocks > 0 {
+                EXIT_OK
+            } else {
+                EXIT_USAGE
+            })
+        }
+        Err(error) => {
+            writeln!(err, "Underground fluid validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13870,6 +14160,24 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.write-vanilla-finalization-commands - server force-load command writer for vanilla finalization"
         ));
+        assert!(out.contains(
+            "DONE rust.command.validate-survival-manifest - survival manifest gate validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.apply-survival-evidence - survival evidence manifest updater"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-cave-density - deterministic cave density validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-cave-connectivity - deterministic cave connectivity validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-ore-histogram-synthetic - synthetic ore histogram validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-underground-fluid-synthetic - synthetic underground fluid validator"
+        ));
     }
 
     #[test]
@@ -14220,6 +14528,114 @@ mod tests {
     }
 
     #[test]
+    fn survival_manifest_and_evidence_commands_run_without_java() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.properties");
+        let output = temp
+            .path()
+            .join("validated")
+            .join("earthmap-survival.properties");
+        let boot = temp.path().join("boot.log");
+        let reboot = temp.path().join("reboot.log");
+        let spawn = temp.path().join("spawn.log");
+
+        let mut values = BTreeMap::new();
+        values.insert(
+            "manifest.version".to_string(),
+            earthmap_gameplay::MANIFEST_VERSION.to_string(),
+        );
+        values.insert(
+            "minecraft.version".to_string(),
+            build_info::MINECRAFT_TARGET.to_string(),
+        );
+        values.insert(
+            "gameplay.claim".to_string(),
+            earthmap_gameplay::CLAIM_EXPLORATION_ONLY.to_string(),
+        );
+        for key in earthmap_gameplay::REQUIRED_BOOLEAN_KEYS {
+            values.insert((*key).to_string(), "true".to_string());
+        }
+        values.insert(
+            "evidence.serverBootSaveReboot".to_string(),
+            "false".to_string(),
+        );
+        values.insert("evidence.spawnToEnd".to_string(), "false".to_string());
+        earthmap_gameplay::write_properties(&source, &values, "test").unwrap();
+        fs::write(&boot, "Server run completed cleanly.").unwrap();
+        fs::write(&reboot, "Server run completed cleanly.").unwrap();
+        fs::write(
+            &spawn,
+            "Server command run completed cleanly.\n[Server] SPAWN_TO_END_ENTITY_TELEPORTED\n",
+        )
+        .unwrap();
+
+        let (code, out, err) =
+            run_capture(&["validate-survival-manifest", source.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Survival manifest validated\n"));
+        assert!(out.contains("manifestValid=true\n"));
+        assert!(out.contains("survivalCompleteAllowed=false\n"));
+        assert!(out.contains("missing=evidence.serverBootSaveReboot\n"));
+        assert!(out.contains("missing=evidence.spawnToEnd\n"));
+
+        let (code, out, err) = run_capture(&[
+            "apply-survival-evidence",
+            source.to_str().unwrap(),
+            output.to_str().unwrap(),
+            boot.to_str().unwrap(),
+            reboot.to_str().unwrap(),
+            spawn.to_str().unwrap(),
+            "survival-complete",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Survival evidence applied\n"));
+        assert!(out.contains("manifestValid=true\n"));
+        assert!(out.contains("survivalCompleteAllowed=true\n"));
+        assert!(out.contains("missingRequirements=0\n"));
+        let written = fs::read_to_string(output).unwrap();
+        assert!(written.contains("evidence.serverBootLog=boot.log\n"));
+        assert!(written.contains("gameplay.claim=survival-complete\n"));
+    }
+
+    #[test]
+    fn cave_ore_and_fluid_validators_run_without_java() {
+        let (code, out, err) = run_capture(&["validate-cave-density", "42", "0", "0", "4"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Cave density validated\n"));
+        assert!(out.contains("sampledBlocks=2416\n"));
+        assert!(out.contains("caveCandidateBlocks="));
+        assert!(out.contains("caveRatio="));
+
+        let (code, out, err) = run_capture(&["validate-cave-connectivity", "42", "0", "0", "4"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Cave connectivity validated\n"));
+        assert!(out.contains("componentCount="));
+        assert!(out.contains("largestComponentRatio="));
+        assert!(out.contains("entranceCandidateConnected="));
+
+        let (code, out, err) = run_capture(&["validate-ore-histogram-synthetic"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Ore histogram validated\n"));
+        assert!(out.contains("chunkCount=1\n"));
+        assert!(out.contains("totalOreBlocks=16\n"));
+        assert!(out.contains("survivalCriticalComplete=true\n"));
+        assert!(out.contains("ore.diamond=2\n"));
+
+        let (code, out, err) = run_capture(&["validate-underground-fluid-synthetic"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Underground fluid validated\n"));
+        assert!(out.contains("waterBlocks="));
+        assert!(out.contains("lavaBlocks="));
+        assert!(out.contains("totalFluidBlocks="));
+    }
+
+    #[test]
     fn trace_surface_region_column_rejects_out_of_range_local_coords_before_io() {
         let (code, out, err) = run_capture(&[
             "trace-surface-region-column",
@@ -14508,6 +14924,12 @@ mod tests {
         assert!(out.contains("validate-surface-spawn <heightmap> <scale> <regionX>"));
         assert!(out.contains("validate-height-seam <heightmap> <scale> <regionX>"));
         assert!(out.contains("write-vanilla-finalization-commands <outputCommands>"));
+        assert!(out.contains("validate-survival-manifest <path>"));
+        assert!(out.contains("apply-survival-evidence <sourceManifest> <outputManifest>"));
+        assert!(out.contains("validate-cave-density <seed> <minBlockX>"));
+        assert!(out.contains("validate-cave-connectivity <seed> <minBlockX>"));
+        assert!(out.contains("validate-ore-histogram-synthetic"));
+        assert!(out.contains("validate-underground-fluid-synthetic"));
         assert!(out.contains("benchmark-region-writers <outputDir> [iterations=3]"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));

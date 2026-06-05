@@ -418,16 +418,23 @@ Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workloa
 Covered commands:
 - [ ] `validate-global-resource-fairness`
 - [ ] `validate-loot-economy`
-- [ ] `validate-survival-manifest`
-- [ ] `apply-survival-evidence`
-- [ ] `validate-cave-density`
-- [ ] `validate-cave-connectivity`
-- [ ] `validate-ore-histogram-synthetic`
-- [ ] `validate-underground-fluid-synthetic`
+- [x] `validate-survival-manifest`
+- [x] `apply-survival-evidence`
+- [x] `validate-cave-density`
+- [x] `validate-cave-connectivity`
+- [x] `validate-ore-histogram-synthetic`
+- [x] `validate-underground-fluid-synthetic`
 Detailed progress:
 - [ ] Validators read generated artifacts directly without Java.
-- [ ] Reports preserve fields consumed by finalization scripts.
+- [x] Reports preserve fields consumed by finalization scripts.
 - [ ] Benchmarks focus on validator wall time and peak memory.
+Partial specs:
+- `earthmap-rs validate-survival-manifest <path>` prints manifest validity, survival completion allowance, claim, and missing requirements.
+- `earthmap-rs apply-survival-evidence <sourceManifest> <outputManifest> <bootLog> <rebootLog> <spawnToEndLog> <claim>` validates logs and writes an updated sorted survival manifest.
+- `earthmap-rs validate-cave-density <seed> <minBlockX> <minBlockZ> <sizeBlocks>` reports deterministic cave density statistics.
+- `earthmap-rs validate-cave-connectivity <seed> <minBlockX> <minBlockZ> <sizeBlocks>` reports deterministic cave component connectivity statistics.
+- `earthmap-rs validate-ore-histogram-synthetic` and `earthmap-rs validate-underground-fluid-synthetic` run Java-free synthetic gameplay smoke gates.
+Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-gameplay --locked` plus targeted CLI survival/cave/ore/fluid tests passed.
 
 ### Nation-war readiness and finalization reports
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented

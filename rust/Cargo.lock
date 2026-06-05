@@ -842,6 +842,7 @@ name = "earthmap-cli"
 version = "0.0.0-phase0"
 dependencies = [
  "earthmap-core",
+ "earthmap-gameplay",
  "earthmap-geo",
  "earthmap-minecraft",
  "earthmap-parity",
@@ -865,8 +866,10 @@ name = "earthmap-gameplay"
 version = "0.0.0-phase0"
 dependencies = [
  "earthmap-core",
+ "earthmap-minecraft",
  "earthmap-region",
  "earthmap-surface",
+ "tempfile",
 ]
 
 [[package]]

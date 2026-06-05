@@ -6,9 +6,12 @@ license.workspace = true
 
 [dependencies]
 earthmap-core = { path = "../earthmap-core" }
+earthmap-minecraft = { path = "../earthmap-minecraft" }
 earthmap-region = { path = "../earthmap-region" }
 earthmap-surface = { path = "../earthmap-surface" }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lib]
 path = "src/lib.rs"
-

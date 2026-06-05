@@ -85,6 +85,36 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "server force-load command writer for vanilla finalization",
     },
     CommandSpec {
+        name: "validate-survival-manifest",
+        status: CommandStatus::Implemented,
+        note: "survival manifest gate validator",
+    },
+    CommandSpec {
+        name: "apply-survival-evidence",
+        status: CommandStatus::Implemented,
+        note: "survival evidence manifest updater",
+    },
+    CommandSpec {
+        name: "validate-cave-density",
+        status: CommandStatus::Implemented,
+        note: "deterministic cave density validator",
+    },
+    CommandSpec {
+        name: "validate-cave-connectivity",
+        status: CommandStatus::Implemented,
+        note: "deterministic cave connectivity validator",
+    },
+    CommandSpec {
+        name: "validate-ore-histogram-synthetic",
+        status: CommandStatus::Implemented,
+        note: "synthetic ore histogram validator",
+    },
+    CommandSpec {
+        name: "validate-underground-fluid-synthetic",
+        status: CommandStatus::Implemented,
+        note: "synthetic underground fluid validator",
+    },
+    CommandSpec {
         name: "quality-production-sample-batch",
         status: CommandStatus::Implemented,
         note: "Rust quality gate production sample batch",
