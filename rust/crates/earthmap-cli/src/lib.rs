@@ -7443,7 +7443,12 @@ mod tests {
         assert!(out.contains(
             "WIP rust.command.generate-vanilla-delegated-region - single vanilla-delegated region parity probe; payload parity is not green"
         ));
-        assert!(!out.contains("DONE rust.command.generate-vanilla-delegated-region"));
+        assert!(!out
+            .lines()
+            .any(|line| line.starts_with("DONE rust.command.generate-vanilla-delegated-region -")));
+        assert!(out.contains(
+            "DONE rust.command.generate-vanilla-delegated-regions-parallel - parallel vanilla-delegated region generation"
+        ));
     }
 
     #[test]

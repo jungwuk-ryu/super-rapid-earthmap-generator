@@ -36,7 +36,7 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "generate-vanilla-delegated-regions-parallel",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "parallel vanilla-delegated region generation",
     },
     CommandSpec {
