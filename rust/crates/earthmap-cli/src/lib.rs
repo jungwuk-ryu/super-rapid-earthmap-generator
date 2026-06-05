@@ -471,6 +471,9 @@ where
         "rewrite-mca-status" if args.len() == 3 => {
             write_result(rewrite_mca_status(stdout, stderr, &args[1], &args[2]))
         }
+        "repair-mca-post-final-water" if args.len() == 2 => {
+            write_result(repair_mca_post_final_water(stdout, stderr, &args[1]))
+        }
         "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
             stdout, stderr, &args[1], &args[2], &args[3],
         )),
@@ -951,6 +954,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  rewrite-mca-status <mcaRegion|regionDir|worldDir> <full|surface|carvers>"
+    )?;
+    writeln!(
+        out,
+        "  repair-mca-post-final-water <mcaRegion|regionDir|worldDir>"
     )?;
     writeln!(
         out,
@@ -7620,6 +7627,542 @@ fn current_mca_timestamp() -> i32 {
     i32::try_from(seconds.min(i32::MAX as u64)).unwrap_or(i32::MAX)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct McaPostFinalWaterRepairReport {
+    region_file_count: usize,
+    chunk_count: usize,
+    repaired_region_count: usize,
+    repaired_chunk_count: usize,
+    repaired_column_count: u64,
+    filled_block_count: u64,
+}
+
+fn repair_mca_post_final_water(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+) -> io::Result<i32> {
+    match repair_mca_post_final_water_impl(Path::new(path)) {
+        Ok(report) => {
+            writeln!(out, "MCA post-final water repaired")?;
+            writeln!(out, "regionFileCount={}", report.region_file_count)?;
+            writeln!(out, "chunkCount={}", report.chunk_count)?;
+            writeln!(out, "repairedRegionCount={}", report.repaired_region_count)?;
+            writeln!(out, "repairedChunkCount={}", report.repaired_chunk_count)?;
+            writeln!(out, "repairedColumnCount={}", report.repaired_column_count)?;
+            writeln!(out, "filledBlockCount={}", report.filled_block_count)?;
+            writeln!(out, "changed={}", report.filled_block_count > 0)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "MCA post-final water repair failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn repair_mca_post_final_water_impl(
+    path: &Path,
+) -> std::result::Result<McaPostFinalWaterRepairReport, String> {
+    let region_files = mca_region_files_for_target(path)?;
+    let mut report = McaPostFinalWaterRepairReport::default();
+    for region_file in region_files {
+        let region_report = repair_mca_post_final_water_region(&region_file)?;
+        report.region_file_count += region_report.region_file_count;
+        report.chunk_count += region_report.chunk_count;
+        report.repaired_region_count += region_report.repaired_region_count;
+        report.repaired_chunk_count += region_report.repaired_chunk_count;
+        report.repaired_column_count += region_report.repaired_column_count;
+        report.filled_block_count += region_report.filled_block_count;
+    }
+    Ok(report)
+}
+
+fn repair_mca_post_final_water_region(
+    region_file: &Path,
+) -> std::result::Result<McaPostFinalWaterRepairReport, String> {
+    let payloads = read_region_payloads(region_file).map_err(|error| error.to_string())?;
+    if payloads.format != RegionFormat::Mca {
+        return Err(format!(
+            "region format mismatch: expected mca got {}",
+            payloads.format.as_manifest_value()
+        ));
+    }
+    let mut repaired_chunks = 0usize;
+    let mut repaired_columns = 0u64;
+    let mut filled_blocks = 0u64;
+    let mut updated_payloads = BTreeMap::new();
+    for (pos, payload) in &payloads.chunks {
+        let result = repair_mca_post_final_water_chunk(payload)?;
+        if result.filled_block_count > 0 {
+            repaired_chunks += 1;
+            repaired_columns += result.repaired_column_count;
+            filled_blocks += result.filled_block_count;
+        }
+        updated_payloads.insert(*pos, result.payload);
+    }
+    if filled_blocks > 0 {
+        earthmap_region::write_mca_region(region_file, &updated_payloads, current_mca_timestamp())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(McaPostFinalWaterRepairReport {
+        region_file_count: 1,
+        chunk_count: payloads.chunks.len(),
+        repaired_region_count: usize::from(filled_blocks > 0),
+        repaired_chunk_count: repaired_chunks,
+        repaired_column_count: repaired_columns,
+        filled_block_count: filled_blocks,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct McaWaterChunkRepairResult {
+    payload: Vec<u8>,
+    repaired_column_count: u64,
+    filled_block_count: u64,
+}
+
+fn repair_mca_post_final_water_chunk(
+    payload: &[u8],
+) -> std::result::Result<McaWaterChunkRepairResult, String> {
+    let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
+    let root_name = named.name().to_string();
+    let Tag::Compound(root) = named.into_tag() else {
+        return Err("chunk root is not an NBT compound".to_string());
+    };
+    let mut chunk = MutableMcaWaterChunk::decode(root)?;
+    let result = chunk.repair_underwater_air()?;
+    if result.filled_block_count == 0 {
+        return Ok(McaWaterChunkRepairResult {
+            payload: payload.to_vec(),
+            repaired_column_count: 0,
+            filled_block_count: 0,
+        });
+    }
+    let root = chunk.flush()?;
+    let payload = nbt::write_to_bytes(&root_name, &root).map_err(|error| error.to_string())?;
+    Ok(McaWaterChunkRepairResult {
+        payload,
+        repaired_column_count: result.repaired_column_count,
+        filled_block_count: result.filled_block_count,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct McaWaterColumnRepairResult {
+    repaired_column_count: u64,
+    filled_block_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct McaWaterColumnShape {
+    terrain_surface_y: i32,
+    water_at_sea_level: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MutableMcaWaterChunk {
+    root: earthmap_minecraft::nbt::Compound,
+    section_tags: Vec<Tag>,
+    sections: BTreeMap<i32, MutableMcaWaterSection>,
+    section_list_changed: bool,
+}
+
+impl MutableMcaWaterChunk {
+    fn decode(root: earthmap_minecraft::nbt::Compound) -> std::result::Result<Self, String> {
+        let section_tags = root
+            .get_list("sections")
+            .map_err(|error| error.to_string())?
+            .values()
+            .to_vec();
+        let mut sections = BTreeMap::new();
+        for (tag_index, section_tag) in section_tags.iter().enumerate() {
+            let Tag::Compound(section) = section_tag else {
+                return Err("chunk section is not an NBT compound".to_string());
+            };
+            if !section.contains("block_states") {
+                continue;
+            }
+            let section = MutableMcaWaterSection::decode(section.clone(), tag_index)?;
+            sections.insert(section.section_y, section);
+        }
+        Ok(Self {
+            root,
+            section_tags,
+            sections,
+            section_list_changed: false,
+        })
+    }
+
+    fn repair_underwater_air(&mut self) -> std::result::Result<McaWaterColumnRepairResult, String> {
+        let mut repaired_column_count = 0u64;
+        let mut filled_block_count = 0u64;
+        for local_z in 0..CHUNK_WIDTH {
+            for local_x in 0..CHUNK_WIDTH {
+                let shape = self.scan_column_shape(local_x, local_z)?;
+                if !shape.water_at_sea_level || shape.terrain_surface_y >= SEA_LEVEL_Y {
+                    continue;
+                }
+                let bottom = if shape.terrain_surface_y == i32::MIN {
+                    OVERWORLD_1_21_11.min_y()
+                } else {
+                    shape.terrain_surface_y + 1
+                };
+                let mut column_fills = 0u64;
+                for y in bottom..=SEA_LEVEL_Y {
+                    if is_air_block(&self.block_name_at(local_x, y, local_z)?)
+                        && self.set_full_water_at(local_x, y, local_z)?
+                    {
+                        column_fills += 1;
+                    }
+                }
+                if column_fills > 0 {
+                    repaired_column_count += 1;
+                    filled_block_count += column_fills;
+                }
+            }
+        }
+        Ok(McaWaterColumnRepairResult {
+            repaired_column_count,
+            filled_block_count,
+        })
+    }
+
+    fn scan_column_shape(
+        &self,
+        local_x: usize,
+        local_z: usize,
+    ) -> std::result::Result<McaWaterColumnShape, String> {
+        let mut terrain_surface_y = i32::MIN;
+        let mut water_at_sea_level = false;
+        for y in OVERWORLD_1_21_11.min_y()..=OVERWORLD_1_21_11.max_y_inclusive() {
+            let block_name = self.block_name_at(local_x, y, local_z)?;
+            if y == SEA_LEVEL_Y && is_water_like_block(&block_name) {
+                water_at_sea_level = true;
+            }
+            if is_mca_water_repair_terrain_surface_candidate(&block_name) {
+                terrain_surface_y = y;
+            }
+        }
+        Ok(McaWaterColumnShape {
+            terrain_surface_y,
+            water_at_sea_level,
+        })
+    }
+
+    fn block_name_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let section_y = y.div_euclid(SECTION_HEIGHT);
+        let Some(section) = self.sections.get(&section_y) else {
+            return Ok(TOPDOWN_AIR_BLOCK.to_string());
+        };
+        section.block_name_at(local_x, y, local_z)
+    }
+
+    fn set_full_water_at(
+        &mut self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<bool, String> {
+        let section = self.section_for_y(y)?;
+        section.set_full_water_at(local_x, y, local_z)
+    }
+
+    fn section_for_y(
+        &mut self,
+        y: i32,
+    ) -> std::result::Result<&mut MutableMcaWaterSection, String> {
+        let section_y = y.div_euclid(SECTION_HEIGHT);
+        if !self.sections.contains_key(&section_y) {
+            let tag_index = self.section_tags.len();
+            let section_tag = empty_mca_water_air_section(section_y)?;
+            let section = MutableMcaWaterSection::decode(section_tag.clone(), tag_index)?;
+            self.section_tags.push(Tag::Compound(section_tag));
+            self.sections.insert(section_y, section);
+            self.section_list_changed = true;
+        }
+        self.sections
+            .get_mut(&section_y)
+            .ok_or_else(|| format!("missing section after creation: {section_y}"))
+    }
+
+    fn flush(mut self) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
+        let mut changed = self.section_list_changed;
+        for section in self.sections.values_mut() {
+            if section.flush()? {
+                self.section_tags[section.tag_index] = Tag::Compound(section.section_tag.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            if self.section_list_changed {
+                self.section_tags.sort_by_key(mca_water_section_sort_key);
+            }
+            self.root
+                .put(
+                    "sections",
+                    Tag::List(
+                        nbt::list(nbt::TAG_COMPOUND, self.section_tags)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(self.root)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MutableMcaWaterSection {
+    section_y: i32,
+    tag_index: usize,
+    section_tag: earthmap_minecraft::nbt::Compound,
+    palette_tags: Vec<Tag>,
+    palette_names: Vec<String>,
+    palette_indices: Vec<usize>,
+    changed: bool,
+}
+
+impl MutableMcaWaterSection {
+    fn decode(
+        section_tag: earthmap_minecraft::nbt::Compound,
+        tag_index: usize,
+    ) -> std::result::Result<Self, String> {
+        let section_y = i32::from(
+            section_tag
+                .get_byte("Y")
+                .map_err(|error| error.to_string())?,
+        );
+        let block_states = section_tag
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?;
+        if !block_states.contains("palette") {
+            return Err("chunk section block_states missing palette".to_string());
+        }
+        let palette_tags = block_states
+            .get_list("palette")
+            .map_err(|error| error.to_string())?
+            .values()
+            .to_vec();
+        if palette_tags.is_empty() {
+            return Err("chunk section block state palette is empty".to_string());
+        }
+        let mut palette_names = Vec::with_capacity(palette_tags.len());
+        for palette_tag in &palette_tags {
+            let Tag::Compound(block_state) = palette_tag else {
+                return Err("block state palette entry is not an NBT compound".to_string());
+            };
+            palette_names.push(
+                block_state
+                    .get_string("Name")
+                    .map_err(|error| error.to_string())?
+                    .to_string(),
+            );
+        }
+        let palette_indices =
+            decode_palette_values(block_states, palette_tags.len(), SECTION_BLOCK_COUNT)?;
+        Ok(Self {
+            section_y,
+            tag_index,
+            section_tag,
+            palette_tags,
+            palette_names,
+            palette_indices,
+            changed: false,
+        })
+    }
+
+    fn block_name_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let block_index = mca_water_block_index(local_x, y, local_z);
+        let palette_index = self
+            .palette_indices
+            .get(block_index)
+            .copied()
+            .ok_or_else(|| format!("missing palette index at {block_index}"))?;
+        self.palette_names
+            .get(palette_index)
+            .cloned()
+            .ok_or_else(|| format!("packed palette index outside palette: {palette_index}"))
+    }
+
+    fn set_full_water_at(
+        &mut self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<bool, String> {
+        if !is_air_block(&self.block_name_at(local_x, y, local_z)?) {
+            return Ok(false);
+        }
+        let block_index = mca_water_block_index(local_x, y, local_z);
+        let water_index = self.full_water_palette_index()?;
+        self.palette_indices[block_index] = water_index;
+        self.changed = true;
+        Ok(true)
+    }
+
+    fn flush(&mut self) -> std::result::Result<bool, String> {
+        if !self.changed {
+            return Ok(false);
+        }
+        let mut block_states = self
+            .section_tag
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?
+            .clone();
+        block_states
+            .put(
+                "palette",
+                Tag::List(
+                    nbt::list(nbt::TAG_COMPOUND, self.palette_tags.clone())
+                        .map_err(|error| error.to_string())?,
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+        let bits_per_entry = bits_per_entry_for_palette_size(self.palette_tags.len())
+            .map_err(|error| error.to_string())?;
+        if bits_per_entry == 0 {
+            block_states
+                .remove("data")
+                .map_err(|error| error.to_string())?;
+        } else {
+            let packed = PackedLongArray::pack(SECTION_BLOCK_COUNT, bits_per_entry, |index| {
+                self.palette_indices[index] as i32
+            })
+            .map_err(|error| error.to_string())?;
+            block_states
+                .put_long_array("data", packed.copy_data())
+                .map_err(|error| error.to_string())?;
+        }
+        self.section_tag
+            .put_compound("block_states", block_states)
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    fn full_water_palette_index(&mut self) -> std::result::Result<usize, String> {
+        for (index, tag) in self.palette_tags.iter().enumerate() {
+            let Tag::Compound(block_state) = tag else {
+                continue;
+            };
+            if is_full_water_state(block_state) {
+                return Ok(index);
+            }
+        }
+        let index = self.palette_tags.len();
+        self.palette_tags.push(full_water_block_state_tag()?);
+        self.palette_names.push("minecraft:water".to_string());
+        Ok(index)
+    }
+}
+
+fn is_mca_water_repair_terrain_surface_candidate(block_name: &str) -> bool {
+    !is_air_block(block_name)
+        && !is_water_like_block(block_name)
+        && !is_log_block(block_name)
+        && !is_leaf_block_name(block_name)
+        && !is_plant_like_block(block_name)
+}
+
+fn mca_water_block_index(local_x: usize, y: i32, local_z: usize) -> usize {
+    let local_y = usize::try_from(y & (SECTION_HEIGHT - 1)).expect("local y is non-negative");
+    (local_y << 8) | (local_z << 4) | local_x
+}
+
+fn full_water_block_state_tag() -> std::result::Result<Tag, String> {
+    let mut properties = nbt::compound();
+    properties
+        .put_string("level", "0")
+        .map_err(|error| error.to_string())?;
+    let mut block = nbt::compound();
+    block
+        .put_string("Name", "minecraft:water")
+        .map_err(|error| error.to_string())?
+        .put_compound("Properties", properties)
+        .map_err(|error| error.to_string())?;
+    Ok(Tag::Compound(block))
+}
+
+fn air_block_state_tag() -> std::result::Result<Tag, String> {
+    let mut block = nbt::compound();
+    block
+        .put_string("Name", TOPDOWN_AIR_BLOCK)
+        .map_err(|error| error.to_string())?;
+    Ok(Tag::Compound(block))
+}
+
+fn empty_mca_water_air_section(
+    section_y: i32,
+) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
+    let mut block_states = nbt::compound();
+    block_states
+        .put(
+            "palette",
+            Tag::List(
+                nbt::list(nbt::TAG_COMPOUND, vec![air_block_state_tag()?])
+                    .map_err(|error| error.to_string())?,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut biomes = nbt::compound();
+    biomes
+        .put(
+            "palette",
+            Tag::List(
+                nbt::list(
+                    nbt::TAG_STRING,
+                    vec![Tag::String("minecraft:ocean".to_string())],
+                )
+                .map_err(|error| error.to_string())?,
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut section = nbt::compound();
+    section
+        .put_byte("Y", section_y)
+        .map_err(|error| error.to_string())?
+        .put_compound("block_states", block_states)
+        .map_err(|error| error.to_string())?
+        .put_compound("biomes", biomes)
+        .map_err(|error| error.to_string())?;
+    Ok(section)
+}
+
+fn is_full_water_state(block_state: &earthmap_minecraft::nbt::Compound) -> bool {
+    if block_state
+        .get_string("Name")
+        .map(|name| name != "minecraft:water")
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Ok(properties) = block_state.get_compound("Properties") else {
+        return true;
+    };
+    !properties.contains("level")
+        || properties
+            .get_string("level")
+            .map(|level| level == "0")
+            .unwrap_or(false)
+}
+
+fn mca_water_section_sort_key(tag: &Tag) -> i32 {
+    let Tag::Compound(section) = tag else {
+        return i32::MAX;
+    };
+    section.get_byte("Y").map(i32::from).unwrap_or(i32::MAX)
+}
+
 fn chunk_root(payload: &[u8]) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
     let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
     let Tag::Compound(root) = named.into_tag() else {
@@ -9061,6 +9604,12 @@ mod tests {
             .set_block_state_id(0, SEA_LEVEL_Y - 1, 0, block_state_ids::AIR)
             .unwrap();
         chunk
+            .set_block_state_id(0, SEA_LEVEL_Y - 2, 0, block_state_ids::AIR)
+            .unwrap();
+        chunk
+            .set_block_state_id(4, 40, 4, block_state_ids::AIR)
+            .unwrap();
+        chunk
             .fill_column(1, 0, 59, 74, block_state_ids::DIRT)
             .unwrap();
         chunk
@@ -9367,6 +9916,9 @@ mod tests {
         ));
         assert!(out.contains("DONE rust.command.rewrite-mca-status - MCA chunk status rewriter"));
         assert!(out.contains(
+            "DONE rust.command.repair-mca-post-final-water - MCA post-final underwater air repairer"
+        ));
+        assert!(out.contains(
             "DONE rust.command.inspect-linear-post-final-integrity - Linear post-final integrity scanner"
         ));
     }
@@ -9656,6 +10208,7 @@ mod tests {
         assert!(out.contains("inspect-mca-post-final-integrity <path>"));
         assert!(out.contains("inspect-linear-post-final-integrity <path>"));
         assert!(out.contains("rewrite-mca-status <mcaRegion|regionDir|worldDir>"));
+        assert!(out.contains("repair-mca-post-final-water <mcaRegion|regionDir|worldDir>"));
         assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
@@ -10340,6 +10893,40 @@ mod tests {
         assert!(err.is_empty());
         assert!(out.contains("rewrittenRegionCount=0\n"));
         assert!(out.contains("rewrittenChunkCount=0\n"));
+    }
+
+    #[test]
+    fn repair_mca_post_final_water_fills_only_underwater_air() {
+        let temp = tempdir().unwrap();
+        let region = temp.path().join("r.0.0.mca");
+        write_post_final_integrity_fixture_region(&region, RegionFormat::Mca);
+
+        let (code, out, err) =
+            run_capture(&["inspect-mca-post-final-integrity", region.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("underwaterAirColumns=1\n"));
+
+        let (code, out, err) =
+            run_capture(&["repair-mca-post-final-water", region.to_str().unwrap()]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA post-final water repaired\n"));
+        assert!(out.contains("regionFileCount=1\n"));
+        assert!(out.contains("chunkCount=1\n"));
+        assert!(out.contains("repairedRegionCount=1\n"));
+        assert!(out.contains("repairedChunkCount=1\n"));
+        assert!(out.contains("repairedColumnCount=1\n"));
+        assert!(out.contains("filledBlockCount=2\n"));
+        assert!(out.contains("changed=true\n"));
+
+        let (code, out, err) =
+            run_capture(&["inspect-mca-post-final-integrity", region.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("underwaterAirColumns=0\n"));
+        assert!(out.contains("waterColumns=255\n"));
     }
 
     #[test]

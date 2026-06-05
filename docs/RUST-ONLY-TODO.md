@@ -257,7 +257,7 @@ Covered MCA commands:
 - [x] `inspect-mca-biomes`
 - [x] `inspect-mca-statuses`
 - [x] `inspect-mca-post-final-integrity`
-- [ ] `repair-mca-post-final-water`
+- [x] `repair-mca-post-final-water`
 - [x] `rewrite-mca-status`
 Covered Linear commands:
 - [x] `validate-linear-region`

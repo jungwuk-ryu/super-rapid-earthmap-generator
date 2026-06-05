@@ -155,6 +155,11 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "MCA chunk status rewriter",
     },
     CommandSpec {
+        name: "repair-mca-post-final-water",
+        status: CommandStatus::Implemented,
+        note: "MCA post-final underwater air repairer",
+    },
+    CommandSpec {
         name: "inspect-linear-post-final-integrity",
         status: CommandStatus::Implemented,
         note: "Linear post-final integrity scanner",
