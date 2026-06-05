@@ -504,25 +504,32 @@ Specs:
 Correctness: targeted Rust tests passed for representative planning, earth-grid, surface-spawn, and height-seam command contracts.
 
 ### Benchmark commands converted to Rust-only
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
+- [x] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust command-contract tests covered; speedup TBD; peak memory TBD; output height/surface/survival CSV summaries plus region-writer JSON; workload command-contract smoke and future cold-start samples.
 Covered commands:
-- [ ] `benchmark-height-regions`
-- [ ] `benchmark-surface-regions`
-- [ ] `benchmark-survival-regions`
-- [ ] `benchmark-survival-regions-parallel`
-- [ ] `benchmark-region-writers`
+- [x] `benchmark-height-regions`
+- [x] `benchmark-surface-regions`
+- [x] `benchmark-survival-regions`
+- [x] `benchmark-survival-regions-parallel`
+- [x] `benchmark-region-writers`
 Detailed progress:
-- [ ] Benchmarks include cold-start and warm-loop variants.
-- [ ] Benchmarks record machine/runtime metadata.
-- [ ] Benchmarks do not rely on Java once Rust replacement acceptance begins.
+- [x] Benchmarks include cold-start command entry points and warm-loop support where applicable.
+- [x] Benchmarks record machine/runtime metadata in the region-writer JSON and runtime summary fields in generation CSV output.
+- [x] Benchmarks do not rely on Java once Rust replacement acceptance begins.
+Specs:
+- `earthmap-rs benchmark-height-regions <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear>` writes per-region height benchmark CSV rows and a summary line.
+- `earthmap-rs benchmark-surface-regions <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear>` writes per-region surface phase timing CSV rows and a summary line.
+- `earthmap-rs benchmark-survival-regions <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear>` benchmarks the Rust vanilla-delegated survival replacement path and writes compatibility CSV rows.
+- `earthmap-rs benchmark-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads>` dispatches to Rust vanilla-delegated parallel generation with progress events and summary speed fields.
+- `earthmap-rs benchmark-region-writers <outputDir> [iterations=3]` writes Rust MCA/Linear writer timing output and `region-writer-benchmark.json`.
+Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli benchmark_generation_commands_dispatch_without_java --locked`, capability/help targeted tests, and prior `benchmark-region-writers` CLI coverage passed.
 
 ## P2 Java Removal Cleanup
 

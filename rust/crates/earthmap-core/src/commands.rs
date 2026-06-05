@@ -150,6 +150,31 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "nation-war readiness report generator",
     },
     CommandSpec {
+        name: "benchmark-height-regions",
+        status: CommandStatus::Implemented,
+        note: "Rust height region generation benchmark",
+    },
+    CommandSpec {
+        name: "benchmark-surface-regions",
+        status: CommandStatus::Implemented,
+        note: "Rust surface region generation benchmark",
+    },
+    CommandSpec {
+        name: "benchmark-survival-regions",
+        status: CommandStatus::Implemented,
+        note: "Rust delegated survival compatibility benchmark",
+    },
+    CommandSpec {
+        name: "benchmark-survival-regions-parallel",
+        status: CommandStatus::Implemented,
+        note: "Rust delegated survival parallel benchmark",
+    },
+    CommandSpec {
+        name: "benchmark-region-writers",
+        status: CommandStatus::Implemented,
+        note: "Rust MCA/Linear region writer benchmark",
+    },
+    CommandSpec {
         name: "scan-osm-pbf",
         status: CommandStatus::Implemented,
         note: "OSM PBF prefix scanner",

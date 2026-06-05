@@ -443,6 +443,26 @@ where
                 parsed.sample_grid,
             ))
         }
+        "benchmark-height-regions" if args.len() == 9 => write_result(benchmark_height_regions(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6], &args[7],
+            &args[8],
+        )),
+        "benchmark-surface-regions" if args.len() == 9 => write_result(benchmark_surface_regions(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6], &args[7],
+            &args[8],
+        )),
+        "benchmark-survival-regions" if args.len() == 9 => {
+            write_result(benchmark_survival_regions(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+                &args[7], &args[8],
+            ))
+        }
+        "benchmark-survival-regions-parallel" if args.len() == 10 => {
+            write_result(benchmark_survival_regions_parallel(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+                &args[7], &args[8], &args[9],
+            ))
+        }
         "benchmark-region-writers" if args.len() == 2 => write_result(benchmark_region_writers(
             stdout,
             stderr,
@@ -2941,6 +2961,22 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  quality-production-sample-batch <samplesCsv> <heightmap> <outputRoot> <scale> <mca> <threads> [cacheRows=512] [prefetchRows=0] [verticalScale=1.25] [textureMode=photo] [surfaceRaster=auto] [chunkStatus=surface] [metricMode=full|current-only] [previewDebug=off|auto|dir]"
+    )?;
+    writeln!(
+        out,
+        "  benchmark-height-regions <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear>"
+    )?;
+    writeln!(
+        out,
+        "  benchmark-surface-regions <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear>"
+    )?;
+    writeln!(
+        out,
+        "  benchmark-survival-regions <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear>"
+    )?;
+    writeln!(
+        out,
+        "  benchmark-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads>"
     )?;
     writeln!(
         out,
@@ -15060,6 +15096,564 @@ fn csv_safe_status(value: &str) -> String {
     value.replace(',', ";").replace('\n', " ")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn benchmark_height_regions(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    match benchmark_height_regions_impl(
+        out,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+    ) {
+        Ok(()) => Ok(EXIT_OK),
+        Err(error) => {
+            writeln!(err, "Height region benchmark failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_surface_regions(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    match benchmark_surface_regions_impl(
+        out,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+    ) {
+        Ok(()) => Ok(EXIT_OK),
+        Err(error) => {
+            writeln!(err, "Surface region benchmark failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_survival_regions(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    match benchmark_survival_regions_impl(
+        out,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+    ) {
+        Ok(()) => Ok(EXIT_OK),
+        Err(error) => {
+            writeln!(err, "Survival region benchmark failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_survival_regions_parallel(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+    threads_text: &str,
+) -> io::Result<i32> {
+    writeln!(
+        out,
+        "notice=legacy survival parallel benchmark is replaced by Rust vanilla-delegated parallel generation"
+    )?;
+    generate_vanilla_delegated_regions_parallel(
+        out,
+        err,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+        threads_text,
+        "surface",
+        "surfaceRaster=auto",
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_height_regions_impl(
+    out: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+) -> std::result::Result<(), String> {
+    let grid = parse_benchmark_region_grid(
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+    )?;
+    let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
+    let total_start = Instant::now();
+    let mut total_chunks = 0usize;
+    let mut total_cache_hits = 0u64;
+    let mut total_cache_misses = 0u64;
+    let mut total_cache_evictions = 0u64;
+    writeln!(
+        out,
+        "type,regionX,regionZ,elapsedMillis,chunks,minSurfaceY,maxSurfaceY,cacheHits,cacheMisses,cacheEvictions,regionFile"
+    )
+    .map_err(|error| error.to_string())?;
+    for region_z in grid.region_z_range() {
+        for region_x in grid.region_x_range() {
+            let start = Instant::now();
+            let settings = HeightOnlySettings::new(
+                heightmap_path,
+                world_dir,
+                "SR EarthMap Height Benchmark",
+                0,
+                grid.scale,
+                region_x,
+                region_z,
+                grid.format,
+                cache_rows,
+            )
+            .map_err(|error| error.to_string())?;
+            let report = earthmap_surface::generate_height_only_region(&settings)
+                .map_err(|error| error.to_string())?;
+            let elapsed_millis = start.elapsed().as_millis();
+            total_chunks += report.chunk_count;
+            total_cache_hits += report.cache_stats.hits;
+            total_cache_misses += report.cache_stats.misses;
+            total_cache_evictions += report.cache_stats.evictions;
+            writeln!(
+                out,
+                "region,{},{},{},{},{},{},{},{},{},{}",
+                report.region_x,
+                report.region_z,
+                elapsed_millis,
+                report.chunk_count,
+                report.min_surface_y,
+                report.max_surface_y,
+                report.cache_stats.hits,
+                report.cache_stats.misses,
+                report.cache_stats.evictions,
+                report.region_file.display()
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    let total_elapsed_millis = total_start.elapsed().as_millis();
+    write_benchmark_summary(
+        out,
+        grid.region_count(),
+        total_chunks,
+        total_elapsed_millis,
+        &[
+            ("cacheHits", total_cache_hits.to_string()),
+            ("cacheMisses", total_cache_misses.to_string()),
+            ("cacheEvictions", total_cache_evictions.to_string()),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_surface_regions_impl(
+    out: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+) -> std::result::Result<(), String> {
+    let grid = parse_benchmark_region_grid(
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+    )?;
+    let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
+    let surface_material_path =
+        parse_optional_surface_material_path("surfaceRaster=auto", Path::new(heightmap_path))?;
+    let texture_mode = if surface_material_path.is_some() {
+        SurfaceTextureMode::Photo
+    } else {
+        SurfaceTextureMode::Classified
+    };
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(surface_material_path.as_deref())?;
+    let total_start = Instant::now();
+    let mut total_chunks = 0usize;
+    let mut total_land_columns = 0i64;
+    let mut total_water_columns = 0i64;
+    writeln!(
+        out,
+        "type,regionX,regionZ,elapsedMillis,chunks,landColumns,waterColumns,minGroundY,maxGroundY,surfaceSampleMillis,chunkBuildMillis,nbtEncodeMillis,regionWriteMillis,previewMillis,metadataMillis,totalInternalMillis,cacheHits,cacheMisses,cacheEvictions,regionFile"
+    )
+    .map_err(|error| error.to_string())?;
+    for region_z in grid.region_z_range() {
+        for region_x in grid.region_x_range() {
+            let report = generate_surface_benchmark_region(
+                heightmap_path,
+                world_dir,
+                "SR EarthMap Surface Benchmark",
+                grid,
+                region_x,
+                region_z,
+                cache_rows,
+                texture_mode,
+                surface_material_path.as_deref(),
+                surface_tile_cache_entries,
+                ChunkGenerationStatus::Full,
+            )?;
+            total_chunks += report.report.chunk_count;
+            total_land_columns += i64::from(report.report.land_columns);
+            total_water_columns += i64::from(report.report.water_columns);
+            writeln!(
+                out,
+                "region,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                report.report.region_x,
+                report.report.region_z,
+                report.elapsed_millis,
+                report.report.chunk_count,
+                report.report.land_columns,
+                report.report.water_columns,
+                report.report.min_ground_y,
+                report.report.max_ground_y,
+                millis(report.report.surface_sample_nanos),
+                millis(report.report.chunk_build_nanos),
+                millis(report.report.nbt_encode_nanos),
+                millis(report.report.region_write_nanos),
+                millis(report.report.preview_nanos),
+                millis(report.report.metadata_nanos),
+                millis(report.report.total_nanos),
+                report.report.cache_stats.hits,
+                report.report.cache_stats.misses,
+                report.report.cache_stats.evictions,
+                report.report.region_file.display()
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    let total_elapsed_millis = total_start.elapsed().as_millis();
+    write_benchmark_summary(
+        out,
+        grid.region_count(),
+        total_chunks,
+        total_elapsed_millis,
+        &[
+            ("landColumns", total_land_columns.to_string()),
+            ("waterColumns", total_water_columns.to_string()),
+            ("textureMode", texture_mode.id().to_string()),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_survival_regions_impl(
+    out: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+) -> std::result::Result<(), String> {
+    let grid = parse_benchmark_region_grid(
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+    )?;
+    let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
+    let surface_material_path =
+        parse_optional_surface_material_path("surfaceRaster=auto", Path::new(heightmap_path))?;
+    let texture_mode = if surface_material_path.is_some() {
+        SurfaceTextureMode::Photo
+    } else {
+        SurfaceTextureMode::Classified
+    };
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(surface_material_path.as_deref())?;
+    let total_start = Instant::now();
+    let mut total_chunks = 0usize;
+    let mut total_land_columns = 0i64;
+    let mut total_water_columns = 0i64;
+    let mut total_output_bytes = 0u64;
+    let mut total_cache_hits = 0u64;
+    let mut total_cache_misses = 0u64;
+    let mut total_cache_evictions = 0u64;
+    writeln!(
+        out,
+        "type,regionX,regionZ,elapsedMillis,chunks,landColumns,waterColumns,minGroundY,maxGroundY,carvedCaveBlocks,caveEntranceColumns,undergroundWaterBlocks,undergroundLavaBlocks,placedOreBlocks,deepslateBlocks,progressionStructures,surfaceMillis,caveMillis,fluidMillis,oreMillis,progressionMillis,nbtEncodeMillis,regionWriteMillis,reportMillis,totalInternalMillis,outputBytes,cacheHits,cacheMisses,cacheEvictions,regionFile"
+    )
+    .map_err(|error| error.to_string())?;
+    for region_z in grid.region_z_range() {
+        for region_x in grid.region_x_range() {
+            let report = generate_surface_benchmark_region(
+                heightmap_path,
+                world_dir,
+                "SR EarthMap Survival Delegated Benchmark",
+                grid,
+                region_x,
+                region_z,
+                cache_rows,
+                texture_mode,
+                surface_material_path.as_deref(),
+                surface_tile_cache_entries,
+                ChunkGenerationStatus::Surface,
+            )?;
+            let output_bytes = std::fs::metadata(&report.report.region_file)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            total_chunks += report.report.chunk_count;
+            total_land_columns += i64::from(report.report.land_columns);
+            total_water_columns += i64::from(report.report.water_columns);
+            total_output_bytes += output_bytes;
+            total_cache_hits += report.report.cache_stats.hits;
+            total_cache_misses += report.report.cache_stats.misses;
+            total_cache_evictions += report.report.cache_stats.evictions;
+            writeln!(
+                out,
+                "region,{},{},{},{},{},{},{},{},0,0,0,0,0,0,0,{},0,0,0,0,{},{},0,{},{},{},{},{},{}",
+                report.report.region_x,
+                report.report.region_z,
+                report.elapsed_millis,
+                report.report.chunk_count,
+                report.report.land_columns,
+                report.report.water_columns,
+                report.report.min_ground_y,
+                report.report.max_ground_y,
+                millis(report.report.surface_sample_nanos),
+                millis(report.report.nbt_encode_nanos),
+                millis(report.report.region_write_nanos),
+                millis(report.report.total_nanos),
+                output_bytes,
+                report.report.cache_stats.hits,
+                report.report.cache_stats.misses,
+                report.report.cache_stats.evictions,
+                report.report.region_file.display()
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    let total_elapsed_millis = total_start.elapsed().as_millis();
+    write_benchmark_summary(
+        out,
+        grid.region_count(),
+        total_chunks,
+        total_elapsed_millis,
+        &[
+            ("landColumns", total_land_columns.to_string()),
+            ("waterColumns", total_water_columns.to_string()),
+            ("outputBytes", total_output_bytes.to_string()),
+            ("cacheHits", total_cache_hits.to_string()),
+            ("cacheMisses", total_cache_misses.to_string()),
+            ("cacheEvictions", total_cache_evictions.to_string()),
+            ("model", "vanillaDelegatedSurface".to_string()),
+            ("textureMode", texture_mode.id().to_string()),
+        ],
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BenchmarkRegionGrid {
+    scale: i32,
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
+    format: OutputFormat,
+}
+
+impl BenchmarkRegionGrid {
+    fn region_count(self) -> usize {
+        usize::try_from(self.cols * self.rows).unwrap_or(0)
+    }
+
+    fn region_x_range(self) -> std::ops::Range<i32> {
+        self.start_region_x..self.start_region_x + self.cols
+    }
+
+    fn region_z_range(self) -> std::ops::Range<i32> {
+        self.start_region_z..self.start_region_z + self.rows
+    }
+}
+
+fn parse_benchmark_region_grid(
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+) -> std::result::Result<BenchmarkRegionGrid, String> {
+    let scale = parse_i32_string(scale_text)?;
+    let start_region_x = parse_i32_string(start_region_x_text)?;
+    let start_region_z = parse_i32_string(start_region_z_text)?;
+    let cols = parse_positive_i32_string("cols", cols_text)?;
+    let rows = parse_positive_i32_string("rows", rows_text)?;
+    let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let _ = cols
+        .checked_mul(rows)
+        .ok_or_else(|| "region grid size overflow".to_string())?;
+    Ok(BenchmarkRegionGrid {
+        scale,
+        start_region_x,
+        start_region_z,
+        cols,
+        rows,
+        format,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_surface_benchmark_region(
+    heightmap_path: &str,
+    world_dir: &str,
+    level_name: &str,
+    grid: BenchmarkRegionGrid,
+    region_x: i32,
+    region_z: i32,
+    cache_rows: usize,
+    texture_mode: SurfaceTextureMode,
+    surface_material_path: Option<&Path>,
+    surface_tile_cache_entries: usize,
+    status: ChunkGenerationStatus,
+) -> std::result::Result<TimedSurfaceRegionReport, String> {
+    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+        heightmap_path,
+        world_dir,
+        level_name,
+        0,
+        grid.scale,
+        region_x,
+        region_z,
+        grid.format,
+        cache_rows,
+        true,
+        status,
+        1.0,
+        texture_mode,
+    )
+    .map_err(|error| error.to_string())?;
+    settings.surface_material_path = surface_material_path.map(Path::to_path_buf);
+    settings.surface_tile_cache_entries = surface_tile_cache_entries;
+    let start = Instant::now();
+    let report =
+        earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
+    Ok(TimedSurfaceRegionReport {
+        elapsed_millis: start.elapsed().as_millis(),
+        report,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TimedSurfaceRegionReport {
+    elapsed_millis: u128,
+    report: SurfaceRegionReport,
+}
+
+fn write_benchmark_summary(
+    out: &mut impl Write,
+    region_count: usize,
+    chunks: usize,
+    elapsed_millis: u128,
+    extra_fields: &[(&str, String)],
+) -> std::result::Result<(), String> {
+    let avg = if region_count == 0 {
+        0.0
+    } else {
+        elapsed_millis as f64 / region_count as f64
+    };
+    let regions_per_hour = if elapsed_millis == 0 {
+        0.0
+    } else {
+        region_count as f64 * 3_600_000.0 / elapsed_millis as f64
+    };
+    let chunks_per_second = if elapsed_millis == 0 {
+        0.0
+    } else {
+        chunks as f64 * 1000.0 / elapsed_millis as f64
+    };
+    write!(
+        out,
+        "summary,regions={region_count},chunks={chunks},elapsedMillis={elapsed_millis},avgMillisPerRegion={},regionsPerHour={},chunksPerSecond={}",
+        java_double_string(avg),
+        java_double_string(regions_per_hour),
+        java_double_string(chunks_per_second)
+    )
+    .map_err(|error| error.to_string())?;
+    for (name, value) in extra_fields {
+        write!(out, ",{name}={value}").map_err(|error| error.to_string())?;
+    }
+    writeln!(out).map_err(|error| error.to_string())
+}
+
 fn benchmark_region_writers(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -16253,6 +16847,21 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.generate-nation-war-readiness-report - nation-war readiness report generator"
         ));
+        assert!(out.contains(
+            "DONE rust.command.benchmark-height-regions - Rust height region generation benchmark"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.benchmark-surface-regions - Rust surface region generation benchmark"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.benchmark-survival-regions - Rust delegated survival compatibility benchmark"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.benchmark-survival-regions-parallel - Rust delegated survival parallel benchmark"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.benchmark-region-writers - Rust MCA/Linear region writer benchmark"
+        ));
         assert!(out.contains("DONE rust.command.scan-osm-pbf - OSM PBF prefix scanner"));
         assert!(
             out.contains("DONE rust.command.scan-osm-pbf-range - OSM PBF ranged prefix scanner")
@@ -16553,6 +17162,48 @@ mod tests {
             assert!(err.contains("format must be mca or linear"));
             assert!(!err.contains("not implemented yet"));
         }
+    }
+
+    #[test]
+    fn benchmark_generation_commands_dispatch_without_java() {
+        for command in [
+            "benchmark-height-regions",
+            "benchmark-surface-regions",
+            "benchmark-survival-regions",
+        ] {
+            let (code, out, err) = run_capture(&[
+                command,
+                "missing-heightmap.tif",
+                "world",
+                "1000",
+                "0",
+                "0",
+                "1",
+                "1",
+                "bad-format",
+            ]);
+            assert_eq!(code, EXIT_USAGE);
+            assert!(out.is_empty());
+            assert!(err.contains("format must be mca or linear"));
+            assert!(!err.contains("not implemented yet"));
+        }
+
+        let (code, out, err) = run_capture(&[
+            "benchmark-survival-regions-parallel",
+            "missing-heightmap.tif",
+            "world",
+            "1000",
+            "0",
+            "0",
+            "1",
+            "1",
+            "bad-format",
+            "1",
+        ]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.contains("legacy survival parallel benchmark is replaced"));
+        assert!(err.contains("format must be mca or linear"));
+        assert!(!err.contains("not implemented yet"));
     }
 
     #[test]
@@ -17135,6 +17786,10 @@ mod tests {
         assert!(out.contains("photo-parity-metric-crop <sourcePng> <expectedPng>"));
         assert!(out.contains("photo-parity-metric-batch <jobsCsv> <outputRoot>"));
         assert!(out.contains("quality-production-sample-batch <samplesCsv> <heightmap>"));
+        assert!(out.contains("benchmark-height-regions <heightmap> <worldDir>"));
+        assert!(out.contains("benchmark-surface-regions <heightmap> <worldDir>"));
+        assert!(out.contains("benchmark-survival-regions <heightmap> <worldDir>"));
+        assert!(out.contains("benchmark-survival-regions-parallel <heightmap> <worldDir>"));
         assert!(out.contains("photo-standard-remap-parity-crop <sourcePng> <imageMagickRemapPng>"));
         assert!(out.contains("photo-standard-remap-parity-batch <jobsCsv> <outputRoot>"));
         assert!(out.contains("photo-production-candidate-diff-crop <sourcePng> <expectedPng>"));
