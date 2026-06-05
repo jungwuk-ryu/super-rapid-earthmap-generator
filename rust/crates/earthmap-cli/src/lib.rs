@@ -39,11 +39,11 @@ use earthmap_region::{
 };
 use earthmap_surface::{
     classify_surface, generate_surface_region_with_open_material_sampler,
-    EarthDataSurfaceMaterialSampler, EarthSurfaceColumn, HeightOnlySettings,
-    LandShallowTopoPhotoSampler, MetImageExportTerrainSampler, OutputFormat, SurfaceMaterialSample,
-    SurfaceRegionColumnTrace, SurfaceRegionReport, SurfaceRegionSettings, SurfaceTextureMode,
-    WwfEcoregionSampler, DEFAULT_SURFACE_TILE_CACHE_ENTRIES, REGION_SIZE_BLOCKS, SEA_LEVEL_Y,
-    SURVIVAL_MANIFEST_FILE_NAME,
+    surface_y_for_elevation_meters, EarthDataSurfaceMaterialSampler, EarthSurfaceColumn,
+    HeightOnlySettings, LandShallowTopoPhotoSampler, MetImageExportTerrainSampler, OutputFormat,
+    SurfaceMaterialSample, SurfaceRegionColumnTrace, SurfaceRegionReport, SurfaceRegionSettings,
+    SurfaceTextureMode, WwfEcoregionSampler, DEFAULT_SURFACE_TILE_CACHE_ENTRIES,
+    REGION_SIZE_BLOCKS, SEA_LEVEL_Y, SURVIVAL_MANIFEST_FILE_NAME,
 };
 use serde_json::{json, Value};
 
@@ -498,6 +498,31 @@ where
                 &args[5],
                 &args[6],
                 &args[7..],
+            ))
+        }
+        "plan-representative-regions" if args.len() == 5 => write_result(
+            plan_representative_regions(stdout, stderr, &args[1], &args[2], &args[3], &args[4]),
+        ),
+        "describe-earth-grid" if args.len() == 3 => {
+            write_result(describe_earth_grid(stdout, stderr, &args[1], &args[2]))
+        }
+        "validate-surface-spawn" if args.len() == 5 => write_result(validate_surface_spawn(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4],
+        )),
+        "validate-height-seam" if args.len() == 6 => write_result(validate_height_seam(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5],
+        )),
+        "write-vanilla-finalization-commands" if (6..=8).contains(&args.len()) => {
+            write_result(write_vanilla_finalization_commands(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                args.get(6).map(String::as_str),
+                args.get(7).map(String::as_str),
             ))
         }
         "trace-surface-region-column" if (6..=8).contains(&args.len()) => {
@@ -2545,7 +2570,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out)?;
     writeln!(
         out,
-        "Status: Rust runtime active prototype. Java remains the compatibility oracle and fallback."
+        "Status: Rust runtime active; normal generation and validation paths are Rust-first."
     )?;
     writeln!(out)?;
     writeln!(out, "Commands:")?;
@@ -2672,6 +2697,23 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+    )?;
+    writeln!(
+        out,
+        "  plan-representative-regions <heightmap> <scale> <outputCsv> <targetRegions>"
+    )?;
+    writeln!(out, "  describe-earth-grid <heightmap> <scale>")?;
+    writeln!(
+        out,
+        "  validate-surface-spawn <heightmap> <scale> <regionX> <regionZ>"
+    )?;
+    writeln!(
+        out,
+        "  validate-height-seam <heightmap> <scale> <regionX> <regionZ> <east|south>"
+    )?;
+    writeln!(
+        out,
+        "  write-vanilla-finalization-commands <outputCommands> <startRegionX> <startRegionZ> <cols> <rows> [windowChunks] [waitMs]"
     )?;
     writeln!(out, "  benchmark-region-writers <outputDir> [iterations=3]")?;
     writeln!(out, "  playability-smoke <worldDir> <outputJson>")?;
@@ -3203,6 +3245,941 @@ fn classify_surface_point_impl(
         format!("fillerBlockStateId={}", column.filler_block_state_id),
         format!("biome={}", column.biome_id),
     ])
+}
+
+fn plan_representative_regions(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    output_csv: &str,
+    target_regions_text: &str,
+) -> io::Result<i32> {
+    match plan_representative_regions_impl(
+        heightmap_path,
+        scale_text,
+        output_csv,
+        target_regions_text,
+    ) {
+        Ok(report) => {
+            writeln!(out, "Representative region plan written")?;
+            writeln!(out, "outputCsv={output_csv}")?;
+            writeln!(out, "scale=1:{}", report.scale_denominator)?;
+            writeln!(out, "widthBlocks={}", report.width_blocks)?;
+            writeln!(out, "heightBlocks={}", report.height_blocks)?;
+            writeln!(out, "candidateRegions={}", report.candidate_regions)?;
+            writeln!(out, "selectedRegions={}", report.selected.len())?;
+            let counts = report.selected_counts_by_class();
+            for region_class in RepresentativeRegionClass::ALL {
+                writeln!(
+                    out,
+                    "class.{}={}",
+                    region_class.as_str(),
+                    counts[region_class.index()]
+                )?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Representative region planning failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn plan_representative_regions_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    output_csv: &str,
+    target_regions_text: &str,
+) -> std::result::Result<RepresentativeRegionPlanReport, String> {
+    let scale = parse_i32_string(scale_text)?;
+    let target_regions = parse_positive_usize_string("targetRegions", target_regions_text)?;
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))
+        .map_err(|error| error.to_string())?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let cache = GeoTiffRowCache::new(&reader, 64).map_err(|error| error.to_string())?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let bounds = RegionGridBounds::for_mapping(&mapping);
+    let mut candidates = Vec::new();
+    for region_z in bounds.min_region_z..=bounds.max_region_z {
+        for region_x in bounds.min_region_x..=bounds.max_region_x {
+            candidates.push(classify_representative_region(
+                &mapping, &sampler, region_x, region_z,
+            )?);
+        }
+    }
+    let selected = select_representative_regions(&candidates, target_regions);
+    let report = RepresentativeRegionPlanReport {
+        scale_denominator: scale,
+        width_blocks: mapping.width_blocks,
+        height_blocks: mapping.height_blocks,
+        candidate_regions: candidates.len(),
+        selected,
+    };
+    write_representative_region_csv(Path::new(output_csv), &report.selected)?;
+    Ok(report)
+}
+
+fn describe_earth_grid(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+) -> io::Result<i32> {
+    match describe_earth_grid_impl(heightmap_path, scale_text) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Earth grid description failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn describe_earth_grid_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))
+        .map_err(|error| error.to_string())?;
+    let scale = parse_i32_string(scale_text)?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let bounds = RegionGridBounds::for_mapping(&mapping);
+    Ok(vec![
+        "Earth grid described".to_string(),
+        format!("heightmap={heightmap_path}"),
+        format!("scale=1:{scale}"),
+        format!("widthBlocks={}", mapping.width_blocks),
+        format!("heightBlocks={}", mapping.height_blocks),
+        format!("minRegionX={}", bounds.min_region_x),
+        format!("maxRegionX={}", bounds.max_region_x),
+        format!("minRegionZ={}", bounds.min_region_z),
+        format!("maxRegionZ={}", bounds.max_region_z),
+        format!("regionCols={}", bounds.columns()),
+        format!("regionRows={}", bounds.rows()),
+        format!("fullEarthRegions={}", bounds.region_count()),
+        format!(
+            "generateVanillaDelegatedArgs={heightmap_path} <worldDir> {scale} {} {} {} {} linear <threads> [maxRegionsThisRun] surface",
+            bounds.min_region_x,
+            bounds.min_region_z,
+            bounds.columns(),
+            bounds.rows()
+        ),
+        format!(
+            "writeFinalizationArgs=<commandsFile> {} {} {} {} [windowChunks] [waitMs]",
+            bounds.min_region_x,
+            bounds.min_region_z,
+            bounds.columns(),
+            bounds.rows()
+        ),
+    ])
+}
+
+fn validate_surface_spawn(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+) -> io::Result<i32> {
+    match validate_surface_spawn_impl(heightmap_path, scale_text, region_x_text, region_z_text) {
+        Ok(report) => {
+            writeln!(
+                out,
+                "{}",
+                if report.viable {
+                    "Surface spawn viable"
+                } else {
+                    "Surface spawn not viable"
+                }
+            )?;
+            writeln!(out, "regionX={}", report.region_x)?;
+            writeln!(out, "regionZ={}", report.region_z)?;
+            writeln!(out, "landColumns={}", report.land_columns)?;
+            writeln!(out, "waterColumns={}", report.water_columns)?;
+            writeln!(out, "bestSpawnX={}", report.best_spawn_x)?;
+            writeln!(out, "bestSpawnY={}", report.best_spawn_y)?;
+            writeln!(out, "bestSpawnZ={}", report.best_spawn_z)?;
+            Ok(if report.viable { EXIT_OK } else { EXIT_USAGE })
+        }
+        Err(error) => {
+            writeln!(err, "Surface spawn validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn validate_surface_spawn_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+) -> std::result::Result<SurfaceSpawnReport, String> {
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))
+        .map_err(|error| error.to_string())?;
+    let scale = parse_i32_string(scale_text)?;
+    let region_x = parse_i32_string(region_x_text)?;
+    let region_z = parse_i32_string(region_z_text)?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let cache = GeoTiffRowCache::new(&reader, 64).map_err(|error| error.to_string())?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let mut land_columns = 0i32;
+    let mut water_columns = 0i32;
+    let mut best_spawn_x = 0i32;
+    let mut best_spawn_z = 0i32;
+    let mut best_spawn_y = i32::MIN;
+
+    for dz in 0..REGION_SIZE_BLOCKS {
+        for dx in 0..REGION_SIZE_BLOCKS {
+            let global_block_x = region_x.wrapping_mul(REGION_SIZE_BLOCKS).wrapping_add(dx);
+            let global_block_z = region_z.wrapping_mul(REGION_SIZE_BLOCKS).wrapping_add(dz);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let column = classify_grid_sample(&mapping, &sampler, map_x, map_z)?;
+            if column.water {
+                water_columns = water_columns.saturating_add(1);
+            } else {
+                land_columns = land_columns.saturating_add(1);
+                if column.ground_surface_y > best_spawn_y {
+                    best_spawn_y = column.ground_surface_y;
+                    best_spawn_x = global_block_x;
+                    best_spawn_z = global_block_z;
+                }
+            }
+        }
+    }
+    let viable = land_columns > 0 && best_spawn_y >= SEA_LEVEL_Y;
+    Ok(SurfaceSpawnReport {
+        region_x,
+        region_z,
+        land_columns,
+        water_columns,
+        best_spawn_x,
+        best_spawn_y,
+        best_spawn_z,
+        viable,
+    })
+}
+
+fn validate_height_seam(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    direction_text: &str,
+) -> io::Result<i32> {
+    match validate_height_seam_impl(
+        heightmap_path,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        direction_text,
+    ) {
+        Ok(report) => {
+            writeln!(
+                out,
+                "{}",
+                if report.passed() {
+                    "Height seam valid"
+                } else {
+                    "Height seam invalid"
+                }
+            )?;
+            writeln!(out, "regionX={}", report.region_x)?;
+            writeln!(out, "regionZ={}", report.region_z)?;
+            writeln!(out, "direction={}", report.direction.as_str())?;
+            writeln!(out, "comparedColumns={}", report.compared_columns)?;
+            writeln!(out, "coordinateFailures={}", report.coordinate_failures)?;
+            writeln!(out, "minSurfaceY={}", report.min_surface_y)?;
+            writeln!(out, "maxSurfaceY={}", report.max_surface_y)?;
+            writeln!(out, "maxAbsSurfaceDelta={}", report.max_abs_surface_delta)?;
+            Ok(if report.passed() { EXIT_OK } else { EXIT_USAGE })
+        }
+        Err(error) => {
+            writeln!(err, "Height seam validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn validate_height_seam_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    direction_text: &str,
+) -> std::result::Result<HeightSeamReport, String> {
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))
+        .map_err(|error| error.to_string())?;
+    let scale = parse_i32_string(scale_text)?;
+    let region_x = parse_i32_string(region_x_text)?;
+    let region_z = parse_i32_string(region_z_text)?;
+    let direction = HeightSeamDirection::parse(direction_text)?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let cache = GeoTiffRowCache::new(&reader, 64).map_err(|error| error.to_string())?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+
+    let mut coordinate_failures = 0i32;
+    let mut min_surface_y = i32::MAX;
+    let mut max_surface_y = i32::MIN;
+    let mut max_abs_surface_delta = 0i32;
+    for index in 0..REGION_SIZE_BLOCKS {
+        let pair = height_seam_boundary_pair(region_x, region_z, direction, index);
+        let map_a_x = pair.0.wrapping_add(mapping.width_blocks / 2);
+        let map_a_z = pair.1.wrapping_add(mapping.height_blocks / 2);
+        let map_b_x = pair.2.wrapping_add(mapping.width_blocks / 2);
+        let map_b_z = pair.3.wrapping_add(mapping.height_blocks / 2);
+        if !height_seam_pair_is_adjacent(map_a_x, map_a_z, map_b_x, map_b_z, direction)
+            || !inside_mapping(map_a_x, map_a_z, &mapping)
+            || !inside_mapping(map_b_x, map_b_z, &mapping)
+        {
+            coordinate_failures = coordinate_failures.saturating_add(1);
+            continue;
+        }
+        let surface_a = height_only_surface_y(&mapping, &sampler, map_a_x, map_a_z)?;
+        let surface_b = height_only_surface_y(&mapping, &sampler, map_b_x, map_b_z)?;
+        min_surface_y = min_surface_y.min(surface_a).min(surface_b);
+        max_surface_y = max_surface_y.max(surface_a).max(surface_b);
+        max_abs_surface_delta = max_abs_surface_delta.max((surface_a - surface_b).abs());
+    }
+    if min_surface_y == i32::MAX {
+        min_surface_y = 0;
+        max_surface_y = 0;
+    }
+    Ok(HeightSeamReport {
+        region_x,
+        region_z,
+        direction,
+        compared_columns: REGION_SIZE_BLOCKS,
+        coordinate_failures,
+        min_surface_y,
+        max_surface_y,
+        max_abs_surface_delta,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_vanilla_finalization_commands(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    output_commands_path: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    window_chunks_text: Option<&str>,
+    wait_ms_text: Option<&str>,
+) -> io::Result<i32> {
+    match write_vanilla_finalization_commands_impl(
+        output_commands_path,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        window_chunks_text,
+        wait_ms_text,
+    ) {
+        Ok(report) => {
+            writeln!(out, "Vanilla finalization command file written")?;
+            writeln!(out, "commandsFile={}", report.commands_file.display())?;
+            writeln!(out, "regionXStart={}", report.start_region_x)?;
+            writeln!(out, "regionZStart={}", report.start_region_z)?;
+            writeln!(out, "cols={}", report.cols)?;
+            writeln!(out, "rows={}", report.rows)?;
+            writeln!(out, "windowChunks={}", report.window_chunks)?;
+            writeln!(out, "waitMs={}", report.wait_ms)?;
+            writeln!(out, "windows={}", report.windows)?;
+            writeln!(
+                out,
+                "maxChunksPerWindow={}",
+                report.window_chunks * report.window_chunks
+            )?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(
+                err,
+                "Vanilla finalization command generation failed: {error}"
+            )?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_vanilla_finalization_commands_impl(
+    output_commands_path: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    window_chunks_text: Option<&str>,
+    wait_ms_text: Option<&str>,
+) -> std::result::Result<VanillaFinalizationCommandReport, String> {
+    let start_region_x = parse_i32_string(start_region_x_text)?;
+    let start_region_z = parse_i32_string(start_region_z_text)?;
+    let cols = parse_i32_string(cols_text)?;
+    let rows = parse_i32_string(rows_text)?;
+    let window_chunks = window_chunks_text
+        .map(parse_i32_string)
+        .transpose()?
+        .unwrap_or(16);
+    let wait_ms = wait_ms_text
+        .map(parse_i32_string)
+        .transpose()?
+        .unwrap_or(8000);
+    if cols <= 0 || rows <= 0 || window_chunks <= 0 || window_chunks > 16 || wait_ms < 0 {
+        return Err(
+            "cols, rows, and windowChunks must be positive; windowChunks must be <= 16; waitMs >= 0"
+                .to_string(),
+        );
+    }
+    let min_chunk_x = start_region_x.wrapping_mul(32);
+    let max_chunk_x = start_region_x
+        .wrapping_add(cols)
+        .wrapping_mul(32)
+        .wrapping_sub(1);
+    let min_chunk_z = start_region_z.wrapping_mul(32);
+    let max_chunk_z = start_region_z
+        .wrapping_add(rows)
+        .wrapping_mul(32)
+        .wrapping_sub(1);
+    let mut commands = String::new();
+    commands.push_str("# Generated by Super-Rapid-EarthMap-Generator\n");
+    commands.push_str(
+        "# Finalizes vanilla-delegated chunks by force-loading <= 256 chunks per window.\n",
+    );
+    commands.push_str(&format!(
+        "# range.regionX={}..{}\n",
+        start_region_x,
+        start_region_x + cols - 1
+    ));
+    commands.push_str(&format!(
+        "# range.regionZ={}..{}\n",
+        start_region_z,
+        start_region_z + rows - 1
+    ));
+    commands.push_str(&format!("# windowChunks={window_chunks}\n"));
+    commands.push_str(&format!("# waitMs={wait_ms}\n"));
+
+    let mut windows = 0i32;
+    let mut chunk_z = min_chunk_z;
+    while chunk_z <= max_chunk_z {
+        let end_chunk_z = max_chunk_z.min(chunk_z + window_chunks - 1);
+        let mut chunk_x = min_chunk_x;
+        while chunk_x <= max_chunk_x {
+            let end_chunk_x = max_chunk_x.min(chunk_x + window_chunks - 1);
+            append_forceload_window(
+                &mut commands,
+                chunk_x,
+                chunk_z,
+                end_chunk_x,
+                end_chunk_z,
+                wait_ms,
+            );
+            windows += 1;
+            chunk_x += window_chunks;
+        }
+        chunk_z += window_chunks;
+    }
+    commands.push_str("save-all flush\n");
+    commands.push_str("@wait-ms 5000\n");
+
+    let output = std::path::PathBuf::from(output_commands_path);
+    if let Some(parent) = output.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    std::fs::write(&output, commands).map_err(|error| error.to_string())?;
+    Ok(VanillaFinalizationCommandReport {
+        commands_file: output,
+        start_region_x,
+        start_region_z,
+        cols,
+        rows,
+        window_chunks,
+        wait_ms,
+        windows,
+    })
+}
+
+fn append_forceload_window(
+    commands: &mut String,
+    chunk_x: i32,
+    chunk_z: i32,
+    end_chunk_x: i32,
+    end_chunk_z: i32,
+    wait_ms: i32,
+) {
+    let min_block_x = chunk_x * CHUNK_WIDTH as i32;
+    let min_block_z = chunk_z * CHUNK_WIDTH as i32;
+    let max_block_x = (end_chunk_x * CHUNK_WIDTH as i32) + CHUNK_WIDTH as i32 - 1;
+    let max_block_z = (end_chunk_z * CHUNK_WIDTH as i32) + CHUNK_WIDTH as i32 - 1;
+    commands.push_str(&format!(
+        "forceload add {min_block_x} {min_block_z} {max_block_x} {max_block_z}\n"
+    ));
+    commands.push_str(&format!("@wait-ms {wait_ms}\n"));
+    commands.push_str("save-all flush\n");
+    commands.push_str("@wait-ms 1000\n");
+    commands.push_str(&format!(
+        "forceload remove {min_block_x} {min_block_z} {max_block_x} {max_block_z}\n"
+    ));
+    commands.push_str("@wait-ms 500\n");
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegionGridBounds {
+    min_region_x: i32,
+    max_region_x: i32,
+    min_region_z: i32,
+    max_region_z: i32,
+}
+
+impl RegionGridBounds {
+    fn for_mapping(mapping: &EarthScaleMapping) -> Self {
+        let min_global_x = -(mapping.width_blocks / 2);
+        let max_global_x = mapping.width_blocks - (mapping.width_blocks / 2) - 1;
+        let min_global_z = -(mapping.height_blocks / 2);
+        let max_global_z = mapping.height_blocks - (mapping.height_blocks / 2) - 1;
+        Self {
+            min_region_x: min_global_x.div_euclid(REGION_SIZE_BLOCKS),
+            max_region_x: max_global_x.div_euclid(REGION_SIZE_BLOCKS),
+            min_region_z: min_global_z.div_euclid(REGION_SIZE_BLOCKS),
+            max_region_z: max_global_z.div_euclid(REGION_SIZE_BLOCKS),
+        }
+    }
+
+    fn columns(self) -> i32 {
+        self.max_region_x - self.min_region_x + 1
+    }
+
+    fn rows(self) -> i32 {
+        self.max_region_z - self.min_region_z + 1
+    }
+
+    fn region_count(self) -> i64 {
+        i64::from(self.columns()) * i64::from(self.rows())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum RepresentativeRegionClass {
+    Ocean,
+    Coast,
+    Mountain,
+    Desert,
+    Jungle,
+    Snow,
+    Land,
+}
+
+impl RepresentativeRegionClass {
+    const ALL: [Self; 7] = [
+        Self::Ocean,
+        Self::Coast,
+        Self::Mountain,
+        Self::Desert,
+        Self::Jungle,
+        Self::Snow,
+        Self::Land,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ocean => "OCEAN",
+            Self::Coast => "COAST",
+            Self::Mountain => "MOUNTAIN",
+            Self::Desert => "DESERT",
+            Self::Jungle => "JUNGLE",
+            Self::Snow => "SNOW",
+            Self::Land => "LAND",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Ocean => 0,
+            Self::Coast => 1,
+            Self::Mountain => 2,
+            Self::Desert => 3,
+            Self::Jungle => 4,
+            Self::Snow => 5,
+            Self::Land => 6,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RegionCandidate {
+    region_x: i32,
+    region_z: i32,
+    region_class: RepresentativeRegionClass,
+    water_ratio: f64,
+    min_ground_y: i32,
+    max_ground_y: i32,
+    dominant_biome: String,
+}
+
+impl RegionCandidate {
+    fn key(&self) -> (i32, i32) {
+        (self.region_x, self.region_z)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RepresentativeRegionPlanReport {
+    scale_denominator: i32,
+    width_blocks: i32,
+    height_blocks: i32,
+    candidate_regions: usize,
+    selected: Vec<RegionCandidate>,
+}
+
+impl RepresentativeRegionPlanReport {
+    fn selected_counts_by_class(&self) -> [usize; 7] {
+        let mut counts = [0usize; 7];
+        for candidate in &self.selected {
+            counts[candidate.region_class.index()] += 1;
+        }
+        counts
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SurfaceSpawnReport {
+    region_x: i32,
+    region_z: i32,
+    land_columns: i32,
+    water_columns: i32,
+    best_spawn_x: i32,
+    best_spawn_y: i32,
+    best_spawn_z: i32,
+    viable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HeightSeamDirection {
+    East,
+    South,
+}
+
+impl HeightSeamDirection {
+    fn parse(text: &str) -> std::result::Result<Self, String> {
+        match text.to_ascii_lowercase().as_str() {
+            "east" | "e" => Ok(Self::East),
+            "south" | "s" => Ok(Self::South),
+            _ => Err("direction must be east or south".to_string()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::East => "EAST",
+            Self::South => "SOUTH",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeightSeamReport {
+    region_x: i32,
+    region_z: i32,
+    direction: HeightSeamDirection,
+    compared_columns: i32,
+    coordinate_failures: i32,
+    min_surface_y: i32,
+    max_surface_y: i32,
+    max_abs_surface_delta: i32,
+}
+
+impl HeightSeamReport {
+    fn passed(self) -> bool {
+        self.coordinate_failures == 0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VanillaFinalizationCommandReport {
+    commands_file: std::path::PathBuf,
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
+    window_chunks: i32,
+    wait_ms: i32,
+    windows: i32,
+}
+
+const REPRESENTATIVE_SAMPLE_OFFSETS: [i32; 4] = [64, 192, 320, 448];
+
+fn classify_representative_region(
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    region_x: i32,
+    region_z: i32,
+) -> std::result::Result<RegionCandidate, String> {
+    let mut water_samples = 0i32;
+    let mut sample_count = 0i32;
+    let mut min_ground_y = i32::MAX;
+    let mut max_ground_y = i32::MIN;
+    let mut biomes = BTreeMap::<String, i32>::new();
+    for local_z in REPRESENTATIVE_SAMPLE_OFFSETS {
+        for local_x in REPRESENTATIVE_SAMPLE_OFFSETS {
+            let global_block_x = region_x
+                .wrapping_mul(REGION_SIZE_BLOCKS)
+                .wrapping_add(local_x);
+            let global_block_z = region_z
+                .wrapping_mul(REGION_SIZE_BLOCKS)
+                .wrapping_add(local_z);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            let column = classify_grid_sample(mapping, sampler, map_x, map_z)?;
+            sample_count += 1;
+            if column.water {
+                water_samples += 1;
+            }
+            min_ground_y = min_ground_y.min(column.ground_surface_y);
+            max_ground_y = max_ground_y.max(column.ground_surface_y);
+            *biomes.entry(column.biome_id).or_default() += 1;
+        }
+    }
+    let dominant_biome = biomes
+        .into_iter()
+        .max_by(|left, right| left.1.cmp(&right.1).then_with(|| right.0.cmp(&left.0)))
+        .map(|(biome, _count)| biome)
+        .unwrap_or_else(|| "minecraft:plains".to_string());
+    let water_ratio = f64::from(water_samples) / f64::from(sample_count);
+    let region_class = representative_region_class(water_ratio, max_ground_y, &dominant_biome);
+    Ok(RegionCandidate {
+        region_x,
+        region_z,
+        region_class,
+        water_ratio,
+        min_ground_y,
+        max_ground_y,
+        dominant_biome,
+    })
+}
+
+fn classify_grid_sample(
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    map_x: i32,
+    map_z: i32,
+) -> std::result::Result<EarthSurfaceColumn, String> {
+    if !inside_mapping(map_x, map_z, mapping) {
+        return Ok(classify_surface(0.0, 0.0, 0.0));
+    }
+    let longitude = mapping
+        .longitude_for_block_x(map_x)
+        .map_err(|error| error.to_string())?;
+    let latitude = mapping
+        .latitude_for_block_z(map_z)
+        .map_err(|error| error.to_string())?;
+    let elevation = sampler
+        .bilinear_meters(longitude, latitude)
+        .map_err(|error| error.to_string())?;
+    Ok(classify_surface(elevation, longitude, latitude))
+}
+
+fn representative_region_class(
+    water_ratio: f64,
+    max_ground_y: i32,
+    dominant_biome: &str,
+) -> RepresentativeRegionClass {
+    if water_ratio >= 0.90 {
+        return RepresentativeRegionClass::Ocean;
+    }
+    if water_ratio >= 0.10 {
+        return RepresentativeRegionClass::Coast;
+    }
+    if max_ground_y >= 105 {
+        return RepresentativeRegionClass::Mountain;
+    }
+    if dominant_biome.contains("desert") {
+        return RepresentativeRegionClass::Desert;
+    }
+    if dominant_biome.contains("jungle") {
+        return RepresentativeRegionClass::Jungle;
+    }
+    if dominant_biome.contains("snow") || max_ground_y >= 90 {
+        return RepresentativeRegionClass::Snow;
+    }
+    RepresentativeRegionClass::Land
+}
+
+fn select_representative_regions(
+    candidates: &[RegionCandidate],
+    target_regions: usize,
+) -> Vec<RegionCandidate> {
+    let mut by_class: [Vec<RegionCandidate>; 7] = std::array::from_fn(|_| Vec::new());
+    for candidate in candidates {
+        by_class[candidate.region_class.index()].push(candidate.clone());
+    }
+    for class_candidates in &mut by_class {
+        class_candidates.sort_by_key(|candidate| (candidate.region_z, candidate.region_x));
+    }
+
+    let mut selected = Vec::with_capacity(target_regions);
+    let mut used = HashSet::<(i32, i32)>::new();
+    for region_class in RepresentativeRegionClass::ALL {
+        add_representatives_evenly(
+            &mut selected,
+            &mut used,
+            &by_class[region_class.index()],
+            representative_quota(region_class, target_regions),
+        );
+    }
+    if selected.len() < target_regions {
+        let mut all = candidates.to_vec();
+        all.sort_by_key(|candidate| (candidate.region_z, candidate.region_x));
+        for candidate in all {
+            if selected.len() >= target_regions {
+                break;
+            }
+            if used.insert(candidate.key()) {
+                selected.push(candidate);
+            }
+        }
+    }
+    selected.sort_by_key(|candidate| {
+        (
+            candidate.region_class,
+            candidate.region_z,
+            candidate.region_x,
+        )
+    });
+    selected.truncate(target_regions);
+    selected
+}
+
+fn add_representatives_evenly(
+    selected: &mut Vec<RegionCandidate>,
+    used: &mut HashSet<(i32, i32)>,
+    candidates: &[RegionCandidate],
+    requested: usize,
+) {
+    if requested == 0 || candidates.is_empty() {
+        return;
+    }
+    let limit = requested.min(candidates.len());
+    for index in 0..limit {
+        let candidate_index =
+            ((index as f64) * (candidates.len() as f64 / limit as f64)).floor() as usize;
+        let candidate = candidates[candidate_index].clone();
+        if used.insert(candidate.key()) {
+            selected.push(candidate);
+        }
+    }
+}
+
+fn representative_quota(region_class: RepresentativeRegionClass, target_regions: usize) -> usize {
+    let ratio = match region_class {
+        RepresentativeRegionClass::Ocean => 0.20,
+        RepresentativeRegionClass::Coast => 0.20,
+        RepresentativeRegionClass::Mountain => 0.15,
+        RepresentativeRegionClass::Desert => 0.15,
+        RepresentativeRegionClass::Jungle => 0.10,
+        RepresentativeRegionClass::Snow => 0.10,
+        RepresentativeRegionClass::Land => 0.10,
+    };
+    1usize.max(((target_regions as f64) * ratio).round() as usize)
+}
+
+fn write_representative_region_csv(
+    output_csv: &Path,
+    candidates: &[RegionCandidate],
+) -> std::result::Result<(), String> {
+    if let Some(parent) = output_csv.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    let mut csv = String::from(
+        "index,regionX,regionZ,class,waterRatio,minGroundY,maxGroundY,dominantBiome\n",
+    );
+    for (index, candidate) in candidates.iter().enumerate() {
+        csv.push_str(&format!(
+            "{},{},{},{},{:.4},{},{},{}\n",
+            index,
+            candidate.region_x,
+            candidate.region_z,
+            candidate.region_class.as_str(),
+            candidate.water_ratio,
+            candidate.min_ground_y,
+            candidate.max_ground_y,
+            candidate.dominant_biome
+        ));
+    }
+    std::fs::write(output_csv, csv).map_err(|error| error.to_string())
+}
+
+fn height_seam_boundary_pair(
+    region_x: i32,
+    region_z: i32,
+    direction: HeightSeamDirection,
+    index: i32,
+) -> (i32, i32, i32, i32) {
+    let base_x = region_x.wrapping_mul(REGION_SIZE_BLOCKS);
+    let base_z = region_z.wrapping_mul(REGION_SIZE_BLOCKS);
+    match direction {
+        HeightSeamDirection::East => (
+            base_x + REGION_SIZE_BLOCKS - 1,
+            base_z + index,
+            base_x + REGION_SIZE_BLOCKS,
+            base_z + index,
+        ),
+        HeightSeamDirection::South => (
+            base_x + index,
+            base_z + REGION_SIZE_BLOCKS - 1,
+            base_x + index,
+            base_z + REGION_SIZE_BLOCKS,
+        ),
+    }
+}
+
+fn height_seam_pair_is_adjacent(
+    map_a_x: i32,
+    map_a_z: i32,
+    map_b_x: i32,
+    map_b_z: i32,
+    direction: HeightSeamDirection,
+) -> bool {
+    match direction {
+        HeightSeamDirection::East => map_b_x == map_a_x + 1 && map_b_z == map_a_z,
+        HeightSeamDirection::South => map_b_x == map_a_x && map_b_z == map_a_z + 1,
+    }
+}
+
+fn height_only_surface_y(
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    map_x: i32,
+    map_z: i32,
+) -> std::result::Result<i32, String> {
+    let longitude = mapping
+        .longitude_for_block_x(map_x)
+        .map_err(|error| error.to_string())?;
+    let latitude = mapping
+        .latitude_for_block_z(map_z)
+        .map_err(|error| error.to_string())?;
+    let elevation = sampler
+        .bilinear_meters(longitude, latitude)
+        .map_err(|error| error.to_string())?;
+    Ok(surface_y_for_elevation_meters(elevation))
+}
+
+fn inside_mapping(map_x: i32, map_z: i32, mapping: &EarthScaleMapping) -> bool {
+    map_x >= 0 && map_x < mapping.width_blocks && map_z >= 0 && map_z < mapping.height_blocks
 }
 
 fn raster_smoke(
@@ -12878,6 +13855,21 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.generate-survival-regions-parallel - Rust vanilla-delegated survival parallel compatibility alias"
         ));
+        assert!(out.contains(
+            "DONE rust.command.plan-representative-regions - deterministic representative region planner"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.describe-earth-grid - Earth grid and full-map region bounds reporter"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-surface-spawn - heightmap-backed surface spawn viability validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-height-seam - heightmap-backed adjacent region seam validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.write-vanilla-finalization-commands - server force-load command writer for vanilla finalization"
+        ));
     }
 
     #[test]
@@ -13079,6 +14071,152 @@ mod tests {
         assert!(out.contains("legacy survival direct parallel generation is replaced"));
         assert!(err.contains("format must be mca or linear"));
         assert!(!err.contains("not implemented yet"));
+    }
+
+    #[test]
+    fn describe_earth_grid_reports_region_bounds_without_java() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("tiny-grid.tif");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+
+        let (code, out, err) =
+            run_capture(&["describe-earth-grid", heightmap.to_str().unwrap(), "10000"]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Earth grid described\n"));
+        assert!(out.contains("scale=1:10000\n"));
+        assert!(out.contains("widthBlocks=4008\n"));
+        assert!(out.contains("heightBlocks=33\n"));
+        assert!(out.contains("minRegionX=-4\n"));
+        assert!(out.contains("maxRegionX=3\n"));
+        assert!(out.contains("minRegionZ=-1\n"));
+        assert!(out.contains("maxRegionZ=0\n"));
+        assert!(out.contains("regionCols=8\n"));
+        assert!(out.contains("regionRows=2\n"));
+        assert!(out.contains("fullEarthRegions=16\n"));
+        assert!(out.contains("generateVanillaDelegatedArgs="));
+        assert!(out.contains("writeFinalizationArgs=<commandsFile> -4 -1 8 2"));
+    }
+
+    #[test]
+    fn plan_representative_regions_writes_csv_without_java() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("tiny-plan.tif");
+        let output_csv = temp.path().join("plan").join("representative.csv");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+
+        let (code, out, err) = run_capture(&[
+            "plan-representative-regions",
+            heightmap.to_str().unwrap(),
+            "10000",
+            output_csv.to_str().unwrap(),
+            "3",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Representative region plan written\n"));
+        assert!(out.contains("scale=1:10000\n"));
+        assert!(out.contains("candidateRegions=16\n"));
+        assert!(out.contains("selectedRegions=3\n"));
+        assert!(out.contains("class.OCEAN="));
+        assert!(out.contains("class.LAND="));
+        let csv = fs::read_to_string(output_csv).unwrap();
+        assert!(csv.starts_with(
+            "index,regionX,regionZ,class,waterRatio,minGroundY,maxGroundY,dominantBiome\n"
+        ));
+        assert_eq!(csv.lines().count(), 4);
+    }
+
+    #[test]
+    fn validate_surface_spawn_reports_viability_without_java() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("tiny-spawn.tif");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+
+        let (code, out, err) = run_capture(&[
+            "validate-surface-spawn",
+            heightmap.to_str().unwrap(),
+            "10",
+            "0",
+            "0",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Surface spawn viable\n"));
+        assert!(out.contains("regionX=0\n"));
+        assert!(out.contains("regionZ=0\n"));
+        assert!(out.contains("landColumns="));
+        assert!(out.contains("waterColumns=0\n"));
+        assert!(out.contains("bestSpawnX="));
+        assert!(out.contains("bestSpawnY="));
+        assert!(out.contains("bestSpawnZ="));
+    }
+
+    #[test]
+    fn validate_height_seam_reports_surface_delta_without_java() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("tiny-seam.tif");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+
+        let (code, out, err) = run_capture(&[
+            "validate-height-seam",
+            heightmap.to_str().unwrap(),
+            "10",
+            "0",
+            "0",
+            "east",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Height seam valid\n"));
+        assert!(out.contains("regionX=0\n"));
+        assert!(out.contains("regionZ=0\n"));
+        assert!(out.contains("direction=EAST\n"));
+        assert!(out.contains("comparedColumns=512\n"));
+        assert!(out.contains("coordinateFailures=0\n"));
+        assert!(out.contains("minSurfaceY="));
+        assert!(out.contains("maxSurfaceY="));
+        assert!(out.contains("maxAbsSurfaceDelta="));
+    }
+
+    #[test]
+    fn write_vanilla_finalization_commands_writes_force_load_windows() {
+        let temp = tempdir().unwrap();
+        let commands = temp.path().join("finalization").join("commands.txt");
+
+        let (code, out, err) = run_capture(&[
+            "write-vanilla-finalization-commands",
+            commands.to_str().unwrap(),
+            "-1",
+            "2",
+            "1",
+            "1",
+            "16",
+            "250",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Vanilla finalization command file written\n"));
+        assert!(out.contains("regionXStart=-1\n"));
+        assert!(out.contains("regionZStart=2\n"));
+        assert!(out.contains("cols=1\n"));
+        assert!(out.contains("rows=1\n"));
+        assert!(out.contains("windowChunks=16\n"));
+        assert!(out.contains("waitMs=250\n"));
+        assert!(out.contains("windows=4\n"));
+        assert!(out.contains("maxChunksPerWindow=256\n"));
+
+        let text = fs::read_to_string(commands).unwrap();
+        assert!(text.contains("# range.regionX=-1..-1\n"));
+        assert!(text.contains("# range.regionZ=2..2\n"));
+        assert!(text.contains("forceload add -512 1024 -257 1279\n"));
+        assert!(text.contains("@wait-ms 250\n"));
+        assert!(text.ends_with("save-all flush\n@wait-ms 5000\n"));
     }
 
     #[test]
@@ -13365,6 +14503,11 @@ mod tests {
         assert!(out.contains("generate-survival-region-plan-parallel <heightmap>"));
         assert!(out.contains("generate-vanilla-delegated-plan-parallel <heightmap>"));
         assert!(out.contains("generate-vanilla-delegated-region-plan-parallel <heightmap>"));
+        assert!(out.contains("plan-representative-regions <heightmap> <scale> <outputCsv>"));
+        assert!(out.contains("describe-earth-grid <heightmap> <scale>"));
+        assert!(out.contains("validate-surface-spawn <heightmap> <scale> <regionX>"));
+        assert!(out.contains("validate-height-seam <heightmap> <scale> <regionX>"));
+        assert!(out.contains("write-vanilla-finalization-commands <outputCommands>"));
         assert!(out.contains("benchmark-region-writers <outputDir> [iterations=3]"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));
@@ -13383,6 +14526,10 @@ mod tests {
         assert!(out.contains("photo-standard-remap-parity-batch <jobsCsv> <outputRoot>"));
         assert!(out.contains("photo-production-candidate-diff-crop <sourcePng> <expectedPng>"));
         assert!(out.contains("photo-carrier-remap-sim-crop <currentSurfacePng> <expectedPng>"));
+        assert!(out.contains(
+            "Status: Rust runtime active; normal generation and validation paths are Rust-first."
+        ));
+        assert!(!out.contains("Java remains the compatibility oracle and fallback"));
     }
 
     #[test]

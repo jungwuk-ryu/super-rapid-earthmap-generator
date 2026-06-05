@@ -60,6 +60,31 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "Rust vanilla-delegated survival parallel compatibility alias",
     },
     CommandSpec {
+        name: "plan-representative-regions",
+        status: CommandStatus::Implemented,
+        note: "deterministic representative region planner",
+    },
+    CommandSpec {
+        name: "describe-earth-grid",
+        status: CommandStatus::Implemented,
+        note: "Earth grid and full-map region bounds reporter",
+    },
+    CommandSpec {
+        name: "validate-surface-spawn",
+        status: CommandStatus::Implemented,
+        note: "heightmap-backed surface spawn viability validator",
+    },
+    CommandSpec {
+        name: "validate-height-seam",
+        status: CommandStatus::Implemented,
+        note: "heightmap-backed adjacent region seam validator",
+    },
+    CommandSpec {
+        name: "write-vanilla-finalization-commands",
+        status: CommandStatus::Implemented,
+        note: "server force-load command writer for vanilla finalization",
+    },
+    CommandSpec {
         name: "quality-production-sample-batch",
         status: CommandStatus::Implemented,
         note: "Rust quality gate production sample batch",

@@ -441,29 +441,37 @@ Detailed progress:
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered commands:
 - [ ] `generate-nation-war-readiness-report`
-- [ ] `write-vanilla-finalization-commands`
+- [x] `write-vanilla-finalization-commands`
 Detailed progress:
 - [ ] Report schema remains readable by existing acceptance gates or those gates are updated.
-- [ ] Output commands target Rust/vanilla workflows, not Java scripts.
+- [x] Output commands target Rust/vanilla workflows, not Java scripts.
+Spec: `earthmap-rs write-vanilla-finalization-commands <outputCommands> <startRegionX> <startRegionZ> <cols> <rows> [windowChunks] [waitMs]`; writes a force-load/save/remove command file; exits 0 on success and 2 on invalid dimensions or write failure.
+Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli write_vanilla_finalization_commands --locked` passed.
 
 ### Representative planning, earth-grid, spawn, and seam tools
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust smoke commands covered by tests; speedup TBD; peak memory TBD; output representative CSV, grid stdout, spawn stdout, seam stdout; workload synthetic GeoTIFF command-contract smoke.
 Covered commands:
-- [ ] `plan-representative-regions`
-- [ ] `describe-earth-grid`
-- [ ] `validate-surface-spawn`
-- [ ] `validate-height-seam`
+- [x] `plan-representative-regions`
+- [x] `describe-earth-grid`
+- [x] `validate-surface-spawn`
+- [x] `validate-height-seam`
 Detailed progress:
-- [ ] Representative planning remains deterministic enough for repeatable gates.
-- [ ] Grid/spawn/seam outputs keep stable fields for scripts.
+- [x] Representative planning remains deterministic enough for repeatable gates.
+- [x] Grid/spawn/seam outputs keep stable fields for scripts.
+Specs:
+- `earthmap-rs plan-representative-regions <heightmap> <scale> <outputCsv> <targetRegions>` writes `index,regionX,regionZ,class,waterRatio,minGroundY,maxGroundY,dominantBiome`.
+- `earthmap-rs describe-earth-grid <heightmap> <scale>` prints full-Earth region bounds and generation/finalization argument templates.
+- `earthmap-rs validate-surface-spawn <heightmap> <scale> <regionX> <regionZ>` exits 0 only when a land spawn at or above sea level exists.
+- `earthmap-rs validate-height-seam <heightmap> <scale> <regionX> <regionZ> <east|south>` validates adjacent coordinate continuity and reports height deltas.
+Correctness: targeted Rust tests passed for representative planning, earth-grid, surface-spawn, and height-seam command contracts.
 
 ### Benchmark commands converted to Rust-only
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
@@ -549,7 +557,7 @@ Detailed progress:
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Detailed progress:
-- [ ] Rust CLI help no longer says Java is the compatibility oracle or fallback.
+- [x] Rust CLI help no longer says Java is the compatibility oracle or fallback.
 - [ ] Docs no longer tell users to use Java for normal validation.
 - [ ] Any remaining Java mentions are explicitly historical or migration-only.
 
