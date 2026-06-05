@@ -353,31 +353,39 @@ Detailed progress:
 - [x] Preserves bounded parallel generation and progress events.
 
 ### Survival and OSM generation commands
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
+- [x] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust dispatch and overlay contract tests covered; speedup TBD; peak memory TBD; output delegated surface region files plus OSM extract metrics; workload synthetic PBF/XML fixtures and future real OSM samples.
 Covered commands:
 - [x] `generate-survival-region`
 - [x] `generate-survival-regions-parallel`
 - [x] `generate-survival-region-osm-synthetic` (replacement alias; synthetic OSM overlay retired from normal path)
 - [x] `generate-survival-regions-parallel-osm-synthetic` (replacement alias; synthetic OSM overlay retired from normal path)
-- [ ] `generate-survival-region-osm-pbf`
-- [ ] `generate-survival-region-osm-pbf-ref-window`
-- [ ] `generate-survival-region-osm-pbf-full-scan`
-- [ ] `generate-survival-region-osm-xml-cache`
+- [x] `generate-survival-region-osm-pbf`
+- [x] `generate-survival-region-osm-pbf-ref-window`
+- [x] `generate-survival-region-osm-pbf-full-scan`
+- [x] `generate-survival-region-osm-xml-cache`
 - [x] `generate-survival-region-plan-parallel`
 - [x] `generate-survival-region-plan-parallel-osm-synthetic` (replacement alias; synthetic OSM overlay retired from normal path)
 Detailed progress:
 - [x] Decide whether legacy direct ecology generation is ported or dropped in favor of vanilla-delegated generation.
 - [x] Any dropped legacy path has a documented replacement command.
 - [x] OSM overlays do not slow the default no-OSM generation path.
-Replacement note: legacy direct survival ecology and synthetic OSM generation names now dispatch to Rust vanilla-delegated surface generation. PBF/XML OSM overlay commands remain open until they are either ported as bounded Rust overlay tools or explicitly retired with a separate replacement path.
+Specs:
+- `earthmap-rs generate-survival-region <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>` dispatches to Rust vanilla-delegated surface generation.
+- `earthmap-rs generate-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [maxRegionsThisRun]` dispatches to Rust vanilla-delegated parallel generation.
+- `earthmap-rs generate-survival-region-osm-pbf <pbf> <maxBlobs> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>` extracts a Rust OSM PBF mask and applies it as a surface overlay in delegated region generation.
+- `earthmap-rs generate-survival-region-osm-pbf-ref-window <pbf> <nodeMaxBlobs> <waySkipBlobs> <wayMaxBlobs> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>` uses the Rust way-reference PBF extractor before delegated generation.
+- `earthmap-rs generate-survival-region-osm-pbf-full-scan <pbf> <maxBlobs> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear> [progressEvery] [progressFile]` streams Rust full-scan progress and then applies the extracted OSM surface overlay.
+- `earthmap-rs generate-survival-region-osm-xml-cache <osmDirectory> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>` extracts a Rust XML cache mask and applies it as a delegated surface overlay.
+Replacement note: legacy direct survival ecology and synthetic OSM generation names dispatch to Rust vanilla-delegated surface generation; PBF/XML OSM generation names now run Rust extractors plus a delegated Rust OSM surface overlay.
+Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli survival_generation_aliases_dispatch_without_java --locked`, capability/help targeted tests, and `cargo test --manifest-path rust\Cargo.toml -p earthmap-surface osm_surface_overlay --locked` passed.
 
 ### OSM scan, validate, and extract commands
 - [x] Spec: CLI args, outputs, exit codes, artifact paths documented

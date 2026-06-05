@@ -60,6 +60,26 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "Rust vanilla-delegated survival parallel compatibility alias",
     },
     CommandSpec {
+        name: "generate-survival-region-osm-pbf",
+        status: CommandStatus::Implemented,
+        note: "Rust survival OSM PBF compatibility alias",
+    },
+    CommandSpec {
+        name: "generate-survival-region-osm-pbf-ref-window",
+        status: CommandStatus::Implemented,
+        note: "Rust survival OSM PBF ref-window compatibility alias",
+    },
+    CommandSpec {
+        name: "generate-survival-region-osm-pbf-full-scan",
+        status: CommandStatus::Implemented,
+        note: "Rust survival OSM PBF full-scan compatibility alias",
+    },
+    CommandSpec {
+        name: "generate-survival-region-osm-xml-cache",
+        status: CommandStatus::Implemented,
+        note: "Rust survival OSM XML cache compatibility alias",
+    },
+    CommandSpec {
         name: "plan-representative-regions",
         status: CommandStatus::Implemented,
         note: "deterministic representative region planner",

@@ -40,10 +40,12 @@ use earthmap_region::{
 use earthmap_surface::{
     classify_surface, generate_surface_region_with_open_material_sampler,
     surface_y_for_elevation_meters, EarthDataSurfaceMaterialSampler, EarthSurfaceColumn,
-    HeightOnlySettings, LandShallowTopoPhotoSampler, MetImageExportTerrainSampler, OutputFormat,
-    SurfaceMaterialSample, SurfaceRegionColumnTrace, SurfaceRegionReport, SurfaceRegionSettings,
-    SurfaceTextureMode, WwfEcoregionSampler, DEFAULT_SURFACE_TILE_CACHE_ENTRIES,
-    REGION_SIZE_BLOCKS, SEA_LEVEL_Y, SURVIVAL_MANIFEST_FILE_NAME,
+    HeightOnlySettings, LandShallowTopoPhotoSampler, MetImageExportTerrainSampler,
+    OsmFeatureKind as SurfaceOsmFeatureKind, OsmRegionFeatureMask as SurfaceOsmRegionFeatureMask,
+    OutputFormat, SurfaceMaterialSample, SurfaceRegionColumnTrace, SurfaceRegionReport,
+    SurfaceRegionSettings, SurfaceTextureMode, WwfEcoregionSampler,
+    DEFAULT_SURFACE_TILE_CACHE_ENTRIES, REGION_SIZE_BLOCKS, SEA_LEVEL_Y,
+    SURVIVAL_MANIFEST_FILE_NAME,
 };
 use serde_json::{json, Value};
 
@@ -353,6 +355,40 @@ where
         {
             write_result(generate_survival_region_alias(
                 stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+            ))
+        }
+        "generate-survival-region-osm-pbf" if args.len() == 9 => {
+            write_result(generate_survival_region_osm_pbf(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+                &args[7], &args[8],
+            ))
+        }
+        "generate-survival-region-osm-pbf-ref-window" if args.len() == 11 => {
+            write_result(generate_survival_region_osm_pbf_ref_window(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+                &args[7], &args[8], &args[9], &args[10],
+            ))
+        }
+        "generate-survival-region-osm-pbf-full-scan" if (9..=11).contains(&args.len()) => {
+            write_result(generate_survival_region_osm_pbf_full_scan(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7],
+                &args[8],
+                args.get(9).map(String::as_str),
+                args.get(10).map(String::as_str),
+            ))
+        }
+        "generate-survival-region-osm-xml-cache" if args.len() == 8 => {
+            write_result(generate_survival_region_osm_xml_cache(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+                &args[7],
             ))
         }
         "generate-survival-regions-parallel"
@@ -2758,6 +2794,22 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  generate-survival-region <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>    (Rust vanilla-delegated alias)"
+    )?;
+    writeln!(
+        out,
+        "  generate-survival-region-osm-pbf <pbf> <maxBlobs> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>"
+    )?;
+    writeln!(
+        out,
+        "  generate-survival-region-osm-pbf-ref-window <pbf> <nodeMaxBlobs> <waySkipBlobs> <wayMaxBlobs> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>"
+    )?;
+    writeln!(
+        out,
+        "  generate-survival-region-osm-pbf-full-scan <pbf> <maxBlobs> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear> [progressEvery] [progressFile]"
+    )?;
+    writeln!(
+        out,
+        "  generate-survival-region-osm-xml-cache <osmDirectory> <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>"
     )?;
     writeln!(
         out,
@@ -6670,6 +6722,336 @@ fn generate_survival_region_alias(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn generate_survival_region_osm_pbf(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    pbf_path: &str,
+    max_blobs_text: &str,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    let result = (|| -> std::result::Result<Vec<String>, String> {
+        let (_scale, mapping) = osm_mapping_for_scale(scale_text)?;
+        let (region_x, region_z) = osm_region_args(region_x_text, region_z_text)?;
+        let max_blobs = parse_i32_string(max_blobs_text)?;
+        let extract = earthmap_osm::extract_mask(
+            Path::new(pbf_path),
+            max_blobs,
+            &mapping,
+            region_x,
+            region_z,
+        )
+        .map_err(osm_error_text)?;
+        survival_osm_generation_lines(
+            "Survival region with OSM PBF overlay generated",
+            heightmap_path,
+            world_dir,
+            scale_text,
+            region_x_text,
+            region_z_text,
+            format_text,
+            Some(format!("pbfPath={pbf_path}")),
+            Some(format!("maxBlobs={max_blobs}")),
+            extract,
+        )
+    })();
+    write_survival_osm_generation_result(out, err, "OSM PBF survival region generation", result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_survival_region_osm_pbf_ref_window(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    pbf_path: &str,
+    node_max_blobs_text: &str,
+    way_skip_blobs_text: &str,
+    way_max_blobs_text: &str,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    let result = (|| -> std::result::Result<Vec<String>, String> {
+        let (node_max_blobs, way_skip_blobs, way_max_blobs, extract) =
+            extract_osm_region_mask_window_impl(
+                pbf_path,
+                scale_text,
+                region_x_text,
+                region_z_text,
+                node_max_blobs_text,
+                way_skip_blobs_text,
+                way_max_blobs_text,
+                true,
+            )?;
+        survival_osm_generation_lines(
+            "Survival region with OSM PBF ref-window overlay generated",
+            heightmap_path,
+            world_dir,
+            scale_text,
+            region_x_text,
+            region_z_text,
+            format_text,
+            Some(format!("nodeMaxBlobs={node_max_blobs}")),
+            Some(format!(
+                "waySkipBlobs={way_skip_blobs}\nwayMaxBlobs={way_max_blobs}"
+            )),
+            extract,
+        )
+    })();
+    write_survival_osm_generation_result(
+        out,
+        err,
+        "OSM PBF ref-window survival region generation",
+        result,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_survival_region_osm_pbf_full_scan(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    pbf_path: &str,
+    max_blobs_text: &str,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+    progress_every_text: Option<&str>,
+    progress_file: Option<&str>,
+) -> io::Result<i32> {
+    let result = (|| -> std::result::Result<Vec<String>, String> {
+        let (_scale, mapping) = osm_mapping_for_scale(scale_text)?;
+        let (region_x, region_z) = osm_region_args(region_x_text, region_z_text)?;
+        let max_blobs = parse_i32_string(max_blobs_text)?;
+        let progress_every = progress_every_text
+            .map(parse_i32_string)
+            .transpose()?
+            .unwrap_or(0);
+        let mut progress_writer = progress_file.map(open_progress_file).transpose()?;
+        let extract = earthmap_osm::extract_full_scan(
+            Path::new(pbf_path),
+            max_blobs,
+            &mapping,
+            region_x,
+            region_z,
+            progress_every,
+            |progress| {
+                let line = osm_full_scan_progress_line(progress);
+                writeln!(out, "{line}").map_err(|error| {
+                    earthmap_osm::OsmError::invalid(format!("failed to write progress: {error}"))
+                })?;
+                if let Some(writer) = progress_writer.as_mut() {
+                    writeln!(writer, "{line}").map_err(|error| {
+                        earthmap_osm::OsmError::invalid(format!(
+                            "failed to write progress file: {error}"
+                        ))
+                    })?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(osm_error_text)?;
+        if let Some(writer) = progress_writer.as_mut() {
+            writer.flush().map_err(|error| error.to_string())?;
+        }
+        let progress_file_line = progress_file.map(|path| format!("progressFile={path}"));
+        survival_osm_generation_lines(
+            "Survival region with OSM PBF full-scan overlay generated",
+            heightmap_path,
+            world_dir,
+            scale_text,
+            region_x_text,
+            region_z_text,
+            format_text,
+            Some(format!("maxBlobs={max_blobs}")),
+            Some(format!(
+                "progressEveryBlobs={progress_every}{}",
+                progress_file_line
+                    .as_ref()
+                    .map(|line| format!("\n{line}"))
+                    .unwrap_or_default()
+            )),
+            extract,
+        )
+    })();
+    write_survival_osm_generation_result(
+        out,
+        err,
+        "OSM PBF full-scan survival region generation",
+        result,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_survival_region_osm_xml_cache(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    osm_directory: &str,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    let result = (|| -> std::result::Result<Vec<String>, String> {
+        let (_scale, mapping) = osm_mapping_for_scale(scale_text)?;
+        let (region_x, region_z) = osm_region_args(region_x_text, region_z_text)?;
+        let identity =
+            earthmap_osm::identify_xml_cache(Path::new(osm_directory)).map_err(osm_error_text)?;
+        let extract = earthmap_osm::extract_xml_region_mask(
+            Path::new(osm_directory),
+            &mapping,
+            region_x,
+            region_z,
+        )
+        .map_err(osm_error_text)?;
+        let mut lines = survival_osm_generation_lines(
+            "Survival region with OSM XML cache overlay generated",
+            heightmap_path,
+            world_dir,
+            scale_text,
+            region_x_text,
+            region_z_text,
+            format_text,
+            Some(format!("osmDirectory={osm_directory}")),
+            None,
+            extract,
+        )?;
+        lines.push(format!("sourceKind={}", identity.kind));
+        lines.push(format!("sourcePath={}", identity.source_path.display()));
+        lines.push(format!("sourceFileCount={}", identity.file_count));
+        lines.push(format!("sourceTotalBytes={}", identity.total_bytes));
+        lines.push(format!("sourceSha256={}", identity.sha256));
+        Ok(lines)
+    })();
+    write_survival_osm_generation_result(
+        out,
+        err,
+        "OSM XML cache survival region generation",
+        result,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn survival_osm_generation_lines(
+    title: &str,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+    first_context_line: Option<String>,
+    second_context_line: Option<String>,
+    extract: earthmap_osm::OsmPbfRegionExtractResult,
+) -> std::result::Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    lines.push(title.to_string());
+    lines.push(
+        "notice=legacy survival direct gameplay generation is replaced by Rust vanilla-delegated surface generation with OSM surface overlay"
+            .to_string(),
+    );
+    if let Some(line) = first_context_line {
+        lines.extend(line.lines().map(str::to_string));
+    }
+    if let Some(line) = second_context_line {
+        lines.extend(line.lines().map(str::to_string));
+    }
+    lines.extend(osm_extract_report_lines(&extract.report));
+    lines.push("osmSurfaceOverlay=true".to_string());
+    lines.extend(generate_vanilla_delegated_region_impl_with_osm_mask(
+        heightmap_path,
+        world_dir,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        format_text,
+        "surface",
+        "surfaceRaster=auto",
+        &[],
+        Some(surface_osm_mask_from_osm(&extract.mask)?),
+    )?);
+    Ok(lines)
+}
+
+fn write_survival_osm_generation_result(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    label: &str,
+    result: std::result::Result<Vec<String>, String>,
+) -> io::Result<i32> {
+    match result {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "{label} failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn surface_osm_mask_from_osm(
+    source: &earthmap_osm::OsmRegionFeatureMask,
+) -> std::result::Result<SurfaceOsmRegionFeatureMask, String> {
+    let mut target = SurfaceOsmRegionFeatureMask::new();
+    for z in 0..REGION_SIZE_BLOCKS {
+        for x in 0..REGION_SIZE_BLOCKS {
+            if source.road_at(x, z).map_err(osm_error_text)? {
+                target.mark(SurfaceOsmFeatureKind::Road, x, z);
+            }
+            if source.waterway_at(x, z).map_err(osm_error_text)? {
+                target.mark(SurfaceOsmFeatureKind::Waterway, x, z);
+            }
+            if source.landuse_at(x, z).map_err(osm_error_text)? {
+                target.mark(SurfaceOsmFeatureKind::Landuse, x, z);
+            }
+            if source.building_at(x, z).map_err(osm_error_text)? {
+                target.mark(SurfaceOsmFeatureKind::Building, x, z);
+            }
+        }
+    }
+    Ok(target)
+}
+
+fn osm_extract_report_lines(report: &earthmap_osm::OsmPbfRegionExtractReport) -> Vec<String> {
+    vec![
+        format!("blobsScanned={}", report.blobs_scanned),
+        format!("osmDataBlobs={}", report.osm_data_blobs),
+        format!("primitiveGroups={}", report.primitive_groups),
+        format!("decodedNodes={}", report.decoded_nodes),
+        format!("decodedWays={}", report.decoded_ways),
+        format!("indexConsideredWays={}", report.index_considered_ways),
+        format!(
+            "indexSkippedMissingNodeWays={}",
+            report.index_skipped_missing_node_ways
+        ),
+        format!("indexedFeatures={}", report.indexed_features),
+        format!("roadFeatures={}", report.road_features),
+        format!("waterwayFeatures={}", report.waterway_features),
+        format!("landuseFeatures={}", report.landuse_features),
+        format!("buildingFeatures={}", report.building_features),
+        format!("roadMaskPixels={}", report.road_mask_pixels),
+        format!("waterwayMaskPixels={}", report.waterway_mask_pixels),
+        format!("landuseMaskPixels={}", report.landuse_mask_pixels),
+        format!("buildingMaskPixels={}", report.building_mask_pixels),
+        format!("elapsedMillis={}", report.elapsed_millis),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
 fn generate_survival_regions_parallel_alias(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -7761,6 +8143,33 @@ fn generate_vanilla_delegated_region_impl(
     surface_raster_text: &str,
     extra_options: &[String],
 ) -> std::result::Result<Vec<String>, String> {
+    generate_vanilla_delegated_region_impl_with_osm_mask(
+        heightmap_path,
+        world_dir,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        format_text,
+        status_text,
+        surface_raster_text,
+        extra_options,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_vanilla_delegated_region_impl_with_osm_mask(
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+    status_text: &str,
+    surface_raster_text: &str,
+    extra_options: &[String],
+    osm_region_feature_mask: Option<SurfaceOsmRegionFeatureMask>,
+) -> std::result::Result<Vec<String>, String> {
     let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
     let compression_options = parse_region_compression_options(format, extra_options)?;
     let status = ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
@@ -7797,6 +8206,7 @@ fn generate_vanilla_delegated_region_impl(
     .map_err(|error| error.to_string())?;
     settings.surface_material_path = Some(surface_material_path.clone());
     settings.surface_tile_cache_entries = surface_tile_cache_entries;
+    settings.osm_region_feature_mask = osm_region_feature_mask;
     apply_region_compression_options(&mut settings, compression_options);
 
     let report =
@@ -15790,6 +16200,18 @@ mod tests {
             "DONE rust.command.generate-survival-regions-parallel - Rust vanilla-delegated survival parallel compatibility alias"
         ));
         assert!(out.contains(
+            "DONE rust.command.generate-survival-region-osm-pbf - Rust survival OSM PBF compatibility alias"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.generate-survival-region-osm-pbf-ref-window - Rust survival OSM PBF ref-window compatibility alias"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.generate-survival-region-osm-pbf-full-scan - Rust survival OSM PBF full-scan compatibility alias"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.generate-survival-region-osm-xml-cache - Rust survival OSM XML cache compatibility alias"
+        ));
+        assert!(out.contains(
             "DONE rust.command.plan-representative-regions - deterministic representative region planner"
         ));
         assert!(out.contains(
@@ -16030,6 +16452,21 @@ mod tests {
 
     #[test]
     fn survival_generation_aliases_dispatch_without_java() {
+        let temp = tempdir().unwrap();
+        let pbf = temp.path().join("tiny.osm.pbf");
+        fs::write(&pbf, synthetic_osm_pbf()).unwrap();
+        let osm_dir = temp.path().join("osm-cache");
+        fs::create_dir_all(&osm_dir).unwrap();
+        fs::write(
+            osm_dir.join("a.osm"),
+            r#"<osm>
+  <node id="1" lat="0.0" lon="0.0"/>
+  <node id="2" lat="0.0" lon="0.1"/>
+  <way id="10"><nd ref="1"/><nd ref="2"/><tag k="highway" v="residential"/></way>
+</osm>"#,
+        )
+        .unwrap();
+
         let (code, out, err) = run_capture(&[
             "generate-survival-region",
             "missing-heightmap.tif",
@@ -16060,6 +16497,62 @@ mod tests {
         assert!(out.contains("legacy survival direct parallel generation is replaced"));
         assert!(err.contains("format must be mca or linear"));
         assert!(!err.contains("not implemented yet"));
+
+        let osm_aliases: Vec<Vec<String>> = vec![
+            vec![
+                "generate-survival-region-osm-pbf".to_string(),
+                pbf.to_string_lossy().into_owned(),
+                "2".to_string(),
+                "missing-heightmap.tif".to_string(),
+                "world".to_string(),
+                "1000".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "bad-format".to_string(),
+            ],
+            vec![
+                "generate-survival-region-osm-pbf-ref-window".to_string(),
+                pbf.to_string_lossy().into_owned(),
+                "2".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+                "missing-heightmap.tif".to_string(),
+                "world".to_string(),
+                "1000".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "bad-format".to_string(),
+            ],
+            vec![
+                "generate-survival-region-osm-pbf-full-scan".to_string(),
+                pbf.to_string_lossy().into_owned(),
+                "2".to_string(),
+                "missing-heightmap.tif".to_string(),
+                "world".to_string(),
+                "1000".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "bad-format".to_string(),
+            ],
+            vec![
+                "generate-survival-region-osm-xml-cache".to_string(),
+                osm_dir.to_string_lossy().into_owned(),
+                "missing-heightmap.tif".to_string(),
+                "world".to_string(),
+                "1000".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "bad-format".to_string(),
+            ],
+        ];
+        for args in osm_aliases {
+            let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let (code, out, err) = run_capture(&borrowed);
+            assert_eq!(code, EXIT_USAGE);
+            assert!(out.is_empty());
+            assert!(err.contains("format must be mca or linear"));
+            assert!(!err.contains("not implemented yet"));
+        }
     }
 
     #[test]
@@ -16596,6 +17089,10 @@ mod tests {
         assert!(out.contains("quality-candidate [heightmap] <worldDir>"));
         assert!(out.contains("generate <heightmap> <worldDir> <scale> <startRegionX>"));
         assert!(out.contains("generate-survival-region <heightmap> <worldDir>"));
+        assert!(out.contains("generate-survival-region-osm-pbf <pbf> <maxBlobs>"));
+        assert!(out.contains("generate-survival-region-osm-pbf-ref-window <pbf>"));
+        assert!(out.contains("generate-survival-region-osm-pbf-full-scan <pbf>"));
+        assert!(out.contains("generate-survival-region-osm-xml-cache <osmDirectory>"));
         assert!(out.contains("generate-survival-regions-parallel <heightmap>"));
         assert!(out.contains("generate-survival-region-plan-parallel <heightmap>"));
         assert!(out.contains("generate-vanilla-delegated-plan-parallel <heightmap>"));

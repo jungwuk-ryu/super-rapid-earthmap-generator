@@ -250,6 +250,7 @@ pub struct SurfaceRegionSettings {
     pub surface_material_path: Option<PathBuf>,
     pub surface_tile_cache_entries: usize,
     pub parallel_column_sampling: bool,
+    pub osm_region_feature_mask: Option<OsmRegionFeatureMask>,
     pub mca_compression_level: Option<u32>,
     pub linear_compression_level: Option<i32>,
 }
@@ -359,6 +360,7 @@ impl SurfaceRegionSettings {
             surface_material_path: None,
             surface_tile_cache_entries: DEFAULT_SURFACE_TILE_CACHE_ENTRIES,
             parallel_column_sampling: true,
+            osm_region_feature_mask: None,
             mca_compression_level: None,
             linear_compression_level: None,
         })
@@ -10673,7 +10675,14 @@ pub fn generate_surface_region_with_open_material_sampler(
             let sample = region_surface.chunk_sample(local_chunk_x, local_chunk_z)?;
 
             let phase_start = Instant::now();
-            let build = build_surface_chunk(chunk_x, chunk_z, sample.columns())?;
+            let build = build_surface_chunk_with_osm_overlay(
+                chunk_x,
+                chunk_z,
+                sample.columns(),
+                settings.osm_region_feature_mask.as_ref(),
+                local_chunk_x * CHUNK_WIDTH as i32,
+                local_chunk_z * CHUNK_WIDTH as i32,
+            )?;
             let chunk_build_nanos = phase_start.elapsed().as_nanos();
 
             let phase_start = Instant::now();
@@ -11311,6 +11320,17 @@ pub fn build_surface_chunk(
     chunk_z: i32,
     columns: &[EarthSurfaceColumn],
 ) -> Result<SurfaceChunkBuild> {
+    build_surface_chunk_with_osm_overlay(chunk_x, chunk_z, columns, None, 0, 0)
+}
+
+pub fn build_surface_chunk_with_osm_overlay(
+    chunk_x: i32,
+    chunk_z: i32,
+    columns: &[EarthSurfaceColumn],
+    osm_mask: Option<&OsmRegionFeatureMask>,
+    region_local_origin_x: i32,
+    region_local_origin_z: i32,
+) -> Result<SurfaceChunkBuild> {
     let expected_columns = CHUNK_WIDTH * CHUNK_WIDTH;
     if columns.len() != expected_columns {
         return Err(SurfaceError::invalid(
@@ -11350,6 +11370,15 @@ pub fn build_surface_chunk(
             water_by_local_column[column_index] = column.water;
             *biome_counts.entry(column.biome_id.clone()).or_insert(0) += 1;
             fill_surface_column(&mut chunk, local_x as i32, local_z as i32, &column)?;
+            apply_osm_surface_overlay(
+                &mut chunk,
+                local_x as i32,
+                local_z as i32,
+                &column,
+                osm_mask,
+                region_local_origin_x + local_x as i32,
+                region_local_origin_z + local_z as i32,
+            )?;
         }
     }
     let biome = dominant_surface_biome(&biome_counts);

@@ -961,6 +961,22 @@ impl OsmRegionFeatureMask {
         count_true(&self.buildings)
     }
 
+    pub fn road_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        feature_at(&self.roads, local_x, local_z)
+    }
+
+    pub fn waterway_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        feature_at(&self.waterways, local_x, local_z)
+    }
+
+    pub fn landuse_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        feature_at(&self.landuse, local_x, local_z)
+    }
+
+    pub fn building_at(&self, local_x: i32, local_z: i32) -> Result<bool> {
+        feature_at(&self.buildings, local_x, local_z)
+    }
+
     fn mark_line(&mut self, kind: OsmFeatureKind, x0: i32, z0: i32, x1: i32, z1: i32) {
         let dx = (x1 - x0).abs();
         let dz = (z1 - z0).abs();
@@ -1004,6 +1020,15 @@ impl OsmRegionFeatureMask {
 
 fn count_true(values: &[bool]) -> i32 {
     values.iter().filter(|&&value| value).count() as i32
+}
+
+fn feature_at(values: &[bool], local_x: i32, local_z: i32) -> Result<bool> {
+    if !(0..REGION_SIZE_BLOCKS).contains(&local_x) || !(0..REGION_SIZE_BLOCKS).contains(&local_z) {
+        return Err(OsmError::invalid(format!(
+            "local coordinate outside region: {local_x},{local_z}"
+        )));
+    }
+    Ok(values[(local_z * REGION_SIZE_BLOCKS + local_x) as usize])
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
