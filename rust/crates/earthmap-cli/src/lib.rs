@@ -442,6 +442,22 @@ where
                 parsed.extra_options,
             ))
         }
+        "generate-vanilla-delegated-plan-parallel"
+        | "generate-vanilla-delegated-region-plan-parallel"
+            if args.len() >= 7 =>
+        {
+            write_result(generate_vanilla_delegated_plan_parallel(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7..],
+            ))
+        }
         "trace-surface-region-column" if (6..=8).contains(&args.len()) => {
             let parsed = trace_column_args(&args);
             write_result(trace_surface_region_column(
@@ -2274,6 +2290,10 @@ struct RegionCompressionOptions {
 
 fn optional_generation_args(args: &[String], first_optional: usize) -> GenerationOptionalArgs<'_> {
     let rest = args.get(first_optional..).unwrap_or(&[]);
+    optional_generation_args_from_rest(rest)
+}
+
+fn optional_generation_args_from_rest(rest: &[String]) -> GenerationOptionalArgs<'_> {
     if rest.is_empty() {
         return GenerationOptionalArgs {
             status: "surface",
@@ -2590,6 +2610,14 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+    )?;
+    writeln!(
+        out,
+        "  generate-vanilla-delegated-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+    )?;
+    writeln!(
+        out,
+        "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(out, "  benchmark-region-writers <outputDir> [iterations=3]")?;
     writeln!(out, "  playability-smoke <worldDir> <outputJson>")?;
@@ -5140,6 +5168,538 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         return Err(stats.errors.join("; "));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_vanilla_delegated_plan_parallel(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    format_text: &str,
+    threads_text: &str,
+    plan_csv: &str,
+    optional_args: &[String],
+) -> io::Result<i32> {
+    match generate_vanilla_delegated_plan_parallel_impl(
+        out,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        format_text,
+        threads_text,
+        plan_csv,
+        optional_args,
+    ) {
+        Ok(()) => Ok(EXIT_OK),
+        Err(error) => {
+            writeln!(
+                err,
+                "Resumable vanilla-delegated plan batch generation failed: {error}"
+            )?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_vanilla_delegated_plan_parallel_impl(
+    out: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    format_text: &str,
+    threads_text: &str,
+    plan_csv: &str,
+    optional_args: &[String],
+) -> std::result::Result<(), String> {
+    let total_start = Instant::now();
+    let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let scale = parse_positive_i32_string("scale", scale_text)?;
+    let threads = parse_positive_usize_string("threads", threads_text)?;
+    let plan_path = Path::new(plan_csv);
+    let plan_regions = read_region_plan_csv(plan_path)?;
+    let (max_regions_this_run, generation_option_offset) =
+        parse_plan_max_regions_this_run(optional_args)?;
+    let generation_options = optional_generation_args_from_rest(
+        optional_args.get(generation_option_offset..).unwrap_or(&[]),
+    );
+    let compression_options =
+        parse_region_compression_options(format, generation_options.extra_options)?;
+    let status = ChunkGenerationStatus::parse(generation_options.status)
+        .map_err(|error| error.to_string())?;
+    if status == ChunkGenerationStatus::Full {
+        return Err("delegated generation status must be surface or carvers".to_string());
+    }
+
+    let submitted_regions = plan_regions.len().min(max_regions_this_run);
+    if submitted_regions == 0 {
+        return Err("maxRegionsThisRun produced an empty submitted plan".to_string());
+    }
+    let heightmap = Path::new(heightmap_path);
+    let world = Path::new(world_dir);
+    let surface_material_path =
+        parse_optional_surface_material_path(generation_options.surface_raster, heightmap)?
+            .ok_or_else(|| {
+                "default textureMode=photo requires a TrueMarble surface raster; use surfaceRaster=auto or pass an explicit TrueMarble.vrt path"
+                    .to_string()
+            })?;
+    let cache_rows = configured_heightmap_cache_rows(heightmap)?;
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(Some(&surface_material_path))?;
+    let resume_fingerprint = vanilla_delegated_plan_resume_fingerprint(
+        heightmap,
+        plan_path,
+        &plan_regions,
+        format,
+        scale,
+        status,
+        &surface_material_path,
+        compression_options,
+    );
+    let worker_count = threads
+        .min(submitted_regions)
+        .min(SURFACE_PHOTO_REGION_WORKER_LIMIT)
+        .max(1);
+    configure_surface_photo_rayon_threads(threads);
+
+    let setup_start = Instant::now();
+    std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
+    let (spawn_region_x, spawn_region_z) = plan_spawn_region(&plan_regions);
+    let spawn_x = spawn_region_x
+        .wrapping_mul(REGION_SIZE_BLOCKS)
+        .wrapping_add(REGION_SIZE_BLOCKS / 2);
+    let spawn_z = spawn_region_z
+        .wrapping_mul(REGION_SIZE_BLOCKS)
+        .wrapping_add(REGION_SIZE_BLOCKS / 2);
+    let level_settings = level_dat_template::Settings::new(
+        "SR EarthMap Vanilla Delegated Plan",
+        0,
+        spawn_x,
+        SEA_LEVEL_Y + 10,
+        spawn_z,
+    )
+    .map_err(|error| error.to_string())?;
+    level_dat_template::write(world.join("level.dat"), &level_settings)
+        .map_err(|error| error.to_string())?;
+    let manifest_file = write_vanilla_delegated_plan_manifest(
+        world,
+        format,
+        scale,
+        plan_path,
+        plan_regions.len(),
+        submitted_regions,
+        status,
+        &surface_material_path,
+    )
+    .map_err(|error| error.to_string())?;
+    let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
+    let stale_temp_files = cleanup_stale_region_temp_files(&world.join("region"));
+    let surface_material_sampler = EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+        &surface_material_path,
+        surface_tile_cache_entries,
+    )
+    .map_err(|error| error.to_string())?;
+    let setup_millis = setup_start.elapsed().as_millis();
+
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "batchStarted",
+            "mode": "plan",
+            "worldDir": normalized_path_display(world),
+            "planCsv": normalized_path_display(plan_path),
+            "format": format.java_name(),
+            "scale": scale,
+            "chunkStatus": status.id(),
+            "plannedRegions": plan_regions.len(),
+            "submittedRegions": submitted_regions,
+            "requestedThreads": threads,
+            "workerThreads": worker_count,
+            "resumeFingerprintMatched": resume.fingerprint_matched,
+            "resumeJournalRegions": resume.completed_regions.len(),
+            "resumeJournal": normalized_path_display(&resume.path),
+        }),
+    )?;
+    for warning in &resume.warnings {
+        writeln!(out, "resumeJournalWarning={}", csv_cell(warning))
+            .map_err(|error| error.to_string())?;
+    }
+    writeln!(
+        out,
+        "type,status,regionX,regionZ,elapsedMillis,chunks,outputBytes,regionFile,message"
+    )
+    .map_err(|error| error.to_string())?;
+
+    let regions = plan_regions
+        .iter()
+        .take(submitted_regions)
+        .copied()
+        .collect::<VecDeque<_>>();
+    let region_queue = Mutex::new(regions);
+    let stop_queueing = AtomicBool::new(false);
+    let resume_completed_regions = Arc::new(resume.completed_regions);
+    let resume_journal = resume.journal;
+    let (event_sender, event_receiver) =
+        mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
+    let mut stats = VanillaDelegatedParallelBatchStats::default();
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let queue = &region_queue;
+            let stop_queueing = &stop_queueing;
+            let surface_material_sampler = &surface_material_sampler;
+            let surface_material_path = &surface_material_path;
+            let completed_regions = Arc::clone(&resume_completed_regions);
+            let journal = Arc::clone(&resume_journal);
+            let sender = event_sender.clone();
+            let fingerprint_matched = resume.fingerprint_matched;
+            scope.spawn(move || loop {
+                if stop_queueing.load(Ordering::SeqCst) {
+                    break;
+                }
+                let next_region = {
+                    let mut queue = queue.lock().expect("queue lock");
+                    if stop_queueing.load(Ordering::SeqCst) {
+                        None
+                    } else {
+                        queue.pop_front()
+                    }
+                };
+                let Some((region_x, region_z)) = next_region else {
+                    break;
+                };
+                let region_file = vanilla_delegated_region_file(world, format, region_x, region_z);
+                if fingerprint_matched && completed_regions.contains(&(region_x, region_z)) {
+                    let skip_start = Instant::now();
+                    if let Ok(validation) = validate_region_file_for_resume(
+                        &region_file,
+                        region_format_for_output(format),
+                        region_x,
+                        region_z,
+                        REGION_CHUNKS_PER_REGION,
+                    ) {
+                        if sender
+                            .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                region_x,
+                                region_z,
+                                elapsed_millis: skip_start.elapsed().as_millis(),
+                                chunks: validation.chunk_count,
+                                output_bytes: validation.file_bytes,
+                                region_file,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if sender
+                    .send(VanillaDelegatedParallelEvent::RegionStarted {
+                        region_x,
+                        region_z,
+                        region_file: region_file.clone(),
+                    })
+                    .is_err()
+                {
+                    break;
+                };
+                let region_start = Instant::now();
+                let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
+                    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+                        heightmap_path,
+                        world_dir,
+                        "SR EarthMap Vanilla Delegated Plan",
+                        0,
+                        scale,
+                        region_x,
+                        region_z,
+                        format,
+                        cache_rows,
+                        false,
+                        status,
+                        1.0,
+                        SurfaceTextureMode::Photo,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    settings.surface_material_path = Some((*surface_material_path).clone());
+                    settings.surface_tile_cache_entries = surface_tile_cache_entries;
+                    settings.parallel_column_sampling = worker_count <= 4;
+                    apply_region_compression_options(&mut settings, compression_options);
+                    let report = generate_surface_region_with_open_material_sampler(
+                        &settings,
+                        Some(surface_material_sampler),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let output_bytes = std::fs::metadata(&report.region_file)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    journal
+                        .lock()
+                        .map_err(|_| "resume journal lock poisoned".to_string())?
+                        .append_region_complete(
+                            report.region_x,
+                            report.region_z,
+                            format,
+                            report.chunk_count,
+                            output_bytes,
+                        )?;
+                    Ok(report)
+                })();
+                match result {
+                    Ok(report) => {
+                        let output_bytes = std::fs::metadata(&report.region_file)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        if sender
+                            .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                elapsed_millis: region_start.elapsed().as_millis(),
+                                output_bytes,
+                                report,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(message) => {
+                        stop_queueing.store(true, Ordering::SeqCst);
+                        let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                            region_x,
+                            region_z,
+                            elapsed_millis: region_start.elapsed().as_millis(),
+                            region_file,
+                            message,
+                        });
+                        break;
+                    }
+                }
+            });
+        }
+        drop(event_sender);
+        while let Ok(event) = event_receiver.recv() {
+            handle_vanilla_delegated_parallel_event(out, &mut stats, event)?;
+        }
+        Ok::<(), String>(())
+    })?;
+    if let Ok(journal) = resume_journal.lock() {
+        journal.sync()?;
+    }
+    let elapsed_millis = total_start.elapsed().as_millis();
+    let generated_regions_per_hour = if elapsed_millis == 0 {
+        0.0
+    } else {
+        (stats.generated_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
+    };
+    let completed_regions = stats.generated_regions + stats.skipped_regions;
+    let completed_regions_per_hour = if elapsed_millis == 0 {
+        0.0
+    } else {
+        (completed_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
+    };
+    let remaining_regions = plan_regions.len().saturating_sub(completed_regions);
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "batchSummary",
+            "mode": "plan",
+            "elapsedMillis": u128_to_u64(elapsed_millis),
+            "plannedRegions": plan_regions.len(),
+            "submittedRegions": submitted_regions,
+            "generatedRegions": stats.generated_regions,
+            "skippedRegions": stats.skipped_regions,
+            "completedRegions": completed_regions,
+            "failedRegions": stats.failed_regions,
+            "remainingRegions": remaining_regions,
+            "allDone": stats.failed_regions == 0 && remaining_regions == 0,
+            "generatedRegionsPerHour": generated_regions_per_hour,
+            "completedRegionsPerHour": completed_regions_per_hour,
+        }),
+    )?;
+    let lines = [
+        "Resumable vanilla-delegated plan batch complete".to_string(),
+        format!("worldDir={}", world.display()),
+        format!("planCsv={}", normalized_path_display(plan_path)),
+        format!("format={}", format.java_name()),
+        format!("scale=1:{scale}"),
+        format!("chunkStatus={}", status.id()),
+        format!("plannedRegions={}", plan_regions.len()),
+        format!("submittedRegions={submitted_regions}"),
+        format!("requestedThreads={threads}"),
+        format!("workerThreads={worker_count}"),
+        format!("surfaceSamplerStrategy=shared"),
+        format!("sharedCacheRows={cache_rows}"),
+        format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
+        compression_options_report_line(format, compression_options),
+        format!(
+            "surfaceMaterialPath={}",
+            normalized_path_display(&surface_material_path)
+        ),
+        format!("resumeJournal={}", resume.path.display()),
+        format!("resumeFingerprintMatched={}", resume.fingerprint_matched),
+        format!("resumeJournalRegions={}", resume_completed_regions.len()),
+        format!("staleTempRegionFilesRemoved={stale_temp_files}"),
+        format!("setupMillis={setup_millis}"),
+        format!(
+            "batchPhaseSummary.surfaceSampleMillis={}",
+            stats.phase_surface_sample_millis
+        ),
+        format!(
+            "batchPhaseSummary.chunkBuildMillis={}",
+            stats.phase_chunk_build_millis
+        ),
+        format!(
+            "batchPhaseSummary.nbtEncodeMillis={}",
+            stats.phase_nbt_encode_millis
+        ),
+        format!(
+            "batchPhaseSummary.regionWriteMillis={}",
+            stats.phase_region_write_millis
+        ),
+        format!(
+            "batchPhaseSummary.metadataMillis={}",
+            stats.phase_metadata_millis
+        ),
+        format!(
+            "batchPhaseSummary.totalInternalMillis={}",
+            stats.phase_total_internal_millis
+        ),
+        format!("elapsedMillis={elapsed_millis}"),
+        format!("generatedRegions={}", stats.generated_regions),
+        format!("skippedRegions={}", stats.skipped_regions),
+        format!("completedRegions={completed_regions}"),
+        format!("failedRegions={}", stats.failed_regions),
+        format!("remainingRegions={remaining_regions}"),
+        format!("generatedRegionsPerHour={generated_regions_per_hour:.2}"),
+        format!("completedRegionsPerHour={completed_regions_per_hour:.2}"),
+        format!(
+            "allDone={}",
+            stats.failed_regions == 0 && remaining_regions == 0
+        ),
+        format!("manifestFile={}", manifest_file.display()),
+    ];
+    for line in lines {
+        writeln!(out, "{line}").map_err(|error| error.to_string())?;
+    }
+    if !stats.errors.is_empty() {
+        return Err(stats.errors.join("; "));
+    }
+    Ok(())
+}
+
+fn parse_plan_max_regions_this_run(
+    optional_args: &[String],
+) -> std::result::Result<(usize, usize), String> {
+    let Some(first) = optional_args.first() else {
+        return Ok((usize::MAX, 0));
+    };
+    if first.contains('=') {
+        return Ok((usize::MAX, 0));
+    }
+    match first.parse::<usize>() {
+        Ok(0) => Err("maxRegionsThisRun must be positive".to_string()),
+        Ok(value) => Ok((value, 1)),
+        Err(_) => Ok((usize::MAX, 0)),
+    }
+}
+
+fn read_region_plan_csv(plan_csv: &Path) -> std::result::Result<Vec<(i32, i32)>, String> {
+    let text = std::fs::read_to_string(plan_csv).map_err(|error| error.to_string())?;
+    let mut regions = Vec::new();
+    for line in text.lines() {
+        let trimmed = strip_utf8_bom(line).trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let columns = split_csv_line(trimmed)?;
+        if columns.len() < 2 {
+            return Err(format!("invalid region plan row: {line}"));
+        }
+        if !is_i32_text(&columns[0])
+            && columns
+                .iter()
+                .any(|column| normalize_csv_header(column).contains("region"))
+        {
+            continue;
+        }
+        let (region_x_text, region_z_text) = if columns.len() >= 4 && is_i32_text(&columns[0]) {
+            (&columns[1], &columns[2])
+        } else {
+            (&columns[0], &columns[1])
+        };
+        let region_x = region_x_text
+            .parse::<i32>()
+            .map_err(|error| format!("invalid regionX in plan row {line}: {error}"))?;
+        let region_z = region_z_text
+            .parse::<i32>()
+            .map_err(|error| format!("invalid regionZ in plan row {line}: {error}"))?;
+        regions.push((region_x, region_z));
+    }
+    if regions.is_empty() {
+        return Err(format!("region plan is empty: {}", plan_csv.display()));
+    }
+    Ok(regions)
+}
+
+fn is_i32_text(text: &str) -> bool {
+    text.parse::<i32>().is_ok()
+}
+
+fn plan_spawn_region(regions: &[(i32, i32)]) -> (i32, i32) {
+    let min_x = regions.iter().map(|(x, _)| *x).min().unwrap_or(0);
+    let max_x = regions.iter().map(|(x, _)| *x).max().unwrap_or(0);
+    let min_z = regions.iter().map(|(_, z)| *z).min().unwrap_or(0);
+    let max_z = regions.iter().map(|(_, z)| *z).max().unwrap_or(0);
+    (
+        min_x.wrapping_add(max_x.wrapping_sub(min_x) / 2),
+        min_z.wrapping_add(max_z.wrapping_sub(min_z) / 2),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vanilla_delegated_plan_resume_fingerprint(
+    heightmap_path: &Path,
+    plan_csv: &Path,
+    regions: &[(i32, i32)],
+    format: OutputFormat,
+    scale: i32,
+    status: ChunkGenerationStatus,
+    surface_material_path: &Path,
+    compression_options: RegionCompressionOptions,
+) -> Value {
+    json!({
+        "schemaVersion": RESUME_FINGERPRINT_SCHEMA_VERSION,
+        "generator": {
+            "name": build_info::NAME,
+            "version": build_info::VERSION,
+            "minecraftTarget": build_info::MINECRAFT_TARGET,
+            "rustPortPhase": build_info::RUST_PORT_PHASE,
+        },
+        "command": "generate-vanilla-delegated-plan-parallel",
+        "format": format.java_name(),
+        "scale": scale,
+        "planCsv": file_identity_for_resume(plan_csv),
+        "planRegions": regions.iter().map(|(x, z)| json!({"regionX": x, "regionZ": z})).collect::<Vec<_>>(),
+        "chunkStatus": status.id(),
+        "textureMode": "photo",
+        "verticalScale": "1.0",
+        "serverDelegation": true,
+        "directCaves": false,
+        "directOres": false,
+        "directVegetation": false,
+        "directStructures": false,
+        "directProgressionStructures": false,
+        "heightmap": file_identity_for_resume(heightmap_path),
+        "surfaceMaterial": file_identity_for_resume(surface_material_path),
+        "surfaceInputs": surface_input_identities_for_resume(surface_material_path),
+        "compression": {
+            "mca": compression_options.mca_compression_level,
+            "linear": compression_options.linear_compression_level,
+        },
+    })
 }
 
 #[derive(Debug)]
@@ -11505,6 +12065,96 @@ fn write_vanilla_delegated_parallel_manifest(
     Ok(manifest_path)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_vanilla_delegated_plan_manifest(
+    world_dir: &Path,
+    format: OutputFormat,
+    scale_denominator: i32,
+    plan_csv: &Path,
+    planned_regions: usize,
+    submitted_regions: usize,
+    status: ChunkGenerationStatus,
+    surface_material_path: &Path,
+) -> io::Result<std::path::PathBuf> {
+    let mut values = base_exploration_only_manifest("vanilla-delegated-plan-parallel");
+    values.insert("features.surfaceRules".to_string(), "true".to_string());
+    values.insert("features.waterSurface".to_string(), "true".to_string());
+    values.insert("features.biomes".to_string(), "heuristic".to_string());
+    values.insert(
+        "features.surfaceMaterialRaster".to_string(),
+        "true".to_string(),
+    );
+    values.insert("features.serverDelegation".to_string(), "true".to_string());
+    values.insert(
+        "generation.format".to_string(),
+        format.java_name().to_string(),
+    );
+    values.insert(
+        "generation.scaleDenominator".to_string(),
+        scale_denominator.to_string(),
+    );
+    values.insert(
+        "generation.planCsv".to_string(),
+        normalized_path_display(plan_csv),
+    );
+    values.insert(
+        "generation.plannedRegions".to_string(),
+        planned_regions.to_string(),
+    );
+    values.insert(
+        "generation.submittedRegions".to_string(),
+        submitted_regions.to_string(),
+    );
+    values.insert(
+        "generation.chunkStatus".to_string(),
+        status.id().to_string(),
+    );
+    values.insert("generation.verticalScale".to_string(), "1.0".to_string());
+    values.insert("generation.textureMode".to_string(), "photo".to_string());
+    values.insert(
+        "generation.surfaceMaterialPath".to_string(),
+        normalized_path_display(surface_material_path),
+    );
+    values.insert(
+        "generation.progressionPlacementPolicy".to_string(),
+        "none".to_string(),
+    );
+    values.insert(
+        "generation.progressionStrategy".to_string(),
+        "none".to_string(),
+    );
+    values.insert(
+        "generation.progressionStructures".to_string(),
+        "0".to_string(),
+    );
+    values.insert("generation.progressionPortalX".to_string(), "0".to_string());
+    values.insert("generation.progressionPortalY".to_string(), "0".to_string());
+    values.insert("generation.progressionPortalZ".to_string(), "0".to_string());
+    values.insert(
+        "generation.directProgressionStructures".to_string(),
+        "false".to_string(),
+    );
+    values.insert("generation.directCaves".to_string(), "false".to_string());
+    values.insert("generation.directOres".to_string(), "false".to_string());
+    values.insert(
+        "generation.directVegetation".to_string(),
+        "false".to_string(),
+    );
+    values.insert(
+        "generation.directStructures".to_string(),
+        "false".to_string(),
+    );
+
+    std::fs::create_dir_all(world_dir)?;
+    let manifest_path = world_dir.join(SURVIVAL_MANIFEST_FILE_NAME);
+    let mut file = std::fs::File::create(&manifest_path)?;
+    writeln!(file, "# SR EarthMap survival manifest")?;
+    for (key, value) in values {
+        writeln!(file, "{key}={}", escape_manifest_value(&value))?;
+    }
+    Ok(manifest_path)
+}
+
 fn base_exploration_only_manifest(generator_name: &str) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
     values.insert("manifest.version".to_string(), "1".to_string());
@@ -12056,6 +12706,12 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.generate - production alias for vanilla-delegated parallel generation"
         ));
+        assert!(out.contains(
+            "DONE rust.command.generate-vanilla-delegated-plan-parallel - bounded/resumable vanilla-delegated plan generation"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.generate-vanilla-delegated-region-plan-parallel - Java-compatible alias for vanilla-delegated plan generation"
+        ));
     }
 
     #[test]
@@ -12167,6 +12823,54 @@ mod tests {
             "1",
             "1",
             "linear",
+            "1",
+            "surfaceRaster=none",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert!(err.contains("default textureMode=photo requires a TrueMarble surface raster"));
+        assert!(!err.contains("not implemented yet"));
+    }
+
+    #[test]
+    fn region_plan_csv_accepts_coordinate_and_indexed_shapes() {
+        let temp = tempdir().unwrap();
+        let plan = temp.path().join("plan.csv");
+        fs::write(
+            &plan,
+            "# comment\nregionX,regionZ,label\n1,-2,alpha\nindex,regionX,regionZ,label\n0,3,4,beta\n",
+        )
+        .unwrap();
+
+        let regions = read_region_plan_csv(&plan).unwrap();
+
+        assert_eq!(regions, vec![(1, -2), (3, 4)]);
+        assert_eq!(plan_spawn_region(&regions), (2, 1));
+        assert_eq!(
+            parse_plan_max_regions_this_run(&["2".to_string(), "surface".to_string()]).unwrap(),
+            (2, 1)
+        );
+        assert_eq!(
+            parse_plan_max_regions_this_run(&["surface".to_string()]).unwrap(),
+            (usize::MAX, 0)
+        );
+    }
+
+    #[test]
+    fn vanilla_delegated_plan_parallel_dispatches_without_java() {
+        let temp = tempdir().unwrap();
+        let plan = temp.path().join("plan.csv");
+        fs::write(&plan, "regionX,regionZ\n0,0\n").unwrap();
+
+        let (code, out, err) = run_capture(&[
+            "generate-vanilla-delegated-region-plan-parallel",
+            "missing-heightmap.tif",
+            "world",
+            "1000",
+            "linear",
+            "1",
+            plan.to_str().unwrap(),
             "1",
             "surfaceRaster=none",
         ]);
@@ -12456,6 +13160,8 @@ mod tests {
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("quality-candidate [heightmap] <worldDir>"));
         assert!(out.contains("generate <heightmap> <worldDir> <scale> <startRegionX>"));
+        assert!(out.contains("generate-vanilla-delegated-plan-parallel <heightmap>"));
+        assert!(out.contains("generate-vanilla-delegated-region-plan-parallel <heightmap>"));
         assert!(out.contains("benchmark-region-writers <outputDir> [iterations=3]"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));

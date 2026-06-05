@@ -335,22 +335,22 @@ Detailed progress:
 - [x] Help text documents `generate`; GUI resolved command still needs a follow-up switch where appropriate.
 
 ### Vanilla delegated plan-parallel aliases
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust dispatch/parser tests `cargo test -p earthmap-cli region_plan_csv_accepts_coordinate_and_indexed_shapes vanilla_delegated_plan_parallel_dispatches_without_java`; speedup TBD; peak memory TBD; output TBD; workload validation-only plan dispatch.
 Covered commands:
-- [ ] `generate-vanilla-delegated-plan-parallel`
-- [ ] `generate-vanilla-delegated-region-plan-parallel`
+- [x] `generate-vanilla-delegated-plan-parallel`
+- [x] `generate-vanilla-delegated-region-plan-parallel`
 Detailed progress:
-- [ ] Reads explicit non-contiguous region plans.
-- [ ] Supports resume journal/fingerprint semantics.
-- [ ] Preserves bounded parallel generation and progress events.
+- [x] Reads explicit non-contiguous region plans.
+- [x] Supports resume journal/fingerprint semantics.
+- [x] Preserves bounded parallel generation and progress events.
 
 ### Survival and OSM generation commands
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented

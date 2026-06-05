@@ -41,12 +41,12 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "generate-vanilla-delegated-plan-parallel",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "bounded/resumable vanilla-delegated plan generation",
     },
     CommandSpec {
         name: "generate-vanilla-delegated-region-plan-parallel",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "Java-compatible alias for vanilla-delegated plan generation",
     },
     CommandSpec {
