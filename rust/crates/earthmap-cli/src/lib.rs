@@ -197,6 +197,22 @@ where
         "sample-vrt-rgb" if args.len() == 4 => {
             write_result(sample_vrt_rgb(stdout, stderr, &args[1], &args[2], &args[3]))
         }
+        "photo-parity-crop" if (10..=13).contains(&args.len()) => write_result(photo_parity_crop(
+            stdout,
+            stderr,
+            &args[1],
+            &args[2],
+            &args[3],
+            &args[4],
+            &args[5],
+            &args[6],
+            &args[7],
+            &args[8],
+            &args[9],
+            args.get(10).map(String::as_str),
+            args.get(11).map(String::as_str),
+            args.get(12).map(String::as_str).unwrap_or("all"),
+        )),
         "photo-compare-crop" if (8..=10).contains(&args.len()) => write_result(photo_compare_crop(
             stdout,
             stderr,
@@ -233,6 +249,64 @@ where
                 &args[1],
                 &args[2],
                 args.get(3).map(String::as_str).unwrap_or("auto"),
+            ))
+        }
+        "photo-standard-remap-parity-crop" if (8..=10).contains(&args.len()) => {
+            write_result(photo_standard_remap_parity_crop(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7],
+                args.get(8).map(String::as_str),
+                args.get(9).map(String::as_str).unwrap_or("all"),
+            ))
+        }
+        "photo-standard-remap-parity-batch" if args.len() == 3 || args.len() == 4 => {
+            write_result(photo_standard_remap_parity_batch(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                args.get(3).map(String::as_str).unwrap_or("auto"),
+            ))
+        }
+        "photo-production-candidate-diff-crop" if (10..=12).contains(&args.len()) => {
+            write_result(photo_production_candidate_diff_crop(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7],
+                &args[8],
+                &args[9],
+                args.get(10).map(String::as_str),
+                args.get(11).map(String::as_str).unwrap_or("all"),
+            ))
+        }
+        "photo-carrier-remap-sim-crop" if args.len() == 11 || args.len() == 12 => {
+            write_result(photo_carrier_remap_sim_crop(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7],
+                &args[8],
+                &args[9],
+                &args[10],
+                args.get(11).map(String::as_str).unwrap_or("8"),
             ))
         }
         "generate-height-region" if args.len() == 7 => write_result(generate_height_region(
@@ -618,6 +692,61 @@ fn photo_compare_crop(
     }
 }
 
+fn photo_parity_crop(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    source_path: &str,
+    met_target_path: &str,
+    current_surface_path: &str,
+    standard_palette_path: &str,
+    output_directory: &str,
+    crop_x: &str,
+    crop_y: &str,
+    crop_width: &str,
+    crop_height: &str,
+    image_magick_remap_path: Option<&str>,
+    mask_path: Option<&str>,
+    mask_mode: &str,
+) -> io::Result<i32> {
+    match parse_photo_crop(crop_x, crop_y, crop_width, crop_height).and_then(
+        |(crop_x, crop_y, crop_width, crop_height)| {
+            let met_target_path = parse_required_optional_cli_path(met_target_path);
+            let current_surface_path = parse_required_optional_cli_path(current_surface_path);
+            let image_magick_remap_path = parse_optional_cli_path(image_magick_remap_path);
+            let mask_path = parse_optional_cli_path(mask_path);
+            quality::write_parity_crop_report(
+                Path::new(source_path),
+                met_target_path.as_deref(),
+                current_surface_path.as_deref(),
+                Path::new(standard_palette_path),
+                Path::new(output_directory),
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+                image_magick_remap_path.as_deref(),
+                mask_path.as_deref(),
+                mask_mode,
+            )
+        },
+    ) {
+        Ok(report) => {
+            writeln!(out, "Photo parity crop written")?;
+            writeln!(
+                out,
+                "outputDirectory={}",
+                cli_path_display(&report.output_directory)
+            )?;
+            write!(out, "{}", report.text)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo parity crop failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
 fn photo_parity_metric_crop(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -713,6 +842,196 @@ selectiveCanopyVsExpectedMean,selectiveCanopyVsSourceMean,outputDirectory"
     }
 }
 
+fn photo_standard_remap_parity_crop(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    source_path: &str,
+    image_magick_remap_path: &str,
+    output_directory: &str,
+    crop_x: &str,
+    crop_y: &str,
+    crop_width: &str,
+    crop_height: &str,
+    mask_path: Option<&str>,
+    mask_mode: &str,
+) -> io::Result<i32> {
+    match parse_photo_crop(crop_x, crop_y, crop_width, crop_height).and_then(
+        |(crop_x, crop_y, crop_width, crop_height)| {
+            let mask_path = parse_optional_cli_path(mask_path);
+            quality::write_standard_remap_parity_report(
+                Path::new(source_path),
+                Path::new(image_magick_remap_path),
+                Path::new(output_directory),
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+                mask_path.as_deref(),
+                mask_mode,
+            )
+        },
+    ) {
+        Ok(report) => {
+            writeln!(out, "Photo Standard remap parity crop written")?;
+            writeln!(
+                out,
+                "outputDirectory={}",
+                cli_path_display(&report.output_directory)
+            )?;
+            write!(out, "{}", report.text)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo Standard remap parity crop failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn photo_standard_remap_parity_batch(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    jobs_csv: &str,
+    output_root: &str,
+    threads: &str,
+) -> io::Result<i32> {
+    match quality::run_standard_remap_batch(Path::new(jobs_csv), Path::new(output_root), threads) {
+        Ok(report) => {
+            writeln!(out, "Photo Standard remap parity batch written")?;
+            writeln!(out, "jobsCsv={}", cli_path_display(&report.jobs_csv))?;
+            writeln!(out, "outputRoot={}", cli_path_display(&report.output_root))?;
+            writeln!(out, "jobs={}", report.jobs)?;
+            writeln!(out, "threads={}", report.threads)?;
+            writeln!(out, "elapsedMillis={}", report.elapsed_millis)?;
+            writeln!(
+                out,
+                "sample,elapsedMillis,pixels,meanDeltaE2000,p95DeltaE2000,exactMatchPercent,outputDirectory"
+            )?;
+            for result in report.results {
+                writeln!(
+                    out,
+                    "{},{},{},{},{},{},{}",
+                    result.sample,
+                    result.elapsed_millis,
+                    result.pixels,
+                    metric_text(result.mean_delta_e2000),
+                    metric_text(result.p95_delta_e2000),
+                    metric_text(result.exact_match_percent),
+                    cli_path_display(&result.output_directory)
+                )?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo Standard remap parity batch failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn photo_production_candidate_diff_crop(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    source_path: &str,
+    expected_path: &str,
+    current_surface_path: &str,
+    candidate_surface_path: &str,
+    output_directory: &str,
+    crop_x: &str,
+    crop_y: &str,
+    crop_width: &str,
+    crop_height: &str,
+    mask_path: Option<&str>,
+    mask_mode: &str,
+) -> io::Result<i32> {
+    match parse_photo_crop(crop_x, crop_y, crop_width, crop_height).and_then(
+        |(crop_x, crop_y, crop_width, crop_height)| {
+            let mask_path = parse_optional_cli_path(mask_path);
+            quality::write_production_candidate_diff_report(
+                Path::new(source_path),
+                Path::new(expected_path),
+                Path::new(current_surface_path),
+                Path::new(candidate_surface_path),
+                Path::new(output_directory),
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+                mask_path.as_deref(),
+                mask_mode,
+            )
+        },
+    ) {
+        Ok(report) => {
+            writeln!(out, "Photo production-candidate diff crop written")?;
+            writeln!(
+                out,
+                "outputDirectory={}",
+                cli_path_display(&report.output_directory)
+            )?;
+            write!(out, "{}", report.text)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo production-candidate diff crop failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn photo_carrier_remap_sim_crop(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    current_surface_path: &str,
+    expected_path: &str,
+    output_directory: &str,
+    crop_x: &str,
+    crop_y: &str,
+    crop_width: &str,
+    crop_height: &str,
+    mask_path: &str,
+    mask_mode: &str,
+    carrier_filter: &str,
+    top_buckets: &str,
+) -> io::Result<i32> {
+    match parse_photo_crop(crop_x, crop_y, crop_width, crop_height).and_then(
+        |(crop_x, crop_y, crop_width, crop_height)| {
+            let mask_path = parse_required_optional_cli_path(mask_path);
+            let top_buckets = top_buckets
+                .parse::<usize>()
+                .map_err(|error| error.to_string())?;
+            quality::write_carrier_remap_simulation_report(
+                Path::new(current_surface_path),
+                Path::new(expected_path),
+                Path::new(output_directory),
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+                mask_path.as_deref(),
+                mask_mode,
+                carrier_filter,
+                top_buckets,
+            )
+        },
+    ) {
+        Ok(report) => {
+            writeln!(out, "Photo carrier remap simulation crop written")?;
+            writeln!(
+                out,
+                "outputDirectory={}",
+                cli_path_display(&report.output_directory)
+            )?;
+            write!(out, "{}", report.text)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo carrier remap simulation crop failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
 fn parse_photo_crop(
     crop_x: &str,
     crop_y: &str,
@@ -731,6 +1050,10 @@ fn parse_photo_crop(
         return Err("crop width and height must be positive".to_string());
     }
     Ok((crop_x, crop_y, crop_width, crop_height))
+}
+
+fn parse_required_optional_cli_path(path: &str) -> Option<std::path::PathBuf> {
+    parse_optional_cli_path(Some(path))
 }
 
 fn parse_optional_cli_path(path: Option<&str>) -> Option<std::path::PathBuf> {
@@ -1239,6 +1562,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out, "  sample-vrt-rgb <terrainVrt> <longitude> <latitude>")?;
     writeln!(
         out,
+        "  photo-parity-crop <sourcePng> <metTargetPng|none> <currentSurfacePng|none> <standardPalettePng> <outputDir> <x> <y> <width> <height> [imageMagickRemapPng|none] [maskPng|none] [all|nonzero|white|land-water-debug]"
+    )?;
+    writeln!(
+        out,
         "  photo-compare-crop <actualPng> <expectedPng> <outputDir> <x> <y> <width> <height> [maskPng|none] [all|nonzero|white|land-water-debug]"
     )?;
     writeln!(
@@ -1248,6 +1575,22 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  photo-parity-metric-batch <jobsCsv> <outputRoot> [threads|auto]"
+    )?;
+    writeln!(
+        out,
+        "  photo-standard-remap-parity-crop <sourcePng> <imageMagickRemapPng> <outputDir> <x> <y> <width> <height> [maskPng|none] [all|nonzero|white|land-water-debug]"
+    )?;
+    writeln!(
+        out,
+        "  photo-standard-remap-parity-batch <jobsCsv> <outputRoot> [threads|auto]"
+    )?;
+    writeln!(
+        out,
+        "  photo-production-candidate-diff-crop <sourcePng> <expectedPng> <currentSurfacePng> <candidateSurfacePng> <outputDir> <x> <y> <width> <height> [maskPng|none] [all|nonzero|white|land-water-debug]"
+    )?;
+    writeln!(
+        out,
+        "  photo-carrier-remap-sim-crop <currentSurfacePng> <expectedPng> <outputDir> <x> <y> <width> <height> <maskPng|none> <all|nonzero|white|land-water-debug> <all|vegetated|sand|red-sand|coarse-dirt|rock|snow|wet|carrierCsv> [topBuckets]"
     )?;
     for name in commands::INITIAL_COMMANDS
         .iter()
@@ -10699,11 +11042,25 @@ mod tests {
         assert!(out.contains("DONE rust.command.linear-topdown-render - Linear V2 top-down render"));
         assert!(out.contains("DONE rust.command.dynmap-tile-mosaic - Dynmap tile mosaic builder"));
         assert!(out.contains("DONE rust.command.photo-compare-crop - PNG crop metric comparator"));
+        assert!(out
+            .contains("DONE rust.command.photo-parity-crop - PNG crop parity artifact generator"));
         assert!(out.contains(
             "DONE rust.command.photo-parity-metric-crop - PNG crop photo metric reporter"
         ));
         assert!(out.contains(
             "DONE rust.command.photo-parity-metric-batch - parallel PNG crop photo metric batch"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.photo-standard-remap-parity-crop - Rust Standard palette remap parity crop"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.photo-standard-remap-parity-batch - parallel Rust Standard palette remap parity batch"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.photo-production-candidate-diff-crop - PNG production candidate diff reporter"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.photo-carrier-remap-sim-crop - PNG carrier remap simulation reporter"
         ));
         assert!(out.contains(
             "DONE rust.command.inspect-mca-post-final-integrity - MCA post-final integrity scanner"
@@ -11026,9 +11383,14 @@ mod tests {
         assert!(out.contains("classify-surface-point [heightmap] <scale> <longitude> <latitude>"));
         assert!(out.contains("raster-smoke [heightmap] <scale> <outputJson>"));
         assert!(out.contains("sample-vrt-rgb <terrainVrt> <longitude> <latitude>"));
+        assert!(out.contains("photo-parity-crop <sourcePng> <metTargetPng|none>"));
         assert!(out.contains("photo-compare-crop <actualPng> <expectedPng>"));
         assert!(out.contains("photo-parity-metric-crop <sourcePng> <expectedPng>"));
         assert!(out.contains("photo-parity-metric-batch <jobsCsv> <outputRoot>"));
+        assert!(out.contains("photo-standard-remap-parity-crop <sourcePng> <imageMagickRemapPng>"));
+        assert!(out.contains("photo-standard-remap-parity-batch <jobsCsv> <outputRoot>"));
+        assert!(out.contains("photo-production-candidate-diff-crop <sourcePng> <expectedPng>"));
+        assert!(out.contains("photo-carrier-remap-sim-crop <currentSurfacePng> <expectedPng>"));
     }
 
     #[test]
@@ -11734,6 +12096,166 @@ beta,{},{},{},1,1,2,2,none,all\n",
             .join("metric-land")
             .join("candidate-canopy-density-4x4.png")
             .is_file());
+    }
+
+    #[test]
+    fn photo_parity_crop_writes_palette_remap_artifacts() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let expected = temp.path().join("expected.png");
+        let current = temp.path().join("current.png");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&expected, false);
+        write_metric_test_png(&current, true);
+        let output = temp.path().join("parity");
+
+        let (code, out, err) = run_capture(&[
+            "photo-parity-crop",
+            source.to_str().unwrap(),
+            expected.to_str().unwrap(),
+            current.to_str().unwrap(),
+            expected.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "0",
+            "0",
+            "4",
+            "4",
+            "none",
+            "none",
+            "all",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo parity crop written\n"));
+        assert!(out.contains("[candidate-rgb-vs-met]\n"));
+        assert!(output.join("source-crop.png").is_file());
+        assert!(output.join("candidate-remap.png").is_file());
+        assert!(output.join("candidate-standard-remap-rgb.png").is_file());
+    }
+
+    #[test]
+    fn photo_standard_remap_parity_crop_and_batch_write_artifacts() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let image_magick = temp.path().join("imagemagick.png");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&image_magick, false);
+        let output = temp.path().join("standard");
+
+        let (code, out, err) = run_capture(&[
+            "photo-standard-remap-parity-crop",
+            source.to_str().unwrap(),
+            image_magick.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "0",
+            "0",
+            "4",
+            "4",
+            "none",
+            "all",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo Standard remap parity crop written\n"));
+        assert!(output.join("java-standard-remap-crop.png").is_file());
+        assert!(output
+            .join("java-standard-remap-vs-imagemagick-error.png")
+            .is_file());
+
+        let jobs = temp.path().join("standard-jobs.csv");
+        fs::write(
+            &jobs,
+            format!(
+                "sample,source,imageMagick,cropX,cropY,cropWidth,cropHeight,mask,maskMode\n\
+alpha,{},{},0,0,4,4,none,all\n\
+beta,{},{},1,1,2,2,none,all\n",
+                source.display(),
+                image_magick.display(),
+                source.display(),
+                image_magick.display()
+            ),
+        )
+        .unwrap();
+        let output_root = temp.path().join("standard-out");
+        let (code, out, err) = run_capture(&[
+            "photo-standard-remap-parity-batch",
+            jobs.to_str().unwrap(),
+            output_root.to_str().unwrap(),
+            "2",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo Standard remap parity batch written\n"));
+        assert!(output_root
+            .join("beta")
+            .join("standard-remap-parity")
+            .join("java-standard-remap-vs-imagemagick-error.png")
+            .is_file());
+    }
+
+    #[test]
+    fn photo_candidate_diff_and_carrier_sim_write_reports() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let expected = temp.path().join("expected.png");
+        let current = temp.path().join("current.png");
+        let candidate = temp.path().join("candidate.png");
+        let carriers = temp.path().join("carriers.csv");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&expected, false);
+        write_metric_test_png(&current, true);
+        write_metric_test_png(&candidate, false);
+        fs::write(&carriers, "id,rgb\nblack,#000000\nwhite,#FFFFFF\n").unwrap();
+
+        let diff_output = temp.path().join("diff");
+        let (code, out, err) = run_capture(&[
+            "photo-production-candidate-diff-crop",
+            source.to_str().unwrap(),
+            expected.to_str().unwrap(),
+            current.to_str().unwrap(),
+            candidate.to_str().unwrap(),
+            diff_output.to_str().unwrap(),
+            "0",
+            "0",
+            "4",
+            "4",
+            "none",
+            "all",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo production-candidate diff crop written\n"));
+        assert!(diff_output
+            .join("production-candidate-token-diff-summary.csv")
+            .is_file());
+        assert!(diff_output
+            .join("candidate-gain-vs-source-primary.png")
+            .is_file());
+
+        let sim_output = temp.path().join("sim");
+        let (code, out, err) = run_capture(&[
+            "photo-carrier-remap-sim-crop",
+            current.to_str().unwrap(),
+            expected.to_str().unwrap(),
+            sim_output.to_str().unwrap(),
+            "0",
+            "0",
+            "4",
+            "4",
+            "none",
+            "all",
+            carriers.to_str().unwrap(),
+            "2",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo carrier remap simulation crop written\n"));
+        assert!(sim_output.join("carrier-remap-simulation.csv").is_file());
+        assert!(sim_output.join("best-positive-remap.png").is_file());
+        let csv = fs::read_to_string(sim_output.join("carrier-remap-simulation.csv")).unwrap();
+        assert!(csv.contains("white,#FFFFFF") || csv.contains("black,#000000"));
     }
 
     #[test]

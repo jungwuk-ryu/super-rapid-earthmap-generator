@@ -65,6 +65,11 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "quality gate sample batch",
     },
     CommandSpec {
+        name: "photo-parity-crop",
+        status: CommandStatus::Implemented,
+        note: "PNG crop parity artifact generator",
+    },
+    CommandSpec {
         name: "photo-compare-crop",
         status: CommandStatus::Implemented,
         note: "PNG crop metric comparator",
@@ -78,6 +83,26 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         name: "photo-parity-metric-batch",
         status: CommandStatus::Implemented,
         note: "parallel PNG crop photo metric batch",
+    },
+    CommandSpec {
+        name: "photo-standard-remap-parity-crop",
+        status: CommandStatus::Implemented,
+        note: "Rust Standard palette remap parity crop",
+    },
+    CommandSpec {
+        name: "photo-standard-remap-parity-batch",
+        status: CommandStatus::Implemented,
+        note: "parallel Rust Standard palette remap parity batch",
+    },
+    CommandSpec {
+        name: "photo-production-candidate-diff-crop",
+        status: CommandStatus::Implemented,
+        note: "PNG production candidate diff reporter",
+    },
+    CommandSpec {
+        name: "photo-carrier-remap-sim-crop",
+        status: CommandStatus::Implemented,
+        note: "PNG carrier remap simulation reporter",
     },
     CommandSpec {
         name: "dynmap-tile-mosaic",

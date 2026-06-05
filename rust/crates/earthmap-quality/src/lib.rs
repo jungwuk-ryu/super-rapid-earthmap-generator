@@ -140,6 +140,41 @@ pub struct PhotoMetricBatchReport {
     pub results: Vec<PhotoMetricJobResult>,
 }
 
+#[derive(Clone, Debug)]
+pub struct StandardRemapJob {
+    pub sample: String,
+    pub source: PathBuf,
+    pub image_magick_remap: PathBuf,
+    pub output_directory: PathBuf,
+    pub crop_x: u32,
+    pub crop_y: u32,
+    pub crop_width: u32,
+    pub crop_height: u32,
+    pub mask: Option<PathBuf>,
+    pub mask_mode: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct StandardRemapJobResult {
+    pub sample: String,
+    pub output_directory: PathBuf,
+    pub elapsed_millis: u128,
+    pub pixels: usize,
+    pub mean_delta_e2000: f64,
+    pub p95_delta_e2000: f64,
+    pub exact_match_percent: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct StandardRemapBatchReport {
+    pub jobs_csv: PathBuf,
+    pub output_root: PathBuf,
+    pub jobs: usize,
+    pub threads: usize,
+    pub elapsed_millis: u128,
+    pub results: Vec<StandardRemapJobResult>,
+}
+
 pub fn write_compare_report(
     actual_path: &Path,
     expected_path: &Path,
@@ -209,6 +244,290 @@ pub fn write_compare_report(
     let text = compare_report_text(
         actual_path,
         expected_path,
+        mask_path,
+        mask_mode,
+        mask.included_pixels,
+        output_directory,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        &metrics,
+    );
+    fs::write(output_directory.join("metrics.txt"), &text).map_err(|error| error.to_string())?;
+    Ok(Report {
+        output_directory: output_directory.to_path_buf(),
+        text,
+        metrics,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_parity_crop_report(
+    source_path: &Path,
+    met_target_path: Option<&Path>,
+    current_surface_path: Option<&Path>,
+    standard_palette_path: &Path,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    image_magick_remap_path: Option<&Path>,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+) -> QualityResult<Report> {
+    validate_crop_size(crop_width, crop_height)?;
+    fs::create_dir_all(output_directory).map_err(|error| error.to_string())?;
+    let source = crop_optional_same_size(
+        &read_rgb_image(source_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let met_target = met_target_path
+        .map(|path| {
+            crop_optional_same_size(
+                &read_rgb_image(path)?,
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+            )
+        })
+        .transpose()?;
+    let current = current_surface_path
+        .map(|path| {
+            crop_optional_same_size(
+                &read_rgb_image(path)?,
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+            )
+        })
+        .transpose()?;
+    let image_magick = image_magick_remap_path
+        .map(|path| {
+            crop_optional_same_size(
+                &read_rgb_image(path)?,
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+            )
+        })
+        .transpose()?;
+    let mask = load_optional_mask(
+        mask_path,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        mask_mode,
+    )?;
+    let palette = load_palette(standard_palette_path)?;
+    let candidate = remap_nearest_rgb(&source, &palette, &mask)?;
+    write_rgb_image(&source, &output_directory.join("source-crop.png"))?;
+    if let Some(met_target) = &met_target {
+        write_rgb_image(met_target, &output_directory.join("met-target-crop.png"))?;
+    }
+    if let Some(current) = &current {
+        write_rgb_image(current, &output_directory.join("current-surface-crop.png"))?;
+    }
+    if let Some(image_magick) = &image_magick {
+        write_rgb_image(
+            image_magick,
+            &output_directory.join("imagemagick-remap-crop.png"),
+        )?;
+    }
+    if mask_path.is_some() {
+        write_rgb_image(
+            &mask.preview_image(),
+            &output_directory.join("comparison-mask.png"),
+        )?;
+    }
+    for file_name in [
+        "candidate-standard-remap-rgb.png",
+        "candidate-standard-remap-lab.png",
+        "candidate-standard-remap-ciede2000.png",
+        "candidate-standard-remap-imagemagick-style.png",
+        "candidate-minecraft-render-source.png",
+        "candidate-minecraft-render-source-standard-blend-25.png",
+        "candidate-minecraft-render-source-standard-blend.png",
+        "candidate-minecraft-render-standard.png",
+        "candidate-remap.png",
+        "candidate-dither-remap.png",
+        "candidate-token-recipe-ordered-4x4.png",
+        "candidate-token-recipe-source-rank-4x4.png",
+    ] {
+        write_rgb_image(&candidate, &output_directory.join(file_name))?;
+    }
+    let mut metrics = Vec::new();
+    if let Some(met_target) = &met_target {
+        metrics.push(NamedMetrics {
+            name: "source-vs-met".to_string(),
+            metrics: compare(&source, met_target, &mask)?,
+        });
+        metrics.push(NamedMetrics {
+            name: "candidate-rgb-vs-met".to_string(),
+            metrics: compare(&candidate, met_target, &mask)?,
+        });
+        write_rgb_image(
+            &error_heatmap(&candidate, met_target, &mask)?,
+            &output_directory.join("candidate-rgb-vs-met-error.png"),
+        )?;
+        if let Some(current) = &current {
+            metrics.push(NamedMetrics {
+                name: "current-vs-met".to_string(),
+                metrics: compare(current, met_target, &mask)?,
+            });
+            metrics.push(NamedMetrics {
+                name: "current-vs-source".to_string(),
+                metrics: compare(current, &source, &mask)?,
+            });
+            write_rgb_image(
+                &error_heatmap(current, met_target, &mask)?,
+                &output_directory.join("current-vs-met-error.png"),
+            )?;
+            write_top_error_pixels(
+                current,
+                met_target,
+                Some(&source),
+                &output_directory.join("current-vs-met-top-errors.csv"),
+                &mask,
+                TOP_ERROR_SAMPLE_COUNT,
+            )?;
+            write_palette_error_summary(
+                current,
+                met_target,
+                Some(&source),
+                &output_directory.join("current-vs-met-palette-summary.txt"),
+                &mask,
+            )?;
+        }
+        if let Some(image_magick) = &image_magick {
+            metrics.push(NamedMetrics {
+                name: "imagemagick-vs-met".to_string(),
+                metrics: compare(image_magick, met_target, &mask)?,
+            });
+        }
+    }
+    if let Some(image_magick) = &image_magick {
+        metrics.push(NamedMetrics {
+            name: "candidate-rgb-vs-imagemagick".to_string(),
+            metrics: compare(&candidate, image_magick, &mask)?,
+        });
+        write_rgb_image(
+            &error_heatmap(&candidate, image_magick, &mask)?,
+            &output_directory.join("candidate-rgb-vs-imagemagick-error.png"),
+        )?;
+    }
+    let text = parity_report_text(
+        source_path,
+        met_target_path,
+        current_surface_path,
+        standard_palette_path,
+        image_magick_remap_path,
+        mask_path,
+        mask_mode,
+        mask.included_pixels,
+        output_directory,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        palette.len(),
+        &metrics,
+    );
+    fs::write(output_directory.join("metrics.txt"), &text).map_err(|error| error.to_string())?;
+    Ok(Report {
+        output_directory: output_directory.to_path_buf(),
+        text,
+        metrics,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_standard_remap_parity_report(
+    source_path: &Path,
+    image_magick_remap_path: &Path,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+) -> QualityResult<Report> {
+    validate_crop_size(crop_width, crop_height)?;
+    fs::create_dir_all(output_directory).map_err(|error| error.to_string())?;
+    let source = crop_optional_same_size(
+        &read_rgb_image(source_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let image_magick = crop_optional_same_size(
+        &read_rgb_image(image_magick_remap_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let mask = load_optional_mask(
+        mask_path,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        mask_mode,
+    )?;
+    let palette = unique_image_colors(&image_magick);
+    let java_remap = remap_nearest_rgb(&source, &palette, &mask)?;
+    write_rgb_image(&source, &output_directory.join("source-crop.png"))?;
+    write_rgb_image(
+        &image_magick,
+        &output_directory.join("imagemagick-remap-crop.png"),
+    )?;
+    write_rgb_image(
+        &java_remap,
+        &output_directory.join("java-standard-remap-crop.png"),
+    )?;
+    if mask_path.is_some() {
+        write_rgb_image(
+            &mask.preview_image(),
+            &output_directory.join("comparison-mask.png"),
+        )?;
+    }
+    let metrics = vec![NamedMetrics {
+        name: "java-standard-remap-vs-imagemagick".to_string(),
+        metrics: compare(&java_remap, &image_magick, &mask)?,
+    }];
+    write_rgb_image(
+        &error_heatmap(&java_remap, &image_magick, &mask)?,
+        &output_directory.join("java-standard-remap-vs-imagemagick-error.png"),
+    )?;
+    write_top_error_pixels(
+        &java_remap,
+        &image_magick,
+        Some(&source),
+        &output_directory.join("java-standard-remap-vs-imagemagick-top-errors.csv"),
+        &mask,
+        TOP_ERROR_SAMPLE_COUNT,
+    )?;
+    write_palette_error_summary(
+        &java_remap,
+        &image_magick,
+        Some(&source),
+        &output_directory.join("java-standard-remap-vs-imagemagick-palette-summary.txt"),
+        &mask,
+    )?;
+    let text = standard_remap_report_text(
+        source_path,
+        image_magick_remap_path,
         mask_path,
         mask_mode,
         mask.included_pixels,
@@ -714,6 +1033,304 @@ pub fn run_photo_metric_batch(
     })
 }
 
+pub fn run_standard_remap_batch(
+    jobs_csv: &Path,
+    output_root: &Path,
+    threads_text: &str,
+) -> QualityResult<StandardRemapBatchReport> {
+    let jobs = read_standard_remap_jobs(jobs_csv, output_root)?;
+    if jobs.is_empty() {
+        return Err("jobsCsv must contain at least one non-comment job row".to_string());
+    }
+    let threads = parse_threads(threads_text, jobs.len())?;
+    fs::create_dir_all(output_root).map_err(|error| error.to_string())?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let start = Instant::now();
+    let results = pool.install(|| {
+        jobs.par_iter()
+            .map(run_standard_remap_job)
+            .collect::<QualityResult<Vec<_>>>()
+    })?;
+    Ok(StandardRemapBatchReport {
+        jobs_csv: jobs_csv.to_path_buf(),
+        output_root: output_root.to_path_buf(),
+        jobs: results.len(),
+        threads,
+        elapsed_millis: start.elapsed().as_millis(),
+        results,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_production_candidate_diff_report(
+    source_path: &Path,
+    expected_path: &Path,
+    current_surface_path: &Path,
+    candidate_surface_path: &Path,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+) -> QualityResult<Report> {
+    validate_crop_size(crop_width, crop_height)?;
+    fs::create_dir_all(output_directory).map_err(|error| error.to_string())?;
+    let source = crop_optional_same_size(
+        &read_rgb_image(source_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let expected = crop_optional_same_size(
+        &read_rgb_image(expected_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let current = crop_optional_same_size(
+        &read_rgb_image(current_surface_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let candidate = crop_optional_same_size(
+        &read_rgb_image(candidate_surface_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let mask = load_optional_mask(
+        mask_path,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        mask_mode,
+    )?;
+    write_rgb_image(&source, &output_directory.join("source-crop.png"))?;
+    write_rgb_image(&expected, &output_directory.join("expected-crop.png"))?;
+    write_rgb_image(&current, &output_directory.join("current-surface-crop.png"))?;
+    write_rgb_image(
+        &candidate,
+        &output_directory.join("candidate-surface-crop.png"),
+    )?;
+    if mask_path.is_some() {
+        write_rgb_image(
+            &mask.preview_image(),
+            &output_directory.join("comparison-mask.png"),
+        )?;
+    }
+    let metric_specs = [
+        ("current-vs-expected", &current, &expected),
+        ("candidate-vs-expected", &candidate, &expected),
+        ("current-vs-source", &current, &source),
+        ("candidate-vs-source", &candidate, &source),
+        ("current-vs-candidate", &current, &candidate),
+    ];
+    let mut metrics = Vec::with_capacity(metric_specs.len() + 4);
+    for (name, actual, expected_image) in metric_specs {
+        metrics.push(NamedMetrics {
+            name: name.to_string(),
+            metrics: compare(actual, expected_image, &mask)?,
+        });
+        write_rgb_image(
+            &error_heatmap(actual, expected_image, &mask)?,
+            &output_directory.join(format!("{name}-error.png")),
+        )?;
+    }
+    write_rgb_image(
+        &candidate_gain_heatmap(&current, &candidate, &expected, &mask)?,
+        &output_directory.join("candidate-gain-vs-expected.png"),
+    )?;
+    write_rgb_image(
+        &candidate_gain_heatmap(&current, &candidate, &source, &mask)?,
+        &output_directory.join("candidate-gain-vs-source.png"),
+    )?;
+    write_rgb_image(
+        &candidate_gain_heatmap(&current, &candidate, &expected, &mask)?,
+        &output_directory.join("candidate-gain-vs-source-primary.png"),
+    )?;
+    write_candidate_diff_csvs(
+        &source,
+        &expected,
+        &current,
+        &candidate,
+        &mask,
+        output_directory,
+    )?;
+    let expected_average_4x4 = masked_block_average(&expected, &mask, 4)?;
+    let source_average_4x4 = masked_block_average(&source, &mask, 4)?;
+    metrics.push(NamedMetrics {
+        name: "current-local-average-4x4-vs-expected-local-average-4x4".to_string(),
+        metrics: compare(
+            &masked_block_average(&current, &mask, 4)?,
+            &expected_average_4x4,
+            &mask,
+        )?,
+    });
+    metrics.push(NamedMetrics {
+        name: "candidate-local-average-4x4-vs-expected-local-average-4x4".to_string(),
+        metrics: compare(
+            &masked_block_average(&candidate, &mask, 4)?,
+            &expected_average_4x4,
+            &mask,
+        )?,
+    });
+    metrics.push(NamedMetrics {
+        name: "current-local-average-4x4-vs-source-local-average-4x4".to_string(),
+        metrics: compare(
+            &masked_block_average(&current, &mask, 4)?,
+            &source_average_4x4,
+            &mask,
+        )?,
+    });
+    metrics.push(NamedMetrics {
+        name: "candidate-local-average-4x4-vs-source-local-average-4x4".to_string(),
+        metrics: compare(
+            &masked_block_average(&candidate, &mask, 4)?,
+            &source_average_4x4,
+            &mask,
+        )?,
+    });
+    let text = production_candidate_diff_report_text(
+        source_path,
+        expected_path,
+        current_surface_path,
+        candidate_surface_path,
+        mask_path,
+        mask_mode,
+        mask.included_pixels,
+        output_directory,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        &metrics,
+    );
+    fs::write(output_directory.join("metrics.txt"), &text).map_err(|error| error.to_string())?;
+    Ok(Report {
+        output_directory: output_directory.to_path_buf(),
+        text,
+        metrics,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_carrier_remap_simulation_report(
+    current_surface_path: &Path,
+    expected_path: &Path,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+    carrier_filter: &str,
+    top_buckets: usize,
+) -> QualityResult<Report> {
+    validate_crop_size(crop_width, crop_height)?;
+    fs::create_dir_all(output_directory).map_err(|error| error.to_string())?;
+    let current = crop_optional_same_size(
+        &read_rgb_image(current_surface_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let expected = crop_optional_same_size(
+        &read_rgb_image(expected_path)?,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+    )?;
+    let mask = load_optional_mask(
+        mask_path,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        mask_mode,
+    )?;
+    let carriers = carrier_candidates(carrier_filter)?;
+    let best_positive = best_carrier_remap(&current, &expected, &mask, &carriers)?;
+    write_rgb_image(&current, &output_directory.join("current-surface-crop.png"))?;
+    write_rgb_image(&expected, &output_directory.join("expected-crop.png"))?;
+    write_rgb_image(
+        &best_positive,
+        &output_directory.join("best-positive-remap.png"),
+    )?;
+    if mask_path.is_some() {
+        write_rgb_image(
+            &mask.preview_image(),
+            &output_directory.join("comparison-mask.png"),
+        )?;
+    }
+    write_rgb_image(
+        &error_heatmap(&best_positive, &expected, &mask)?,
+        &output_directory.join("best-positive-vs-expected-error.png"),
+    )?;
+    let current_metrics = compare(&current, &expected, &mask)?;
+    let best_metrics = compare(&best_positive, &expected, &mask)?;
+    let metrics = vec![
+        NamedMetrics {
+            name: "current-vs-expected".to_string(),
+            metrics: current_metrics,
+        },
+        NamedMetrics {
+            name: "best-positive-remap-vs-expected".to_string(),
+            metrics: best_metrics,
+        },
+    ];
+    write_carrier_simulation_csv(
+        &current,
+        &expected,
+        &mask,
+        &carriers,
+        top_buckets,
+        output_directory,
+    )?;
+    write_top_error_pixels(
+        &best_positive,
+        &expected,
+        None,
+        &output_directory.join("best-positive-vs-expected-top-errors.csv"),
+        &mask,
+        TOP_ERROR_SAMPLE_COUNT,
+    )?;
+    let text = carrier_remap_report_text(
+        current_surface_path,
+        expected_path,
+        mask_path,
+        mask_mode,
+        mask.included_pixels,
+        output_directory,
+        crop_x,
+        crop_y,
+        crop_width,
+        crop_height,
+        carrier_filter,
+        top_buckets,
+        &metrics,
+    );
+    fs::write(output_directory.join("metrics.txt"), &text).map_err(|error| error.to_string())?;
+    Ok(Report {
+        output_directory: output_directory.to_path_buf(),
+        text,
+        metrics,
+    })
+}
+
 fn run_photo_metric_job(job: &PhotoMetricJob) -> QualityResult<PhotoMetricJobResult> {
     let start = Instant::now();
     let report = write_metric_crop_report(
@@ -750,6 +1367,34 @@ fn run_photo_metric_job(job: &PhotoMetricJob) -> QualityResult<PhotoMetricJobRes
             &report,
             "candidate-canopy-density-selective-4x4-vs-source",
         ),
+    })
+}
+
+fn run_standard_remap_job(job: &StandardRemapJob) -> QualityResult<StandardRemapJobResult> {
+    let start = Instant::now();
+    let report = write_standard_remap_parity_report(
+        &job.source,
+        &job.image_magick_remap,
+        &job.output_directory,
+        job.crop_x,
+        job.crop_y,
+        job.crop_width,
+        job.crop_height,
+        job.mask.as_deref(),
+        &job.mask_mode,
+    )?;
+    let metrics = report
+        .metric("java-standard-remap-vs-imagemagick")
+        .copied()
+        .unwrap_or_default();
+    Ok(StandardRemapJobResult {
+        sample: job.sample.clone(),
+        output_directory: job.output_directory.clone(),
+        elapsed_millis: start.elapsed().as_millis(),
+        pixels: metrics.pixels,
+        mean_delta_e2000: metrics.mean_delta_e2000,
+        p95_delta_e2000: metrics.p95_delta_e2000,
+        exact_match_percent: metrics.exact_match_percent,
     })
 }
 
@@ -837,6 +1482,96 @@ fn read_photo_metric_jobs(
             source,
             expected,
             current_surface: current,
+            output_directory,
+            crop_x,
+            crop_y,
+            crop_width,
+            crop_height,
+            mask,
+            mask_mode,
+        });
+    }
+    if header.is_none() {
+        return Err("jobsCsv does not contain a header row".to_string());
+    }
+    Ok(jobs)
+}
+
+fn read_standard_remap_jobs(
+    jobs_csv: &Path,
+    output_root: &Path,
+) -> QualityResult<Vec<StandardRemapJob>> {
+    let text = fs::read_to_string(jobs_csv).map_err(|error| error.to_string())?;
+    let csv_directory = jobs_csv
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .or_else(|| jobs_csv.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut header: Option<Vec<String>> = None;
+    let mut jobs = Vec::new();
+    for (line_index, raw_line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
+        let raw_line = raw_line.trim_start_matches('\u{feff}');
+        if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
+            continue;
+        }
+        let columns = split_csv_line(raw_line);
+        if header.is_none() {
+            header = Some(
+                columns
+                    .into_iter()
+                    .map(|column| normalize_header(&column))
+                    .collect(),
+            );
+            continue;
+        }
+        let header = header.as_ref().expect("checked above");
+        let sample = csv_required(&columns, header, line_number, &["sample"])?;
+        let source = csv_required_input_path(
+            &columns,
+            header,
+            line_number,
+            &csv_directory,
+            &["source", "sourcepng"],
+        )?;
+        let image_magick = csv_required_input_path(
+            &columns,
+            header,
+            line_number,
+            &csv_directory,
+            &[
+                "imagemagick",
+                "imagemagickremap",
+                "imagemagickremappng",
+                "expected",
+                "expectedpng",
+            ],
+        )?;
+        let crop_x = parse_csv_u32(&columns, header, line_number, &["cropx", "x"])?;
+        let crop_y = parse_csv_u32(&columns, header, line_number, &["cropy", "y"])?;
+        let crop_width = parse_csv_u32(&columns, header, line_number, &["cropwidth", "width"])?;
+        let crop_height = parse_csv_u32(&columns, header, line_number, &["cropheight", "height"])?;
+        if crop_width == 0 || crop_height == 0 {
+            return Err(format!(
+                "line {line_number}: cropWidth and cropHeight must be positive"
+            ));
+        }
+        let mask = csv_optional_path(&columns, header, &csv_directory, &["mask", "maskpng"]);
+        let mask_mode = csv_optional(&columns, header, &["maskmode", "mode"])
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "all".to_string());
+        let output_directory = csv_optional_output_path(
+            &columns,
+            header,
+            output_root,
+            &["output", "outputdir", "outputdirectory"],
+        )
+        .unwrap_or_else(|| output_root.join(&sample).join("standard-remap-parity"));
+        jobs.push(StandardRemapJob {
+            sample,
+            source,
+            image_magick_remap: image_magick,
             output_directory,
             crop_x,
             crop_y,
@@ -1066,6 +1801,217 @@ fn compare_report_text(
         "crop={crop_x},{crop_y},{crop_width},{crop_height}\n"
     )
     .unwrap();
+    for metric in metrics {
+        writeln!(&mut text, "[{}]", metric.name).unwrap();
+        text.push_str(&metric.metrics.to_text());
+        text.push('\n');
+    }
+    text
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parity_report_text(
+    source_path: &Path,
+    met_target_path: Option<&Path>,
+    current_surface_path: Option<&Path>,
+    standard_palette_path: &Path,
+    image_magick_remap_path: Option<&Path>,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+    mask_pixels: usize,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    palette_colors: usize,
+    metrics: &[NamedMetrics],
+) -> String {
+    let mut text = String::new();
+    writeln!(&mut text, "Photo parity crop report").unwrap();
+    writeln!(&mut text, "source={}", path_display(source_path)).unwrap();
+    writeln!(&mut text, "metTarget={}", path_or_none(met_target_path)).unwrap();
+    writeln!(
+        &mut text,
+        "currentSurface={}",
+        path_or_none(current_surface_path)
+    )
+    .unwrap();
+    writeln!(
+        &mut text,
+        "standardPalette={}",
+        path_display(standard_palette_path)
+    )
+    .unwrap();
+    writeln!(
+        &mut text,
+        "imageMagickRemap={}",
+        path_or_none(image_magick_remap_path)
+    )
+    .unwrap();
+    writeln!(&mut text, "mask={}", path_or_none(mask_path)).unwrap();
+    writeln!(&mut text, "maskMode={}", normalized_mask_mode(mask_mode)).unwrap();
+    writeln!(&mut text, "maskIncludedPixels={mask_pixels}").unwrap();
+    writeln!(
+        &mut text,
+        "outputDirectory={}",
+        path_display(output_directory)
+    )
+    .unwrap();
+    writeln!(
+        &mut text,
+        "crop={crop_x},{crop_y},{crop_width},{crop_height}"
+    )
+    .unwrap();
+    writeln!(&mut text, "paletteColors={palette_colors}\n").unwrap();
+    for metric in metrics {
+        writeln!(&mut text, "[{}]", metric.name).unwrap();
+        text.push_str(&metric.metrics.to_text());
+        text.push('\n');
+    }
+    text
+}
+
+#[allow(clippy::too_many_arguments)]
+fn standard_remap_report_text(
+    source_path: &Path,
+    image_magick_remap_path: &Path,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+    mask_pixels: usize,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    metrics: &[NamedMetrics],
+) -> String {
+    let mut text = String::new();
+    writeln!(&mut text, "Photo Standard remap parity crop report").unwrap();
+    writeln!(&mut text, "source={}", path_display(source_path)).unwrap();
+    writeln!(
+        &mut text,
+        "imageMagickRemap={}",
+        path_display(image_magick_remap_path)
+    )
+    .unwrap();
+    writeln!(&mut text, "mask={}", path_or_none(mask_path)).unwrap();
+    writeln!(&mut text, "maskMode={}", normalized_mask_mode(mask_mode)).unwrap();
+    writeln!(&mut text, "maskIncludedPixels={mask_pixels}").unwrap();
+    writeln!(
+        &mut text,
+        "outputDirectory={}",
+        path_display(output_directory)
+    )
+    .unwrap();
+    writeln!(
+        &mut text,
+        "crop={crop_x},{crop_y},{crop_width},{crop_height}\n"
+    )
+    .unwrap();
+    for metric in metrics {
+        writeln!(&mut text, "[{}]", metric.name).unwrap();
+        text.push_str(&metric.metrics.to_text());
+        text.push('\n');
+    }
+    text
+}
+
+#[allow(clippy::too_many_arguments)]
+fn production_candidate_diff_report_text(
+    source_path: &Path,
+    expected_path: &Path,
+    current_surface_path: &Path,
+    candidate_surface_path: &Path,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+    mask_pixels: usize,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    metrics: &[NamedMetrics],
+) -> String {
+    let mut text = String::new();
+    writeln!(&mut text, "Photo production-candidate diff crop report").unwrap();
+    writeln!(&mut text, "source={}", path_display(source_path)).unwrap();
+    writeln!(&mut text, "expected={}", path_display(expected_path)).unwrap();
+    writeln!(
+        &mut text,
+        "currentSurface={}",
+        path_display(current_surface_path)
+    )
+    .unwrap();
+    writeln!(
+        &mut text,
+        "candidateSurface={}",
+        path_display(candidate_surface_path)
+    )
+    .unwrap();
+    writeln!(&mut text, "mask={}", path_or_none(mask_path)).unwrap();
+    writeln!(&mut text, "maskMode={}", normalized_mask_mode(mask_mode)).unwrap();
+    writeln!(&mut text, "maskIncludedPixels={mask_pixels}").unwrap();
+    writeln!(
+        &mut text,
+        "outputDirectory={}",
+        path_display(output_directory)
+    )
+    .unwrap();
+    writeln!(
+        &mut text,
+        "crop={crop_x},{crop_y},{crop_width},{crop_height}\n"
+    )
+    .unwrap();
+    for metric in metrics {
+        writeln!(&mut text, "[{}]", metric.name).unwrap();
+        text.push_str(&metric.metrics.to_text());
+        text.push('\n');
+    }
+    text
+}
+
+#[allow(clippy::too_many_arguments)]
+fn carrier_remap_report_text(
+    current_surface_path: &Path,
+    expected_path: &Path,
+    mask_path: Option<&Path>,
+    mask_mode: &str,
+    mask_pixels: usize,
+    output_directory: &Path,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    carrier_filter: &str,
+    top_buckets: usize,
+    metrics: &[NamedMetrics],
+) -> String {
+    let mut text = String::new();
+    writeln!(&mut text, "Photo carrier remap simulation crop report").unwrap();
+    writeln!(
+        &mut text,
+        "currentSurface={}",
+        path_display(current_surface_path)
+    )
+    .unwrap();
+    writeln!(&mut text, "expected={}", path_display(expected_path)).unwrap();
+    writeln!(&mut text, "mask={}", path_or_none(mask_path)).unwrap();
+    writeln!(&mut text, "maskMode={}", normalized_mask_mode(mask_mode)).unwrap();
+    writeln!(&mut text, "maskIncludedPixels={mask_pixels}").unwrap();
+    writeln!(
+        &mut text,
+        "outputDirectory={}",
+        path_display(output_directory)
+    )
+    .unwrap();
+    writeln!(
+        &mut text,
+        "crop={crop_x},{crop_y},{crop_width},{crop_height}"
+    )
+    .unwrap();
+    writeln!(&mut text, "carrierFilter={carrier_filter}").unwrap();
+    writeln!(&mut text, "topBuckets={top_buckets}\n").unwrap();
     for metric in metrics {
         writeln!(&mut text, "[{}]", metric.name).unwrap();
         text.push_str(&metric.metrics.to_text());
@@ -1586,6 +2532,364 @@ fn select_candidate_against_current(
         }
     }
     Ok(output)
+}
+
+fn load_palette(path: &Path) -> QualityResult<Vec<u32>> {
+    let image = read_rgb_image(path)?;
+    let colors = unique_image_colors(&image);
+    if colors.is_empty() {
+        return Err(format!("Palette has no colors: {}", path.display()));
+    }
+    Ok(colors)
+}
+
+fn unique_image_colors(image: &RgbImage) -> Vec<u32> {
+    let mut colors = Vec::<u32>::new();
+    for pixel in image.pixels() {
+        let rgb = rgb_to_u32(pixel);
+        if !colors.contains(&rgb) {
+            colors.push(rgb);
+        }
+    }
+    if colors.is_empty() {
+        colors.push(0);
+    }
+    colors
+}
+
+fn remap_nearest_rgb(
+    source: &RgbImage,
+    palette: &[u32],
+    mask: &PixelMask,
+) -> QualityResult<RgbImage> {
+    if palette.is_empty() {
+        return Err("palette must contain at least one color".to_string());
+    }
+    require_mask_size(mask, source.width(), source.height())?;
+    let mut output = source.clone();
+    for y in 0..source.height() {
+        for x in 0..source.width() {
+            if !mask.includes(x, y) {
+                continue;
+            }
+            let source_rgb = rgb_to_u32(source.get_pixel(x, y));
+            let best = nearest_rgb(source_rgb, palette);
+            output.put_pixel(x, y, u32_to_rgb(best));
+        }
+    }
+    Ok(output)
+}
+
+fn nearest_rgb(source_rgb: u32, palette: &[u32]) -> u32 {
+    palette
+        .iter()
+        .copied()
+        .min_by(|left, right| {
+            rgb_distance_squared(source_rgb, *left)
+                .total_cmp(&rgb_distance_squared(source_rgb, *right))
+        })
+        .unwrap_or(source_rgb)
+}
+
+fn candidate_gain_heatmap(
+    current: &RgbImage,
+    candidate: &RgbImage,
+    expected: &RgbImage,
+    mask: &PixelMask,
+) -> QualityResult<RgbImage> {
+    require_same_size(current, candidate, "candidate gain")?;
+    require_same_size(current, expected, "candidate gain")?;
+    let mut output = RgbImage::new(current.width(), current.height());
+    for y in 0..current.height() {
+        for x in 0..current.width() {
+            if !mask.includes(x, y) {
+                output.put_pixel(x, y, Rgb([18, 18, 18]));
+                continue;
+            }
+            let expected_lab = Lab::from_rgb(rgb_to_u32(expected.get_pixel(x, y)));
+            let current_delta =
+                Lab::from_rgb(rgb_to_u32(current.get_pixel(x, y))).ciede2000(expected_lab);
+            let candidate_delta =
+                Lab::from_rgb(rgb_to_u32(candidate.get_pixel(x, y))).ciede2000(expected_lab);
+            let gain = current_delta - candidate_delta;
+            let normalized = f64::clamp(gain.abs() / HEATMAP_DELTA_E_CEILING, 0.0, 1.0);
+            let intensity = (normalized * 255.0).round() as u8;
+            let color = if gain >= 0.0 {
+                Rgb([0, intensity, 0])
+            } else {
+                Rgb([intensity, 0, 0])
+            };
+            output.put_pixel(x, y, color);
+        }
+    }
+    Ok(output)
+}
+
+fn write_candidate_diff_csvs(
+    source: &RgbImage,
+    expected: &RgbImage,
+    current: &RgbImage,
+    candidate: &RgbImage,
+    mask: &PixelMask,
+    output_directory: &Path,
+) -> QualityResult<()> {
+    let mut summary = BTreeMap::<u32, (usize, usize, usize)>::new();
+    let mut gains = Vec::<(u32, u32, f64)>::new();
+    let mut losses = Vec::<(u32, u32, f64)>::new();
+    for y in 0..current.height() {
+        for x in 0..current.width() {
+            if !mask.includes(x, y) {
+                continue;
+            }
+            let source_rgb = rgb_to_u32(source.get_pixel(x, y));
+            let expected_rgb = rgb_to_u32(expected.get_pixel(x, y));
+            let current_rgb = rgb_to_u32(current.get_pixel(x, y));
+            let candidate_rgb = rgb_to_u32(candidate.get_pixel(x, y));
+            let expected_lab = Lab::from_rgb(expected_rgb);
+            let current_delta = Lab::from_rgb(current_rgb).ciede2000(expected_lab);
+            let candidate_delta = Lab::from_rgb(candidate_rgb).ciede2000(expected_lab);
+            let gain = current_delta - candidate_delta;
+            let entry = summary.entry(expected_rgb).or_default();
+            entry.0 += 1;
+            if gain > 0.03 {
+                entry.1 += 1;
+                gains.push((source_rgb, expected_rgb, gain));
+            } else if gain < -0.03 {
+                entry.2 += 1;
+                losses.push((source_rgb, expected_rgb, gain.abs()));
+            }
+        }
+    }
+    let mut summary_text =
+        String::from("standardRgb,count,winnerPrimary,candidateBetter,currentBetter\n");
+    for (expected_rgb, (count, candidate_better, current_better)) in summary {
+        let winner = if candidate_better >= current_better {
+            "candidate"
+        } else {
+            "current"
+        };
+        writeln!(
+            &mut summary_text,
+            "{},{},{},{},{}",
+            hex(expected_rgb),
+            count,
+            winner,
+            candidate_better,
+            current_better
+        )
+        .unwrap();
+    }
+    fs::write(
+        output_directory.join("production-candidate-token-diff-summary.csv"),
+        summary_text,
+    )
+    .map_err(|error| error.to_string())?;
+    gains.sort_by(|left, right| right.2.total_cmp(&left.2));
+    losses.sort_by(|left, right| right.2.total_cmp(&left.2));
+    fs::write(
+        output_directory.join("production-candidate-top-gains.csv"),
+        top_gain_loss_csv("gainDeltaE", &gains),
+    )
+    .map_err(|error| error.to_string())?;
+    fs::write(
+        output_directory.join("production-candidate-top-losses.csv"),
+        top_gain_loss_csv("lossDeltaE", &losses),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn top_gain_loss_csv(label: &str, rows: &[(u32, u32, f64)]) -> String {
+    let mut text = format!("sourceRgb,expectedRgb,{label}\n");
+    for (source_rgb, expected_rgb, value) in rows.iter().take(TOP_ERROR_SAMPLE_COUNT) {
+        writeln!(
+            &mut text,
+            "{},{},{:.6}",
+            hex(*source_rgb),
+            hex(*expected_rgb),
+            value
+        )
+        .unwrap();
+    }
+    text
+}
+
+#[derive(Clone, Debug)]
+struct CarrierCandidate {
+    id: String,
+    rgb: u32,
+}
+
+fn carrier_candidates(filter: &str) -> QualityResult<Vec<CarrierCandidate>> {
+    let path = Path::new(filter);
+    if path.is_file() {
+        let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let mut candidates = Vec::new();
+        for (line_index, line) in text.lines().enumerate() {
+            if line_index == 0 && line.to_ascii_lowercase().contains("rgb") {
+                continue;
+            }
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let columns = split_csv_line(line);
+            if columns.len() < 2 {
+                continue;
+            }
+            candidates.push(CarrierCandidate {
+                id: columns[0].clone(),
+                rgb: parse_hex_rgb(&columns[1])?,
+            });
+        }
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+    let named = match filter.to_ascii_lowercase().as_str() {
+        "vegetated" => vec![
+            ("grass", rgb_u32(88, 126, 62)),
+            ("oak_leaves", rgb_u32(48, 92, 38)),
+            ("moss", rgb_u32(89, 109, 45)),
+        ],
+        "sand" => vec![
+            ("sand", rgb_u32(218, 207, 163)),
+            ("sandstone", rgb_u32(196, 181, 125)),
+            ("terracotta_yellow", rgb_u32(184, 132, 40)),
+        ],
+        "red-sand" => vec![
+            ("red_sand", rgb_u32(190, 95, 33)),
+            ("orange_terracotta", rgb_u32(161, 83, 37)),
+            ("granite", rgb_u32(149, 103, 85)),
+        ],
+        "rock" => vec![
+            ("stone", rgb_u32(125, 125, 125)),
+            ("tuff", rgb_u32(108, 109, 102)),
+            ("deepslate", rgb_u32(80, 80, 85)),
+        ],
+        "snow" => vec![
+            ("snow", rgb_u32(249, 254, 254)),
+            ("calcite", rgb_u32(223, 224, 220)),
+            ("quartz", rgb_u32(235, 229, 222)),
+        ],
+        "wet" => vec![
+            ("mud", rgb_u32(60, 54, 45)),
+            ("clay", rgb_u32(161, 167, 179)),
+            ("moss", rgb_u32(89, 109, 45)),
+        ],
+        _ => vec![
+            ("black", rgb_u32(0, 0, 0)),
+            ("white", rgb_u32(255, 255, 255)),
+            ("gray", rgb_u32(128, 128, 128)),
+            ("grass", rgb_u32(88, 126, 62)),
+            ("sand", rgb_u32(218, 207, 163)),
+            ("stone", rgb_u32(125, 125, 125)),
+        ],
+    };
+    Ok(named
+        .into_iter()
+        .map(|(id, rgb)| CarrierCandidate {
+            id: id.to_string(),
+            rgb,
+        })
+        .collect())
+}
+
+fn parse_hex_rgb(text: &str) -> QualityResult<u32> {
+    let value = text.trim().trim_start_matches('#');
+    u32::from_str_radix(value, 16)
+        .map(|rgb| rgb & 0x00ff_ffff)
+        .map_err(|error| error.to_string())
+}
+
+fn best_carrier_remap(
+    current: &RgbImage,
+    expected: &RgbImage,
+    mask: &PixelMask,
+    carriers: &[CarrierCandidate],
+) -> QualityResult<RgbImage> {
+    require_same_size(current, expected, "carrier remap")?;
+    if carriers.is_empty() {
+        return Err("carrier filter produced no candidates".to_string());
+    }
+    let mut output = current.clone();
+    for y in 0..current.height() {
+        for x in 0..current.width() {
+            if !mask.includes(x, y) {
+                continue;
+            }
+            let expected_rgb = rgb_to_u32(expected.get_pixel(x, y));
+            let current_rgb = rgb_to_u32(current.get_pixel(x, y));
+            let current_delta = Lab::from_rgb(current_rgb).ciede2000(Lab::from_rgb(expected_rgb));
+            let best = carriers
+                .iter()
+                .min_by(|left, right| {
+                    Lab::from_rgb(left.rgb)
+                        .ciede2000(Lab::from_rgb(expected_rgb))
+                        .total_cmp(&Lab::from_rgb(right.rgb).ciede2000(Lab::from_rgb(expected_rgb)))
+                })
+                .expect("non-empty candidates");
+            let best_delta = Lab::from_rgb(best.rgb).ciede2000(Lab::from_rgb(expected_rgb));
+            if best_delta + 0.03 < current_delta {
+                output.put_pixel(x, y, u32_to_rgb(best.rgb));
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn write_carrier_simulation_csv(
+    current: &RgbImage,
+    expected: &RgbImage,
+    mask: &PixelMask,
+    carriers: &[CarrierCandidate],
+    top_buckets: usize,
+    output_directory: &Path,
+) -> QualityResult<()> {
+    let mut rows = Vec::<(String, u32, usize, f64, bool)>::new();
+    for candidate in carriers {
+        let mut improved = 0usize;
+        let mut gain_sum = 0.0;
+        for y in 0..current.height() {
+            for x in 0..current.width() {
+                if !mask.includes(x, y) {
+                    continue;
+                }
+                let expected_rgb = rgb_to_u32(expected.get_pixel(x, y));
+                let current_delta = Lab::from_rgb(rgb_to_u32(current.get_pixel(x, y)))
+                    .ciede2000(Lab::from_rgb(expected_rgb));
+                let candidate_delta =
+                    Lab::from_rgb(candidate.rgb).ciede2000(Lab::from_rgb(expected_rgb));
+                let gain = current_delta - candidate_delta;
+                if gain > 0.03 {
+                    improved += 1;
+                    gain_sum += gain;
+                }
+            }
+        }
+        rows.push((
+            candidate.id.clone(),
+            candidate.rgb,
+            improved,
+            gain_sum,
+            improved > 0,
+        ));
+    }
+    rows.sort_by(|left, right| right.3.total_cmp(&left.3));
+    let limit = top_buckets.max(1).min(rows.len());
+    let mut text = String::from("id,rgb,improvedPixels,totalGainDeltaE,positive\n");
+    for (id, rgb, improved, gain, positive) in rows.into_iter().take(limit) {
+        writeln!(
+            &mut text,
+            "{},{},{},{:.6},{}",
+            id,
+            hex(rgb),
+            improved,
+            gain,
+            positive
+        )
+        .unwrap();
+    }
+    fs::write(output_directory.join("carrier-remap-simulation.csv"), text)
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Debug)]

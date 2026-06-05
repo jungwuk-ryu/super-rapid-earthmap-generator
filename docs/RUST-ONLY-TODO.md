@@ -163,17 +163,17 @@ Detailed progress:
 - [ ] Benchmark covers five-crop batch cold start and representative 1:1000 samples.
 
 ### Rust photo metric crop/batch tools
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered commands:
-- [ ] `photo-parity-crop`
+- [x] `photo-parity-crop`
 - [x] `photo-compare-crop`
 - [x] `photo-parity-metric-crop`
 - [x] `photo-parity-metric-batch`
@@ -185,41 +185,41 @@ Detailed progress:
 - [x] Batch mode uses worker threads without unbounded memory growth.
 
 ### Rust Standard remap parity tools
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered commands:
-- [ ] `photo-standard-remap-parity-crop`
-- [ ] `photo-standard-remap-parity-batch`
+- [x] `photo-standard-remap-parity-crop`
+- [x] `photo-standard-remap-parity-batch`
 Detailed progress:
-- [ ] Defines whether ImageMagick remains an optional reference-only dependency or is replaced by a Rust Standard palette remapper.
-- [ ] Rust normal path does not shell out to Java.
-- [ ] Crop and batch outputs stay compatible with quality gate scripts.
+- [x] Defines whether ImageMagick remains an optional reference-only dependency or is replaced by a Rust Standard palette remapper.
+- [x] Rust normal path does not shell out to Java.
+- [x] Crop and batch outputs stay compatible with quality gate scripts.
 - [ ] Benchmark includes a one-crop cold start and multi-crop batch.
 
 ### Rust candidate diff/carrier simulation tools
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered commands:
-- [ ] `photo-production-candidate-diff-crop`
-- [ ] `photo-carrier-remap-sim-crop`
+- [x] `photo-production-candidate-diff-crop`
+- [x] `photo-carrier-remap-sim-crop`
 Detailed progress:
-- [ ] Supports carrier bucket filters currently used by research scripts.
-- [ ] Writes candidate/diff/error artifacts expected by experiments.
-- [ ] Keeps simulation optional and out of normal generation performance path.
+- [x] Supports carrier bucket filters currently used by research scripts.
+- [x] Writes candidate/diff/error artifacts expected by experiments.
+- [x] Keeps simulation optional and out of normal generation performance path.
 - [ ] Benchmark records cold-start and per-crop runtime.
 
 ### Rust `dynmap-tile-mosaic`
