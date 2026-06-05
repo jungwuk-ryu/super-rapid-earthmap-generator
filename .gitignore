@@ -1,5 +1,8 @@
 build/
+.idea/
+rust/target/
 vendor/minecraft/*/server.jar
+*.iml
 *.log
 hs_err_pid*.log
 /worlds/
