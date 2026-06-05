@@ -103,39 +103,41 @@ Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workloa
 These items directly block deleting the Java codebase.
 
 ### Rust `mca-topdown-render`
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Detailed progress:
-- [ ] MCA region reader feeds renderer without Java.
-- [ ] `visible` mode renders the highest visible non-air block with biome-aware tint where needed.
-- [ ] `terrain` mode matches the documented terrain-only behavior.
-- [ ] Multi-region mosaic writes PNG plus metadata/properties.
-- [ ] Reports region count, missing regions, chunk count, missing chunks, rendered column count, water columns, leaf columns.
+- [x] MCA region reader feeds renderer without Java.
+- [x] `visible` mode renders the highest visible non-air block with biome-aware tint where needed.
+- [x] `terrain` mode matches the documented terrain-only behavior.
+- [x] Multi-region mosaic writes PNG plus metadata/properties.
+- [x] Reports region count, missing regions, chunk count, missing chunks, rendered column count, water columns, leaf columns.
 - [ ] Benchmark covers at least a 7x6 region mosaic and a 1:1000 whole-continent mosaic.
+Spec: `earthmap-rs mca-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]`; writes RGB PNG plus sibling `.properties`; exits 0 on success and 2 on validation/render failure.
 
 ### Rust Linear top-down renderer
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Detailed progress:
-- [ ] Linear V2 region reader feeds renderer without converting to MCA.
-- [ ] Shares render core with MCA renderer.
-- [ ] Supports the same `visible|terrain` modes.
-- [ ] Reports the same metadata fields as MCA renderer.
+- [x] Linear V2 region reader feeds renderer without converting to MCA.
+- [x] Shares render core with MCA renderer.
+- [x] Supports the same `visible|terrain` modes.
+- [x] Reports the same metadata fields as MCA renderer.
 - [ ] Benchmark covers the same region windows as MCA renderer.
+Spec: `earthmap-rs linear-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]`; writes RGB PNG plus sibling `.properties`; exits 0 on success and 2 on validation/render failure.
 
 ### Rust `quality-production-sample-batch`
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented

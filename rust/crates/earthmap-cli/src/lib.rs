@@ -24,7 +24,9 @@ use earthmap_minecraft::{
     chunk_model::{
         ChunkModel, BIOME_CELL_WIDTH, CHUNK_WIDTH, SECTION_BIOME_CELL_COUNT, SECTION_BLOCK_COUNT,
     },
-    chunk_nbt_encoder, level_dat_template,
+    chunk_nbt_encoder,
+    dimension_profile::{OVERWORLD_1_21_11, SECTION_HEIGHT},
+    level_dat_template,
     nbt::{self, Tag},
     packed_long_array::PackedLongArray,
     section_palette::bits_per_entry_for_palette_size,
@@ -71,6 +73,9 @@ const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
 const VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME: &str = "earthmap-vanilla-delegated-resume.ndjson";
 const PARALLEL_EVENT_CHANNEL_CAPACITY: usize = 1024;
+const TOPDOWN_REGION_SIZE_BLOCKS: usize = 512;
+const TOPDOWN_AIR_BLOCK: &str = "minecraft:air";
+const TOPDOWN_DEFAULT_BIOME: &str = "minecraft:plains";
 const FLAT_TEST_MCA_LEVEL_NAME: &str = "SR EarthMap Flat Test";
 const FLAT_TEST_LINEAR_LEVEL_NAME: &str = "SR EarthMap Linear Flat Test";
 const FLAT_TEST_MCA_SEED: i64 = 987654321;
@@ -338,6 +343,34 @@ where
         "compare-mca-linear-region-payloads" if args.len() == 3 => write_result(
             compare_mca_linear_region_payloads_cli(stdout, stderr, &args[1], &args[2]),
         ),
+        "mca-topdown-render" if args.len() == 7 || args.len() == 8 => {
+            write_result(topdown_render_cli(
+                stdout,
+                stderr,
+                TopdownFormat::Mca,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                args.get(7).map(String::as_str),
+            ))
+        }
+        "linear-topdown-render" if args.len() == 7 || args.len() == 8 => {
+            write_result(topdown_render_cli(
+                stdout,
+                stderr,
+                TopdownFormat::Linear,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                args.get(7).map(String::as_str),
+            ))
+        }
         "convert-mca-region-to-linear" if args.len() == 3 => write_result(
             convert_mca_region_to_linear(stdout, stderr, &args[1], &args[2]),
         ),
@@ -850,6 +883,14 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"
+    )?;
+    writeln!(
+        out,
+        "  mca-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]"
+    )?;
+    writeln!(
+        out,
+        "  linear-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]"
     )?;
     writeln!(
         out,
@@ -5333,6 +5374,719 @@ fn compare_mca_linear_region_payloads_cli(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopdownFormat {
+    Mca,
+    Linear,
+}
+
+impl TopdownFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            TopdownFormat::Mca => "mca",
+            TopdownFormat::Linear => "linear",
+        }
+    }
+
+    fn success_title(self) -> &'static str {
+        match self {
+            TopdownFormat::Mca => "MCA top-down render written",
+            TopdownFormat::Linear => "Linear top-down render written",
+        }
+    }
+
+    fn error_title(self) -> &'static str {
+        match self {
+            TopdownFormat::Mca => "MCA top-down render failed",
+            TopdownFormat::Linear => "Linear top-down render failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopdownMode {
+    Visible,
+    Terrain,
+}
+
+impl TopdownMode {
+    fn parse(text: Option<&str>) -> std::result::Result<Self, String> {
+        match text.unwrap_or("visible").to_ascii_lowercase().as_str() {
+            "visible" | "top" => Ok(Self::Visible),
+            "terrain" | "surface" => Ok(Self::Terrain),
+            _ => Err("mode must be visible or terrain".to_string()),
+        }
+    }
+
+    fn as_text(self) -> &'static str {
+        match self {
+            TopdownMode::Visible => "visible",
+            TopdownMode::Terrain => "terrain",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct TopdownStats {
+    region_count: usize,
+    missing_regions: usize,
+    chunk_count: usize,
+    missing_chunks: usize,
+    column_count: u64,
+    air_columns: u64,
+    water_top_columns: u64,
+    leaf_top_columns: u64,
+}
+
+#[derive(Clone, Debug)]
+struct TopdownReport {
+    world_dir: std::path::PathBuf,
+    output_path: std::path::PathBuf,
+    metadata_path: std::path::PathBuf,
+    start_region_x: i32,
+    start_region_z: i32,
+    columns: i32,
+    rows: i32,
+    width: usize,
+    height: usize,
+    mode: TopdownMode,
+    stats: TopdownStats,
+}
+
+impl TopdownReport {
+    fn properties_text(&self) -> String {
+        format!(
+            concat!(
+                "worldDir={}\n",
+                "outputPath={}\n",
+                "metadataPath={}\n",
+                "startRegionX={}\n",
+                "startRegionZ={}\n",
+                "columns={}\n",
+                "rows={}\n",
+                "width={}\n",
+                "height={}\n",
+                "mode={}\n",
+                "regionCount={}\n",
+                "missingRegions={}\n",
+                "chunkCount={}\n",
+                "missingChunks={}\n",
+                "columnCount={}\n",
+                "airColumns={}\n",
+                "waterTopColumns={}\n",
+                "leafTopColumns={}\n"
+            ),
+            normalized_path_display(&self.world_dir),
+            normalized_path_display(&self.output_path),
+            normalized_path_display(&self.metadata_path),
+            self.start_region_x,
+            self.start_region_z,
+            self.columns,
+            self.rows,
+            self.width,
+            self.height,
+            self.mode.as_text(),
+            self.stats.region_count,
+            self.stats.missing_regions,
+            self.stats.chunk_count,
+            self.stats.missing_chunks,
+            self.stats.column_count,
+            self.stats.air_columns,
+            self.stats.water_top_columns,
+            self.stats.leaf_top_columns
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TopBlock {
+    block_name: String,
+    biome_id: String,
+}
+
+fn topdown_render_cli(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    format: TopdownFormat,
+    world_dir: &str,
+    output_path: &str,
+    start_region_x: &str,
+    start_region_z: &str,
+    columns: &str,
+    rows: &str,
+    mode: Option<&str>,
+) -> io::Result<i32> {
+    match topdown_render_impl(
+        format,
+        Path::new(world_dir),
+        Path::new(output_path),
+        start_region_x,
+        start_region_z,
+        columns,
+        rows,
+        mode,
+    ) {
+        Ok(report) => {
+            writeln!(out, "{}", format.success_title())?;
+            write_topdown_report(out, &report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "{}: {error}", format.error_title())?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn write_topdown_report(out: &mut impl Write, report: &TopdownReport) -> io::Result<()> {
+    writeln!(
+        out,
+        "worldDir={}",
+        normalized_path_display(&report.world_dir)
+    )?;
+    writeln!(
+        out,
+        "outputPath={}",
+        normalized_path_display(&report.output_path)
+    )?;
+    writeln!(
+        out,
+        "metadataPath={}",
+        normalized_path_display(&report.metadata_path)
+    )?;
+    writeln!(out, "startRegionX={}", report.start_region_x)?;
+    writeln!(out, "startRegionZ={}", report.start_region_z)?;
+    writeln!(out, "columns={}", report.columns)?;
+    writeln!(out, "rows={}", report.rows)?;
+    writeln!(out, "width={}", report.width)?;
+    writeln!(out, "height={}", report.height)?;
+    writeln!(out, "mode={}", report.mode.as_text())?;
+    writeln!(out, "regionCount={}", report.stats.region_count)?;
+    writeln!(out, "missingRegions={}", report.stats.missing_regions)?;
+    writeln!(out, "chunkCount={}", report.stats.chunk_count)?;
+    writeln!(out, "missingChunks={}", report.stats.missing_chunks)?;
+    writeln!(out, "columnCount={}", report.stats.column_count)?;
+    writeln!(out, "airColumns={}", report.stats.air_columns)?;
+    writeln!(out, "waterTopColumns={}", report.stats.water_top_columns)?;
+    writeln!(out, "leafTopColumns={}", report.stats.leaf_top_columns)
+}
+
+fn topdown_render_impl(
+    format: TopdownFormat,
+    world_dir: &Path,
+    output_path: &Path,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    columns_text: &str,
+    rows_text: &str,
+    mode_text: Option<&str>,
+) -> std::result::Result<TopdownReport, String> {
+    let start_region_x = parse_i32_string(start_region_x_text)?;
+    let start_region_z = parse_i32_string(start_region_z_text)?;
+    let columns = parse_positive_i32_string("columns", columns_text)?;
+    let rows = parse_positive_i32_string("rows", rows_text)?;
+    let mode = TopdownMode::parse(mode_text)?;
+    let region_dir = world_dir.join("region");
+    if !region_dir.is_dir() {
+        return Err(format!(
+            "world region directory not found: {}",
+            region_dir.display()
+        ));
+    }
+
+    let end_region_x = start_region_x
+        .checked_add(columns)
+        .ok_or_else(|| "startRegionX + cols is outside i32 range".to_string())?;
+    let end_region_z = start_region_z
+        .checked_add(rows)
+        .ok_or_else(|| "startRegionZ + rows is outside i32 range".to_string())?;
+    let width = topdown_image_dimension("columns", columns)?;
+    let height = topdown_image_dimension("rows", rows)?;
+    let pixel_bytes = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| "top-down output image is too large".to_string())?;
+    let mut pixels = vec![0u8; pixel_bytes];
+    let mut stats = TopdownStats::default();
+
+    for rz in start_region_z..end_region_z {
+        for rx in start_region_x..end_region_x {
+            let region_path = region_dir.join(format!("r.{rx}.{rz}.{}", format.extension()));
+            if !region_path.is_file() {
+                stats.missing_regions += 1;
+                continue;
+            }
+            let payloads = read_region_payloads(&region_path).map_err(|error| error.to_string())?;
+            let expected_format = match format {
+                TopdownFormat::Mca => RegionFormat::Mca,
+                TopdownFormat::Linear => RegionFormat::Linear,
+            };
+            if payloads.format != expected_format {
+                return Err(format!(
+                    "region format mismatch for {}: expected {} got {}",
+                    region_path.display(),
+                    expected_format.as_manifest_value(),
+                    payloads.format.as_manifest_value()
+                ));
+            }
+            stats.region_count += 1;
+            let region_image_x = usize::try_from(rx - start_region_x)
+                .expect("region x offset is non-negative")
+                * TOPDOWN_REGION_SIZE_BLOCKS;
+            let region_image_z = usize::try_from(rz - start_region_z)
+                .expect("region z offset is non-negative")
+                * TOPDOWN_REGION_SIZE_BLOCKS;
+            for chunk_z in 0..32u8 {
+                for chunk_x in 0..32u8 {
+                    let pos =
+                        ChunkLocalPos::new(chunk_x, chunk_z).map_err(|error| error.to_string())?;
+                    let Some(payload) = payloads.chunks.get(&pos) else {
+                        stats.missing_chunks += 1;
+                        continue;
+                    };
+                    let chunk = TopdownChunk::decode(payload)?;
+                    stats.chunk_count += 1;
+                    for local_z in 0..CHUNK_WIDTH {
+                        for local_x in 0..CHUNK_WIDTH {
+                            let top = chunk.top_block(local_x, local_z, mode)?;
+                            let image_x =
+                                region_image_x + (usize::from(chunk_x) * CHUNK_WIDTH) + local_x;
+                            let image_z =
+                                region_image_z + (usize::from(chunk_z) * CHUNK_WIDTH) + local_z;
+                            let color = topdown_color_for(&top.block_name, &top.biome_id);
+                            write_rgb_pixel(&mut pixels, width, image_x, image_z, color);
+                            stats.column_count += 1;
+                            if is_air_block(&top.block_name) {
+                                stats.air_columns += 1;
+                            } else if is_water_like_block(&top.block_name) {
+                                stats.water_top_columns += 1;
+                            } else if is_leaf_block_name(&top.block_name) {
+                                stats.leaf_top_columns += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    write_rgb_png(output_path, width as u32, height as u32, &pixels)?;
+    let metadata_path = topdown_metadata_path(output_path);
+    let report = TopdownReport {
+        world_dir: world_dir.to_path_buf(),
+        output_path: output_path.to_path_buf(),
+        metadata_path,
+        start_region_x,
+        start_region_z,
+        columns,
+        rows,
+        width,
+        height,
+        mode,
+        stats,
+    };
+    std::fs::write(&report.metadata_path, report.properties_text())
+        .map_err(|error| error.to_string())?;
+    Ok(report)
+}
+
+fn topdown_image_dimension(name: &str, regions: i32) -> std::result::Result<usize, String> {
+    let dimension = usize::try_from(regions)
+        .expect("positive region count fits usize")
+        .checked_mul(TOPDOWN_REGION_SIZE_BLOCKS)
+        .ok_or_else(|| format!("{name} makes the top-down image too large"))?;
+    if dimension > u32::MAX as usize {
+        return Err(format!("{name} makes the top-down PNG dimension too large"));
+    }
+    Ok(dimension)
+}
+
+fn write_rgb_pixel(pixels: &mut [u8], width: usize, x: usize, z: usize, color: (u8, u8, u8)) {
+    let offset = ((z * width) + x) * 3;
+    pixels[offset] = color.0;
+    pixels[offset + 1] = color.1;
+    pixels[offset + 2] = color.2;
+}
+
+fn write_rgb_png(
+    path: &Path,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> std::result::Result<(), String> {
+    let file = File::create(path).map_err(|error| error.to_string())?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png = encoder.write_header().map_err(|error| error.to_string())?;
+    png.write_image_data(pixels)
+        .map_err(|error| error.to_string())
+}
+
+fn topdown_metadata_path(output_path: &Path) -> std::path::PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("topdown.png");
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    output_path.with_file_name(format!("{stem}.properties"))
+}
+
+#[derive(Clone, Debug)]
+struct TopdownChunk {
+    sections: BTreeMap<i32, TopdownSection>,
+}
+
+impl TopdownChunk {
+    fn decode(payload: &[u8]) -> std::result::Result<Self, String> {
+        let root = chunk_root(payload)?;
+        let sections_tag = root
+            .get_list("sections")
+            .map_err(|error| error.to_string())?;
+        let mut sections = BTreeMap::new();
+        for section_tag in sections_tag.values() {
+            let Tag::Compound(section) = section_tag else {
+                return Err("chunk section is not an NBT compound".to_string());
+            };
+            if !section.contains("block_states") {
+                continue;
+            }
+            let decoded = TopdownSection::decode(section)?;
+            sections.insert(decoded.section_y, decoded);
+        }
+        Ok(Self { sections })
+    }
+
+    fn top_block(
+        &self,
+        local_x: usize,
+        local_z: usize,
+        mode: TopdownMode,
+    ) -> std::result::Result<TopBlock, String> {
+        for y in (OVERWORLD_1_21_11.min_y()..=OVERWORLD_1_21_11.max_y_inclusive()).rev() {
+            let block_name = self.block_name_at(local_x, y, local_z)?;
+            if is_air_block(&block_name) {
+                continue;
+            }
+            if mode == TopdownMode::Terrain
+                && (is_plant_like_block(&block_name)
+                    || is_leaf_block_name(&block_name)
+                    || is_log_block(&block_name))
+            {
+                continue;
+            }
+            return Ok(TopBlock {
+                biome_id: self.biome_id_at(local_x, y, local_z)?,
+                block_name,
+            });
+        }
+        Ok(TopBlock {
+            block_name: TOPDOWN_AIR_BLOCK.to_string(),
+            biome_id: TOPDOWN_DEFAULT_BIOME.to_string(),
+        })
+    }
+
+    fn block_name_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let section_y = y.div_euclid(SECTION_HEIGHT);
+        let Some(section) = self.sections.get(&section_y) else {
+            return Ok(TOPDOWN_AIR_BLOCK.to_string());
+        };
+        section.block_name_at(local_x, y, local_z)
+    }
+
+    fn biome_id_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let section_y = y.div_euclid(SECTION_HEIGHT);
+        let Some(section) = self.sections.get(&section_y) else {
+            return Ok(TOPDOWN_DEFAULT_BIOME.to_string());
+        };
+        section.biome_id_at(local_x, y, local_z)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TopdownSection {
+    section_y: i32,
+    block_palette: Vec<String>,
+    block_values: Vec<usize>,
+    biome_palette: Vec<String>,
+    biome_values: Vec<usize>,
+}
+
+impl TopdownSection {
+    fn decode(section: &earthmap_minecraft::nbt::Compound) -> std::result::Result<Self, String> {
+        let section_y = i32::from(section.get_byte("Y").map_err(|error| error.to_string())?);
+        let block_states = section
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?;
+        let block_palette = block_state_palette_names(block_states)?;
+        let block_values =
+            decode_palette_values(block_states, block_palette.len(), SECTION_BLOCK_COUNT)?;
+        let (biome_palette, biome_values) = if section.contains("biomes") {
+            let biomes = section
+                .get_compound("biomes")
+                .map_err(|error| error.to_string())?;
+            let palette = biome_palette_names(biomes)?;
+            let values =
+                decode_biome_palette_values(biomes, palette.len(), SECTION_BIOME_CELL_COUNT)?;
+            (palette, values)
+        } else {
+            (
+                vec![TOPDOWN_DEFAULT_BIOME.to_string()],
+                vec![0; SECTION_BIOME_CELL_COUNT],
+            )
+        };
+        Ok(Self {
+            section_y,
+            block_palette,
+            block_values,
+            biome_palette,
+            biome_values,
+        })
+    }
+
+    fn block_name_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let local_y = usize::try_from(y & (SECTION_HEIGHT - 1)).expect("local y is non-negative");
+        let index = (local_y << 8) | (local_z << 4) | local_x;
+        let palette_index = self
+            .block_values
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("missing block palette value at {index}"))?;
+        self.block_palette
+            .get(palette_index)
+            .cloned()
+            .ok_or_else(|| format!("block palette index outside palette: {palette_index}"))
+    }
+
+    fn biome_id_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let local_y = usize::try_from(y & (SECTION_HEIGHT - 1)).expect("local y is non-negative");
+        let biome_x = local_x / BIOME_CELL_WIDTH;
+        let biome_y = local_y / BIOME_CELL_WIDTH;
+        let biome_z = local_z / BIOME_CELL_WIDTH;
+        let index = (biome_y * BIOME_CELL_WIDTH * BIOME_CELL_WIDTH)
+            + (biome_z * BIOME_CELL_WIDTH)
+            + biome_x;
+        let palette_index = self
+            .biome_values
+            .get(index)
+            .copied()
+            .ok_or_else(|| format!("missing biome palette value at {index}"))?;
+        self.biome_palette
+            .get(palette_index)
+            .cloned()
+            .ok_or_else(|| format!("biome palette index outside palette: {palette_index}"))
+    }
+}
+
+fn topdown_color_for(block_name: &str, biome_id: &str) -> (u8, u8, u8) {
+    if is_air_block(block_name) {
+        return (0, 0, 0);
+    }
+    if is_water_like_block(block_name) {
+        return water_color_for_biome(biome_id);
+    }
+    if is_log_block(block_name) {
+        return (102, 75, 42);
+    }
+    if block_name == "minecraft:lava" {
+        return (215, 78, 28);
+    }
+    if let Some(block_id) = render_block_state_id(block_name) {
+        return earthmap_surface::render_surface_rgb(block_id, Some(biome_id));
+    }
+    fallback_color_for_block_name(block_name)
+}
+
+fn render_block_state_id(block_name: &str) -> Option<i32> {
+    Some(match block_name {
+        "minecraft:grass_block" => block_state_ids::GRASS_BLOCK,
+        "minecraft:oak_leaves" => block_state_ids::OAK_LEAVES,
+        "minecraft:jungle_leaves" => block_state_ids::JUNGLE_LEAVES,
+        "minecraft:dark_oak_leaves" => block_state_ids::DARK_OAK_LEAVES,
+        "minecraft:spruce_leaves" => block_state_ids::SPRUCE_LEAVES,
+        "minecraft:moss_block" => block_state_ids::MOSS_BLOCK,
+        "minecraft:podzol" => block_state_ids::PODZOL,
+        "minecraft:coarse_dirt" => block_state_ids::COARSE_DIRT,
+        "minecraft:dirt" => block_state_ids::DIRT,
+        "minecraft:rooted_dirt" => block_state_ids::ROOTED_DIRT,
+        "minecraft:mycelium" => block_state_ids::MYCELIUM,
+        "minecraft:mud" => block_state_ids::MUD,
+        "minecraft:packed_mud" => block_state_ids::PACKED_MUD,
+        "minecraft:green_terracotta" => block_state_ids::GREEN_TERRACOTTA,
+        "minecraft:lime_terracotta" => block_state_ids::LIME_TERRACOTTA,
+        "minecraft:gray_terracotta" => block_state_ids::GRAY_TERRACOTTA,
+        "minecraft:black_terracotta" => block_state_ids::BLACK_TERRACOTTA,
+        "minecraft:black_concrete" => block_state_ids::BLACK_CONCRETE,
+        "minecraft:sand" => block_state_ids::SAND,
+        "minecraft:sandstone" => block_state_ids::SANDSTONE,
+        "minecraft:end_stone" => block_state_ids::END_STONE,
+        "minecraft:end_stone_bricks" => block_state_ids::END_STONE_BRICKS,
+        "minecraft:smooth_sandstone" => block_state_ids::SMOOTH_SANDSTONE,
+        "minecraft:cut_sandstone" => block_state_ids::CUT_SANDSTONE,
+        "minecraft:chiseled_sandstone" => block_state_ids::CHISELED_SANDSTONE,
+        "minecraft:smooth_red_sandstone" => block_state_ids::SMOOTH_RED_SANDSTONE,
+        "minecraft:cut_red_sandstone" => block_state_ids::CUT_RED_SANDSTONE,
+        "minecraft:chiseled_red_sandstone" => block_state_ids::CHISELED_RED_SANDSTONE,
+        "minecraft:mud_bricks" => block_state_ids::MUD_BRICKS,
+        "minecraft:dripstone_block" => block_state_ids::DRIPSTONE_BLOCK,
+        "minecraft:yellow_terracotta" => block_state_ids::YELLOW_TERRACOTTA,
+        "minecraft:white_terracotta" => block_state_ids::WHITE_TERRACOTTA,
+        "minecraft:light_gray_terracotta" => block_state_ids::LIGHT_GRAY_TERRACOTTA,
+        "minecraft:bone_block" => block_state_ids::BONE_BLOCK,
+        "minecraft:calcite" => block_state_ids::CALCITE,
+        "minecraft:quartz_block" => block_state_ids::QUARTZ_BLOCK,
+        "minecraft:gravel" => block_state_ids::GRAVEL,
+        "minecraft:terracotta" => block_state_ids::TERRACOTTA,
+        "minecraft:red_sand" => block_state_ids::RED_SAND,
+        "minecraft:orange_terracotta" => block_state_ids::ORANGE_TERRACOTTA,
+        "minecraft:red_terracotta" => block_state_ids::RED_TERRACOTTA,
+        "minecraft:brown_terracotta" => block_state_ids::BROWN_TERRACOTTA,
+        "minecraft:granite" => block_state_ids::GRANITE,
+        "minecraft:stone" => block_state_ids::STONE,
+        "minecraft:tuff" => block_state_ids::TUFF,
+        "minecraft:deepslate" => block_state_ids::DEEPSLATE,
+        "minecraft:andesite" => block_state_ids::ANDESITE,
+        "minecraft:diorite" => block_state_ids::DIORITE,
+        "minecraft:cyan_terracotta" => block_state_ids::CYAN_TERRACOTTA,
+        "minecraft:snow_block" => block_state_ids::SNOW_BLOCK,
+        "minecraft:clay" => block_state_ids::CLAY,
+        _ => return None,
+    })
+}
+
+fn is_air_block(block_name: &str) -> bool {
+    matches!(
+        block_name,
+        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+    )
+}
+
+fn is_water_like_block(block_name: &str) -> bool {
+    block_name == "minecraft:water"
+        || block_name.contains("seagrass")
+        || block_name.contains("kelp")
+}
+
+fn is_leaf_block_name(block_name: &str) -> bool {
+    block_name.ends_with("_leaves") || block_name.contains("azalea_leaves")
+}
+
+fn is_log_block(block_name: &str) -> bool {
+    block_name.ends_with("_log")
+        || block_name.ends_with("_wood")
+        || block_name.ends_with("_stem")
+        || block_name.ends_with("_hyphae")
+}
+
+fn is_plant_like_block(block_name: &str) -> bool {
+    block_name.ends_with("_grass")
+        || block_name.ends_with("_fern")
+        || block_name.ends_with("_flower")
+        || block_name.ends_with("_sapling")
+        || block_name.ends_with("_bush")
+        || matches!(
+            block_name,
+            "minecraft:fern"
+                | "minecraft:bush"
+                | "minecraft:glow_lichen"
+                | "minecraft:lily_pad"
+                | "minecraft:leaf_litter"
+                | "minecraft:hanging_roots"
+                | "minecraft:spore_blossom"
+                | "minecraft:pointed_dripstone"
+        )
+        || block_name.contains("bamboo")
+        || block_name.contains("cactus")
+        || block_name.contains("coral")
+        || block_name.contains("pickle")
+        || block_name.contains("sugar_cane")
+        || block_name.contains("cocoa")
+        || block_name.contains("dandelion")
+        || block_name.contains("poppy")
+        || block_name.contains("melon")
+        || block_name.contains("pumpkin")
+        || block_name.contains("mushroom")
+        || block_name.contains("roots")
+        || block_name.contains("vines")
+        || block_name.contains("vine")
+}
+
+fn water_color_for_biome(biome_id: &str) -> (u8, u8, u8) {
+    let biome = biome_id.to_ascii_lowercase();
+    if biome.contains("swamp") || biome.contains("mangrove") {
+        return (38, 55, 38);
+    }
+    if biome.contains("deep") {
+        if biome.contains("warm") {
+            return (8, 40, 58);
+        }
+        if biome.contains("cold") || biome.contains("frozen") {
+            return (10, 30, 58);
+        }
+        return (4, 18, 42);
+    }
+    if biome.contains("lukewarm") {
+        return (14, 58, 84);
+    }
+    if biome.contains("warm") {
+        return (18, 78, 94);
+    }
+    if biome.contains("cold") || biome.contains("frozen") {
+        return (27, 61, 85);
+    }
+    if biome.contains("river") {
+        return (16, 54, 89);
+    }
+    if biome.contains("ocean") {
+        return (6, 24, 54);
+    }
+    (8, 28, 59)
+}
+
+fn fallback_color_for_block_name(block_name: &str) -> (u8, u8, u8) {
+    let hash = java_string_hash_code(&block_name.to_ascii_lowercase()) as u32;
+    (
+        (64 + ((hash >> 16) & 0x7f)) as u8,
+        (64 + ((hash >> 8) & 0x7f)) as u8,
+        (64 + (hash & 0x7f)) as u8,
+    )
+}
+
+fn java_string_hash_code(text: &str) -> i32 {
+    let mut hash = 0i32;
+    for unit in text.encode_utf16() {
+        hash = hash.wrapping_mul(31).wrapping_add(i32::from(unit));
+    }
+    hash
+}
+
 fn convert_mca_region_to_linear(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -7212,6 +7966,54 @@ mod tests {
         )
     }
 
+    fn read_png_rgb(path: &Path) -> (u32, u32, Vec<u8>) {
+        let decoder = png::Decoder::new(fs::File::open(path).unwrap());
+        let mut reader = decoder.read_info().unwrap();
+        let mut buffer = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buffer).unwrap();
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        (
+            info.width,
+            info.height,
+            buffer[..info.buffer_size()].to_vec(),
+        )
+    }
+
+    fn generate_single_chunk_render_world(world_dir: &Path, format: TopdownFormat) {
+        let region_dir = world_dir.join("region");
+        fs::create_dir_all(&region_dir).unwrap();
+        let settings = level_dat_template::Settings::new(
+            "topdown-single-chunk",
+            0,
+            8,
+            FLAT_TEST_SURFACE_Y + 2,
+            8,
+        )
+        .unwrap();
+        level_dat_template::write(world_dir.join("level.dat"), &settings).unwrap();
+
+        let mut payloads = BTreeMap::new();
+        let chunk = flat_test_chunk(0, 0).unwrap();
+        let bytes = chunk_nbt_encoder::encode_to_bytes(&chunk, 0).unwrap();
+        payloads.insert(ChunkLocalPos::new(0, 0).unwrap(), bytes);
+
+        match format {
+            TopdownFormat::Mca => {
+                earthmap_region::write_mca_region(&region_dir.join("r.0.0.mca"), &payloads, 0)
+                    .unwrap();
+            }
+            TopdownFormat::Linear => {
+                earthmap_region::write_linear_v2_region(
+                    &region_dir.join("r.0.0.linear"),
+                    &payloads,
+                    0,
+                )
+                .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn resume_journal_loads_completed_regions_for_matching_fingerprint() {
         let temp = tempdir().unwrap();
@@ -7487,6 +8289,8 @@ mod tests {
         assert!(
             out.contains("DONE rust.command.inspect-linear-statuses - Linear chunk status scanner")
         );
+        assert!(out.contains("DONE rust.command.mca-topdown-render - MCA top-down render"));
+        assert!(out.contains("DONE rust.command.linear-topdown-render - Linear V2 top-down render"));
     }
 
     #[test]
@@ -8218,6 +9022,88 @@ mod tests {
         assert!(out.contains("missingInMca=0\n"));
         assert!(out.contains("missingInLinear=0\n"));
         assert!(out.contains("firstMismatch=\n"));
+    }
+
+    #[test]
+    fn mca_topdown_render_reports_flat_fixture() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat-mca");
+        let output = temp.path().join("mca-topdown.png");
+        generate_single_chunk_render_world(&world, TopdownFormat::Mca);
+
+        let (code, out, err) = run_capture(&[
+            "mca-topdown-render",
+            world.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "0",
+            "0",
+            "1",
+            "1",
+            "visible",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA top-down render written\n"));
+        assert!(out.contains("width=512\n"));
+        assert!(out.contains("height=512\n"));
+        assert!(out.contains("mode=visible\n"));
+        assert!(out.contains("regionCount=1\n"));
+        assert!(out.contains("missingRegions=0\n"));
+        assert!(out.contains("chunkCount=1\n"));
+        assert!(out.contains("missingChunks=1023\n"));
+        assert!(out.contains("columnCount=256\n"));
+        assert!(out.contains("airColumns=0\n"));
+        let metadata = fs::read_to_string(temp.path().join("mca-topdown.properties")).unwrap();
+        assert!(metadata.contains("chunkCount=1\n"));
+        let (width, height, pixels) = read_png_rgb(&output);
+        assert_eq!((width, height), (512, 512));
+        assert_eq!(&pixels[0..3], &[100, 146, 67]);
+        assert_eq!(
+            &pixels[((CHUNK_WIDTH * 512) * 3)..((CHUNK_WIDTH * 512) * 3 + 3)],
+            &[0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn linear_topdown_render_reports_flat_fixture() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat-linear");
+        let output = temp.path().join("linear-topdown.png");
+        generate_single_chunk_render_world(&world, TopdownFormat::Linear);
+
+        let (code, out, err) = run_capture(&[
+            "linear-topdown-render",
+            world.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "0",
+            "0",
+            "1",
+            "1",
+            "terrain",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear top-down render written\n"));
+        assert!(out.contains("width=512\n"));
+        assert!(out.contains("height=512\n"));
+        assert!(out.contains("mode=terrain\n"));
+        assert!(out.contains("regionCount=1\n"));
+        assert!(out.contains("missingRegions=0\n"));
+        assert!(out.contains("chunkCount=1\n"));
+        assert!(out.contains("missingChunks=1023\n"));
+        assert!(out.contains("columnCount=256\n"));
+        assert!(out.contains("airColumns=0\n"));
+        let metadata = fs::read_to_string(temp.path().join("linear-topdown.properties")).unwrap();
+        assert!(metadata.contains("mode=terrain\n"));
+        let (width, height, pixels) = read_png_rgb(&output);
+        assert_eq!((width, height), (512, 512));
+        assert_eq!(&pixels[0..3], &[100, 146, 67]);
+        assert_eq!(
+            &pixels[((CHUNK_WIDTH * 512) * 3)..((CHUNK_WIDTH * 512) * 3 + 3)],
+            &[0, 0, 0]
+        );
     }
 
     #[test]

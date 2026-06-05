@@ -66,8 +66,13 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "mca-topdown-render",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "MCA top-down render",
+    },
+    CommandSpec {
+        name: "linear-topdown-render",
+        status: CommandStatus::Implemented,
+        note: "Linear V2 top-down render",
     },
     CommandSpec {
         name: "validate-mca-region",
