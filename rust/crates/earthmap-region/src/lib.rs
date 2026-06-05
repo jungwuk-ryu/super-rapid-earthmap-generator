@@ -18,6 +18,7 @@ const MCA_SECTOR_BYTES: usize = 4096;
 const MCA_HEADER_BYTES: usize = MCA_SECTOR_BYTES * 2;
 const MCA_HEADER_SECTORS: usize = 2;
 const MCA_COMPRESSION_ZLIB: u8 = 2;
+const MCA_DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 
 const LINEAR_SUPERBLOCK: u64 = 0xc3ff_1318_3cca_9d9a;
 const LINEAR_VERSION: u8 = 3;
@@ -112,11 +113,30 @@ pub fn write_mca_region(
     chunk_payloads: &BTreeMap<ChunkLocalPos, Vec<u8>>,
     timestamp: i32,
 ) -> Result<()> {
+    write_mca_region_with_compression(
+        path,
+        chunk_payloads,
+        timestamp,
+        MCA_DEFAULT_COMPRESSION_LEVEL,
+    )
+}
+
+pub fn write_mca_region_with_compression(
+    path: impl AsRef<Path>,
+    chunk_payloads: &BTreeMap<ChunkLocalPos, Vec<u8>>,
+    timestamp: i32,
+    compression_level: u32,
+) -> Result<()> {
+    if compression_level > 9 {
+        return Err(RegionError::Invalid(
+            "mcaCompression must be in the zlib range 0..9".to_string(),
+        ));
+    }
     let path = path.as_ref();
     let mut entries = Vec::new();
     for (pos, payload) in chunk_payloads {
         validate_payload(*pos, payload)?;
-        let compressed = zlib(payload)?;
+        let compressed = zlib(payload, compression_level)?;
         let chunk_length = compressed
             .len()
             .checked_add(1)
@@ -262,8 +282,8 @@ pub fn sectors_for(byte_count: usize) -> Result<usize> {
     Ok(byte_count.div_ceil(MCA_SECTOR_BYTES))
 }
 
-fn zlib(payload: &[u8]) -> Result<Vec<u8>> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+fn zlib(payload: &[u8], compression_level: u32) -> Result<Vec<u8>> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(compression_level));
     encoder.write_all(payload)?;
     Ok(encoder.finish()?)
 }
@@ -817,6 +837,37 @@ mod tests {
         assert_eq!(read_u32_be(&bytes, timestamp_offset).unwrap(), 42);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn writes_mca_region_with_custom_compression_round_trip_payloads() {
+        let path = temp_region_path("r.1.0.mca");
+        let payloads = sample_payloads();
+
+        write_mca_region_with_compression(&path, &payloads, 42, 9)
+            .expect("MCA region should write with custom compression");
+        let region = read_region_payloads(&path).expect("MCA region should read");
+
+        assert_eq!(region.format, RegionFormat::Mca);
+        assert_eq!(region.region_x, 1);
+        assert_eq!(region.region_z, 0);
+        assert_eq!(region.chunks, payloads);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_mca_compression_outside_zlib_range() {
+        let error = write_mca_region_with_compression(
+            temp_region_path("r.0.1.mca"),
+            &sample_payloads(),
+            42,
+            10,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("0..9"));
     }
 
     #[test]

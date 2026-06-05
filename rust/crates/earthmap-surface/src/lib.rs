@@ -250,6 +250,8 @@ pub struct SurfaceRegionSettings {
     pub surface_material_path: Option<PathBuf>,
     pub surface_tile_cache_entries: usize,
     pub parallel_column_sampling: bool,
+    pub mca_compression_level: Option<u32>,
+    pub linear_compression_level: Option<i32>,
 }
 
 impl SurfaceRegionSettings {
@@ -357,6 +359,8 @@ impl SurfaceRegionSettings {
             surface_material_path: None,
             surface_tile_cache_entries: DEFAULT_SURFACE_TILE_CACHE_ENTRIES,
             parallel_column_sampling: true,
+            mca_compression_level: None,
+            linear_compression_level: None,
         })
     }
 }
@@ -10490,12 +10494,7 @@ pub fn generate_height_only_region(
         settings.region_x,
         settings.region_z,
     );
-    match settings.output_format {
-        OutputFormat::Mca => earthmap_region::write_mca_region(&region_file, &chunks, 0)?,
-        OutputFormat::LinearV2 => {
-            earthmap_region::write_linear_v2_region(&region_file, &chunks, 0)?
-        }
-    }
+    write_region_file(settings.output_format, &region_file, &chunks)?;
     write_exploration_only_manifest(settings)?;
 
     Ok(HeightOnlyRegionReport {
@@ -10659,12 +10658,7 @@ pub fn generate_surface_region_with_open_material_sampler(
         settings.region_z,
     );
     let phase_start = Instant::now();
-    match settings.output_format {
-        OutputFormat::Mca => earthmap_region::write_mca_region(&region_file, &chunks, 0)?,
-        OutputFormat::LinearV2 => {
-            earthmap_region::write_linear_v2_region(&region_file, &chunks, 0)?
-        }
-    }
+    write_region_with_settings(settings, &region_file, &chunks)?;
     let region_write_nanos = phase_start.elapsed().as_nanos();
 
     if settings.write_world_metadata {
@@ -15531,6 +15525,49 @@ fn region_file(
     world_dir
         .join("region")
         .join(format!("r.{region_x}.{region_z}.{extension}"))
+}
+
+fn write_region_with_settings(
+    settings: &SurfaceRegionSettings,
+    region_file: &Path,
+    chunks: &BTreeMap<ChunkLocalPos, Vec<u8>>,
+) -> Result<()> {
+    match settings.output_format {
+        OutputFormat::Mca => {
+            if let Some(level) = settings.mca_compression_level {
+                earthmap_region::write_mca_region_with_compression(region_file, chunks, 0, level)?;
+            } else {
+                earthmap_region::write_mca_region(region_file, chunks, 0)?;
+            }
+        }
+        OutputFormat::LinearV2 => {
+            if let Some(level) = settings.linear_compression_level {
+                earthmap_region::write_linear_v2_region_with_compression(
+                    region_file,
+                    chunks,
+                    0,
+                    level,
+                )?;
+            } else {
+                earthmap_region::write_linear_v2_region(region_file, chunks, 0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_region_file(
+    output_format: OutputFormat,
+    region_file: &Path,
+    chunks: &BTreeMap<ChunkLocalPos, Vec<u8>>,
+) -> Result<()> {
+    match output_format {
+        OutputFormat::Mca => earthmap_region::write_mca_region(region_file, chunks, 0)?,
+        OutputFormat::LinearV2 => {
+            earthmap_region::write_linear_v2_region(region_file, chunks, 0)?;
+        }
+    }
+    Ok(())
 }
 
 fn java_math_round_double_to_narrowed_i32(value: f64) -> i32 {

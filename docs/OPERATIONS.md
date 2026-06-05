@@ -44,6 +44,28 @@ GUI area setup:
 - Scale denominator `1000` means roughly one Minecraft block per kilometer at the equator. Smaller values generate
   larger worlds; larger values generate smaller worlds.
 
+GUI generation setup:
+
+- Choose `linear` for DivineMC Linear region output or `mca` for classic Minecraft region output.
+- Linear compression is zstd level `1..22`; default is `4`. Lower values are faster, higher values can produce smaller
+  `.linear` files.
+- MCA compression is zlib level `0..9`; default is `6`. Lower values are faster, higher values can produce smaller
+  `.mca` files.
+
+The same options are available from the CLI:
+
+```powershell
+cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
+  generate-vanilla-delegated-regions-parallel C:\earth_map_resources\HQheightmap.tif D:\worldgen 1000 `
+  26 -10 3 3 linear 8 surface surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt linearCompression=4
+
+cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
+  generate-vanilla-delegated-regions-parallel C:\earth_map_resources\HQheightmap.tif D:\worldgen 1000 `
+  26 -10 3 3 mca 8 surface surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt mcaCompression=6
+```
+
+`compression=N` can be used instead of the format-specific key; it applies to the selected output format.
+
 Fast filtered test:
 
 ```powershell

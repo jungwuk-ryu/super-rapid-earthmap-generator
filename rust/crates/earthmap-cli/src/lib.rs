@@ -225,7 +225,7 @@ where
             write_result(playability_smoke(stdout, stderr, &args[1], &args[2]))
         }
         "generate-vanilla-delegated-region"
-            if (6..=9).contains(&args.len()) && vanilla_delegated_args(&args).is_some() =>
+            if args.len() >= 6 && vanilla_delegated_args(&args).is_some() =>
         {
             let parsed = vanilla_delegated_args(&args).expect("validated vanilla delegated args");
             write_result(generate_vanilla_delegated_region(
@@ -239,11 +239,11 @@ where
                 parsed.format,
                 parsed.status,
                 parsed.surface_raster,
+                parsed.extra_options,
             ))
         }
         "generate-vanilla-delegated-regions-parallel"
-            if (10..=12).contains(&args.len())
-                && vanilla_delegated_regions_parallel_args(&args).is_some() =>
+            if args.len() >= 10 && vanilla_delegated_regions_parallel_args(&args).is_some() =>
         {
             let parsed = vanilla_delegated_regions_parallel_args(&args)
                 .expect("validated vanilla delegated parallel args");
@@ -261,6 +261,7 @@ where
                 parsed.threads,
                 parsed.status,
                 parsed.surface_raster,
+                parsed.extra_options,
             ))
         }
         "trace-surface-region-column" if (6..=8).contains(&args.len()) => {
@@ -370,6 +371,7 @@ struct VanillaDelegatedArgs<'a> {
     format: &'a str,
     status: &'a str,
     surface_raster: &'a str,
+    extra_options: &'a [String],
 }
 
 struct VanillaDelegatedRegionsParallelArgs<'a> {
@@ -384,6 +386,7 @@ struct VanillaDelegatedRegionsParallelArgs<'a> {
     threads: &'a str,
     status: &'a str,
     surface_raster: &'a str,
+    extra_options: &'a [String],
 }
 
 struct QualityCandidateArgs<'a> {
@@ -441,7 +444,7 @@ fn optional_quality_candidate_args(args: &[String], first_optional: usize) -> (&
 fn vanilla_delegated_args(args: &[String]) -> Option<VanillaDelegatedArgs<'_>> {
     let uses_default_heightmap = args.get(5).is_some_and(|arg| is_output_format_text(arg));
     if uses_default_heightmap {
-        let (status, surface_raster) = optional_status_and_surface_raster(args, 6);
+        let optional = optional_generation_args(args, 6);
         return Some(VanillaDelegatedArgs {
             heightmap_path: DEFAULT_HEIGHTMAP_PATH,
             world_dir: args[1].as_str(),
@@ -449,14 +452,15 @@ fn vanilla_delegated_args(args: &[String]) -> Option<VanillaDelegatedArgs<'_>> {
             region_x: args[3].as_str(),
             region_z: args[4].as_str(),
             format: args[5].as_str(),
-            status,
-            surface_raster,
+            status: optional.status,
+            surface_raster: optional.surface_raster,
+            extra_options: optional.extra_options,
         });
     }
     if !args.get(6).is_some_and(|arg| is_output_format_text(arg)) {
         return None;
     }
-    let (status, surface_raster) = optional_status_and_surface_raster(args, 7);
+    let optional = optional_generation_args(args, 7);
     Some(VanillaDelegatedArgs {
         heightmap_path: args[1].as_str(),
         world_dir: args[2].as_str(),
@@ -464,8 +468,9 @@ fn vanilla_delegated_args(args: &[String]) -> Option<VanillaDelegatedArgs<'_>> {
         region_x: args[4].as_str(),
         region_z: args[5].as_str(),
         format: args[6].as_str(),
-        status,
-        surface_raster,
+        status: optional.status,
+        surface_raster: optional.surface_raster,
+        extra_options: optional.extra_options,
     })
 }
 
@@ -475,7 +480,7 @@ fn vanilla_delegated_regions_parallel_args(
     if !args.get(8).is_some_and(|arg| is_output_format_text(arg)) {
         return None;
     }
-    let (status, surface_raster) = optional_status_and_surface_raster(args, 10);
+    let optional = optional_generation_args(args, 10);
     Some(VanillaDelegatedRegionsParallelArgs {
         heightmap_path: args[1].as_str(),
         world_dir: args[2].as_str(),
@@ -486,27 +491,148 @@ fn vanilla_delegated_regions_parallel_args(
         rows: args[7].as_str(),
         format: args[8].as_str(),
         threads: args[9].as_str(),
-        status,
-        surface_raster,
+        status: optional.status,
+        surface_raster: optional.surface_raster,
+        extra_options: optional.extra_options,
     })
 }
 
-fn optional_status_and_surface_raster(args: &[String], first_optional: usize) -> (&str, &str) {
-    if args.len() == first_optional + 1
-        && args
-            .get(first_optional)
-            .is_some_and(|arg| arg.contains('='))
-    {
-        return ("surface", args[first_optional].as_str());
+struct GenerationOptionalArgs<'a> {
+    status: &'a str,
+    surface_raster: &'a str,
+    extra_options: &'a [String],
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RegionCompressionOptions {
+    mca_compression_level: Option<u32>,
+    linear_compression_level: Option<i32>,
+}
+
+fn optional_generation_args(args: &[String], first_optional: usize) -> GenerationOptionalArgs<'_> {
+    let rest = args.get(first_optional..).unwrap_or(&[]);
+    if rest.is_empty() {
+        return GenerationOptionalArgs {
+            status: "surface",
+            surface_raster: "surfaceRaster=auto",
+            extra_options: &[],
+        };
     }
-    (
-        args.get(first_optional)
-            .map(String::as_str)
-            .unwrap_or("surface"),
-        args.get(first_optional + 1)
-            .map(String::as_str)
-            .unwrap_or("surfaceRaster=auto"),
-    )
+    if is_surface_raster_option(&rest[0]) {
+        return GenerationOptionalArgs {
+            status: "surface",
+            surface_raster: rest[0].as_str(),
+            extra_options: &rest[1..],
+        };
+    }
+    if rest[0].contains('=') {
+        return GenerationOptionalArgs {
+            status: "surface",
+            surface_raster: "surfaceRaster=auto",
+            extra_options: rest,
+        };
+    }
+    let status = rest[0].as_str();
+    if rest.len() >= 2 && (is_surface_raster_option(&rest[1]) || !rest[1].contains('=')) {
+        GenerationOptionalArgs {
+            status,
+            surface_raster: rest[1].as_str(),
+            extra_options: &rest[2..],
+        }
+    } else {
+        GenerationOptionalArgs {
+            status,
+            surface_raster: "surfaceRaster=auto",
+            extra_options: &rest[1..],
+        }
+    }
+}
+
+fn is_surface_raster_option(value: &str) -> bool {
+    value
+        .split_once('=')
+        .is_some_and(|(key, _)| key.eq_ignore_ascii_case("surfaceRaster"))
+}
+
+fn parse_region_compression_options(
+    format: OutputFormat,
+    options: &[String],
+) -> std::result::Result<RegionCompressionOptions, String> {
+    let mut parsed = RegionCompressionOptions::default();
+    for option in options {
+        let (key, value) = option
+            .split_once('=')
+            .ok_or_else(|| format!("optional generation argument must be key=value: {option}"))?;
+        if key.eq_ignore_ascii_case("compression") || key.eq_ignore_ascii_case("compressionLevel") {
+            match format {
+                OutputFormat::Mca => {
+                    parsed.mca_compression_level = Some(parse_mca_compression_level(value)?);
+                }
+                OutputFormat::LinearV2 => {
+                    parsed.linear_compression_level = Some(parse_linear_compression_level(value)?);
+                }
+            }
+            continue;
+        }
+        if key.eq_ignore_ascii_case("mcaCompression")
+            || key.eq_ignore_ascii_case("mcaCompressionLevel")
+        {
+            parsed.mca_compression_level = Some(parse_mca_compression_level(value)?);
+            continue;
+        }
+        if key.eq_ignore_ascii_case("linearCompression")
+            || key.eq_ignore_ascii_case("linearCompressionLevel")
+        {
+            parsed.linear_compression_level = Some(parse_linear_compression_level(value)?);
+            continue;
+        }
+        return Err(format!("unknown generation option: {key}"));
+    }
+    Ok(parsed)
+}
+
+fn parse_mca_compression_level(value: &str) -> std::result::Result<u32, String> {
+    let level = value.parse::<u32>().map_err(|error| error.to_string())?;
+    if level > 9 {
+        return Err(format!(
+            "mcaCompression must be in the zlib range 0..9: {level}"
+        ));
+    }
+    Ok(level)
+}
+
+fn parse_linear_compression_level(value: &str) -> std::result::Result<i32, String> {
+    let level = parse_i32_string(value)?;
+    if !(1..=22).contains(&level) {
+        return Err(format!(
+            "linearCompression must be in the DivineMC-safe zstd range 1..22: {level}"
+        ));
+    }
+    Ok(level)
+}
+
+fn apply_region_compression_options(
+    settings: &mut SurfaceRegionSettings,
+    options: RegionCompressionOptions,
+) {
+    settings.mca_compression_level = options.mca_compression_level;
+    settings.linear_compression_level = options.linear_compression_level;
+}
+
+fn compression_options_report_line(
+    format: OutputFormat,
+    options: RegionCompressionOptions,
+) -> String {
+    match format {
+        OutputFormat::Mca => options
+            .mca_compression_level
+            .map(|level| format!("mcaCompression={level}"))
+            .unwrap_or_else(|| "mcaCompression=default".to_string()),
+        OutputFormat::LinearV2 => options
+            .linear_compression_level
+            .map(|level| format!("linearCompression={level}"))
+            .unwrap_or_else(|| "linearCompression=default".to_string()),
+    }
 }
 
 struct TraceColumnArgs<'a> {
@@ -641,6 +767,14 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  quality-candidate [heightmap] <worldDir> <scale> <regionX> <regionZ> <mca|linear> [surfaceRaster=auto|path|none] [sampleGrid=64]"
+    )?;
+    writeln!(
+        out,
+        "  generate-vanilla-delegated-region [heightmap] <worldDir> <scale> <regionX> <regionZ> <mca|linear> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+    )?;
+    writeln!(
+        out,
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(out, "  benchmark-region-writers <outputDir> [iterations=3]")?;
     writeln!(out, "  playability-smoke <worldDir> <outputJson>")?;
@@ -2639,6 +2773,7 @@ fn generate_vanilla_delegated_region(
     format_text: &str,
     status_text: &str,
     surface_raster_text: &str,
+    extra_options: &[String],
 ) -> io::Result<i32> {
     match generate_vanilla_delegated_region_impl(
         heightmap_path,
@@ -2649,6 +2784,7 @@ fn generate_vanilla_delegated_region(
         format_text,
         status_text,
         surface_raster_text,
+        extra_options,
     ) {
         Ok(lines) => {
             for line in lines {
@@ -2673,8 +2809,10 @@ fn generate_vanilla_delegated_region_impl(
     format_text: &str,
     status_text: &str,
     surface_raster_text: &str,
+    extra_options: &[String],
 ) -> std::result::Result<Vec<String>, String> {
     let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let compression_options = parse_region_compression_options(format, extra_options)?;
     let status = ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
     if status == ChunkGenerationStatus::Full {
         return Err("delegated generation status must be surface or carvers".to_string());
@@ -2708,6 +2846,7 @@ fn generate_vanilla_delegated_region_impl(
     .map_err(|error| error.to_string())?;
     settings.surface_material_path = Some(surface_material_path.clone());
     settings.surface_tile_cache_entries = surface_tile_cache_entries;
+    apply_region_compression_options(&mut settings, compression_options);
 
     let report =
         earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
@@ -2716,6 +2855,7 @@ fn generate_vanilla_delegated_region_impl(
         world_dir,
         status,
         &surface_material_path,
+        compression_options,
     ))
 }
 
@@ -2742,6 +2882,7 @@ fn generate_vanilla_delegated_regions_parallel(
     threads_text: &str,
     status_text: &str,
     surface_raster_text: &str,
+    extra_options: &[String],
 ) -> io::Result<i32> {
     match generate_vanilla_delegated_regions_parallel_impl(
         heightmap_path,
@@ -2755,6 +2896,7 @@ fn generate_vanilla_delegated_regions_parallel(
         threads_text,
         status_text,
         surface_raster_text,
+        extra_options,
     ) {
         Ok(lines) => {
             for line in lines {
@@ -2785,9 +2927,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     threads_text: &str,
     status_text: &str,
     surface_raster_text: &str,
+    extra_options: &[String],
 ) -> std::result::Result<Vec<String>, String> {
     let total_start = Instant::now();
     let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let compression_options = parse_region_compression_options(format, extra_options)?;
     let status = ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
     if status == ChunkGenerationStatus::Full {
         return Err("delegated generation status must be surface or carvers".to_string());
@@ -2899,6 +3043,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                     settings.surface_material_path = Some(surface_material_path.clone());
                     settings.surface_tile_cache_entries = surface_tile_cache_entries;
                     settings.parallel_column_sampling = worker_count <= 4;
+                    apply_region_compression_options(&mut settings, compression_options);
                     generate_surface_region_with_open_material_sampler(
                         &settings,
                         Some(&surface_material_sampler),
@@ -2957,6 +3102,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         "surfaceSamplerStrategy=shared".to_string(),
         format!("sharedCacheRows={cache_rows}"),
         format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
+        compression_options_report_line(format, compression_options),
         format!(
             "surfaceMaterialPath={}",
             normalized_path_display(&surface_material_path)
@@ -3606,6 +3752,7 @@ fn vanilla_delegated_region_report_lines(
     world_dir: &str,
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
+    compression_options: RegionCompressionOptions,
 ) -> Vec<String> {
     let mut lines = vec![
         "Vanilla-delegated surface region generated".to_string(),
@@ -3614,6 +3761,7 @@ fn vanilla_delegated_region_report_lines(
         format!("format={}", report.output_format.java_name()),
         format!("scale=1:{}", report.scale_denominator),
         format!("chunkStatus={}", status.id()),
+        compression_options_report_line(report.output_format, compression_options),
         format!(
             "surfaceMaterialPath={}",
             normalized_path_display(surface_material_path)
@@ -5863,6 +6011,7 @@ mod tests {
         assert_eq!(parsed.scale, "147760");
         assert_eq!(parsed.status, "full");
         assert_eq!(parsed.surface_raster, "surfaceRaster=D:\\surface.vrt");
+        assert!(parsed.extra_options.is_empty());
     }
 
     #[test]
@@ -5886,6 +6035,96 @@ mod tests {
         assert_eq!(parsed.scale, "147760");
         assert_eq!(parsed.status, "surface");
         assert_eq!(parsed.surface_raster, "surfaceRaster=D:\\surface.vrt");
+        assert!(parsed.extra_options.is_empty());
+    }
+
+    #[test]
+    fn vanilla_delegated_args_keep_compression_as_optional_generation_option() {
+        let args = [
+            "generate-vanilla-delegated-region",
+            "E:\\HQheightmap.tif",
+            "D:\\world",
+            "147760",
+            "0",
+            "0",
+            "linear",
+            "compression=9",
+        ]
+        .map(String::from);
+
+        let parsed = vanilla_delegated_args(&args).unwrap();
+
+        assert_eq!(parsed.status, "surface");
+        assert_eq!(parsed.surface_raster, "surfaceRaster=auto");
+        assert_eq!(parsed.extra_options, ["compression=9".to_string()]);
+    }
+
+    #[test]
+    fn vanilla_delegated_parallel_args_keep_surface_raster_and_compression_options() {
+        let args = [
+            "generate-vanilla-delegated-regions-parallel",
+            "E:\\HQheightmap.tif",
+            "D:\\world",
+            "1000",
+            "26",
+            "-10",
+            "3",
+            "3",
+            "mca",
+            "8",
+            "carvers",
+            "surfaceRaster=D:\\surface.vrt",
+            "mcaCompression=9",
+        ]
+        .map(String::from);
+
+        let parsed = vanilla_delegated_regions_parallel_args(&args).unwrap();
+
+        assert_eq!(parsed.status, "carvers");
+        assert_eq!(parsed.surface_raster, "surfaceRaster=D:\\surface.vrt");
+        assert_eq!(parsed.extra_options, ["mcaCompression=9".to_string()]);
+    }
+
+    #[test]
+    fn region_compression_options_apply_generic_key_to_selected_format() {
+        let linear = parse_region_compression_options(
+            OutputFormat::LinearV2,
+            &["compression=9".to_string()],
+        )
+        .unwrap();
+        let mca =
+            parse_region_compression_options(OutputFormat::Mca, &["compression=3".to_string()])
+                .unwrap();
+
+        assert_eq!(
+            linear,
+            RegionCompressionOptions {
+                linear_compression_level: Some(9),
+                mca_compression_level: None
+            }
+        );
+        assert_eq!(
+            mca,
+            RegionCompressionOptions {
+                linear_compression_level: None,
+                mca_compression_level: Some(3)
+            }
+        );
+    }
+
+    #[test]
+    fn region_compression_options_reject_out_of_range_values() {
+        let mca_error =
+            parse_region_compression_options(OutputFormat::Mca, &["mcaCompression=10".to_string()])
+                .unwrap_err();
+        let linear_error = parse_region_compression_options(
+            OutputFormat::LinearV2,
+            &["linearCompression=23".to_string()],
+        )
+        .unwrap_err();
+
+        assert!(mca_error.contains("0..9"));
+        assert!(linear_error.contains("1..22"));
     }
 
     #[test]
@@ -6590,6 +6829,7 @@ manifestFile={}\n",
             world.to_str().unwrap(),
             ChunkGenerationStatus::Surface,
             &material,
+            RegionCompressionOptions::default(),
         )
         .join("\n")
             + "\n";
@@ -6603,6 +6843,7 @@ regionZ=-1\n\
 format=LINEAR_V2\n\
 scale=1:5000\n\
 chunkStatus=minecraft:surface\n\
+linearCompression=default\n\
 surfaceMaterialPath={}\n\
 serverDelegation=true\n\
 directCaves=false\n\

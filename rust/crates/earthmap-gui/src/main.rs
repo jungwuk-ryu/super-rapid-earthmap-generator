@@ -201,6 +201,8 @@ struct GenerationOptions {
     cols: i32,
     rows: i32,
     format: OutputFormatChoice,
+    linear_compression_level: i32,
+    mca_compression_level: u32,
     threads: usize,
     status: ChunkStatusChoice,
     cache_rows: String,
@@ -224,6 +226,8 @@ impl Default for GenerationOptions {
             cols: 3,
             rows: 3,
             format: OutputFormatChoice::Linear,
+            linear_compression_level: 4,
+            mca_compression_level: 6,
             threads: 8,
             status: ChunkStatusChoice::Surface,
             cache_rows: DEFAULT_CACHE_ROWS.to_string(),
@@ -249,6 +253,20 @@ impl GenerationOptions {
             trimmed.to_string()
         } else {
             format!("surfaceRaster={trimmed}")
+        }
+    }
+
+    fn compression_option(&self) -> String {
+        match self.format {
+            OutputFormatChoice::Linear => {
+                format!(
+                    "linearCompression={}",
+                    self.linear_compression_level.clamp(1, 22)
+                )
+            }
+            OutputFormatChoice::Mca => {
+                format!("mcaCompression={}", self.mca_compression_level.min(9))
+            }
         }
     }
 
@@ -289,6 +307,7 @@ fn build_generation_args(options: &GenerationOptions) -> Vec<String> {
         options.threads.max(1).to_string(),
         options.status.as_cli_arg().to_string(),
         options.normalized_surface_raster(),
+        options.compression_option(),
     ]
 }
 
@@ -855,6 +874,30 @@ impl eframe::App for EarthMapGuiApp {
                         );
                     });
                 ui.small("Linear is recommended for fast inspection. MCA is the classic Minecraft region format.");
+                match self.options.format {
+                    OutputFormatChoice::Linear => {
+                        ui.horizontal(|ui| {
+                            ui.label("Linear compression");
+                            ui.add(
+                                egui::DragValue::new(
+                                    &mut self.options.linear_compression_level,
+                                )
+                                .range(1..=22),
+                            );
+                        });
+                        ui.small("zstd level. 1 is fastest, 22 is smallest. Default is 4.");
+                    }
+                    OutputFormatChoice::Mca => {
+                        ui.horizontal(|ui| {
+                            ui.label("MCA compression");
+                            ui.add(
+                                egui::DragValue::new(&mut self.options.mca_compression_level)
+                                    .range(0..=9),
+                            );
+                        });
+                        ui.small("zlib level. 0 is fastest, 9 is smallest. Default is 6.");
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label("Height cache rows");
                     ui.text_edit_singleline(&mut self.options.cache_rows);
@@ -1100,6 +1143,7 @@ mod tests {
             args[11],
             r"surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt"
         );
+        assert_eq!(args[12], "linearCompression=4");
     }
 
     #[test]
@@ -1110,6 +1154,18 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[11], r"surfaceRaster=D:\earthmap\TrueMarble.vrt");
+    }
+
+    #[test]
+    fn mca_generation_args_include_selected_compression_level() {
+        let options = GenerationOptions {
+            format: OutputFormatChoice::Mca,
+            mca_compression_level: 9,
+            ..GenerationOptions::default()
+        };
+        let args = build_generation_args(&options);
+        assert_eq!(args[8], "mca");
+        assert_eq!(args[12], "mcaCompression=9");
     }
 
     #[test]
