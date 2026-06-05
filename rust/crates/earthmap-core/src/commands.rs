@@ -115,6 +115,56 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "synthetic underground fluid validator",
     },
     CommandSpec {
+        name: "scan-osm-pbf",
+        status: CommandStatus::Implemented,
+        note: "OSM PBF prefix scanner",
+    },
+    CommandSpec {
+        name: "scan-osm-pbf-range",
+        status: CommandStatus::Implemented,
+        note: "OSM PBF ranged prefix scanner",
+    },
+    CommandSpec {
+        name: "validate-osm-pbf",
+        status: CommandStatus::Implemented,
+        note: "OSM PBF scanned-prefix integrity validator",
+    },
+    CommandSpec {
+        name: "benchmark-osm-index",
+        status: CommandStatus::Implemented,
+        note: "synthetic OSM region index benchmark",
+    },
+    CommandSpec {
+        name: "extract-osm-region-mask",
+        status: CommandStatus::Implemented,
+        note: "OSM PBF region feature mask extractor",
+    },
+    CommandSpec {
+        name: "extract-osm-region-mask-window",
+        status: CommandStatus::Implemented,
+        note: "bounded OSM PBF node/way window mask extractor",
+    },
+    CommandSpec {
+        name: "extract-osm-region-mask-ref-window",
+        status: CommandStatus::Implemented,
+        note: "bounded OSM PBF way-reference mask extractor",
+    },
+    CommandSpec {
+        name: "extract-osm-region-mask-full-scan",
+        status: CommandStatus::Implemented,
+        note: "OSM PBF full-scan region feature mask extractor",
+    },
+    CommandSpec {
+        name: "extract-osm-xml-region-mask",
+        status: CommandStatus::Implemented,
+        note: "OSM XML cache region feature mask extractor",
+    },
+    CommandSpec {
+        name: "identify-osm-xml-cache",
+        status: CommandStatus::Implemented,
+        note: "OSM XML cache source identity reporter",
+    },
+    CommandSpec {
         name: "quality-production-sample-batch",
         status: CommandStatus::Implemented,
         note: "Rust quality gate production sample batch",

@@ -380,30 +380,41 @@ Detailed progress:
 Replacement note: legacy direct survival ecology and synthetic OSM generation names now dispatch to Rust vanilla-delegated surface generation. PBF/XML OSM overlay commands remain open until they are either ported as bounded Rust overlay tools or explicitly retired with a separate replacement path.
 
 ### OSM scan, validate, and extract commands
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
+- [x] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust command-contract tests covered; speedup TBD; peak memory TBD; output PBF scan stdout, PBF/XML mask stdout, full-scan progress file; workload synthetic PBF/XML command-contract smoke.
 Covered commands:
-- [ ] `scan-osm-pbf`
-- [ ] `scan-osm-pbf-range`
-- [ ] `validate-osm-pbf`
-- [ ] `benchmark-osm-index`
-- [ ] `extract-osm-region-mask`
-- [ ] `extract-osm-region-mask-window`
-- [ ] `extract-osm-region-mask-ref-window`
-- [ ] `extract-osm-region-mask-full-scan`
-- [ ] `extract-osm-xml-region-mask`
-- [ ] `identify-osm-xml-cache`
+- [x] `scan-osm-pbf`
+- [x] `scan-osm-pbf-range`
+- [x] `validate-osm-pbf`
+- [x] `benchmark-osm-index`
+- [x] `extract-osm-region-mask`
+- [x] `extract-osm-region-mask-window`
+- [x] `extract-osm-region-mask-ref-window`
+- [x] `extract-osm-region-mask-full-scan`
+- [x] `extract-osm-xml-region-mask`
+- [x] `identify-osm-xml-cache`
 Detailed progress:
-- [ ] PBF scanning is streaming and bounded by blob limits.
-- [ ] Mask extraction supports the existing region/window semantics.
+- [x] PBF scanning is streaming and bounded by blob limits.
+- [x] Mask extraction supports the existing region/window semantics.
 - [ ] Benchmarks include a small PBF scan and a full-scan workload.
+Specs:
+- `earthmap-rs scan-osm-pbf <path> <maxBlobs>` and `scan-osm-pbf-range <path> <skipBlobs> <maxBlobs>` stream PBF blobs and report OSM header/data counts plus primitive statistics.
+- `earthmap-rs validate-osm-pbf <path> <maxBlobs>` exits 0 for a valid scanned prefix and reports blob/byte failure details on invalid input.
+- `earthmap-rs benchmark-osm-index <scale> <regionX> <regionZ> <wayCount>` runs a synthetic region index benchmark and reports setup/index timing.
+- `earthmap-rs extract-osm-region-mask <path> <scale> <regionX> <regionZ> <maxBlobs>` extracts region feature masks from bounded PBF scans.
+- `earthmap-rs extract-osm-region-mask-window <path> <scale> <regionX> <regionZ> <nodeMaxBlobs> <waySkipBlobs> <wayMaxBlobs>` preserves node/way window extraction semantics.
+- `earthmap-rs extract-osm-region-mask-ref-window <path> <scale> <regionX> <regionZ> <nodeMaxBlobs> <waySkipBlobs> <wayMaxBlobs>` first discovers way references, then retains referenced nodes.
+- `earthmap-rs extract-osm-region-mask-full-scan <path> <scale> <regionX> <regionZ> [maxBlobs] [progressEvery] [progressFile]` streams progress lines and optionally appends them to a progress file.
+- `earthmap-rs extract-osm-xml-region-mask <osmDirectory> <scale> <regionX> <regionZ>` extracts masks from sorted `.osm` XML cache files.
+- `earthmap-rs identify-osm-xml-cache <directory>` reports XML cache kind, path, file count, total bytes, and SHA-256 identity.
+Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-osm --locked` and `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli osm_ --locked` passed.
 
 ### Gameplay and finalization validators
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented

@@ -543,6 +543,52 @@ where
         "validate-underground-fluid-synthetic" if args.len() == 1 => {
             write_result(validate_underground_fluid_synthetic(stdout, stderr))
         }
+        "scan-osm-pbf" if args.len() == 3 => {
+            write_result(scan_osm_pbf(stdout, stderr, &args[1], &args[2]))
+        }
+        "scan-osm-pbf-range" if args.len() == 4 => write_result(scan_osm_pbf_range(
+            stdout, stderr, &args[1], &args[2], &args[3],
+        )),
+        "validate-osm-pbf" if args.len() == 3 => {
+            write_result(validate_osm_pbf(stdout, stderr, &args[1], &args[2]))
+        }
+        "benchmark-osm-index" if args.len() == 5 => write_result(benchmark_osm_index(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4],
+        )),
+        "extract-osm-region-mask" if args.len() == 6 => write_result(extract_osm_region_mask(
+            stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5],
+        )),
+        "extract-osm-region-mask-window" if args.len() == 8 => {
+            write_result(extract_osm_region_mask_window(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+                &args[7],
+            ))
+        }
+        "extract-osm-region-mask-ref-window" if args.len() == 8 => {
+            write_result(extract_osm_region_mask_ref_window(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+                &args[7],
+            ))
+        }
+        "extract-osm-region-mask-full-scan" if (5..=8).contains(&args.len()) => {
+            write_result(extract_osm_region_mask_full_scan(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                args.get(5).map(String::as_str),
+                args.get(6).map(String::as_str),
+                args.get(7).map(String::as_str),
+            ))
+        }
+        "extract-osm-xml-region-mask" if args.len() == 5 => write_result(
+            extract_osm_xml_region_mask(stdout, stderr, &args[1], &args[2], &args[3], &args[4]),
+        ),
+        "identify-osm-xml-cache" if args.len() == 2 => {
+            write_result(identify_osm_xml_cache(stdout, stderr, &args[1]))
+        }
         "trace-surface-region-column" if (6..=8).contains(&args.len()) => {
             let parsed = trace_column_args(&args);
             write_result(trace_surface_region_column(
@@ -2748,6 +2794,34 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(out, "  validate-ore-histogram-synthetic")?;
     writeln!(out, "  validate-underground-fluid-synthetic")?;
+    writeln!(out, "  scan-osm-pbf <path> <maxBlobs>")?;
+    writeln!(out, "  scan-osm-pbf-range <path> <skipBlobs> <maxBlobs>")?;
+    writeln!(out, "  validate-osm-pbf <path> <maxBlobs>")?;
+    writeln!(
+        out,
+        "  benchmark-osm-index <scale> <regionX> <regionZ> <wayCount>"
+    )?;
+    writeln!(
+        out,
+        "  extract-osm-region-mask <path> <scale> <regionX> <regionZ> <maxBlobs>"
+    )?;
+    writeln!(
+        out,
+        "  extract-osm-region-mask-window <path> <scale> <regionX> <regionZ> <nodeMaxBlobs> <waySkipBlobs> <wayMaxBlobs>"
+    )?;
+    writeln!(
+        out,
+        "  extract-osm-region-mask-ref-window <path> <scale> <regionX> <regionZ> <nodeMaxBlobs> <waySkipBlobs> <wayMaxBlobs>"
+    )?;
+    writeln!(
+        out,
+        "  extract-osm-region-mask-full-scan <path> <scale> <regionX> <regionZ> [maxBlobs] [progressEvery] [progressFile]"
+    )?;
+    writeln!(
+        out,
+        "  extract-osm-xml-region-mask <osmDirectory> <scale> <regionX> <regionZ>"
+    )?;
+    writeln!(out, "  identify-osm-xml-cache <directory>")?;
     writeln!(out, "  benchmark-region-writers <outputDir> [iterations=3]")?;
     writeln!(out, "  playability-smoke <worldDir> <outputJson>")?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
@@ -4024,6 +4098,528 @@ fn validate_underground_fluid_synthetic(
             Ok(EXIT_USAGE)
         }
     }
+}
+
+fn scan_osm_pbf(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    max_blobs_text: &str,
+) -> io::Result<i32> {
+    match parse_i32_string(max_blobs_text)
+        .map_err(earthmap_osm::OsmError::invalid)
+        .and_then(|max_blobs| earthmap_osm::scan_pbf(Path::new(path), max_blobs))
+    {
+        Ok(report) => {
+            writeln!(out, "OSM PBF scan complete")?;
+            write_osm_scan_report(out, &report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "OSM PBF scan failed: {error}")?;
+            write_osm_failure_details(err, &error)?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn scan_osm_pbf_range(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    skip_blobs_text: &str,
+    max_blobs_text: &str,
+) -> io::Result<i32> {
+    match parse_i32_string(skip_blobs_text)
+        .and_then(|skip_blobs| {
+            parse_i32_string(max_blobs_text).map(|max_blobs| (skip_blobs, max_blobs))
+        })
+        .map_err(earthmap_osm::OsmError::invalid)
+        .and_then(|(skip_blobs, max_blobs)| {
+            earthmap_osm::scan_pbf_range(Path::new(path), skip_blobs, max_blobs)
+                .map(|report| (skip_blobs, report))
+        }) {
+        Ok((skip_blobs, report)) => {
+            writeln!(out, "OSM PBF scan complete")?;
+            writeln!(out, "skipBlobs={skip_blobs}")?;
+            write_osm_scan_report(out, &report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "OSM PBF scan failed: {error}")?;
+            write_osm_failure_details(err, &error)?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn validate_osm_pbf(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    max_blobs_text: &str,
+) -> io::Result<i32> {
+    match parse_i32_string(max_blobs_text)
+        .map_err(earthmap_osm::OsmError::invalid)
+        .and_then(|max_blobs| earthmap_osm::scan_pbf(Path::new(path), max_blobs))
+    {
+        Ok(report) => {
+            writeln!(out, "OSM PBF integrity valid for scanned prefix")?;
+            write_osm_scan_report(out, &report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "OSM PBF integrity failed")?;
+            write_osm_failure_details(err, &error)?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn benchmark_osm_index(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    way_count_text: &str,
+) -> io::Result<i32> {
+    match parse_i32_string(scale_text)
+        .and_then(|scale| parse_i32_string(region_x_text).map(|region_x| (scale, region_x)))
+        .and_then(|(scale, region_x)| {
+            parse_i32_string(region_z_text).map(|region_z| (scale, region_x, region_z))
+        })
+        .and_then(|(scale, region_x, region_z)| {
+            parse_i32_string(way_count_text).map(|way_count| {
+                earthmap_osm::benchmark_osm_index(scale, region_x, region_z, way_count)
+            })
+        }) {
+        Ok(Ok(report)) => {
+            writeln!(out, "OSM region index benchmark complete")?;
+            writeln!(out, "scale=1:{}", report.scale)?;
+            writeln!(out, "regionX={}", report.region_x)?;
+            writeln!(out, "regionZ={}", report.region_z)?;
+            writeln!(out, "ways={}", report.ways)?;
+            writeln!(out, "nodes={}", report.nodes)?;
+            writeln!(out, "setupMillis={}", report.setup_millis)?;
+            writeln!(out, "indexMillis={}", report.index_millis)?;
+            writeln!(
+                out,
+                "waysPerSecond={}",
+                java_double_string(report.ways_per_second)
+            )?;
+            writeln!(out, "features={}", report.features)?;
+            writeln!(out, "skippedUnscopedWays={}", report.skipped_unscoped_ways)?;
+            writeln!(
+                out,
+                "skippedMissingNodeWays={}",
+                report.skipped_missing_node_ways
+            )?;
+            Ok(EXIT_OK)
+        }
+        Ok(Err(error)) => {
+            writeln!(err, "OSM region index benchmark failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+        Err(error) => {
+            writeln!(err, "OSM region index benchmark failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn extract_osm_region_mask(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    max_blobs_text: &str,
+) -> io::Result<i32> {
+    match osm_mapping_for_scale(scale_text)
+        .and_then(|(scale, mapping)| {
+            osm_region_args(region_x_text, region_z_text)
+                .map(|(region_x, region_z)| (scale, mapping, region_x, region_z))
+        })
+        .and_then(|(_scale, mapping, region_x, region_z)| {
+            parse_i32_string(max_blobs_text).map(|max_blobs| {
+                earthmap_osm::extract_mask(Path::new(path), max_blobs, &mapping, region_x, region_z)
+            })
+        }) {
+        Ok(Ok(result)) => {
+            writeln!(out, "OSM region mask extracted")?;
+            write_osm_extract_report(out, &result.report)?;
+            Ok(EXIT_OK)
+        }
+        Ok(Err(error)) => {
+            writeln!(err, "OSM region mask extraction failed: {error}")?;
+            write_osm_failure_details(err, &error)?;
+            Ok(EXIT_USAGE)
+        }
+        Err(error) => {
+            writeln!(err, "OSM region mask extraction failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn extract_osm_region_mask_window(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    node_max_blobs_text: &str,
+    way_skip_blobs_text: &str,
+    way_max_blobs_text: &str,
+) -> io::Result<i32> {
+    match extract_osm_region_mask_window_impl(
+        path,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        node_max_blobs_text,
+        way_skip_blobs_text,
+        way_max_blobs_text,
+        false,
+    ) {
+        Ok((node_max_blobs, way_skip_blobs, way_max_blobs, result)) => {
+            writeln!(out, "OSM region mask window extracted")?;
+            writeln!(out, "nodeMaxBlobs={node_max_blobs}")?;
+            writeln!(out, "waySkipBlobs={way_skip_blobs}")?;
+            writeln!(out, "wayMaxBlobs={way_max_blobs}")?;
+            write_osm_extract_report(out, &result.report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "OSM region mask window extraction failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn extract_osm_region_mask_ref_window(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    node_max_blobs_text: &str,
+    way_skip_blobs_text: &str,
+    way_max_blobs_text: &str,
+) -> io::Result<i32> {
+    match extract_osm_region_mask_window_impl(
+        path,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        node_max_blobs_text,
+        way_skip_blobs_text,
+        way_max_blobs_text,
+        true,
+    ) {
+        Ok((node_max_blobs, way_skip_blobs, way_max_blobs, result)) => {
+            writeln!(out, "OSM region mask ref-window extracted")?;
+            writeln!(out, "nodeMaxBlobs={node_max_blobs}")?;
+            writeln!(out, "waySkipBlobs={way_skip_blobs}")?;
+            writeln!(out, "wayMaxBlobs={way_max_blobs}")?;
+            write_osm_extract_report(out, &result.report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "OSM region mask ref-window extraction failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_osm_region_mask_window_impl(
+    path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    node_max_blobs_text: &str,
+    way_skip_blobs_text: &str,
+    way_max_blobs_text: &str,
+    ref_window: bool,
+) -> std::result::Result<(i32, i32, i32, earthmap_osm::OsmPbfRegionExtractResult), String> {
+    let (_scale, mapping) = osm_mapping_for_scale(scale_text)?;
+    let (region_x, region_z) = osm_region_args(region_x_text, region_z_text)?;
+    let node_max_blobs = parse_i32_string(node_max_blobs_text)?;
+    let way_skip_blobs = parse_i32_string(way_skip_blobs_text)?;
+    let way_max_blobs = parse_i32_string(way_max_blobs_text)?;
+    let result = if ref_window {
+        earthmap_osm::extract_way_ref_window(
+            Path::new(path),
+            node_max_blobs,
+            way_skip_blobs,
+            way_max_blobs,
+            &mapping,
+            region_x,
+            region_z,
+        )
+    } else {
+        earthmap_osm::extract_window(
+            Path::new(path),
+            node_max_blobs,
+            way_skip_blobs,
+            way_max_blobs,
+            &mapping,
+            region_x,
+            region_z,
+        )
+    }
+    .map_err(osm_error_text)?;
+    Ok((node_max_blobs, way_skip_blobs, way_max_blobs, result))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_osm_region_mask_full_scan(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    max_blobs_text: Option<&str>,
+    progress_every_text: Option<&str>,
+    progress_file: Option<&str>,
+) -> io::Result<i32> {
+    let result = (|| -> std::result::Result<_, String> {
+        let (_scale, mapping) = osm_mapping_for_scale(scale_text)?;
+        let (region_x, region_z) = osm_region_args(region_x_text, region_z_text)?;
+        let max_blobs = max_blobs_text
+            .map(parse_i32_string)
+            .transpose()?
+            .unwrap_or(i32::MAX);
+        let progress_every = progress_every_text
+            .map(parse_i32_string)
+            .transpose()?
+            .unwrap_or(0);
+        let mut progress_writer = progress_file.map(open_progress_file).transpose()?;
+        let result = earthmap_osm::extract_full_scan(
+            Path::new(path),
+            max_blobs,
+            &mapping,
+            region_x,
+            region_z,
+            progress_every,
+            |progress| {
+                let line = osm_full_scan_progress_line(progress);
+                writeln!(out, "{line}").map_err(|error| {
+                    earthmap_osm::OsmError::invalid(format!("failed to write progress: {error}"))
+                })?;
+                if let Some(writer) = progress_writer.as_mut() {
+                    writeln!(writer, "{line}").map_err(|error| {
+                        earthmap_osm::OsmError::invalid(format!(
+                            "failed to write progress file: {error}"
+                        ))
+                    })?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(osm_error_text)?;
+        if let Some(writer) = progress_writer.as_mut() {
+            writer.flush().map_err(|error| error.to_string())?;
+        }
+        Ok((max_blobs, progress_every, result))
+    })();
+
+    match result {
+        Ok((max_blobs, progress_every, result)) => {
+            writeln!(out, "OSM region mask full scan extracted")?;
+            writeln!(out, "maxBlobs={max_blobs}")?;
+            writeln!(out, "progressEveryBlobs={progress_every}")?;
+            if let Some(progress_file) = progress_file {
+                writeln!(out, "progressFile={progress_file}")?;
+            }
+            write_osm_extract_report(out, &result.report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "OSM region mask full-scan extraction failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn extract_osm_xml_region_mask(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    directory: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+) -> io::Result<i32> {
+    match osm_mapping_for_scale(scale_text)
+        .and_then(|(_scale, mapping)| {
+            osm_region_args(region_x_text, region_z_text)
+                .map(|(region_x, region_z)| (mapping, region_x, region_z))
+        })
+        .map(|(mapping, region_x, region_z)| {
+            earthmap_osm::extract_xml_region_mask(
+                Path::new(directory),
+                &mapping,
+                region_x,
+                region_z,
+            )
+        }) {
+        Ok(Ok(result)) => {
+            writeln!(out, "OSM XML cache region mask extracted")?;
+            writeln!(out, "osmDirectory={directory}")?;
+            write_osm_extract_report(out, &result.report)?;
+            Ok(EXIT_OK)
+        }
+        Ok(Err(error)) => {
+            writeln!(err, "OSM XML cache region mask extraction failed: {error}")?;
+            write_osm_failure_details(err, &error)?;
+            Ok(EXIT_USAGE)
+        }
+        Err(error) => {
+            writeln!(err, "OSM XML cache region mask extraction failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn identify_osm_xml_cache(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    directory: &str,
+) -> io::Result<i32> {
+    match earthmap_osm::identify_xml_cache(Path::new(directory)) {
+        Ok(identity) => {
+            writeln!(out, "sourceKind={}", identity.kind)?;
+            writeln!(out, "sourcePath={}", identity.source_path.display())?;
+            writeln!(out, "sourceFileCount={}", identity.file_count)?;
+            writeln!(out, "sourceTotalBytes={}", identity.total_bytes)?;
+            writeln!(out, "sourceSha256={}", identity.sha256)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "OSM XML cache identification failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn osm_mapping_for_scale(
+    scale_text: &str,
+) -> std::result::Result<(i32, EarthScaleMapping), String> {
+    let scale = parse_i32_string(scale_text)?;
+    let mapping = EarthScaleMapping::for_denominator(scale, -90.0, 90.0)
+        .map_err(|error| error.to_string())?;
+    Ok((scale, mapping))
+}
+
+fn osm_region_args(
+    region_x_text: &str,
+    region_z_text: &str,
+) -> std::result::Result<(i32, i32), String> {
+    Ok((
+        parse_i32_string(region_x_text)?,
+        parse_i32_string(region_z_text)?,
+    ))
+}
+
+fn write_osm_scan_report(
+    out: &mut impl Write,
+    report: &earthmap_osm::OsmPbfScanReport,
+) -> io::Result<()> {
+    writeln!(out, "blobsScanned={}", report.blobs_scanned)?;
+    writeln!(out, "osmHeaderBlobs={}", report.osm_header_blobs)?;
+    writeln!(out, "osmDataBlobs={}", report.osm_data_blobs)?;
+    writeln!(out, "compressedBytes={}", report.compressed_bytes)?;
+    writeln!(out, "decodedBytes={}", report.decoded_bytes)?;
+    writeln!(out, "primitiveGroups={}", report.primitive_groups)?;
+    writeln!(out, "denseNodes={}", report.dense_nodes)?;
+    writeln!(out, "ways={}", report.ways)?;
+    writeln!(out, "highwayWays={}", report.highway_ways)?;
+    writeln!(out, "elapsedMillis={}", report.elapsed_millis)?;
+    Ok(())
+}
+
+fn write_osm_extract_report(
+    out: &mut impl Write,
+    report: &earthmap_osm::OsmPbfRegionExtractReport,
+) -> io::Result<()> {
+    writeln!(out, "blobsScanned={}", report.blobs_scanned)?;
+    writeln!(out, "osmDataBlobs={}", report.osm_data_blobs)?;
+    writeln!(out, "primitiveGroups={}", report.primitive_groups)?;
+    writeln!(out, "decodedNodes={}", report.decoded_nodes)?;
+    writeln!(out, "decodedWays={}", report.decoded_ways)?;
+    writeln!(out, "indexConsideredWays={}", report.index_considered_ways)?;
+    writeln!(
+        out,
+        "indexSkippedMissingNodeWays={}",
+        report.index_skipped_missing_node_ways
+    )?;
+    writeln!(out, "indexedFeatures={}", report.indexed_features)?;
+    writeln!(out, "roadFeatures={}", report.road_features)?;
+    writeln!(out, "waterwayFeatures={}", report.waterway_features)?;
+    writeln!(out, "landuseFeatures={}", report.landuse_features)?;
+    writeln!(out, "buildingFeatures={}", report.building_features)?;
+    writeln!(out, "roadMaskPixels={}", report.road_mask_pixels)?;
+    writeln!(out, "waterwayMaskPixels={}", report.waterway_mask_pixels)?;
+    writeln!(out, "landuseMaskPixels={}", report.landuse_mask_pixels)?;
+    writeln!(out, "buildingMaskPixels={}", report.building_mask_pixels)?;
+    writeln!(out, "elapsedMillis={}", report.elapsed_millis)?;
+    Ok(())
+}
+
+fn write_osm_failure_details(
+    err: &mut impl Write,
+    error: &earthmap_osm::OsmError,
+) -> io::Result<()> {
+    writeln!(err, "failure={error}")?;
+    if let Some(blob_index) = error.blob_index() {
+        writeln!(err, "failureBlobIndex={blob_index}")?;
+    }
+    if let Some(byte_offset) = error.byte_offset() {
+        writeln!(err, "failureByteOffset={byte_offset}")?;
+    }
+    Ok(())
+}
+
+fn osm_error_text(error: earthmap_osm::OsmError) -> String {
+    if let (Some(blob_index), Some(byte_offset)) = (error.blob_index(), error.byte_offset()) {
+        format!("{error} (blobIndex={blob_index}, byteOffset={byte_offset})")
+    } else {
+        error.to_string()
+    }
+}
+
+fn open_progress_file(path: &str) -> std::result::Result<BufWriter<File>, String> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    Ok(BufWriter::new(file))
+}
+
+fn osm_full_scan_progress_line(progress: earthmap_osm::FullScanProgress) -> String {
+    format!(
+        "progress,blobIndex={},byteOffset={},elapsedMillis={},retainedNodes={},consideredWays={},indexedFeatures={},primitiveGroups={}",
+        progress.blob_index,
+        progress.byte_offset,
+        progress.elapsed_millis,
+        progress.retained_nodes,
+        progress.considered_ways,
+        progress.indexed_features,
+        progress.primitive_groups
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14178,6 +14774,34 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.validate-underground-fluid-synthetic - synthetic underground fluid validator"
         ));
+        assert!(out.contains("DONE rust.command.scan-osm-pbf - OSM PBF prefix scanner"));
+        assert!(
+            out.contains("DONE rust.command.scan-osm-pbf-range - OSM PBF ranged prefix scanner")
+        );
+        assert!(out.contains(
+            "DONE rust.command.validate-osm-pbf - OSM PBF scanned-prefix integrity validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.benchmark-osm-index - synthetic OSM region index benchmark"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.extract-osm-region-mask - OSM PBF region feature mask extractor"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.extract-osm-region-mask-window - bounded OSM PBF node/way window mask extractor"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.extract-osm-region-mask-ref-window - bounded OSM PBF way-reference mask extractor"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.extract-osm-region-mask-full-scan - OSM PBF full-scan region feature mask extractor"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.extract-osm-xml-region-mask - OSM XML cache region feature mask extractor"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.identify-osm-xml-cache - OSM XML cache source identity reporter"
+        ));
     }
 
     #[test]
@@ -14930,6 +15554,16 @@ mod tests {
         assert!(out.contains("validate-cave-connectivity <seed> <minBlockX>"));
         assert!(out.contains("validate-ore-histogram-synthetic"));
         assert!(out.contains("validate-underground-fluid-synthetic"));
+        assert!(out.contains("scan-osm-pbf <path> <maxBlobs>"));
+        assert!(out.contains("scan-osm-pbf-range <path> <skipBlobs> <maxBlobs>"));
+        assert!(out.contains("validate-osm-pbf <path> <maxBlobs>"));
+        assert!(out.contains("benchmark-osm-index <scale> <regionX> <regionZ> <wayCount>"));
+        assert!(out.contains("extract-osm-region-mask <path> <scale> <regionX>"));
+        assert!(out.contains("extract-osm-region-mask-window <path> <scale>"));
+        assert!(out.contains("extract-osm-region-mask-ref-window <path> <scale>"));
+        assert!(out.contains("extract-osm-region-mask-full-scan <path> <scale>"));
+        assert!(out.contains("extract-osm-xml-region-mask <osmDirectory> <scale>"));
+        assert!(out.contains("identify-osm-xml-cache <directory>"));
         assert!(out.contains("benchmark-region-writers <outputDir> [iterations=3]"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));
@@ -14952,6 +15586,142 @@ mod tests {
             "Status: Rust runtime active; normal generation and validation paths are Rust-first."
         ));
         assert!(!out.contains("Java remains the compatibility oracle and fallback"));
+    }
+
+    #[test]
+    fn osm_pbf_commands_run_without_java() {
+        let temp = tempdir().unwrap();
+        let pbf = temp.path().join("tiny.osm.pbf");
+        fs::write(&pbf, synthetic_osm_pbf()).unwrap();
+
+        let (code, out, err) = run_capture(&["scan-osm-pbf", pbf.to_str().unwrap(), "2"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM PBF scan complete"));
+        assert!(out.contains("osmHeaderBlobs=1"));
+        assert!(out.contains("osmDataBlobs=1"));
+        assert!(out.contains("denseNodes=2"));
+        assert!(out.contains("highwayWays=1"));
+
+        let (code, out, err) =
+            run_capture(&["scan-osm-pbf-range", pbf.to_str().unwrap(), "1", "1"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("skipBlobs=1"));
+        assert!(out.contains("osmDataBlobs=1"));
+
+        let (code, out, err) = run_capture(&["validate-osm-pbf", pbf.to_str().unwrap(), "2"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM PBF integrity valid for scanned prefix"));
+
+        let (code, out, err) = run_capture(&["benchmark-osm-index", "1000", "0", "0", "16"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM region index benchmark complete"));
+        assert!(out.contains("ways=16"));
+        assert!(out.contains("features=16"));
+
+        let (code, out, err) = run_capture(&[
+            "extract-osm-region-mask",
+            pbf.to_str().unwrap(),
+            "1000",
+            "0",
+            "0",
+            "2",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM region mask extracted"));
+        assert!(out.contains("indexedFeatures=1"));
+        assert!(out.contains("roadFeatures=1"));
+
+        let (code, out, err) = run_capture(&[
+            "extract-osm-region-mask-window",
+            pbf.to_str().unwrap(),
+            "1000",
+            "0",
+            "0",
+            "2",
+            "0",
+            "0",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM region mask window extracted"));
+        assert!(out.contains("nodeMaxBlobs=2"));
+
+        let (code, out, err) = run_capture(&[
+            "extract-osm-region-mask-ref-window",
+            pbf.to_str().unwrap(),
+            "1000",
+            "0",
+            "0",
+            "2",
+            "1",
+            "1",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM region mask ref-window extracted"));
+        assert!(out.contains("indexedFeatures=1"));
+
+        let progress = temp.path().join("progress.csv");
+        let (code, out, err) = run_capture(&[
+            "extract-osm-region-mask-full-scan",
+            pbf.to_str().unwrap(),
+            "1000",
+            "0",
+            "0",
+            "2",
+            "1",
+            progress.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM region mask full scan extracted"));
+        assert!(out.contains("progress,blobIndex=1"));
+        assert!(fs::read_to_string(progress)
+            .unwrap()
+            .contains("progress,blobIndex=1"));
+    }
+
+    #[test]
+    fn osm_xml_cache_commands_run_without_java() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("xml");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("a.osm"),
+            r#"<osm>
+<node id="1" lon="0.0" lat="0.0" />
+<node id="2" lon="0.01" lat="0.0" />
+<way id="7"><nd ref="1"/><nd ref="2"/><tag k="highway" v="primary"/></way>
+</osm>"#,
+        )
+        .unwrap();
+        fs::write(dir.join("ignore.txt"), "ignored").unwrap();
+
+        let (code, out, err) = run_capture(&["identify-osm-xml-cache", dir.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("sourceKind=xml-directory"));
+        assert!(out.contains("sourceFileCount=1"));
+        assert!(out.contains("sourceSha256="));
+
+        let (code, out, err) = run_capture(&[
+            "extract-osm-xml-region-mask",
+            dir.to_str().unwrap(),
+            "1000",
+            "0",
+            "0",
+        ]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("OSM XML cache region mask extracted"));
+        assert!(out.contains("osmDirectory="));
+        assert!(out.contains("indexedFeatures=1"));
+        assert!(out.contains("roadFeatures=1"));
     }
 
     #[test]
@@ -17005,6 +17775,95 @@ manifestFile={}\n",
         assert!(manifest.contains("generation.directVegetation=false\n"));
         assert!(manifest.contains("generation.directStructures=false\n"));
         assert!(manifest.contains("generation.directProgressionStructures=false\n"));
+    }
+
+    fn synthetic_osm_pbf() -> Vec<u8> {
+        let header_blob = osm_blob_message(1, b"header");
+        let data_block = synthetic_osm_primitive_block();
+        let data_blob = osm_blob_message(1, &data_block);
+        let mut out = Vec::new();
+        append_osm_blob(&mut out, "OSMHeader", &header_blob);
+        append_osm_blob(&mut out, "OSMData", &data_blob);
+        out
+    }
+
+    fn append_osm_blob(out: &mut Vec<u8>, blob_type: &str, blob: &[u8]) {
+        let mut header = Vec::new();
+        proto_field_bytes(&mut header, 1, blob_type.as_bytes());
+        proto_field_varint(&mut header, 3, blob.len() as u64);
+        out.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        out.extend_from_slice(&header);
+        out.extend_from_slice(blob);
+    }
+
+    fn synthetic_osm_primitive_block() -> Vec<u8> {
+        let strings = ["", "highway", "primary"];
+        let mut string_table = Vec::new();
+        for value in strings {
+            proto_field_bytes(&mut string_table, 1, value.as_bytes());
+        }
+        let mut dense = Vec::new();
+        proto_field_bytes(&mut dense, 1, &packed_sint64(&[1, 1]));
+        proto_field_bytes(&mut dense, 8, &packed_sint64(&[0, 0]));
+        proto_field_bytes(&mut dense, 9, &packed_sint64(&[0, 100_000]));
+        let mut way = Vec::new();
+        proto_field_varint(&mut way, 1, 5);
+        proto_field_bytes(&mut way, 2, &packed_varints(&[1]));
+        proto_field_bytes(&mut way, 3, &packed_varints(&[2]));
+        proto_field_bytes(&mut way, 8, &packed_sint64(&[1, 1]));
+        let mut group = Vec::new();
+        proto_field_bytes(&mut group, 2, &dense);
+        proto_field_bytes(&mut group, 3, &way);
+        let mut block = Vec::new();
+        proto_field_bytes(&mut block, 1, &string_table);
+        proto_field_bytes(&mut block, 2, &group);
+        proto_field_varint(&mut block, 17, 100);
+        block
+    }
+
+    fn osm_blob_message(raw_field_number: i32, payload: &[u8]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        proto_field_bytes(&mut blob, raw_field_number, payload);
+        blob
+    }
+
+    fn proto_field_bytes(out: &mut Vec<u8>, field_number: i32, bytes: &[u8]) {
+        proto_varint(out, ((field_number as u64) << 3) | 2);
+        proto_varint(out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
+    }
+
+    fn proto_field_varint(out: &mut Vec<u8>, field_number: i32, value: u64) {
+        proto_varint(out, (field_number as u64) << 3);
+        proto_varint(out, value);
+    }
+
+    fn packed_varints(values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            proto_varint(&mut out, *value as u64);
+        }
+        out
+    }
+
+    fn packed_sint64(values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            proto_varint(&mut out, zigzag_i64(*value));
+        }
+        out
+    }
+
+    fn zigzag_i64(value: i64) -> u64 {
+        ((value << 1) ^ (value >> 63)) as u64
+    }
+
+    fn proto_varint(out: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            out.push(((value as u8) & 0x7F) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
     }
 
     fn synthetic_bigtiff_heightmap() -> Vec<u8> {

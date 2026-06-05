@@ -6,6 +6,7 @@ members = [
   "crates/earthmap-minecraft",
   "crates/earthmap-region",
   "crates/earthmap-gameplay",
+  "crates/earthmap-osm",
   "crates/earthmap-quality",
   "crates/earthmap-cli",
   "crates/earthmap-parity",

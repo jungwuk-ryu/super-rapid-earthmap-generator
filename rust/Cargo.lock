@@ -845,6 +845,7 @@ dependencies = [
  "earthmap-gameplay",
  "earthmap-geo",
  "earthmap-minecraft",
+ "earthmap-osm",
  "earthmap-parity",
  "earthmap-quality",
  "earthmap-region",
@@ -902,6 +903,17 @@ version = "0.0.0-phase0"
 dependencies = [
  "earthmap-core",
  "flate2",
+]
+
+[[package]]
+name = "earthmap-osm"
+version = "0.0.0-phase0"
+dependencies = [
+ "earthmap-geo",
+ "flate2",
+ "quick-xml 0.40.1",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
