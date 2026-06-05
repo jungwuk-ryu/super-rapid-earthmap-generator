@@ -18,8 +18,8 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const DEFAULT_HEIGHTMAP_PATH: &str = r"C:\earth_map_resources\HQheightmap.tif";
 const DEFAULT_WORLD_DIR: &str = r"D:\earthmap\gui-world";
 const DEFAULT_TIF_ROOT: &str = r"D:\earthmap\TifFiles";
-const DEFAULT_CACHE_ROWS: &str = "1024";
-const DEFAULT_SURFACE_TILE_CACHE_ENTRIES: &str = "512";
+const DEFAULT_CACHE_ROWS: &str = "auto";
+const DEFAULT_SURFACE_TILE_CACHE_ENTRIES: &str = "auto";
 const REGION_SIZE_BLOCKS: i32 = 512;
 const FULL_EARTH_MIN_LATITUDE: f64 = -90.0;
 const FULL_EARTH_MAX_LATITUDE: f64 = 90.0;
@@ -82,6 +82,13 @@ enum OutputFormatChoice {
 
 impl OutputFormatChoice {
     fn as_cli_arg(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Mca => "mca",
+        }
+    }
+
+    fn region_extension(self) -> &'static str {
         match self {
             Self::Linear => "linear",
             Self::Mca => "mca",
@@ -418,6 +425,23 @@ fn path_status(label: &str, path: &str, file: bool) -> String {
     }
 }
 
+fn count_region_files(world_dir: &Path, extension: &str) -> usize {
+    let region_dir = world_dir.join("region");
+    let Ok(entries) = std::fs::read_dir(region_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(extension))
+        })
+        .count()
+}
+
 #[derive(Debug)]
 enum WorkerEvent {
     Line(String),
@@ -442,6 +466,9 @@ struct GenerationRun {
     cancel: Arc<AtomicBool>,
     child: Arc<Mutex<Option<std::process::Child>>>,
     started_at: Instant,
+    world_dir: PathBuf,
+    region_extension: &'static str,
+    last_file_poll: Instant,
 }
 
 impl GenerationRun {
@@ -525,6 +552,9 @@ impl EarthMapGuiApp {
             cancel,
             child,
             started_at: Instant::now(),
+            world_dir: PathBuf::from(self.options.world_dir.trim()),
+            region_extension: self.options.format.region_extension(),
+            last_file_poll: Instant::now() - Duration::from_secs(2),
         });
     }
 
@@ -592,6 +622,21 @@ impl EarthMapGuiApp {
         }
     }
 
+    fn poll_region_files(&mut self) {
+        let Some(run) = self.run.as_mut() else {
+            return;
+        };
+        if run.last_file_poll.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        run.last_file_poll = Instant::now();
+        let count = count_region_files(&run.world_dir, run.region_extension);
+        if count > self.progress.completed_regions {
+            self.progress.completed_regions = count.min(self.progress.total_regions);
+            self.progress.last_region = format!("{count} region files on disk");
+        }
+    }
+
     fn push_log_line(&mut self, line: String) {
         self.log_lines.push(line);
         if self.log_lines.len() > 400 {
@@ -627,6 +672,7 @@ impl EarthMapGuiApp {
 impl eframe::App for EarthMapGuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_worker_events();
+        self.poll_region_files();
         let ctx = ui.ctx().clone();
         if self.run.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -906,6 +952,7 @@ impl eframe::App for EarthMapGuiApp {
                     ui.label("Surface tile cache");
                     ui.text_edit_singleline(&mut self.options.surface_tile_cache_entries);
                 });
+                ui.small("Use auto to tune cache sizes from system memory and available companion rasters.");
                 ui.horizontal(|ui| {
                     ui.label("Rayon threads");
                     ui.text_edit_singleline(&mut self.options.rayon_threads);
@@ -1176,6 +1223,29 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[11], "surfaceRaster=auto");
+    }
+
+    #[test]
+    fn count_region_files_counts_only_selected_format() {
+        let root = std::env::temp_dir().join(format!(
+            "earthmap-gui-region-count-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let region = root.join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        std::fs::write(region.join("r.0.0.linear"), b"linear").unwrap();
+        std::fs::write(region.join("r.0.1.linear"), b"linear").unwrap();
+        std::fs::write(region.join("r.0.0.mca"), b"mca").unwrap();
+        std::fs::write(region.join("notes.txt"), b"ignore").unwrap();
+
+        assert_eq!(count_region_files(&root, "linear"), 2);
+        assert_eq!(count_region_files(&root, "mca"), 1);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

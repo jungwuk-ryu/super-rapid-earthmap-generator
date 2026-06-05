@@ -277,7 +277,6 @@ struct VrtSource {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct VrtReaderKey {
     path: PathBuf,
-    thread_id: std::thread::ThreadId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1174,18 +1173,19 @@ impl VrtRgbMosaicReader {
         let reader = {
             let reader_key = VrtReaderKey {
                 path: source.path.clone(),
-                thread_id: std::thread::current().id(),
             };
             let mut readers = self
                 .readers
                 .lock()
                 .map_err(|_| GeoError::invalid("VRT reader cache lock poisoned"))?;
             if !readers.contains_key(&reader_key) {
+                let tile_cache_entries =
+                    vrt_reader_tile_cache_entries(self.tile_cache_entries, self.sources.len());
                 readers.insert(
                     reader_key.clone(),
                     Arc::new(GeoTiffRgbReader::open_with_tile_cache_entries(
                         &source.path,
-                        self.tile_cache_entries,
+                        tile_cache_entries,
                     )?),
                 );
             }
@@ -1197,6 +1197,13 @@ impl VrtRgbMosaicReader {
         };
         reader.sample_pixel_packed(source_x, source_y)
     }
+}
+
+fn vrt_reader_tile_cache_entries(total_tile_cache_entries: usize, source_count: usize) -> usize {
+    total_tile_cache_entries
+        .max(1)
+        .div_ceil(source_count.max(1))
+        .max(1)
 }
 
 impl VrtSource {
@@ -4209,6 +4216,14 @@ mod tests {
             split_reader.sample_nearest(2.25, 1.75).unwrap(),
             RgbColor::of(101, 102, 103)
         );
+    }
+
+    #[test]
+    fn vrt_reader_tile_cache_entries_are_bounded_across_sources() {
+        assert_eq!(vrt_reader_tile_cache_entries(512, 1), 512);
+        assert_eq!(vrt_reader_tile_cache_entries(512, 81), 7);
+        assert_eq!(vrt_reader_tile_cache_entries(1, 81), 1);
+        assert_eq!(vrt_reader_tile_cache_entries(0, 81), 1);
     }
 
     #[test]

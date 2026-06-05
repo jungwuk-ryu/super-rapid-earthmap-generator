@@ -45,6 +45,16 @@ const QUALITY_PREVIEW_GRID_MIN: usize = 8;
 const QUALITY_PREVIEW_GRID_MAX: usize = 256;
 const HEIGHTMAP_CACHE_ROWS_ENV: &str = "EARTHMAP_HEIGHTMAP_CACHE_ROWS";
 const SURFACE_TILE_CACHE_ENTRIES_ENV: &str = "EARTHMAP_SURFACE_TILE_CACHE_ENTRIES";
+const CACHE_AUTO_VALUE: &str = "auto";
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const BYTES_PER_GIB: u64 = 1024 * BYTES_PER_MIB;
+const HEIGHTMAP_CACHE_MEMORY_PERCENT: u64 = 8;
+const HEIGHTMAP_CACHE_MIN_ROWS: usize = 128;
+const HEIGHTMAP_CACHE_MAX_ROWS: usize = 8192;
+const SURFACE_TILE_CACHE_MEMORY_PERCENT: u64 = 12;
+const SURFACE_TILE_CACHE_ASSUMED_ENTRY_BYTES: u64 = 512 * 1024;
+const SURFACE_TILE_CACHE_MIN_ENTRIES: usize = 64;
+const SURFACE_TILE_CACHE_MAX_ENTRIES: usize = 32_768;
 const SURFACE_PHOTO_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
@@ -1776,7 +1786,7 @@ fn generate_surface_region_impl(
     let region_x = parse_i32_string(region_x_text)?;
     let region_z = parse_i32_string(region_z_text)?;
     let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
-    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
+    let surface_tile_cache_entries = configured_surface_tile_cache_entries(None)?;
     let settings = SurfaceRegionSettings::new(
         heightmap_path,
         world_dir,
@@ -1852,7 +1862,8 @@ fn generate_quality_candidate_impl(
     let surface_material_path =
         parse_optional_surface_material_path(surface_raster_text, heightmap)?;
     let cache_rows = configured_heightmap_cache_rows(heightmap)?;
-    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(surface_material_path.as_deref())?;
     let world_dir = Path::new(world_dir);
     let evidence_dir = world_dir.join("rust-quality-evidence");
     std::fs::create_dir_all(&evidence_dir).map_err(|error| error.to_string())?;
@@ -2827,7 +2838,8 @@ fn generate_vanilla_delegated_region_impl(
     let region_x = parse_i32_string(region_x_text)?;
     let region_z = parse_i32_string(region_z_text)?;
     let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
-    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(Some(&surface_material_path))?;
     let mut settings = SurfaceRegionSettings::new_with_texture_options(
         heightmap_path,
         world_dir,
@@ -2956,7 +2968,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                 .to_string()
         })?;
     let cache_rows = configured_heightmap_cache_rows(heightmap)?;
-    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(Some(&surface_material_path))?;
 
     let worker_count = threads
         .min(region_count)
@@ -3318,7 +3331,8 @@ fn surface_region_trace_settings(
                     .to_string()
             })?;
     let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
-    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(Some(&surface_material_path))?;
     let mut settings = SurfaceRegionSettings::new_with_texture_options(
         heightmap_path,
         ".",
@@ -3985,23 +3999,22 @@ fn auto_shared_heightmap_cache_rows(
     heightmap_path: &Path,
     threads: i32,
 ) -> std::result::Result<usize, String> {
-    let minimum_rows = 512_i32.max(threads.checked_mul(128).ok_or("threads overflow")?);
     let reader = GeoTiffHeightmapReader::open(heightmap_path).map_err(|error| error.to_string())?;
     let row_bytes = i64::from(reader.metadata().width)
         .checked_mul(2)
         .ok_or_else(|| "heightmap row byte count overflow".to_string())?;
-    let budget_bytes = 512_i64 * 1024 * 1024;
-    let budget_rows = if budget_bytes <= 0 {
-        minimum_rows
-    } else {
-        (budget_bytes / row_bytes).max(1) as i32
-    };
-    Ok(usize::try_from(minimum_rows.max(budget_rows.min(1024))).expect("positive cache rows"))
+    auto_shared_heightmap_cache_rows_for_memory(
+        row_bytes as u64,
+        usize::try_from(threads.max(1)).expect("positive thread count"),
+        total_physical_memory_bytes(),
+    )
 }
 
 fn configured_heightmap_cache_rows(heightmap_path: &Path) -> std::result::Result<usize, String> {
     if let Ok(text) = std::env::var(HEIGHTMAP_CACHE_ROWS_ENV) {
-        return parse_positive_usize_env(HEIGHTMAP_CACHE_ROWS_ENV, &text);
+        if !is_auto_cache_value(&text) {
+            return parse_positive_usize_env(HEIGHTMAP_CACHE_ROWS_ENV, &text);
+        }
     }
     let threads = std::thread::available_parallelism()
         .map(|value| value.get())
@@ -4010,11 +4023,145 @@ fn configured_heightmap_cache_rows(heightmap_path: &Path) -> std::result::Result
     auto_shared_heightmap_cache_rows(heightmap_path, threads)
 }
 
-fn configured_surface_tile_cache_entries() -> std::result::Result<usize, String> {
+fn configured_surface_tile_cache_entries(
+    surface_material_path: Option<&Path>,
+) -> std::result::Result<usize, String> {
     if let Ok(text) = std::env::var(SURFACE_TILE_CACHE_ENTRIES_ENV) {
-        return parse_positive_usize_env(SURFACE_TILE_CACHE_ENTRIES_ENV, &text);
+        if !is_auto_cache_value(&text) {
+            return parse_positive_usize_env(SURFACE_TILE_CACHE_ENTRIES_ENV, &text);
+        }
     }
-    Ok(DEFAULT_SURFACE_TILE_CACHE_ENTRIES)
+    Ok(auto_surface_tile_cache_entries_for_memory(
+        total_physical_memory_bytes(),
+        surface_cache_reader_count(surface_material_path),
+    ))
+}
+
+fn is_auto_cache_value(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty() || trimmed.eq_ignore_ascii_case(CACHE_AUTO_VALUE)
+}
+
+fn auto_shared_heightmap_cache_rows_for_memory(
+    row_bytes: u64,
+    threads: usize,
+    total_memory_bytes: Option<u64>,
+) -> std::result::Result<usize, String> {
+    if row_bytes == 0 {
+        return Err("heightmap row byte count must be positive".to_string());
+    }
+    let fallback_budget = 512 * BYTES_PER_MIB;
+    let budget_bytes = auto_cache_budget_bytes(
+        total_memory_bytes,
+        HEIGHTMAP_CACHE_MEMORY_PERCENT,
+        4 * BYTES_PER_GIB,
+        fallback_budget,
+    );
+    let budget_rows =
+        usize::try_from((budget_bytes / row_bytes).max(1)).unwrap_or(HEIGHTMAP_CACHE_MAX_ROWS);
+    let concurrency_rows = threads.saturating_mul(64).max(HEIGHTMAP_CACHE_MIN_ROWS);
+    Ok(budget_rows
+        .max(concurrency_rows.min(HEIGHTMAP_CACHE_MAX_ROWS))
+        .clamp(HEIGHTMAP_CACHE_MIN_ROWS, HEIGHTMAP_CACHE_MAX_ROWS))
+}
+
+fn auto_surface_tile_cache_entries_for_memory(
+    total_memory_bytes: Option<u64>,
+    cache_reader_count: usize,
+) -> usize {
+    let fallback_budget = u64::try_from(DEFAULT_SURFACE_TILE_CACHE_ENTRIES)
+        .unwrap_or(256)
+        .saturating_mul(SURFACE_TILE_CACHE_ASSUMED_ENTRY_BYTES)
+        .saturating_mul(cache_reader_count.max(1) as u64);
+    let budget_bytes = auto_cache_budget_bytes(
+        total_memory_bytes,
+        SURFACE_TILE_CACHE_MEMORY_PERCENT,
+        16 * BYTES_PER_GIB,
+        fallback_budget,
+    );
+    let per_reader_budget = budget_bytes / cache_reader_count.max(1) as u64;
+    usize::try_from((per_reader_budget / SURFACE_TILE_CACHE_ASSUMED_ENTRY_BYTES).max(1))
+        .unwrap_or(SURFACE_TILE_CACHE_MAX_ENTRIES)
+        .clamp(
+            SURFACE_TILE_CACHE_MIN_ENTRIES,
+            SURFACE_TILE_CACHE_MAX_ENTRIES,
+        )
+}
+
+fn auto_cache_budget_bytes(
+    total_memory_bytes: Option<u64>,
+    percent_of_total: u64,
+    max_budget_bytes: u64,
+    fallback_budget_bytes: u64,
+) -> u64 {
+    let Some(total_memory_bytes) = total_memory_bytes.filter(|value| *value > 0) else {
+        return fallback_budget_bytes.min(max_budget_bytes).max(1);
+    };
+    let reserve_bytes = (total_memory_bytes / 4)
+        .max(4 * BYTES_PER_GIB)
+        .min(total_memory_bytes.saturating_sub(BYTES_PER_GIB));
+    let process_budget = total_memory_bytes
+        .saturating_sub(reserve_bytes)
+        .max(BYTES_PER_MIB);
+    let target_budget = total_memory_bytes
+        .saturating_mul(percent_of_total)
+        .checked_div(100)
+        .unwrap_or(0);
+    target_budget
+        .max(fallback_budget_bytes.min(process_budget))
+        .min(process_budget)
+        .min(max_budget_bytes)
+        .max(1)
+}
+
+fn surface_cache_reader_count(surface_material_path: Option<&Path>) -> usize {
+    let Some(surface_material_path) = surface_material_path else {
+        return 1;
+    };
+    let terrain_dir = normalized_path(surface_material_path)
+        .parent()
+        .map(Path::to_path_buf);
+    let tif_root = terrain_dir
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf);
+    let vegetation = tif_root.as_ref().map(|root| root.join("vegetation"));
+    let mut count = 1usize;
+    if tif_root
+        .as_ref()
+        .is_some_and(|root| root.join("climate.tif").is_file())
+    {
+        count += 1;
+    }
+    if let Some(vegetation) = &vegetation {
+        for name in [
+            "EvergreenBroadleafTrees.tif",
+            "DeciduousBroadleafTrees.tif",
+            "EvergreenDeciduousNeedleleafTrees.tif",
+            "mixed.tif",
+            "HerbaceousVegetation.tif",
+            "Shrubs.tif",
+            "Snow.tif",
+            "Swamp.tif",
+        ] {
+            if vegetation.join(name).is_file() {
+                count += 1;
+            }
+        }
+    }
+    if tif_root
+        .as_ref()
+        .is_some_and(|root| root.join("ocean_temp_infill.tif").is_file())
+    {
+        count += 1;
+    }
+    if tif_root.as_ref().is_some_and(|root| {
+        root.join("land_shallow_topo_west.tif").is_file()
+            && root.join("land_shallow_topo_east.tif").is_file()
+    }) {
+        count += 2;
+    }
+    count
 }
 
 fn parse_positive_usize_env(name: &str, text: &str) -> std::result::Result<usize, String> {
@@ -4073,13 +4220,29 @@ fn total_physical_memory_bytes() -> Option<u64> {
         )
         .and_then(|text| parse_u64_digits(&text))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        command_stdout_first_line("sh", &["-c", "getconf _PHYS_PAGES && getconf PAGE_SIZE"])
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
             .and_then(|text| {
-                let mut values = text.lines().filter_map(parse_u64_digits);
-                Some(values.next()?.saturating_mul(values.next()?))
+                text.lines()
+                    .find(|line| line.starts_with("MemTotal:"))
+                    .and_then(parse_u64_digits)
+                    .map(|kib| kib.saturating_mul(1024))
             })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        command_stdout_first_line("sysctl", &["-n", "hw.memsize"])
+            .and_then(|text| parse_u64_digits(&text))
+    }
+    #[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
+    {
+        let pages = command_stdout_first_line("getconf", &["_PHYS_PAGES"])
+            .and_then(|text| parse_u64_digits(&text))?;
+        let page_size = command_stdout_first_line("getconf", &["PAGE_SIZE"])
+            .and_then(|text| parse_u64_digits(&text))?;
+        Some(pages.saturating_mul(page_size))
     }
 }
 
@@ -6125,6 +6288,44 @@ mod tests {
 
         assert!(mca_error.contains("0..9"));
         assert!(linear_error.contains("1..22"));
+    }
+
+    #[test]
+    fn auto_cache_tuning_scales_with_system_memory_without_exhausting_it() {
+        let small_memory = Some(16 * BYTES_PER_GIB);
+        let large_memory = Some(128 * BYTES_PER_GIB);
+
+        let small_height_rows =
+            auto_shared_heightmap_cache_rows_for_memory(864_000, 8, small_memory).unwrap();
+        let large_height_rows =
+            auto_shared_heightmap_cache_rows_for_memory(864_000, 8, large_memory).unwrap();
+        let small_surface_entries = auto_surface_tile_cache_entries_for_memory(small_memory, 12);
+        let large_surface_entries = auto_surface_tile_cache_entries_for_memory(large_memory, 12);
+
+        assert!(large_height_rows > small_height_rows);
+        assert!(large_height_rows <= HEIGHTMAP_CACHE_MAX_ROWS);
+        assert!(large_surface_entries > small_surface_entries);
+        assert!(large_surface_entries <= SURFACE_TILE_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn auto_surface_cache_reader_count_includes_companion_rasters() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("TifFiles");
+        let terrain = root.join("terrain");
+        let vegetation = root.join("vegetation");
+        fs::create_dir_all(&terrain).unwrap();
+        fs::create_dir_all(&vegetation).unwrap();
+        let true_marble = terrain.join("TrueMarble.vrt");
+        fs::write(&true_marble, b"vrt").unwrap();
+        fs::write(root.join("climate.tif"), b"climate").unwrap();
+        fs::write(root.join("ocean_temp_infill.tif"), b"ocean").unwrap();
+        fs::write(root.join("land_shallow_topo_west.tif"), b"west").unwrap();
+        fs::write(root.join("land_shallow_topo_east.tif"), b"east").unwrap();
+        fs::write(vegetation.join("Shrubs.tif"), b"shrubs").unwrap();
+
+        assert_eq!(surface_cache_reader_count(Some(&true_marble)), 6);
+        assert_eq!(surface_cache_reader_count(None), 1);
     }
 
     #[test]

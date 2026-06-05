@@ -51,6 +51,8 @@ GUI generation setup:
   `.linear` files.
 - MCA compression is zlib level `0..9`; default is `6`. Lower values are faster, higher values can produce smaller
   `.mca` files.
+- Cache fields accept `auto`. In auto mode the Rust CLI sizes heightmap rows and surface tile caches from the machine's
+  physical memory and the detected companion rasters, while leaving memory headroom for the OS and chunk generation.
 
 The same options are available from the CLI:
 
@@ -65,6 +67,15 @@ cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthm
 ```
 
 `compression=N` can be used instead of the format-specific key; it applies to the selected output format.
+
+Cache tuning can be overridden with environment variables when needed:
+
+```powershell
+$env:EARTHMAP_HEIGHTMAP_CACHE_ROWS = "auto"
+$env:EARTHMAP_SURFACE_TILE_CACHE_ENTRIES = "auto"
+```
+
+Use positive integers only for controlled benchmarking; `auto` is the recommended default for normal generation.
 
 Fast filtered test:
 

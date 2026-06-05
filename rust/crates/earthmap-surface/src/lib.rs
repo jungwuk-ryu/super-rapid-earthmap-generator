@@ -7309,7 +7309,10 @@ impl EarthDataSurfaceMaterialSampler {
             ecoregions: WwfEcoregionSampler::open_auto_cache(true_marble_path)?
                 .map(|sampler| Box::new(sampler) as Box<dyn EcoregionSampler>),
             terrain_tokens: MetImageExportTerrainSampler::open_auto(true_marble_path)?,
-            land_shallow_topo: LandShallowTopoPhotoSampler::open_near(true_marble_path)?,
+            land_shallow_topo: LandShallowTopoPhotoSampler::open_near_with_tile_cache_entries(
+                true_marble_path,
+                tile_cache_entries,
+            )?,
             material_cache: ShardedAccessCache::new(
                 Self::MATERIAL_CACHE_ENTRIES,
                 Self::CACHE_SHARDS,
@@ -7959,6 +7962,7 @@ impl<T: Clone> ShardedAccessCache<T> {
 pub struct LandShallowTopoPhotoSampler {
     west_path: PathBuf,
     east_path: PathBuf,
+    tile_cache_entries: usize,
     readers: Mutex<HashMap<LandShallowReaderKey, Arc<GeoTiffRgbReader>>>,
 }
 
@@ -7970,6 +7974,13 @@ impl LandShallowTopoPhotoSampler {
     const ROW_CACHE_ENTRIES: usize = 1024;
 
     pub fn open_near(true_marble_path: impl AsRef<Path>) -> Result<Option<Self>> {
+        Self::open_near_with_tile_cache_entries(true_marble_path, Self::ROW_CACHE_ENTRIES)
+    }
+
+    pub fn open_near_with_tile_cache_entries(
+        true_marble_path: impl AsRef<Path>,
+        tile_cache_entries: usize,
+    ) -> Result<Option<Self>> {
         let normalized = absolute_normalized_path(true_marble_path.as_ref())?;
         let Some(tif_root) = normalized.parent().and_then(Path::parent) else {
             return Ok(None);
@@ -7982,6 +7993,7 @@ impl LandShallowTopoPhotoSampler {
         Ok(Some(Self {
             west_path,
             east_path,
+            tile_cache_entries: tile_cache_entries.max(1),
             readers: Mutex::new(HashMap::new()),
         }))
     }
@@ -8048,7 +8060,6 @@ impl LandShallowTopoPhotoSampler {
     fn reader(&self, path: &Path) -> Result<Arc<GeoTiffRgbReader>> {
         let key = LandShallowReaderKey {
             path: path.to_path_buf(),
-            thread_id: std::thread::current().id(),
         };
         {
             let readers = self.readers.lock().map_err(|_| {
@@ -8060,7 +8071,7 @@ impl LandShallowTopoPhotoSampler {
         }
         let loaded = Arc::new(GeoTiffRgbReader::open_with_tile_cache_entries(
             path,
-            Self::ROW_CACHE_ENTRIES,
+            self.tile_cache_entries,
         )?);
         let mut readers = self
             .readers
@@ -8077,7 +8088,6 @@ impl LandShallowTopoPhotoSampler {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LandShallowReaderKey {
     path: PathBuf,
-    thread_id: std::thread::ThreadId,
 }
 
 #[derive(Debug)]
