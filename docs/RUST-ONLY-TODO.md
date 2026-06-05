@@ -140,26 +140,26 @@ Detailed progress:
 Spec: `earthmap-rs linear-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]`; writes RGB PNG plus sibling `.properties`; exits 0 on success and 2 on validation/render failure.
 
 ### Rust `quality-production-sample-batch`
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust smoke `cargo test -p earthmap-cli quality_production_sample_batch_generates_artifacts_without_java -- --ignored` completed in 41.99s test time; speedup TBD; peak memory TBD; output one MCA region, one topdown PNG, metrics, summary CSV, contact sheet, properties, evidence JSON; workload synthetic one-sample MCA smoke.
 Detailed progress:
-- [ ] Accepts the existing samples CSV columns.
-- [ ] Runs multiple samples in one Rust process.
-- [ ] Reuses heightmap/surface raster readers across samples where possible.
-- [ ] Writes per-sample world, render, metrics, properties, and evidence JSON.
-- [ ] Writes batch summary CSV.
-- [ ] Writes batch contact sheet.
-- [ ] Supports `metricMode=current-only`.
-- [ ] Supports `metricMode=full` or explicitly drops it with replacement rationale.
-- [ ] Supports `previewDebug=off|auto|dir`.
-- [ ] Enforces the same current quality gate thresholds or a documented replacement gate.
+- [x] Accepts the existing samples CSV columns.
+- [x] Runs multiple samples in one Rust process.
+- [x] Reuses heightmap/surface raster readers across samples where possible.
+- [x] Writes per-sample world, render, metrics, properties, and evidence JSON.
+- [x] Writes batch summary CSV.
+- [x] Writes batch contact sheet.
+- [x] Supports `metricMode=current-only`.
+- [x] Supports `metricMode=full` or explicitly drops it with replacement rationale.
+- [x] Supports `previewDebug=off|auto|dir`.
+- [x] Enforces the same current quality gate thresholds or a documented replacement gate.
 - [ ] Benchmark covers five-crop batch cold start and representative 1:1000 samples.
 
 ### Rust photo metric crop/batch tools

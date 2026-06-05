@@ -61,8 +61,8 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "quality-production-sample-batch",
-        status: CommandStatus::NotPortedYet,
-        note: "quality gate sample batch",
+        status: CommandStatus::Implemented,
+        note: "Rust quality gate production sample batch",
     },
     CommandSpec {
         name: "photo-parity-crop",

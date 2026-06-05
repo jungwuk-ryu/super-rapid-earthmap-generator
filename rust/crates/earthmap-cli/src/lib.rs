@@ -251,6 +251,19 @@ where
                 args.get(3).map(String::as_str).unwrap_or("auto"),
             ))
         }
+        "quality-production-sample-batch" if args.len() >= 7 => {
+            write_result(quality_production_sample_batch(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7..],
+            ))
+        }
         "photo-standard-remap-parity-crop" if (8..=10).contains(&args.len()) => {
             write_result(photo_standard_remap_parity_crop(
                 stdout,
@@ -840,6 +853,1016 @@ selectiveCanopyVsExpectedMean,selectiveCanopyVsSourceMean,outputDirectory"
             Ok(EXIT_USAGE)
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionMetricMode {
+    Full,
+    CurrentOnly,
+}
+
+impl ProductionMetricMode {
+    fn parse(text: &str) -> std::result::Result<Self, String> {
+        if text.trim().is_empty() {
+            return Err("metricMode must be full or current-only".to_string());
+        }
+        let normalized = text.trim().to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "full" | "candidate" | "candidate-full" => Ok(Self::Full),
+            "current" | "current-only" | "currentonly" | "production-current" => {
+                Ok(Self::CurrentOnly)
+            }
+            _ => Err(format!("metricMode must be full or current-only: {text}")),
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::CurrentOnly => "current-only",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProductionPreviewDebug {
+    Off,
+    Auto,
+    Directory(std::path::PathBuf),
+}
+
+impl ProductionPreviewDebug {
+    fn parse(text: &str) -> std::result::Result<Self, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty()
+            || matches_ignore_ascii_case(trimmed, &["none", "off", "false", "null"])
+        {
+            return Ok(Self::Off);
+        }
+        if matches_ignore_ascii_case(trimmed, &["auto", "true", "on"]) {
+            return Ok(Self::Auto);
+        }
+        Ok(Self::Directory(std::path::PathBuf::from(trimmed)))
+    }
+
+    fn id(&self) -> String {
+        match self {
+            Self::Off => "off".to_string(),
+            Self::Auto => "auto".to_string(),
+            Self::Directory(path) => normalized_path_display(path),
+        }
+    }
+
+    fn directory_for(&self, job: &ProductionSampleJob) -> Option<std::path::PathBuf> {
+        match self {
+            Self::Off => None,
+            Self::Auto => Some(job.output_directory.join("preview-debug")),
+            Self::Directory(root) => Some(root.join(&job.sample)),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProductionSampleOptions {
+    cache_rows: usize,
+    prefetch_rows: usize,
+    vertical_scale: f64,
+    texture_mode: SurfaceTextureMode,
+    surface_raster: String,
+    chunk_status: ChunkGenerationStatus,
+    metric_mode: ProductionMetricMode,
+    preview_debug: ProductionPreviewDebug,
+}
+
+#[derive(Clone, Debug)]
+struct ProductionSampleJob {
+    sample: String,
+    region_x: i32,
+    region_z: i32,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    source: std::path::PathBuf,
+    expected_standard: std::path::PathBuf,
+    land_mask: Option<std::path::PathBuf>,
+    mask_mode: String,
+    output_directory: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct ProductionSampleJobResult {
+    sample: String,
+    output_directory: std::path::PathBuf,
+    elapsed_millis: u128,
+    generation_millis: u128,
+    render_millis: u128,
+    metric_millis: u128,
+    region_file: std::path::PathBuf,
+    current_render: std::path::PathBuf,
+    metric_directory: std::path::PathBuf,
+    current_vs_expected_mean: f64,
+    current_vs_source_mean: f64,
+    preview_debug_directory: Option<std::path::PathBuf>,
+    production_source_debug: Option<std::path::PathBuf>,
+    production_source_vs_reference_mean: f64,
+    production_source_vs_expected_mean: f64,
+    missing_regions: usize,
+    missing_chunks: usize,
+    evidence_json: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct ProductionSampleBatchReport {
+    samples: usize,
+    requested_threads: usize,
+    elapsed_millis: u128,
+    summary_csv: std::path::PathBuf,
+    contact_sheet: std::path::PathBuf,
+    results: Vec<ProductionSampleJobResult>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quality_production_sample_batch(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    samples_csv: &str,
+    heightmap: &str,
+    output_root: &str,
+    scale: &str,
+    format: &str,
+    threads: &str,
+    optional_args: &[String],
+) -> io::Result<i32> {
+    match quality_production_sample_batch_impl(
+        Path::new(samples_csv),
+        Path::new(heightmap),
+        Path::new(output_root),
+        scale,
+        format,
+        threads,
+        optional_args,
+    ) {
+        Ok(report) => {
+            writeln!(out, "Quality production sample batch complete")?;
+            writeln!(out, "samples={}", report.samples)?;
+            writeln!(out, "requestedThreads={}", report.requested_threads)?;
+            writeln!(out, "execution=single-rust-sequential")?;
+            writeln!(out, "elapsedMillis={}", report.elapsed_millis)?;
+            writeln!(
+                out,
+                "summaryCsv={}",
+                normalized_path_display(&report.summary_csv)
+            )?;
+            writeln!(
+                out,
+                "contactSheet={}",
+                normalized_path_display(&report.contact_sheet)
+            )?;
+            writeln!(
+                out,
+                "sample,elapsedMillis,generationMillis,renderMillis,metricMillis,currentVsExpectedMean,currentVsSourceMean,outputDirectory"
+            )?;
+            for result in &report.results {
+                writeln!(
+                    out,
+                    "{},{},{},{},{},{},{},{}",
+                    csv_field(&result.sample),
+                    result.elapsed_millis,
+                    result.generation_millis,
+                    result.render_millis,
+                    result.metric_millis,
+                    production_metric_text(result.current_vs_expected_mean),
+                    production_metric_text(result.current_vs_source_mean),
+                    csv_field(&normalized_path_display(&result.output_directory))
+                )?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Quality production sample batch failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quality_production_sample_batch_impl(
+    samples_csv: &Path,
+    heightmap: &Path,
+    output_root: &Path,
+    scale_text: &str,
+    format_text: &str,
+    threads_text: &str,
+    optional_args: &[String],
+) -> std::result::Result<ProductionSampleBatchReport, String> {
+    let scale = parse_positive_i32_string("scale", scale_text)?;
+    let format = parse_quality_sample_output_format(format_text)?;
+    let requested_threads = parse_positive_usize_string("threads", threads_text)?;
+    let options = parse_production_sample_options(optional_args, heightmap)?;
+    let jobs = read_production_sample_jobs(samples_csv, output_root)?;
+    if jobs.is_empty() {
+        return Err("samplesCsv contains no jobs".to_string());
+    }
+    std::fs::create_dir_all(output_root).map_err(|error| error.to_string())?;
+
+    let surface_material_path =
+        parse_optional_surface_material_path(&options.surface_raster, heightmap)?;
+    if options.texture_mode == SurfaceTextureMode::Photo && surface_material_path.is_none() {
+        return Err(
+            "textureMode=photo requires surfaceRaster=auto or an explicit path".to_string(),
+        );
+    }
+    let surface_tile_cache_entries =
+        configured_surface_tile_cache_entries(surface_material_path.as_deref())?;
+    let surface_material_sampler = if options.texture_mode == SurfaceTextureMode::Photo {
+        surface_material_path
+            .as_ref()
+            .map(|path| {
+                EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+                    path,
+                    surface_tile_cache_entries,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .transpose()?
+    } else {
+        None
+    };
+
+    let batch_start = Instant::now();
+    let mut results = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        results.push(run_production_sample_job(
+            job,
+            heightmap,
+            scale,
+            format,
+            &options,
+            surface_material_path.as_deref(),
+            surface_tile_cache_entries,
+            surface_material_sampler.as_ref(),
+        )?);
+    }
+
+    let summary_csv = output_root.join("quality-production-sample-summary.csv");
+    write_text(&summary_csv, &production_sample_summary_csv(&results))?;
+    let contact_sheet = write_production_sample_contact_sheet(
+        &results,
+        &output_root.join("quality-production-sample-contact-sheet.png"),
+    )?;
+
+    Ok(ProductionSampleBatchReport {
+        samples: jobs.len(),
+        requested_threads,
+        elapsed_millis: batch_start.elapsed().as_millis(),
+        summary_csv,
+        contact_sheet,
+        results,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_production_sample_job(
+    job: &ProductionSampleJob,
+    heightmap: &Path,
+    scale: i32,
+    format: OutputFormat,
+    options: &ProductionSampleOptions,
+    surface_material_path: Option<&Path>,
+    surface_tile_cache_entries: usize,
+    surface_material_sampler: Option<&EarthDataSurfaceMaterialSampler>,
+) -> std::result::Result<ProductionSampleJobResult, String> {
+    let sample_start = Instant::now();
+    std::fs::create_dir_all(&job.output_directory).map_err(|error| error.to_string())?;
+    let world_dir = job.output_directory.join("world");
+    let photo_parity_dir = job.output_directory.join("photo-parity");
+    std::fs::create_dir_all(&photo_parity_dir).map_err(|error| error.to_string())?;
+    let preview_debug_directory = options.preview_debug.directory_for(job);
+    if let Some(directory) = &preview_debug_directory {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+
+    let generation_start = Instant::now();
+    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+        heightmap,
+        &world_dir,
+        format!("SR EarthMap Quality {}", job.sample),
+        0,
+        scale,
+        job.region_x,
+        job.region_z,
+        format,
+        options.cache_rows,
+        true,
+        options.chunk_status,
+        options.vertical_scale,
+        options.texture_mode,
+    )
+    .map_err(|error| error.to_string())?;
+    settings.surface_material_path = surface_material_path.map(Path::to_path_buf);
+    settings.surface_tile_cache_entries = surface_tile_cache_entries;
+    let surface_report =
+        generate_surface_region_with_open_material_sampler(&settings, surface_material_sampler)
+            .map_err(|error| error.to_string())?;
+    let generation_millis = generation_start.elapsed().as_millis();
+
+    let render_start = Instant::now();
+    let current_render = photo_parity_dir.join("mca-visible-topdown.png");
+    let render_report = topdown_render_impl(
+        TopdownFormat::Mca,
+        &world_dir,
+        &current_render,
+        &job.region_x.to_string(),
+        &job.region_z.to_string(),
+        "1",
+        "1",
+        Some("visible"),
+    )?;
+    let render_millis = render_start.elapsed().as_millis();
+
+    let metric_start = Instant::now();
+    let metric_directory = photo_parity_dir.join("metric-land");
+    let metric_report = match options.metric_mode {
+        ProductionMetricMode::CurrentOnly => quality::write_current_metric_crop_report(
+            &job.source,
+            &job.expected_standard,
+            &current_render,
+            &metric_directory,
+            job.crop_x,
+            job.crop_y,
+            job.crop_width,
+            job.crop_height,
+            job.land_mask.as_deref(),
+            &job.mask_mode,
+        ),
+        ProductionMetricMode::Full => quality::write_metric_crop_report(
+            &job.source,
+            &job.expected_standard,
+            &current_render,
+            &metric_directory,
+            job.crop_x,
+            job.crop_y,
+            job.crop_width,
+            job.crop_height,
+            job.land_mask.as_deref(),
+            &job.mask_mode,
+        ),
+    }
+    .map_err(|error| error.to_string())?;
+    let metric_millis = metric_start.elapsed().as_millis();
+
+    let current_vs_expected_mean = quality_metric_mean(&metric_report, "current-vs-expected");
+    let current_vs_source_mean = quality_metric_mean(&metric_report, "current-vs-source");
+    let evidence_json = job
+        .output_directory
+        .join("quality-production-sample-evidence.json");
+
+    let result = ProductionSampleJobResult {
+        sample: job.sample.clone(),
+        output_directory: job.output_directory.clone(),
+        elapsed_millis: sample_start.elapsed().as_millis(),
+        generation_millis,
+        render_millis,
+        metric_millis,
+        region_file: surface_report.region_file.clone(),
+        current_render,
+        metric_directory: metric_report.output_directory.clone(),
+        current_vs_expected_mean,
+        current_vs_source_mean,
+        preview_debug_directory,
+        production_source_debug: None,
+        production_source_vs_reference_mean: f64::NAN,
+        production_source_vs_expected_mean: f64::NAN,
+        missing_regions: render_report.stats.missing_regions,
+        missing_chunks: render_report.stats.missing_chunks,
+        evidence_json,
+    };
+
+    write_production_sample_properties(job, options, &surface_report, &render_report, &result)?;
+    write_production_sample_evidence_json(
+        job,
+        options,
+        &surface_report,
+        &render_report,
+        &result,
+        surface_material_path,
+        surface_tile_cache_entries,
+    )?;
+    Ok(result)
+}
+
+fn parse_quality_sample_output_format(text: &str) -> std::result::Result<OutputFormat, String> {
+    let format = OutputFormat::parse(text).map_err(|error| error.to_string())?;
+    if format != OutputFormat::Mca {
+        return Err(
+            "quality-production-sample-batch currently requires mca for topdown parity".to_string(),
+        );
+    }
+    Ok(format)
+}
+
+fn parse_production_sample_options(
+    optional_args: &[String],
+    heightmap_path: &Path,
+) -> std::result::Result<ProductionSampleOptions, String> {
+    let mut cache_rows = 512usize;
+    let mut prefetch_rows = 0usize;
+    let mut vertical_scale = 1.25f64;
+    let mut texture_mode = SurfaceTextureMode::Photo;
+    let mut surface_raster = "auto".to_string();
+    let mut chunk_status = ChunkGenerationStatus::Surface;
+    let mut metric_mode = ProductionMetricMode::Full;
+    let mut preview_debug = ProductionPreviewDebug::Off;
+
+    for option in optional_args {
+        if option.trim().is_empty() {
+            continue;
+        }
+        let (key, value) = option
+            .split_once('=')
+            .ok_or_else(|| format!("quality sample options must be key=value: {option}"))?;
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "cacheRows" | "sharedCacheRows" | "heightmapCacheRows" => {
+                cache_rows = parse_optional_auto_positive_usize(value, "cacheRows")?
+                    .unwrap_or_else(|| {
+                        configured_heightmap_cache_rows(heightmap_path).unwrap_or(512)
+                    });
+            }
+            "prefetchRows" | "readAheadRows" => {
+                prefetch_rows =
+                    parse_optional_auto_nonnegative_usize(value, "prefetchRows")?.unwrap_or(0);
+            }
+            "verticalScale" | "heightScale" | "yScale" | "reliefScale" => {
+                vertical_scale = value.parse::<f64>().map_err(|error| error.to_string())?;
+                if !vertical_scale.is_finite() || vertical_scale <= 0.0 {
+                    return Err(format!("verticalScale must be positive: {value}"));
+                }
+            }
+            "textureMode" | "texture" | "surfaceMode" | "renderMode" => {
+                texture_mode =
+                    SurfaceTextureMode::parse(value).map_err(|error| error.to_string())?;
+            }
+            "surfaceRaster" | "terrainRaster" | "surfaceMaterial" | "trueMarble" => {
+                surface_raster = value.to_string();
+            }
+            "status" | "chunkStatus" => {
+                chunk_status =
+                    ChunkGenerationStatus::parse(value).map_err(|error| error.to_string())?;
+                if chunk_status == ChunkGenerationStatus::Full {
+                    return Err("quality sample chunkStatus must be surface or carvers".to_string());
+                }
+            }
+            "metricMode" | "metricsMode" | "metricScope" | "metricsScope" => {
+                metric_mode = ProductionMetricMode::parse(value)?;
+            }
+            "previewDebug" | "previewDebugDir" | "debugPreview" | "debugPreviewDir"
+            | "debugSource" => {
+                preview_debug = ProductionPreviewDebug::parse(value)?;
+            }
+            _ => return Err(format!("unknown quality sample option: {key}")),
+        }
+    }
+    if prefetch_rows >= cache_rows {
+        return Err(
+            "prefetchRows must be lower than cacheRows for quality sample runs".to_string(),
+        );
+    }
+    if texture_mode == SurfaceTextureMode::Photo
+        && parse_optional_surface_material_path(&surface_raster, heightmap_path)?.is_none()
+    {
+        return Err(
+            "textureMode=photo requires surfaceRaster=auto or an explicit path".to_string(),
+        );
+    }
+
+    Ok(ProductionSampleOptions {
+        cache_rows,
+        prefetch_rows,
+        vertical_scale,
+        texture_mode,
+        surface_raster,
+        chunk_status,
+        metric_mode,
+        preview_debug,
+    })
+}
+
+fn parse_optional_auto_positive_usize(
+    value: &str,
+    name: &str,
+) -> std::result::Result<Option<usize>, String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let parsed = value.parse::<usize>().map_err(|error| error.to_string())?;
+    if parsed == 0 {
+        return Err(format!("{name} must be positive: {parsed}"));
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_optional_auto_nonnegative_usize(
+    value: &str,
+    name: &str,
+) -> std::result::Result<Option<usize>, String> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let parsed = value.parse::<usize>().map_err(|error| error.to_string())?;
+    if parsed == usize::MAX {
+        return Err(format!("{name} is out of range: {value}"));
+    }
+    Ok(Some(parsed))
+}
+
+fn read_production_sample_jobs(
+    samples_csv: &Path,
+    output_root: &Path,
+) -> std::result::Result<Vec<ProductionSampleJob>, String> {
+    let text = std::fs::read_to_string(samples_csv).map_err(|error| error.to_string())?;
+    let csv_directory = samples_csv
+        .canonicalize()
+        .unwrap_or_else(|_| samples_csv.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let mut header = Vec::<String>::new();
+    let mut header_index = BTreeMap::<String, usize>::new();
+    let mut jobs = Vec::<ProductionSampleJob>::new();
+
+    for (line_index, line) in text.lines().enumerate() {
+        let line_number = line_index + 1;
+        let raw_line = strip_utf8_bom(line);
+        if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
+            continue;
+        }
+        let columns = split_csv_line(raw_line)?;
+        if header.is_empty() {
+            header = columns;
+            for (index, name) in header.iter().enumerate() {
+                header_index.insert(normalize_csv_header(name), index);
+            }
+            continue;
+        }
+
+        let sample = csv_required(&columns, &header_index, line_number, &["sample"])?;
+        let region_x = csv_required(&columns, &header_index, line_number, &["regionX"])?
+            .parse::<i32>()
+            .map_err(|error| error.to_string())?;
+        let region_z = csv_required(&columns, &header_index, line_number, &["regionZ"])?
+            .parse::<i32>()
+            .map_err(|error| error.to_string())?;
+        let crop_x = csv_required(&columns, &header_index, line_number, &["cropX", "x"])?
+            .parse::<u32>()
+            .map_err(|error| error.to_string())?;
+        let crop_y = csv_required(&columns, &header_index, line_number, &["cropY", "y"])?
+            .parse::<u32>()
+            .map_err(|error| error.to_string())?;
+        let crop_width = csv_required(
+            &columns,
+            &header_index,
+            line_number,
+            &["cropWidth", "width"],
+        )?
+        .parse::<u32>()
+        .map_err(|error| error.to_string())?;
+        let crop_height = csv_required(
+            &columns,
+            &header_index,
+            line_number,
+            &["cropHeight", "height"],
+        )?
+        .parse::<u32>()
+        .map_err(|error| error.to_string())?;
+        if crop_width == 0 || crop_height == 0 {
+            return Err(format!(
+                "cropWidth and cropHeight must be positive at line {line_number}"
+            ));
+        }
+        let source = csv_required_input_path(
+            &columns,
+            &header_index,
+            line_number,
+            &csv_directory,
+            &["sourcePng", "source"],
+        )?;
+        let expected_standard = csv_required_input_path(
+            &columns,
+            &header_index,
+            line_number,
+            &csv_directory,
+            &[
+                "expectedStandardPng",
+                "expectedStandard",
+                "expected",
+                "standardPng",
+            ],
+        )?;
+        let land_mask = csv_optional_input_path(
+            &columns,
+            &header_index,
+            &csv_directory,
+            &["landMaskPng", "landMask", "mask", "maskPng"],
+        );
+        let mask_mode = csv_optional(&columns, &header_index, &["maskMode", "mode"])
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                if land_mask.is_some() {
+                    "land".to_string()
+                } else {
+                    "all".to_string()
+                }
+            });
+        let output_directory = csv_optional_output_path(
+            &columns,
+            &header_index,
+            output_root,
+            &["output", "outputDir", "outputDirectory"],
+        )
+        .unwrap_or_else(|| output_root.join(&sample));
+
+        jobs.push(ProductionSampleJob {
+            sample,
+            region_x,
+            region_z,
+            crop_x,
+            crop_y,
+            crop_width,
+            crop_height,
+            source,
+            expected_standard,
+            land_mask,
+            mask_mode,
+            output_directory,
+        });
+    }
+
+    if header.is_empty() {
+        return Err("samplesCsv does not contain a header row".to_string());
+    }
+    Ok(jobs)
+}
+
+fn strip_utf8_bom(value: &str) -> &str {
+    value.strip_prefix('\u{feff}').unwrap_or(value)
+}
+
+fn normalize_csv_header(value: &str) -> String {
+    value.trim().replace(['_', '-'], "").to_ascii_lowercase()
+}
+
+fn split_csv_line(line: &str) -> std::result::Result<Vec<String>, String> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            if quoted && chars.peek() == Some(&'"') {
+                current.push('"');
+                let _ = chars.next();
+            } else {
+                quoted = !quoted;
+            }
+        } else if ch == ',' && !quoted {
+            values.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    if quoted {
+        return Err(format!("unterminated quoted CSV value: {line}"));
+    }
+    values.push(current.trim().to_string());
+    Ok(values)
+}
+
+fn csv_required(
+    columns: &[String],
+    header_index: &BTreeMap<String, usize>,
+    line_number: usize,
+    names: &[&str],
+) -> std::result::Result<String, String> {
+    let value = csv_optional(columns, header_index, names);
+    if value.is_none_or(|value| value.trim().is_empty()) {
+        return Err(format!(
+            "missing required CSV column {} at line {line_number}",
+            names[0]
+        ));
+    }
+    Ok(value.unwrap().to_string())
+}
+
+fn csv_optional<'a>(
+    columns: &'a [String],
+    header_index: &BTreeMap<String, usize>,
+    names: &[&str],
+) -> Option<&'a str> {
+    for name in names {
+        if let Some(index) = header_index.get(&normalize_csv_header(name)) {
+            if let Some(value) = columns.get(*index) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn csv_required_input_path(
+    columns: &[String],
+    header_index: &BTreeMap<String, usize>,
+    line_number: usize,
+    base_directory: &Path,
+    names: &[&str],
+) -> std::result::Result<std::path::PathBuf, String> {
+    let value = csv_required(columns, header_index, line_number, names)?;
+    Ok(resolve_csv_path(&value, base_directory))
+}
+
+fn csv_optional_input_path(
+    columns: &[String],
+    header_index: &BTreeMap<String, usize>,
+    base_directory: &Path,
+    names: &[&str],
+) -> Option<std::path::PathBuf> {
+    csv_optional(columns, header_index, names)
+        .and_then(parse_optional_csv_path)
+        .map(|value| resolve_csv_path(value, base_directory))
+}
+
+fn csv_optional_output_path(
+    columns: &[String],
+    header_index: &BTreeMap<String, usize>,
+    base_directory: &Path,
+    names: &[&str],
+) -> Option<std::path::PathBuf> {
+    csv_optional(columns, header_index, names)
+        .and_then(parse_optional_csv_path)
+        .map(|value| resolve_csv_path(value, base_directory))
+}
+
+fn parse_optional_csv_path(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || matches_ignore_ascii_case(trimmed, &["none", "off", "false", "null"]) {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn resolve_csv_path(value: &str, base_directory: &Path) -> std::path::PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_directory.join(path).components().collect()
+    }
+}
+
+fn quality_metric_mean(report: &quality::Report, name: &str) -> f64 {
+    report
+        .metric(name)
+        .map(|metrics| metrics.mean_delta_e2000)
+        .unwrap_or(f64::NAN)
+}
+
+fn production_metric_text(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.6}")
+    } else {
+        "nan".to_string()
+    }
+}
+
+fn production_path_text(path: Option<&Path>) -> String {
+    path.map(normalized_path_display)
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn production_sample_summary_csv(results: &[ProductionSampleJobResult]) -> String {
+    let mut text = String::from(
+        "sample,elapsedMillis,generationMillis,renderMillis,metricMillis,\
+currentVsExpectedMean,currentVsSourceMean,missingRegions,missingChunks,\
+outputDirectory,currentRender,metricDirectory,previewDebugDirectory,productionSourceDebug,\
+productionSourceVsReferenceMean,productionSourceVsExpectedMean,evidenceJson\n",
+    );
+    for result in results {
+        let row = [
+            csv_field(&result.sample),
+            result.elapsed_millis.to_string(),
+            result.generation_millis.to_string(),
+            result.render_millis.to_string(),
+            result.metric_millis.to_string(),
+            production_metric_text(result.current_vs_expected_mean),
+            production_metric_text(result.current_vs_source_mean),
+            result.missing_regions.to_string(),
+            result.missing_chunks.to_string(),
+            csv_field(&normalized_path_display(&result.output_directory)),
+            csv_field(&normalized_path_display(&result.current_render)),
+            csv_field(&normalized_path_display(&result.metric_directory)),
+            csv_field(&production_path_text(
+                result.preview_debug_directory.as_deref(),
+            )),
+            csv_field(&production_path_text(
+                result.production_source_debug.as_deref(),
+            )),
+            production_metric_text(result.production_source_vs_reference_mean),
+            production_metric_text(result.production_source_vs_expected_mean),
+            csv_field(&normalized_path_display(&result.evidence_json)),
+        ];
+        text.push_str(&row.join(","));
+        text.push('\n');
+    }
+    text
+}
+
+fn write_production_sample_properties(
+    job: &ProductionSampleJob,
+    options: &ProductionSampleOptions,
+    _surface_report: &SurfaceRegionReport,
+    render_report: &TopdownReport,
+    result: &ProductionSampleJobResult,
+) -> std::result::Result<(), String> {
+    let text = format!(
+        "sample={}\nregionX={}\nregionZ={}\ncropX={}\ncropY={}\ncropWidth={}\n\
+cropHeight={}\ncacheRows={}\nprefetchRows={}\nverticalScale={}\ntextureMode={}\n\
+chunkStatus={}\nmetricMode={}\npreviewDebug={}\nregionFile={}\ncurrentRender={}\n\
+metricDirectory={}\npreviewDebugDirectory={}\nproductionSourceDebug={}\n\
+productionSourceVsReferenceMean={}\nproductionSourceVsExpectedMean={}\n\
+elapsedMillis={}\ngenerationMillis={}\nrenderMillis={}\nmetricMillis={}\n\
+currentVsExpectedMean={}\ncurrentVsSourceMean={}\nmissingRegions={}\nmissingChunks={}\n\
+evidenceJson={}\n",
+        job.sample,
+        job.region_x,
+        job.region_z,
+        job.crop_x,
+        job.crop_y,
+        job.crop_width,
+        job.crop_height,
+        options.cache_rows,
+        options.prefetch_rows,
+        options.vertical_scale,
+        options.texture_mode.id(),
+        options.chunk_status.id(),
+        options.metric_mode.id(),
+        options.preview_debug.id(),
+        normalized_path_display(&result.region_file),
+        normalized_path_display(&result.current_render),
+        normalized_path_display(&result.metric_directory),
+        production_path_text(result.preview_debug_directory.as_deref()),
+        production_path_text(result.production_source_debug.as_deref()),
+        production_metric_text(result.production_source_vs_reference_mean),
+        production_metric_text(result.production_source_vs_expected_mean),
+        result.elapsed_millis,
+        result.generation_millis,
+        result.render_millis,
+        result.metric_millis,
+        production_metric_text(result.current_vs_expected_mean),
+        production_metric_text(result.current_vs_source_mean),
+        render_report.stats.missing_regions,
+        render_report.stats.missing_chunks,
+        normalized_path_display(&result.evidence_json)
+    );
+    write_text(
+        &job.output_directory
+            .join("quality-production-sample.properties"),
+        &text,
+    )
+}
+
+fn write_production_sample_evidence_json(
+    job: &ProductionSampleJob,
+    options: &ProductionSampleOptions,
+    surface_report: &SurfaceRegionReport,
+    render_report: &TopdownReport,
+    result: &ProductionSampleJobResult,
+    surface_material_path: Option<&Path>,
+    surface_tile_cache_entries: usize,
+) -> std::result::Result<(), String> {
+    let document = json!({
+        "schemaVersion": 1,
+        "sample": job.sample,
+        "inputs": {
+            "sourcePng": normalized_path_display(&job.source),
+            "expectedStandardPng": normalized_path_display(&job.expected_standard),
+            "landMaskPng": production_path_text(job.land_mask.as_deref()),
+            "maskMode": job.mask_mode,
+        },
+        "generation": {
+            "regionX": job.region_x,
+            "regionZ": job.region_z,
+            "chunkStatus": options.chunk_status.id(),
+            "textureMode": options.texture_mode.id(),
+            "surfaceRaster": surface_material_path
+                .map(normalized_path_display)
+                .unwrap_or_else(|| "none".to_string()),
+            "cacheRows": options.cache_rows,
+            "prefetchRows": options.prefetch_rows,
+            "verticalScale": options.vertical_scale,
+            "surfaceTileCacheEntries": surface_tile_cache_entries,
+        },
+        "artifacts": {
+            "worldDir": normalized_path_display(&job.output_directory.join("world")),
+            "regionFile": normalized_path_display(&surface_report.region_file),
+            "currentRender": normalized_path_display(&result.current_render),
+            "metricDirectory": normalized_path_display(&result.metric_directory),
+            "previewDebugDirectory": production_path_text(result.preview_debug_directory.as_deref()),
+            "productionSourceDebug": production_path_text(result.production_source_debug.as_deref()),
+        },
+        "timingsMillis": {
+            "elapsed": result.elapsed_millis,
+            "generation": result.generation_millis,
+            "render": result.render_millis,
+            "metric": result.metric_millis,
+        },
+        "metrics": {
+            "currentVsExpectedMean": result.current_vs_expected_mean,
+            "currentVsSourceMean": result.current_vs_source_mean,
+            "productionSourceVsReferenceMean": result.production_source_vs_reference_mean,
+            "productionSourceVsExpectedMean": result.production_source_vs_expected_mean,
+        },
+        "topdown": {
+            "missingRegions": render_report.stats.missing_regions,
+            "missingChunks": render_report.stats.missing_chunks,
+            "columnCount": render_report.stats.column_count,
+            "waterTopColumns": render_report.stats.water_top_columns,
+            "leafTopColumns": render_report.stats.leaf_top_columns,
+        }
+    });
+    write_json(&result.evidence_json, &document)
+}
+
+fn write_production_sample_contact_sheet(
+    results: &[ProductionSampleJobResult],
+    output_path: &Path,
+) -> std::result::Result<std::path::PathBuf, String> {
+    const COLUMNS: usize = 4;
+    let mut rows = Vec::<[image::RgbImage; COLUMNS]>::new();
+    let mut cell_width = 1u32;
+    let mut cell_height = 1u32;
+    for result in results {
+        let paths = [
+            result.metric_directory.join("source-crop.png"),
+            result.metric_directory.join("expected-crop.png"),
+            result.metric_directory.join("current-surface-crop.png"),
+            result
+                .metric_directory
+                .join("current-vs-expected-error.png"),
+        ];
+        let images = paths
+            .map(|path| {
+                image::open(&path)
+                    .map_err(|error| {
+                        format!(
+                            "failed to read contact sheet image {}: {error}",
+                            path.display()
+                        )
+                    })
+                    .map(|image| image.to_rgb8())
+            })
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for image in &images {
+            cell_width = cell_width.max(image.width());
+            cell_height = cell_height.max(image.height());
+        }
+        let [source, expected, current, error] = images
+            .try_into()
+            .map_err(|_| "internal contact sheet image count mismatch".to_string())?;
+        rows.push([source, expected, current, error]);
+    }
+    let width = cell_width
+        .checked_mul(COLUMNS as u32)
+        .ok_or_else(|| "contact sheet width overflow".to_string())?;
+    let height = cell_height
+        .checked_mul(rows.len() as u32)
+        .ok_or_else(|| "contact sheet height overflow".to_string())?;
+    let mut sheet = image::RgbImage::from_pixel(width, height, image::Rgb([24, 24, 24]));
+    for (row_index, row) in rows.iter().enumerate() {
+        let y_offset = row_index as u32 * cell_height;
+        for (column_index, image) in row.iter().enumerate() {
+            let x_offset = column_index as u32 * cell_width;
+            image::imageops::replace(&mut sheet, image, i64::from(x_offset), i64::from(y_offset));
+        }
+    }
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    sheet.save(output_path).map_err(|error| error.to_string())?;
+    Ok(output_path.to_path_buf())
 }
 
 fn photo_standard_remap_parity_crop(
@@ -1575,6 +2598,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  photo-parity-metric-batch <jobsCsv> <outputRoot> [threads|auto]"
+    )?;
+    writeln!(
+        out,
+        "  quality-production-sample-batch <samplesCsv> <heightmap> <outputRoot> <scale> <mca> <threads> [cacheRows=512] [prefetchRows=0] [verticalScale=1.25] [textureMode=photo] [surfaceRaster=auto] [chunkStatus=surface] [metricMode=full|current-only] [previewDebug=off|auto|dir]"
     )?;
     writeln!(
         out,
@@ -11051,6 +12078,9 @@ mod tests {
             "DONE rust.command.photo-parity-metric-batch - parallel PNG crop photo metric batch"
         ));
         assert!(out.contains(
+            "DONE rust.command.quality-production-sample-batch - Rust quality gate production sample batch"
+        ));
+        assert!(out.contains(
             "DONE rust.command.photo-standard-remap-parity-crop - Rust Standard palette remap parity crop"
         ));
         assert!(out.contains(
@@ -11387,6 +12417,7 @@ mod tests {
         assert!(out.contains("photo-compare-crop <actualPng> <expectedPng>"));
         assert!(out.contains("photo-parity-metric-crop <sourcePng> <expectedPng>"));
         assert!(out.contains("photo-parity-metric-batch <jobsCsv> <outputRoot>"));
+        assert!(out.contains("quality-production-sample-batch <samplesCsv> <heightmap>"));
         assert!(out.contains("photo-standard-remap-parity-crop <sourcePng> <imageMagickRemapPng>"));
         assert!(out.contains("photo-standard-remap-parity-batch <jobsCsv> <outputRoot>"));
         assert!(out.contains("photo-production-candidate-diff-crop <sourcePng> <expectedPng>"));
@@ -12256,6 +13287,161 @@ beta,{},{},1,1,2,2,none,all\n",
         assert!(sim_output.join("best-positive-remap.png").is_file());
         let csv = fs::read_to_string(sim_output.join("carrier-remap-simulation.csv")).unwrap();
         assert!(csv.contains("white,#FFFFFF") || csv.contains("black,#000000"));
+    }
+
+    #[test]
+    fn quality_production_sample_csv_accepts_existing_columns_and_aliases() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let expected = temp.path().join("expected.png");
+        let mask = temp.path().join("mask.png");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&expected, false);
+        write_metric_test_png(&mask, false);
+        let output_root = temp.path().join("out");
+        let samples = temp.path().join("samples.csv");
+        fs::write(
+            &samples,
+            "sample,regionX,regionZ,x,y,width,height,source,expected,mask,outputDir\n\
+alpha,1,-2,0,1,4,3,source.png,expected.png,mask.png,custom-out\n",
+        )
+        .unwrap();
+
+        let jobs = read_production_sample_jobs(&samples, &output_root).unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.sample, "alpha");
+        assert_eq!((job.region_x, job.region_z), (1, -2));
+        assert_eq!(
+            (job.crop_x, job.crop_y, job.crop_width, job.crop_height),
+            (0, 1, 4, 3)
+        );
+        assert_eq!(
+            normalized_path_display(&job.source),
+            normalized_path_display(&source)
+        );
+        assert_eq!(
+            normalized_path_display(&job.expected_standard),
+            normalized_path_display(&expected)
+        );
+        assert_eq!(
+            job.land_mask.as_deref().map(normalized_path_display),
+            Some(normalized_path_display(&mask))
+        );
+        assert_eq!(job.mask_mode, "land");
+        assert_eq!(job.output_directory, output_root.join("custom-out"));
+    }
+
+    #[test]
+    fn quality_production_sample_batch_rejects_linear_before_generation() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let expected = temp.path().join("expected.png");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&expected, false);
+        let samples = temp.path().join("samples.csv");
+        fs::write(
+            &samples,
+            format!(
+                "sample,regionX,regionZ,cropX,cropY,cropWidth,cropHeight,sourcePng,expectedStandardPng\n\
+alpha,0,0,0,0,4,4,{},{}\n",
+                source.display(),
+                expected.display()
+            ),
+        )
+        .unwrap();
+
+        let (code, out, err) = run_capture(&[
+            "quality-production-sample-batch",
+            samples.to_str().unwrap(),
+            "missing-heightmap.tif",
+            temp.path().join("out").to_str().unwrap(),
+            "1000",
+            "linear",
+            "1",
+            "textureMode=classified",
+            "surfaceRaster=none",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert!(err
+            .contains("quality-production-sample-batch currently requires mca for topdown parity"));
+    }
+
+    #[test]
+    #[ignore = "slow full-region quality smoke; run when changing quality-production-sample-batch generation"]
+    fn quality_production_sample_batch_generates_artifacts_without_java() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("height.tif");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+        let source = temp.path().join("source.png");
+        let expected = temp.path().join("expected.png");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&expected, false);
+        let samples = temp.path().join("samples.csv");
+        fs::write(
+            &samples,
+            format!(
+                "sample,regionX,regionZ,cropX,cropY,cropWidth,cropHeight,sourcePng,expectedStandardPng\n\
+alpha,0,0,0,0,4,4,{},{}\n",
+                source.display(),
+                expected.display()
+            ),
+        )
+        .unwrap();
+        let output_root = temp.path().join("quality-out");
+
+        let (code, out, err) = run_capture(&[
+            "quality-production-sample-batch",
+            samples.to_str().unwrap(),
+            heightmap.to_str().unwrap(),
+            output_root.to_str().unwrap(),
+            "1000",
+            "mca",
+            "1",
+            "cacheRows=2",
+            "prefetchRows=0",
+            "textureMode=classified",
+            "surfaceRaster=none",
+            "chunkStatus=surface",
+            "metricMode=current-only",
+            "previewDebug=auto",
+        ]);
+
+        assert_eq!(code, EXIT_OK, "stderr={err}");
+        assert!(err.is_empty());
+        assert!(out.contains("Quality production sample batch complete\n"));
+        assert!(out.contains("execution=single-rust-sequential\n"));
+        assert!(output_root
+            .join("quality-production-sample-summary.csv")
+            .is_file());
+        assert!(output_root
+            .join("quality-production-sample-contact-sheet.png")
+            .is_file());
+        let sample_root = output_root.join("alpha");
+        assert!(sample_root
+            .join("world")
+            .join("region")
+            .join("r.0.0.mca")
+            .is_file());
+        assert!(sample_root
+            .join("photo-parity")
+            .join("mca-visible-topdown.png")
+            .is_file());
+        assert!(sample_root
+            .join("photo-parity")
+            .join("metric-land")
+            .join("metrics.txt")
+            .is_file());
+        assert!(sample_root
+            .join("quality-production-sample.properties")
+            .is_file());
+        assert!(sample_root
+            .join("quality-production-sample-evidence.json")
+            .is_file());
+        assert!(sample_root.join("preview-debug").is_dir());
     }
 
     #[test]
