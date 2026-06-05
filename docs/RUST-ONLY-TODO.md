@@ -363,20 +363,21 @@ Detailed progress:
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered commands:
-- [ ] `generate-survival-region`
-- [ ] `generate-survival-regions-parallel`
-- [ ] `generate-survival-region-osm-synthetic`
-- [ ] `generate-survival-regions-parallel-osm-synthetic`
+- [x] `generate-survival-region`
+- [x] `generate-survival-regions-parallel`
+- [x] `generate-survival-region-osm-synthetic` (replacement alias; synthetic OSM overlay retired from normal path)
+- [x] `generate-survival-regions-parallel-osm-synthetic` (replacement alias; synthetic OSM overlay retired from normal path)
 - [ ] `generate-survival-region-osm-pbf`
 - [ ] `generate-survival-region-osm-pbf-ref-window`
 - [ ] `generate-survival-region-osm-pbf-full-scan`
 - [ ] `generate-survival-region-osm-xml-cache`
-- [ ] `generate-survival-region-plan-parallel`
-- [ ] `generate-survival-region-plan-parallel-osm-synthetic`
+- [x] `generate-survival-region-plan-parallel`
+- [x] `generate-survival-region-plan-parallel-osm-synthetic` (replacement alias; synthetic OSM overlay retired from normal path)
 Detailed progress:
-- [ ] Decide whether legacy direct ecology generation is ported or dropped in favor of vanilla-delegated generation.
-- [ ] Any dropped legacy path has a documented replacement command.
-- [ ] OSM overlays do not slow the default no-OSM generation path.
+- [x] Decide whether legacy direct ecology generation is ported or dropped in favor of vanilla-delegated generation.
+- [x] Any dropped legacy path has a documented replacement command.
+- [x] OSM overlays do not slow the default no-OSM generation path.
+Replacement note: legacy direct survival ecology and synthetic OSM generation names now dispatch to Rust vanilla-delegated surface generation. PBF/XML OSM overlay commands remain open until they are either ported as bounded Rust overlay tools or explicitly retired with a separate replacement path.
 
 ### OSM scan, validate, and extract commands
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented

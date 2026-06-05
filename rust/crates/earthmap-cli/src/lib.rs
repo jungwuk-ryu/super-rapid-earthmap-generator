@@ -348,6 +348,48 @@ where
             &args[4],
             &args[5],
         )),
+        "generate-survival-region" | "generate-survival-region-osm-synthetic"
+            if args.len() == 7 =>
+        {
+            write_result(generate_survival_region_alias(
+                stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+            ))
+        }
+        "generate-survival-regions-parallel"
+        | "generate-survival-regions-parallel-osm-synthetic"
+            if args.len() == 10 || args.len() == 11 =>
+        {
+            write_result(generate_survival_regions_parallel_alias(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7],
+                &args[8],
+                &args[9],
+                args.get(10).map(String::as_str),
+            ))
+        }
+        "generate-survival-region-plan-parallel"
+        | "generate-survival-region-plan-parallel-osm-synthetic"
+            if args.len() == 7 || args.len() == 8 =>
+        {
+            write_result(generate_survival_region_plan_parallel_alias(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                args.get(7).map(String::as_str),
+            ))
+        }
         "quality-candidate"
             if (6..=9).contains(&args.len()) && quality_candidate_args(&args).is_some() =>
         {
@@ -2605,6 +2647,18 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
+        "  generate-survival-region <heightmap> <worldDir> <scale> <regionX> <regionZ> <mca|linear>    (Rust vanilla-delegated alias)"
+    )?;
+    writeln!(
+        out,
+        "  generate-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [maxRegionsThisRun]    (Rust vanilla-delegated alias)"
+    )?;
+    writeln!(
+        out,
+        "  generate-survival-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun]    (Rust vanilla-delegated alias)"
+    )?;
+    writeln!(
+        out,
         "  generate-vanilla-delegated-region [heightmap] <worldDir> <scale> <regionX> <regionZ> <mca|linear> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(
@@ -3673,6 +3727,112 @@ fn generate_surface_region_impl(
     let report =
         earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
     Ok(surface_region_report_lines(&report, world_dir))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_survival_region_alias(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+) -> io::Result<i32> {
+    writeln!(
+        out,
+        "notice=legacy survival direct generation is replaced by Rust vanilla-delegated surface generation"
+    )?;
+    generate_vanilla_delegated_region(
+        out,
+        err,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        format_text,
+        "surface",
+        "surfaceRaster=auto",
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_survival_regions_parallel_alias(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+    threads_text: &str,
+    max_regions_this_run: Option<&str>,
+) -> io::Result<i32> {
+    writeln!(
+        out,
+        "notice=legacy survival direct parallel generation is replaced by Rust vanilla-delegated parallel generation"
+    )?;
+    if let Some(max_regions_this_run) = max_regions_this_run {
+        writeln!(
+            out,
+            "notice=maxRegionsThisRun={} is ignored by the grid alias; use generate-vanilla-delegated-plan-parallel for bounded non-contiguous runs",
+            max_regions_this_run
+        )?;
+    }
+    generate_vanilla_delegated_regions_parallel(
+        out,
+        err,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+        threads_text,
+        "surface",
+        "surfaceRaster=auto",
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_survival_region_plan_parallel_alias(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    format_text: &str,
+    threads_text: &str,
+    plan_csv: &str,
+    max_regions_this_run: Option<&str>,
+) -> io::Result<i32> {
+    writeln!(
+        out,
+        "notice=legacy survival plan generation is replaced by Rust vanilla-delegated plan generation"
+    )?;
+    let optional_args = max_regions_this_run
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
+    generate_vanilla_delegated_plan_parallel(
+        out,
+        err,
+        heightmap_path,
+        world_dir,
+        scale_text,
+        format_text,
+        threads_text,
+        plan_csv,
+        &optional_args,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12712,6 +12872,12 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.generate-vanilla-delegated-region-plan-parallel - Java-compatible alias for vanilla-delegated plan generation"
         ));
+        assert!(out.contains(
+            "DONE rust.command.generate-survival-region - Rust vanilla-delegated survival compatibility alias"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.generate-survival-regions-parallel - Rust vanilla-delegated survival parallel compatibility alias"
+        ));
     }
 
     #[test]
@@ -12878,6 +13044,40 @@ mod tests {
         assert_eq!(code, EXIT_USAGE);
         assert!(out.is_empty());
         assert!(err.contains("default textureMode=photo requires a TrueMarble surface raster"));
+        assert!(!err.contains("not implemented yet"));
+    }
+
+    #[test]
+    fn survival_generation_aliases_dispatch_without_java() {
+        let (code, out, err) = run_capture(&[
+            "generate-survival-region",
+            "missing-heightmap.tif",
+            "world",
+            "1000",
+            "0",
+            "0",
+            "bad-format",
+        ]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.contains("legacy survival direct generation is replaced"));
+        assert!(err.contains("format must be mca or linear"));
+        assert!(!err.contains("not implemented yet"));
+
+        let (code, out, err) = run_capture(&[
+            "generate-survival-regions-parallel",
+            "missing-heightmap.tif",
+            "world",
+            "1000",
+            "0",
+            "0",
+            "1",
+            "1",
+            "bad-format",
+            "1",
+        ]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.contains("legacy survival direct parallel generation is replaced"));
+        assert!(err.contains("format must be mca or linear"));
         assert!(!err.contains("not implemented yet"));
     }
 
@@ -13160,6 +13360,9 @@ mod tests {
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("quality-candidate [heightmap] <worldDir>"));
         assert!(out.contains("generate <heightmap> <worldDir> <scale> <startRegionX>"));
+        assert!(out.contains("generate-survival-region <heightmap> <worldDir>"));
+        assert!(out.contains("generate-survival-regions-parallel <heightmap>"));
+        assert!(out.contains("generate-survival-region-plan-parallel <heightmap>"));
         assert!(out.contains("generate-vanilla-delegated-plan-parallel <heightmap>"));
         assert!(out.contains("generate-vanilla-delegated-region-plan-parallel <heightmap>"));
         assert!(out.contains("benchmark-region-writers <outputDir> [iterations=3]"));

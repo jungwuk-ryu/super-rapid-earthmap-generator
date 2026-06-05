@@ -51,13 +51,13 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "generate-survival-region",
-        status: CommandStatus::NotPortedYet,
-        note: "single vanilla-delegated survival compatibility workflow",
+        status: CommandStatus::Implemented,
+        note: "Rust vanilla-delegated survival compatibility alias",
     },
     CommandSpec {
         name: "generate-survival-regions-parallel",
-        status: CommandStatus::NotPortedYet,
-        note: "parallel vanilla-delegated survival compatibility workflow",
+        status: CommandStatus::Implemented,
+        note: "Rust vanilla-delegated survival parallel compatibility alias",
     },
     CommandSpec {
         name: "quality-production-sample-batch",
