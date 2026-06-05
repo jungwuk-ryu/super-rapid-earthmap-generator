@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,8 +33,8 @@ const REGION_STATE_SKIPPED: u8 = 3;
 const REGION_STATE_GENERATED: u8 = 4;
 const REGION_STATE_FAILED: u8 = 5;
 const ROLLING_SPEED_WINDOW: Duration = Duration::from_secs(60);
-const WORLD_MAP_TEXTURE_WIDTH: usize = 720;
-const WORLD_MAP_TEXTURE_HEIGHT: usize = 360;
+const WORLD_MAP_BACKGROUND_PNG: &[u8] =
+    include_bytes!("../assets/world-background-truemarble-2048.png");
 const MAX_STATUS_TEXTURE_DIMENSION: usize = 2048;
 const STATUS_TEXTURE_UPLOAD_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -623,60 +623,29 @@ fn draw_rect_outline(painter: &egui::Painter, rect: egui::Rect, color: egui::Col
 }
 
 fn world_map_background_image() -> egui::ColorImage {
-    let mut pixels = Vec::with_capacity(WORLD_MAP_TEXTURE_WIDTH * WORLD_MAP_TEXTURE_HEIGHT);
-    for y in 0..WORLD_MAP_TEXTURE_HEIGHT {
-        let latitude = 90.0 - ((y as f64 + 0.5) / WORLD_MAP_TEXTURE_HEIGHT as f64) * 180.0;
-        for x in 0..WORLD_MAP_TEXTURE_WIDTH {
-            let longitude = ((x as f64 + 0.5) / WORLD_MAP_TEXTURE_WIDTH as f64) * 360.0 - 180.0;
-            pixels.push(world_map_pixel(longitude, latitude));
-        }
-    }
-    egui::ColorImage::new([WORLD_MAP_TEXTURE_WIDTH, WORLD_MAP_TEXTURE_HEIGHT], pixels)
-}
-
-fn world_map_pixel(longitude: f64, latitude: f64) -> egui::Color32 {
-    if rough_world_land_mask(longitude, latitude) {
-        let dry = ((latitude.abs() / 90.0) * 0.25 + rough_noise(longitude, latitude) * 0.35)
-            .clamp(0.0, 1.0);
-        let green = (115.0 + (1.0 - dry) * 55.0) as u8;
-        let red = (85.0 + dry * 65.0) as u8;
-        let blue = (70.0 + (1.0 - dry) * 35.0) as u8;
-        egui::Color32::from_rgb(red, green, blue)
-    } else {
-        let depth =
-            (0.55 + (latitude.abs() / 90.0) * 0.20 + rough_noise(longitude, latitude) * 0.10)
-                .clamp(0.0, 1.0);
-        egui::Color32::from_rgb(
-            (22.0 + depth * 18.0) as u8,
-            (82.0 + depth * 34.0) as u8,
-            (132.0 + depth * 55.0) as u8,
-        )
-    }
-}
-
-fn rough_world_land_mask(lon: f64, lat: f64) -> bool {
-    in_ellipse(lon, lat, -105.0, 47.0, 58.0, 25.0)
-        || in_ellipse(lon, lat, -84.0, 20.0, 28.0, 18.0)
-        || in_ellipse(lon, lat, -60.0, -17.0, 27.0, 39.0)
-        || in_ellipse(lon, lat, 20.0, 2.0, 33.0, 36.0)
-        || in_ellipse(lon, lat, 70.0, 50.0, 78.0, 29.0)
-        || in_ellipse(lon, lat, 103.0, 25.0, 44.0, 25.0)
-        || in_ellipse(lon, lat, 134.0, -25.0, 24.0, 16.0)
-        || in_ellipse(lon, lat, 46.0, -20.0, 13.0, 16.0)
-        || in_ellipse(lon, lat, -42.0, 74.0, 20.0, 10.0)
-        || in_ellipse(lon, lat, 138.0, -42.0, 7.0, 4.0)
-        || in_ellipse(lon, lat, 140.0, 38.0, 8.0, 10.0)
-}
-
-fn in_ellipse(lon: f64, lat: f64, center_lon: f64, center_lat: f64, rx: f64, ry: f64) -> bool {
-    let dx = (lon - center_lon) / rx;
-    let dy = (lat - center_lat) / ry;
-    (dx * dx) + (dy * dy) <= 1.0
-}
-
-fn rough_noise(lon: f64, lat: f64) -> f64 {
-    let value = (lon.to_radians().sin() * 12.9898 + lat.to_radians().cos() * 78.233).sin();
-    (value + 1.0) * 0.5
+    let decoder = png::Decoder::new(Cursor::new(WORLD_MAP_BACKGROUND_PNG));
+    let mut reader = decoder
+        .read_info()
+        .expect("embedded world map PNG metadata must decode");
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buffer)
+        .expect("embedded world map PNG pixels must decode");
+    let bytes = &buffer[..info.buffer_size()];
+    let pixels = match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgb, png::BitDepth::Eight) => bytes
+            .chunks_exact(3)
+            .map(|pixel| egui::Color32::from_rgb(pixel[0], pixel[1], pixel[2]))
+            .collect(),
+        (png::ColorType::Rgba, png::BitDepth::Eight) => bytes
+            .chunks_exact(4)
+            .map(|pixel| {
+                egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3])
+            })
+            .collect(),
+        _ => panic!("embedded world map PNG must be 8-bit RGB or RGBA"),
+    };
+    egui::ColorImage::new([info.width as usize, info.height as usize], pixels)
 }
 
 #[derive(Debug)]
@@ -1918,6 +1887,14 @@ mod tests {
         });
         assert_eq!(scale, 2);
         assert_eq!((width, height), (1600, 800));
+    }
+
+    #[test]
+    fn world_map_background_image_decodes_embedded_satellite_asset() {
+        let image = world_map_background_image();
+
+        assert_eq!(image.size, [2048, 1024]);
+        assert_eq!(image.pixels.len(), 2048 * 1024);
     }
 
     #[test]

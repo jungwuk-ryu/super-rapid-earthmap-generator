@@ -10,6 +10,7 @@ earthmap-cli = { path = "../earthmap-cli" }
 earthmap-geo = { path = "../earthmap-geo" }
 eframe.workspace = true
 mimalloc.workspace = true
+png.workspace = true
 rfd.workspace = true
 serde_json.workspace = true
 
