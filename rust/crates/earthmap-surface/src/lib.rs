@@ -1893,6 +1893,24 @@ fn classify_surface_material_by_semantic_intent(
         ));
     }
 
+    if is_bare_desert_photo_source(sample, metrics) {
+        return Some(hot_desert_surface_column(
+            base,
+            sample,
+            metrics,
+            elevation_meters,
+            longitude,
+            latitude,
+            sahara_score,
+            dry_savanna_score,
+            patch_noise,
+            fine_noise,
+            local_relief_meters,
+            terrain,
+            semantic_terrain,
+        ));
+    }
+
     if is_forest_savanna_mosaic_intent(
         sample,
         metrics,
@@ -3160,9 +3178,6 @@ fn surface_material_semantic_fallback_color(
     {
         return Some(RgbColor::of(45, 96, 42));
     }
-    if is_tropical_savanna_climate(climate) || is_steppe_climate(climate) || savanna_like {
-        return Some(RgbColor::of(126, 123, 70));
-    }
     if is_desert_climate(climate) || dry_ecoregion {
         if vegetation >= 0.04
             && (savanna_like || surface_material_sahel_score(longitude, latitude) >= 0.18)
@@ -3170,6 +3185,9 @@ fn surface_material_semantic_fallback_color(
             return Some(RgbColor::of(126, 123, 70));
         }
         return Some(RgbColor::of(230, 205, 160));
+    }
+    if is_tropical_savanna_climate(climate) || is_steppe_climate(climate) || savanna_like {
+        return Some(RgbColor::of(126, 123, 70));
     }
     if is_temperate_climate(climate) || is_cold_climate(climate) || forest_like {
         return Some(RgbColor::of(78, 118, 64));
@@ -4433,9 +4451,17 @@ fn has_vegetation_evidence(sample: &SurfaceMaterialSample, metrics: SurfaceColor
         || sample.herbaceous_cover() >= 0.16
         || sample.shrub_cover() >= 0.16
         || is_green_like(metrics)
-        || is_olive_dry_grass(metrics)
     {
         return true;
+    }
+    if is_olive_dry_grass(metrics) {
+        let bare_desert_context = is_desert_climate(sample.climate_class)
+            && is_dry_ecoregion_biome(sample)
+            && !has_sparse_structural_vegetation_evidence(sample)
+            && (is_desert_sand_like(metrics) || is_dry_land_neutral(metrics));
+        if !bare_desert_context {
+            return true;
+        }
     }
     let vegetation = sample.vegetation_cover();
     if vegetation <= 0.0 {
@@ -4454,6 +4480,34 @@ fn has_vegetation_evidence(sample: &SurfaceMaterialSample, metrics: SurfaceColor
     !is_desert_climate(sample.climate_class)
         && !is_dry_ecoregion_biome(sample)
         && vegetation >= 0.08
+}
+
+fn has_sparse_structural_vegetation_evidence(sample: &SurfaceMaterialSample) -> bool {
+    sample.tree_cover() >= 0.04
+        || sample.herbaceous_cover() >= 0.08
+        || sample.shrub_cover() >= 0.08
+        || sample.vegetation_cover() >= 0.10
+}
+
+fn is_bare_desert_photo_source(
+    sample: &SurfaceMaterialSample,
+    metrics: SurfaceColorMetrics,
+) -> bool {
+    if is_green_like(metrics) || has_sparse_structural_vegetation_evidence(sample) {
+        return false;
+    }
+    let arid_context = is_desert_climate(sample.climate_class) || is_dry_ecoregion_biome(sample);
+    if !arid_context {
+        return false;
+    }
+    let bright_arid_land = metrics.value >= 0.52
+        && (22.0..=72.0).contains(&metrics.hue)
+        && metrics.red >= metrics.blue * 1.02
+        && metrics.green >= metrics.blue * 0.95;
+    is_desert_sand_like(metrics)
+        || is_pale_dry_land(metrics)
+        || is_dry_land_neutral(metrics)
+        || (is_orange_rock_like(metrics) && bright_arid_land && metrics.saturation <= 0.62)
 }
 
 fn is_dry_core_ecoregion_evidence(
@@ -6411,6 +6465,8 @@ fn is_photo_solver_pale_sand_carrier(top: i32) -> bool {
     matches!(
         top,
         block_state_ids::SANDSTONE
+            | block_state_ids::QUARTZ_BLOCK
+            | block_state_ids::BONE_BLOCK
             | block_state_ids::END_STONE
             | block_state_ids::END_STONE_BRICKS
             | block_state_ids::SMOOTH_SANDSTONE
@@ -11216,6 +11272,9 @@ pub fn sanitize_surface_column_for_production(column: &EarthSurfaceColumn) -> Ea
         &column.biome_id,
         column.water,
     );
+    if !column.water && is_photo_sand_carrier_column(column) && is_sand_like_surface(top) {
+        filler = top;
+    }
     if column.water && (top == block_state_ids::GRAVEL || is_sand_like_surface(top)) {
         top = stable_water_floor_replacement(column);
         filler = top;
@@ -11224,6 +11283,7 @@ pub fn sanitize_surface_column_for_production(column: &EarthSurfaceColumn) -> Ea
         && is_sand_like_surface(top)
         && (column.ground_surface_y <= SEA_LEVEL_Y + 6
             || !is_true_sandy_land_biome(&column.biome_id))
+        && !is_photo_sand_carrier_column(column)
     {
         top = if is_wet_surface_biome(&column.biome_id) {
             block_state_ids::MUD
@@ -12073,6 +12133,12 @@ fn is_photo_preserved_natural_surface_top(block: i32) -> bool {
         return false;
     }
     is_allowed_natural_surface_top(block)
+}
+
+fn is_photo_sand_carrier_column(column: &EarthSurfaceColumn) -> bool {
+    is_photo_material_driven_column(column)
+        && (is_sand_like_surface(column.top_block_state_id)
+            || is_photo_solver_pale_sand_carrier(column.top_block_state_id))
 }
 
 fn is_sand_like_surface(block: i32) -> bool {
@@ -16990,11 +17056,15 @@ mod tests {
             0.0,
             0.0,
         );
+        assert_ne!(
+            savanna_ecoregion_edge.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
         assert_eq!(
             savanna_ecoregion_edge.filler_block_state_id,
-            block_state_ids::DIRT
+            savanna_ecoregion_edge.top_block_state_id
         );
-        assert_eq!(savanna_ecoregion_edge.biome_id, "minecraft:savanna");
+        assert_eq!(savanna_ecoregion_edge.biome_id, "minecraft:desert");
         assert_eq!(savanna_ecoregion_edge.decision_source, "intent");
 
         let bright_savanna_hot_desert = SurfaceMaterialSample::land(
@@ -17212,11 +17282,15 @@ mod tests {
             0.0,
             0.0,
         );
+        assert_ne!(
+            dry_core_transition.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
         assert_eq!(
             dry_core_transition.filler_block_state_id,
-            block_state_ids::DIRT
+            dry_core_transition.top_block_state_id
         );
-        assert_eq!(dry_core_transition.biome_id, "minecraft:savanna");
+        assert_eq!(dry_core_transition.biome_id, "minecraft:desert");
         assert_eq!(dry_core_transition.decision_source, "intent-ecoregion");
 
         let dry_core_hot_desert_candidate = SurfaceMaterialSample::land(
@@ -17677,6 +17751,75 @@ mod tests {
         );
         assert_eq!(climate_desert.top_block_state_id, block_state_ids::SAND);
         assert_eq!(climate_desert.biome_id, "minecraft:desert");
+
+        let bare_mauritania_savanna_raster = SurfaceMaterialSample::new(
+            RgbColor::of(240, 204, 151),
+            RgbColor::of(230, 205, 160),
+            TerrainTokenSource::JavaStandardPalette,
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            48090,
+            512,
+            35,
+            "Sahelian Acacia savanna",
+            "minecraft:savanna",
+            2.0 / 3.0,
+        );
+        let mauritania_bare_desert = apply_test_surface_material_sample(
+            &base_land,
+            bare_mauritania_savanna_raster,
+            456.0,
+            -10.456394260761073,
+            18.356804511519044,
+            0.0,
+            46.0,
+        );
+        assert_ne!(
+            mauritania_bare_desert.top_block_state_id,
+            block_state_ids::GRASS_BLOCK
+        );
+        assert_eq!(mauritania_bare_desert.biome_id, "minecraft:desert");
+        assert_eq!(mauritania_bare_desert.decision_source, "intent");
+
+        let no_color_south_saharan_steppe = SurfaceMaterialSample::land(
+            RgbColor::unavailable(),
+            4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            48090,
+            512,
+            35,
+            "South Saharan steppe and woodlands",
+            "minecraft:desert",
+            2.0 / 3.0,
+        );
+        let south_saharan_fallback = apply_test_surface_material_sample(
+            &base_land,
+            no_color_south_saharan_steppe,
+            456.0,
+            -8.003992514036185,
+            17.997484933066872,
+            0.0,
+            46.0,
+        );
+        assert_eq!(
+            south_saharan_fallback.top_block_state_id,
+            block_state_ids::SAND
+        );
+        assert_eq!(south_saharan_fallback.biome_id, "minecraft:desert");
 
         let desert_edge_vegetation = SurfaceMaterialSample::land(
             RgbColor::of(126, 123, 70),
@@ -18941,6 +19084,26 @@ mod tests {
             cleaned.filler_block_state_id,
             block_state_ids::SMOOTH_SANDSTONE
         );
+
+        for pale_top in [
+            block_state_ids::QUARTZ_BLOCK,
+            block_state_ids::BONE_BLOCK,
+            block_state_ids::END_STONE,
+        ] {
+            let pale_photo_plain = surface_column(
+                false,
+                SEA_LEVEL_Y + 9,
+                i32::MIN,
+                pale_top,
+                block_state_ids::DIRT,
+                "minecraft:plains",
+            )
+            .with_decision_source("photo-palette")
+            .with_terrain_token_source(TerrainTokenSource::JavaStandardPalette);
+            let cleaned = sanitize_surface_column_for_production(&pale_photo_plain);
+            assert_eq!(cleaned.top_block_state_id, block_state_ids::SAND);
+            assert_eq!(cleaned.filler_block_state_id, block_state_ids::SAND);
+        }
 
         let red_interior = surface_column(
             false,
