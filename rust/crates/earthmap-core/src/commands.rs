@@ -100,9 +100,19 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "MCA block palette scanner",
     },
     CommandSpec {
+        name: "validate-mca-survival-palette",
+        status: CommandStatus::Implemented,
+        note: "MCA survival palette validator",
+    },
+    CommandSpec {
         name: "inspect-linear-palettes",
         status: CommandStatus::Implemented,
         note: "Linear block palette scanner",
+    },
+    CommandSpec {
+        name: "validate-linear-survival-palette",
+        status: CommandStatus::Implemented,
+        note: "Linear survival palette validator",
     },
     CommandSpec {
         name: "inspect-mca-biomes",

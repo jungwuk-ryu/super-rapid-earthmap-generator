@@ -249,7 +249,7 @@ Detailed progress:
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered MCA commands:
 - [x] `validate-mca-region`
-- [ ] `validate-mca-survival-palette`
+- [x] `validate-mca-survival-palette`
 - [x] `inspect-mca-palettes`
 - [x] `inspect-mca-biomes`
 - [x] `inspect-mca-statuses`
@@ -258,7 +258,7 @@ Covered MCA commands:
 - [ ] `rewrite-mca-status`
 Covered Linear commands:
 - [x] `validate-linear-region`
-- [ ] `validate-linear-survival-palette`
+- [x] `validate-linear-survival-palette`
 - [x] `inspect-linear-palettes`
 - [x] `inspect-linear-biomes`
 - [x] `inspect-linear-statuses`

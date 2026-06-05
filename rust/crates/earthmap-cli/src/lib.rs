@@ -351,6 +351,15 @@ where
             "MCA palettes scanned",
             "MCA palette inspection failed",
         )),
+        "validate-mca-survival-palette" if args.len() == 2 => {
+            write_result(validate_survival_palette(
+                stdout,
+                stderr,
+                &args[1],
+                "MCA survival palette scanned",
+                "MCA survival palette validation failed",
+            ))
+        }
         "inspect-linear-palettes" if args.len() == 2 => write_result(inspect_block_palettes(
             stdout,
             stderr,
@@ -358,6 +367,15 @@ where
             "Linear palettes scanned",
             "Linear palette inspection failed",
         )),
+        "validate-linear-survival-palette" if args.len() == 2 => {
+            write_result(validate_survival_palette(
+                stdout,
+                stderr,
+                &args[1],
+                "Linear survival palette scanned",
+                "Linear survival palette validation failed",
+            ))
+        }
         "inspect-mca-biomes" if args.len() == 2 => write_result(inspect_biomes(
             stdout,
             stderr,
@@ -842,7 +860,9 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         "  convert-mca-world-to-linear <mcaWorldDir> <linearWorldDir>"
     )?;
     writeln!(out, "  inspect-mca-palettes <path>")?;
+    writeln!(out, "  validate-mca-survival-palette <path>")?;
     writeln!(out, "  inspect-linear-palettes <path>")?;
+    writeln!(out, "  validate-linear-survival-palette <path>")?;
     writeln!(out, "  inspect-mca-biomes <path>")?;
     writeln!(out, "  inspect-linear-biomes <path>")?;
     writeln!(out, "  inspect-mca-statuses <path>")?;
@@ -5520,6 +5540,47 @@ struct BlockPaletteScan {
     hits: BTreeMap<String, usize>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct OreKindSpec {
+    id: &'static str,
+    survival_critical: bool,
+}
+
+const ORE_KIND_SPECS: &[OreKindSpec] = &[
+    OreKindSpec {
+        id: "coal",
+        survival_critical: true,
+    },
+    OreKindSpec {
+        id: "iron",
+        survival_critical: true,
+    },
+    OreKindSpec {
+        id: "copper",
+        survival_critical: true,
+    },
+    OreKindSpec {
+        id: "gold",
+        survival_critical: true,
+    },
+    OreKindSpec {
+        id: "redstone",
+        survival_critical: true,
+    },
+    OreKindSpec {
+        id: "lapis",
+        survival_critical: true,
+    },
+    OreKindSpec {
+        id: "diamond",
+        survival_critical: true,
+    },
+    OreKindSpec {
+        id: "emerald",
+        survival_critical: false,
+    },
+];
+
 #[derive(Clone, Debug, Default)]
 struct BiomePaletteScan {
     region_chunk_count: usize,
@@ -5535,6 +5596,88 @@ struct StatusScan {
     region_chunk_count: usize,
     decoded_chunk_count: usize,
     counts: BTreeMap<String, usize>,
+}
+
+fn validate_survival_palette(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+    title: &str,
+    error_prefix: &str,
+) -> io::Result<i32> {
+    match scan_block_palettes(region) {
+        Ok(report) => {
+            let has_deepslate = palette_contains(&report, "minecraft:deepslate");
+            let mut survival_critical_complete = has_deepslate;
+            let mut all_ores_present = true;
+            writeln!(out, "{title}")?;
+            writeln!(out, "regionChunkCount={}", report.region_chunk_count)?;
+            writeln!(out, "decodedChunkCount={}", report.decoded_chunk_count)?;
+            writeln!(out, "decodedSectionCount={}", report.decoded_section_count)?;
+            writeln!(out, "paletteEntryCount={}", report.palette_entry_count)?;
+            writeln!(out, "has.deepslate={has_deepslate}")?;
+            writeln!(
+                out,
+                "has.water={}",
+                palette_contains(&report, "minecraft:water")
+            )?;
+            writeln!(
+                out,
+                "has.lava={}",
+                palette_contains(&report, "minecraft:lava")
+            )?;
+            writeln!(
+                out,
+                "paletteHits.minecraft:water={}",
+                palette_hits(&report, "minecraft:water")
+            )?;
+            writeln!(
+                out,
+                "paletteHits.minecraft:lava={}",
+                palette_hits(&report, "minecraft:lava")
+            )?;
+            for kind in ORE_KIND_SPECS {
+                let stone_name = format!("minecraft:{}_ore", kind.id);
+                let deepslate_name = format!("minecraft:deepslate_{}_ore", kind.id);
+                let present = palette_contains(&report, &stone_name)
+                    || palette_contains(&report, &deepslate_name);
+                writeln!(out, "has.ore.{}={present}", kind.id)?;
+                writeln!(
+                    out,
+                    "paletteHits.{stone_name}={}",
+                    palette_hits(&report, &stone_name)
+                )?;
+                writeln!(
+                    out,
+                    "paletteHits.{deepslate_name}={}",
+                    palette_hits(&report, &deepslate_name)
+                )?;
+                if kind.survival_critical {
+                    survival_critical_complete &= present;
+                }
+                all_ores_present &= present;
+            }
+            writeln!(out, "survivalCriticalComplete={survival_critical_complete}")?;
+            writeln!(out, "allOresPresent={all_ores_present}")?;
+            Ok(if survival_critical_complete {
+                EXIT_OK
+            } else {
+                EXIT_USAGE
+            })
+        }
+        Err(error) => {
+            writeln!(err, "{error_prefix}: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn palette_contains(report: &BlockPaletteScan, name: &str) -> bool {
+    palette_hits(report, name) > 0
+}
+
+fn palette_hits(report: &BlockPaletteScan, name: &str) -> usize {
+    report.hits.get(name).copied().unwrap_or(0)
 }
 
 fn inspect_block_palettes(
@@ -7323,8 +7466,14 @@ mod tests {
             "DONE rust.command.convert-mca-world-to-linear - MCA world to Linear V2 converter"
         ));
         assert!(out.contains("DONE rust.command.inspect-mca-palettes - MCA block palette scanner"));
+        assert!(out.contains(
+            "DONE rust.command.validate-mca-survival-palette - MCA survival palette validator"
+        ));
         assert!(out
             .contains("DONE rust.command.inspect-linear-palettes - Linear block palette scanner"));
+        assert!(out.contains(
+            "DONE rust.command.validate-linear-survival-palette - Linear survival palette validator"
+        ));
         assert!(out.contains("DONE rust.command.inspect-mca-biomes - MCA biome palette scanner"));
         assert!(
             out.contains("DONE rust.command.inspect-linear-biomes - Linear biome palette scanner")
@@ -7607,7 +7756,9 @@ mod tests {
         assert!(out.contains("convert-mca-region-to-linear <mcaRegion> <linearRegion>"));
         assert!(out.contains("convert-mca-world-to-linear <mcaWorldDir> <linearWorldDir>"));
         assert!(out.contains("inspect-mca-palettes <path>"));
+        assert!(out.contains("validate-mca-survival-palette <path>"));
         assert!(out.contains("inspect-linear-palettes <path>"));
+        assert!(out.contains("validate-linear-survival-palette <path>"));
         assert!(out.contains("inspect-mca-biomes <path>"));
         assert!(out.contains("inspect-linear-biomes <path>"));
         assert!(out.contains("inspect-mca-statuses <path>"));
@@ -8131,6 +8282,15 @@ mod tests {
         assert!(out.contains("decodedChunkCount=1024\n"));
         assert!(out.contains("paletteHits.minecraft:grass_block="));
 
+        let (code, out, err) = run_capture(&["validate-mca-survival-palette", region]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA survival palette scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("has.deepslate=false\n"));
+        assert!(out.contains("has.ore.coal=false\n"));
+        assert!(out.contains("survivalCriticalComplete=false\n"));
+
         let (code, out, err) = run_capture(&["inspect-mca-biomes", region]);
         assert_eq!(code, EXIT_OK);
         assert!(err.is_empty());
@@ -8163,6 +8323,15 @@ mod tests {
         assert!(out.contains("regionChunkCount=1024\n"));
         assert!(out.contains("decodedChunkCount=1024\n"));
         assert!(out.contains("paletteHits.minecraft:grass_block="));
+
+        let (code, out, err) = run_capture(&["validate-linear-survival-palette", region]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear survival palette scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("has.deepslate=false\n"));
+        assert!(out.contains("has.ore.coal=false\n"));
+        assert!(out.contains("survivalCriticalComplete=false\n"));
 
         let (code, out, err) = run_capture(&["inspect-linear-biomes", region]);
         assert_eq!(code, EXIT_OK);
