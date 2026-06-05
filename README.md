@@ -1,6 +1,6 @@
 # Super-Rapid EarthMap Generator
 
-Photo-first Earth surface generator for Minecraft Java 1.21.11.
+Photo-first Earth surface generator for Minecraft 1.21.11 worlds.
 
 Current status: **active prototype, production readiness NO-GO**. Do not start a full Earth or nation-war generation
 until the gates in `docs/QUALITY-GATES.md` pass for the same candidate build/config.
@@ -26,16 +26,18 @@ until the gates in `docs/QUALITY-GATES.md` pass for the same candidate build/con
 .\scripts\test.ps1
 ```
 
-`scripts/test.ps1` defaults to a single JVM test runner. Use `-Isolated` only when debugging a test that must run in
-its own Java process.
+`scripts/test.ps1` delegates to the Rust workspace test wrapper. Use `-Isolated` when debugging a Rust test that must
+run one case at a time.
 
 ## Fast Quality Loop
 
 Use batch commands before any full sample run:
 
 ```powershell
-.\scripts\run.ps1 photo-parity-metric-batch <jobsCsv> <outputRoot> auto
-.\scripts\run.ps1 quality-production-sample-batch <samplesCsv> <heightmap> <outputRoot> 5000 mca 1 `
+cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
+  photo-parity-metric-batch <jobsCsv> <outputRoot> auto
+cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
+  quality-production-sample-batch <samplesCsv> <heightmap> <outputRoot> 5000 mca 1 `
   cacheRows=512 prefetchRows=0 verticalScale=1.25 textureMode=photo surfaceRaster=auto chunkStatus=surface `
   metricMode=current-only previewDebug=off
 ```

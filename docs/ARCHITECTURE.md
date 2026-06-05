@@ -33,7 +33,7 @@ with leaf blocks.
 
 ## Current Structural Boundaries
 
-- `EarthMapCli` remains the public command entrypoint.
+- `earthmap-rs` is the public command entrypoint.
 - Long-term command extraction is planned, but command names and file outputs must stay stable first.
-- `scripts/test.ps1` uses a single JVM `TestSuiteRunner` by default.
-- `quality-production-sample-batch` reuses one JVM and one heightmap/surface-raster context for multiple samples.
+- `scripts/test.ps1` delegates to the Rust workspace test wrapper.
+- `quality-production-sample-batch` reuses Rust heightmap and surface-raster contexts for multiple samples.

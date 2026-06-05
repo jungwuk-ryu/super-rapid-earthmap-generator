@@ -24,22 +24,16 @@ if ($Build) {
     & (Join-Path $ProjectRoot 'scripts\build.ps1') -ProjectRoot $ProjectRoot
 }
 
-$mainOut = Join-Path $ProjectRoot 'build\classes\main'
-if (-not (Test-Path -LiteralPath (Join-Path $mainOut 'net\earthmap\cli\EarthMapCli.class'))) {
-    throw "EarthMapCli.class was not found. Run with -Build or execute scripts\build.ps1 first."
+$rustRoot = Join-Path $ProjectRoot 'rust'
+$runScript = Join-Path (Join-Path $rustRoot 'scripts') 'run.ps1'
+if (-not (Test-Path -LiteralPath $runScript)) {
+    throw "Rust run wrapper not found: $runScript"
 }
-
-$classpathEntries = @($mainOut)
-$vendorLib = Join-Path $ProjectRoot 'vendor\lib'
-if (Test-Path -LiteralPath $vendorLib) {
-    $classpathEntries += Get-ChildItem -LiteralPath $vendorLib -Filter '*.jar' |
-        Sort-Object FullName |
-        ForEach-Object { $_.FullName }
-}
-$classpath = $classpathEntries -join [IO.Path]::PathSeparator
 
 $timer = [Diagnostics.Stopwatch]::StartNew()
-java "--enable-native-access=ALL-UNNAMED" -cp $classpath net.earthmap.cli.EarthMapCli `
+Write-Host ("fastCarrierRemapSimCrop.command={0} {1}" -f $runScript, 'photo-carrier-remap-sim-crop')
+& $runScript `
+    -RustRoot $rustRoot `
     photo-carrier-remap-sim-crop `
     $CurrentSurfacePng `
     $ExpectedPng `

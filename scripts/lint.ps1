@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $files = Get-ChildItem -Path $ProjectRoot -Recurse -File |
     Where-Object {
         $_.FullName -notmatch '\\build\\' -and
-        $_.Extension -in '.java', '.md', '.json', '.ps1', '.mjs'
+        $_.Extension -in '.rs', '.toml', '.md', '.json', '.ps1', '.mjs'
     }
 
 $failures = New-Object System.Collections.Generic.List[string]

@@ -12,11 +12,11 @@
   "sourceBranch": "ver/1.21.11",
   "sourceTag": "ver-1.21.11",
   "buildTimeUtc": "2026-04-27T22:56:27Z",
-  "localJar": "D:\\earthmap\\super-rapid-earthmap-generator\\vendor\\divinemc\\1.21.11\\27\\divinemc-1.21.11-27.jar",
+  "localJar": "removed-from-rust-only-workspace",
   "javaRuntimeTested": "25.0.2",
   "javaNotes": [
-    "BX Team installation docs require Java 25 or newer at the time this pin was verified.",
-    "BX Team API metadata for version 1.21.11 reports minimum Java 21.",
+    "Archived reference only. BX Team installation docs required Java 25 or newer at the time this pin was verified.",
+    "BX Team API metadata for version 1.21.11 reported minimum Java 21.",
     "P1.11 validation ran with Java 25.0.2 and --add-modules=jdk.incubator.vector."
   ],
   "verification": {

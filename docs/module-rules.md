@@ -1,14 +1,17 @@
 # Module Rules
 
-The project currently uses a JDK-only source layout, not Maven/Gradle modules.
+The active project uses a Rust workspace layout.
 
-Keep package boundaries clear:
+Keep crate boundaries clear:
 
-- `net.earthmap.cli`: command entrypoint and argument adaptation
-- `net.earthmap.geo`: raster readers and caches
-- `net.earthmap.terrain`: surface sampling, solver, and region generation
-- `net.earthmap.minecraft`: chunk/NBT/region primitives
-- `net.earthmap.quality`: renderers, metrics, and contact-sheet harnesses
-- `net.earthmap.gameplay`: survival validators and delegated gameplay helpers
+- `earthmap-cli`: command entrypoint, argument adaptation, and user-facing output.
+- `earthmap-core`: shared command metadata and cross-crate policy types.
+- `earthmap-raster`: raster readers, caches, and sampling helpers.
+- `earthmap-surface`: surface sampling, photo solver, and region generation.
+- `earthmap-minecraft`: chunk, NBT, region, MCA, and Linear primitives.
+- `earthmap-quality`: renderers, metrics, and contact-sheet harnesses.
+- `earthmap-gameplay`: survival validators and delegated gameplay helpers.
+- `earthmap-osm`: OSM scan, validation, extraction, and mask generation.
 
-Do not move to physical modules until the solver, CLI command, and generation-context boundaries are stable.
+Do not merge crates or introduce new crate boundaries until the solver, CLI command, and generation-context boundaries
+are stable under the Rust-only gates.

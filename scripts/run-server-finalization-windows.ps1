@@ -39,19 +39,13 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
-$buildScript = Join-Path $repoRoot 'scripts\build.ps1'
+$rustRoot = Join-Path $repoRoot 'rust'
+$runScript = Join-Path (Join-Path $rustRoot 'scripts') 'run.ps1'
 $rconScript = Join-Path $repoRoot 'scripts\send-rcon-command.mjs'
 
-& $buildScript -ProjectRoot $repoRoot | Out-Null
-$mainOut = Join-Path $repoRoot 'build\classes\main'
-$vendorLib = Join-Path $repoRoot 'vendor\lib'
-$classpathEntries = @($mainOut)
-if (Test-Path -LiteralPath $vendorLib) {
-    $classpathEntries += Get-ChildItem -LiteralPath $vendorLib -Filter '*.jar' | Sort-Object FullName | ForEach-Object {
-        $_.FullName
-    }
+if (!(Test-Path -LiteralPath $runScript)) {
+    throw "Rust run wrapper not found: $runScript"
 }
-$earthMapClasspath = $classpathEntries -join [IO.Path]::PathSeparator
 
 if ($WaitSeconds -lt 0) {
     throw "WaitSeconds must be >= 0."
@@ -107,20 +101,21 @@ function ConvertTo-StatusHistogram {
     }
 }
 
-function Invoke-EarthMapCli {
+function Invoke-EarthMapRs {
     param([string[]]$CliArgs)
 
-    $result = Invoke-EarthMapCliResult -CliArgs $CliArgs
+    $result = Invoke-EarthMapRsResult -CliArgs $CliArgs
     if ($result.exitCode -ne 0) {
-        throw "EarthMapCli failed for args: $($CliArgs -join ' ')"
+        throw "earthmap-rs failed for args: $($CliArgs -join ' ')"
     }
     $result.output
 }
 
-function Invoke-EarthMapCliResult {
+function Invoke-EarthMapRsResult {
     param([string[]]$CliArgs)
 
-    $output = @(& java "--enable-native-access=ALL-UNNAMED" -cp $earthMapClasspath net.earthmap.cli.EarthMapCli @CliArgs)
+    Write-Host ("earthmap.command={0} {1}" -f $runScript, ($CliArgs -join ' '))
+    $output = @(& $runScript -RustRoot $rustRoot @CliArgs)
     [PSCustomObject]@{
         exitCode = $LASTEXITCODE
         output = $output
@@ -135,7 +130,7 @@ function Read-StatusHistogram {
     } else {
         'inspect-mca-statuses'
     }
-    $lines = Invoke-EarthMapCli -CliArgs @($command, $Path)
+    $lines = Invoke-EarthMapRs -CliArgs @($command, $Path)
     ConvertTo-StatusHistogram $lines
 }
 
@@ -286,7 +281,7 @@ function Read-PostFinalIntegrity {
         } else {
             'inspect-mca-post-final-integrity'
         }
-        $lines = Invoke-EarthMapCli -CliArgs @($command, $region.path)
+        $lines = Invoke-EarthMapRs -CliArgs @($command, $region.path)
         $values = ConvertTo-KeyValueMap $lines
         foreach ($key in $sumKeys) {
             Add-LongValue -Target $aggregate -Key $key -Value (Get-LongValue -Values $values -Key $key)
@@ -358,7 +353,7 @@ function Read-SurvivalPaletteValidation {
         } else {
             'validate-mca-survival-palette'
         }
-        $result = Invoke-EarthMapCliResult -CliArgs @($command, $region.path)
+        $result = Invoke-EarthMapRsResult -CliArgs @($command, $region.path)
         $values = ConvertTo-KeyValueMap $result.output
         $complete = $values.Contains('survivalCriticalComplete') `
             -and ([string]$values['survivalCriticalComplete']).Equals('true', [StringComparison]::OrdinalIgnoreCase)

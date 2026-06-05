@@ -3258,15 +3258,15 @@ fn print_capabilities(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "DONE rust.phase5.metImageExportTerrainSamplerBootstrap - MetImageExportTerrainSampler discovers Java MET image_exports tiles, parses aux GeoTransform metadata, samples PNG terrain-token colors with a bounded image cache, and EarthDataSurfaceMaterialSampler prefers exported tokens when present."
+        "DONE rust.phase5.metImageExportTerrainSamplerBootstrap - MetImageExportTerrainSampler discovers MET image_exports tiles, parses aux GeoTransform metadata, samples PNG terrain-token colors with a bounded image cache, and EarthDataSurfaceMaterialSampler prefers exported tokens when present."
     )?;
     writeln!(
         out,
-        "DONE rust.phase5.landShallowTopoPhotoSamplerBootstrap - LandShallowTopoPhotoSampler discovers west/east topographic GeoTIFF halves and EarthDataSurfaceMaterialSampler.sample_photo follows Java photo-source preference, coarse evidence, and terrain-token rules."
+        "DONE rust.phase5.landShallowTopoPhotoSamplerBootstrap - LandShallowTopoPhotoSampler discovers west/east topographic GeoTIFF halves and EarthDataSurfaceMaterialSampler.sample_photo follows the documented photo-source preference, coarse evidence, and terrain-token rules."
     )?;
     writeln!(
         out,
-        "DONE rust.phase5.naturalSurfacePolicyBootstrap - NaturalSurfaceBlockPolicy and CoastalSurfaceCleaner production-safe surface cleanup contracts are ported for Java fixture cases."
+        "DONE rust.phase5.naturalSurfacePolicyBootstrap - NaturalSurfaceBlockPolicy and CoastalSurfaceCleaner production-safe surface cleanup contracts are covered by Rust fixtures."
     )?;
     for spec in commands::INITIAL_COMMANDS {
         let status = match spec.status {
@@ -3287,7 +3287,7 @@ fn print_not_implemented(err: &mut impl Write, command: &str) -> io::Result<i32>
     )?;
     writeln!(
         err,
-        "Java output remains the oracle; use scripts/run.ps1 until the matching Rust port phase is green."
+        "No legacy fallback is available in Rust-only mode; use an implemented earthmap-rs command or finish the Rust port for this command."
     )?;
     Ok(EXIT_USAGE)
 }
@@ -16785,7 +16785,7 @@ mod tests {
             "DONE rust.command.generate-vanilla-delegated-plan-parallel - bounded/resumable vanilla-delegated plan generation"
         ));
         assert!(out.contains(
-            "DONE rust.command.generate-vanilla-delegated-region-plan-parallel - Java-compatible alias for vanilla-delegated plan generation"
+            "DONE rust.command.generate-vanilla-delegated-region-plan-parallel - compatibility alias for vanilla-delegated plan generation"
         ));
         assert!(out.contains(
             "DONE rust.command.generate-survival-region - Rust vanilla-delegated survival compatibility alias"
@@ -17797,7 +17797,7 @@ mod tests {
         assert!(out.contains(
             "Status: Rust runtime active; normal generation and validation paths are Rust-first."
         ));
-        assert!(!out.contains("Java remains the compatibility oracle and fallback"));
+        assert!(!out.contains("legacy fallback"));
     }
 
     #[test]

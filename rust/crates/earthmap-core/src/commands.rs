@@ -47,7 +47,7 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "generate-vanilla-delegated-region-plan-parallel",
         status: CommandStatus::Implemented,
-        note: "Java-compatible alias for vanilla-delegated plan generation",
+        note: "compatibility alias for vanilla-delegated plan generation",
     },
     CommandSpec {
         name: "generate-survival-region",
@@ -390,22 +390,22 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "inspect-heightmap",
         status: CommandStatus::ImplementedShellOnly,
-        note: "inspect Java-compatible GeoTIFF heightmap metadata",
+        note: "inspect documented GeoTIFF heightmap metadata",
     },
     CommandSpec {
         name: "locate-heightmap-point",
         status: CommandStatus::ImplementedShellOnly,
-        note: "locate longitude/latitude in the Java-compatible Earth grid",
+        note: "locate longitude/latitude in the documented Earth grid",
     },
     CommandSpec {
         name: "classify-surface-point",
         status: CommandStatus::ImplementedShellOnly,
-        note: "classify a heightmap-backed Java-compatible surface point",
+        note: "classify a heightmap-backed surface point",
     },
     CommandSpec {
         name: "sample-vrt-rgb",
         status: CommandStatus::ImplementedShellOnly,
-        note: "sample a Java-compatible VRT RGB mosaic",
+        note: "sample a VRT RGB mosaic",
     },
 ];
 

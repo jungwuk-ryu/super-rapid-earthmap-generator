@@ -16,12 +16,12 @@
   },
   "serverBuildTime": "2025-12-09T12:20:42+00:00",
   "serverJavaVersion": 21,
-  "localJar": "D:\\earthmap\\super-rapid-earthmap-generator\\vendor\\minecraft\\1.21.11\\server.jar",
+  "localJar": "removed-from-rust-only-workspace",
   "verified": true,
   "verificationEvidence": "D:\\earthmap\\agent-runs\\20260526-233855-phase0-bootstrap\\VALIDATION\\minecraft-1.21.11-server-pin.json",
   "notes": [
-    "This pin is for the official Mojang 1.21.11 server jar.",
+    "Archived reference only. This pin is for the official Mojang 1.21.11 server jar.",
     "worldVersion/protocolVersion/packVersion are extracted from server.jar version.json.",
-    "Full registry reports are not yet extracted; complete P1.2 before writing production worlds."
+    "The local vendor jar was removed from the Rust-only workspace."
   ]
 }

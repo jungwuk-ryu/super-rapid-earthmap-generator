@@ -24,7 +24,7 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $scriptRoot
-$run = Join-Path $scriptRoot "run.ps1"
+$run = Join-Path (Join-Path (Join-Path $repoRoot 'rust') 'scripts') 'run.ps1'
 $photoMetricScript = Join-Path $scriptRoot "run-photo-parity-metric-crop.ps1"
 $requiredSummarySchemaVersion = 11
 
@@ -126,7 +126,6 @@ function Get-LogFailureHint {
         'Exception in thread',
         'OutOfMemoryError',
         'StackOverflowError',
-        'java\.lang\.[A-Za-z0-9_]+(?:Exception|Error)',
         'CLI failed with exit code',
         'BUILD FAILED',
         '\bFAILED\b',

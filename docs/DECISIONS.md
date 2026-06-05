@@ -9,14 +9,14 @@
 
 ## 2026-06-01: Test Loop
 
-- `scripts/test.ps1` defaults to one JVM through `net.earthmap.tests.TestSuiteRunner`.
-- Per-class JVM execution remains available as `-Isolated`.
+- `scripts/test.ps1` delegates to the Rust workspace test wrapper.
+- Isolated execution remains available as `-Isolated` for one-test-at-a-time Rust debugging.
 
 ## 2026-06-01: Quality Runtime
 
 - `prefetchRows=0` is the quality-sample default.
 - PowerShell remains the outer orchestration layer.
-- Node.js is only considered if it helps call a one-JVM batch/worker flow.
+- Batch quality work should use Rust CLI commands that reuse raster contexts inside the process.
 
 ## 2026-06-01: Photo Solver Boundary
 

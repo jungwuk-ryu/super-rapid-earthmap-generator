@@ -2,12 +2,13 @@
 
 ## Scope
 
-These instructions apply to the Java project rooted at this directory.
+These instructions apply to the Rust-only EarthMap project rooted at this directory.
 
 ## Working Rules
 
 - Read the relevant code and tests before editing.
-- Preserve Java output compatibility unless the task explicitly changes behavior.
+- Preserve Minecraft, Linear, MCA, visual-quality, and metric compatibility unless the task explicitly changes behavior.
+- Do not use byte-for-byte Java parity as a default completion condition. File-format invariants still matter.
 - Do not revert or overwrite unrelated dirty worktree changes.
 - Stage files explicitly. Never rely on broad staging commands when unrelated changes are present.
 - Use `C:\earth_map_resources\HQheightmap.tif` as the standard local HeightMap path for CLI examples,
@@ -16,7 +17,8 @@ These instructions apply to the Java project rooted at this directory.
 ## Verification
 
 - Prefer targeted tests first, then broader tests when the change affects shared behavior.
-- Use `.\scripts\test.ps1 -Filter '<TestClassOrPattern>'` for focused Java regression checks.
+- Use `.\scripts\test.ps1 -Filter '<TestNameOrPattern>'` for focused Rust regression checks.
+- Use `cargo test --manifest-path rust\Cargo.toml --workspace` for full workspace verification.
 - Run the full relevant suite before marking high-risk generation, region, NBT, or CLI changes complete.
 
 ## Commit Discipline

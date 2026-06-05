@@ -88,7 +88,7 @@ build/config.
    Produce source, Standard remap, current production render, candidate render, and error heatmaps.
 
 2. **Tier 1: fast five-crop metrics**
-   Run Sahara core, Arabia coast, Mediterranean edge, Congo edge, and Europe forest in one JVM where possible.
+   Run Sahara core, Arabia coast, Mediterranean edge, Congo edge, and Europe forest in one Rust batch where possible.
 
 3. **Tier 2: targeted production proof**
    Run one or two production MCA samples without skipped gates. Congo/Europe are the first canopy targets.

@@ -2,18 +2,18 @@
 
 ## Prerequisites
 
-- JDK 25 on `PATH`
+- Rust toolchain with `cargo` on `PATH`
 - PowerShell 7 or Windows PowerShell capable of running the scripts
 - `C:\earth_map_resources\HQheightmap.tif`
 - `D:\earthmap\TifFiles\terrain\TrueMarble.vrt` or another explicit `surfaceRaster` path
-- ImageMagick only for workflows that produce Standard-remap reference images outside Java
+- ImageMagick only for optional archived reference-image workflows
 
 ## Normal Commands
 
 ```powershell
 .\scripts\build.ps1
 .\scripts\test.ps1
-.\scripts\run.ps1 --help
+cargo run --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- --help
 ```
 
 Rust GUI:
@@ -83,7 +83,7 @@ Fast filtered test:
 .\scripts\test.ps1 -Filter PhotoSurface
 ```
 
-Isolated legacy test mode:
+Isolated Rust test mode:
 
 ```powershell
 .\scripts\test.ps1 -Isolated
@@ -100,7 +100,8 @@ sample,regionX,regionZ,cropX,cropY,cropWidth,cropHeight,sourcePng,expectedStanda
 Run:
 
 ```powershell
-.\scripts\run.ps1 quality-production-sample-batch samples.csv C:\earth_map_resources\HQheightmap.tif `
+cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
+  quality-production-sample-batch samples.csv C:\earth_map_resources\HQheightmap.tif `
   D:\earthmap\quality\photo-parity\vNEXT 5000 mca 1 `
   cacheRows=512 prefetchRows=0 verticalScale=1.25 textureMode=photo surfaceRaster=auto chunkStatus=surface `
   metricMode=current-only previewDebug=off
@@ -135,4 +136,5 @@ reported as NO-GO for release evidence.
 
 - Generated junk inside the repo should be archived, not deleted first.
 - The current reset archive is `D:\earthmap\archive\super-rapid-reset-20260601`.
-- If a generation process is suspected to be stuck, inspect Java command lines before stopping anything.
+- If a generation process is suspected to be stuck, inspect `earthmap-rs` command lines and recent progress logs before
+  stopping anything.

@@ -18,7 +18,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
-$runScript = Join-Path $repoRoot 'scripts\run.ps1'
+$rustRoot = Join-Path $repoRoot 'rust'
+$runScript = Join-Path (Join-Path $rustRoot 'scripts') 'run.ps1'
 $rconScript = Join-Path $repoRoot 'scripts\send-rcon-command.mjs'
 $regionFile = Join-Path $WorldDir ("region\r.{0}.{1}.mca" -f $RegionX, $RegionZ)
 
@@ -39,7 +40,8 @@ if (($StartLocalChunkX + $ChunkWidth) -gt 32 -or ($StartLocalChunkZ + $ChunkHeig
 function Read-StatusHistogram {
     param([string]$Path)
 
-    $lines = & $runScript inspect-mca-statuses $Path
+    Write-Host ("earthmap.command={0} {1}" -f $runScript, "inspect-mca-statuses $Path")
+    $lines = & $runScript -RustRoot $rustRoot inspect-mca-statuses $Path
     if ($LASTEXITCODE -ne 0) {
         throw "inspect-mca-statuses failed for $Path"
     }
