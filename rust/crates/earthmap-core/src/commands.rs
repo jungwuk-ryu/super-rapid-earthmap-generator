@@ -71,18 +71,18 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "validate-mca-region",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "MCA region validator",
     },
     CommandSpec {
         name: "validate-linear-region",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "Linear V2 region validator",
     },
     CommandSpec {
         name: "compare-mca-linear-region-payloads",
-        status: CommandStatus::NotPortedYet,
-        note: "MCA/Linear payload parity comparator",
+        status: CommandStatus::Implemented,
+        note: "MCA/Linear payload comparator",
     },
     CommandSpec {
         name: "inspect-mca-palettes",

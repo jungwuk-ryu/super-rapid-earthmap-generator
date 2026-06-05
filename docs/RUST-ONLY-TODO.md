@@ -248,7 +248,7 @@ Detailed progress:
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered MCA commands:
-- [ ] `validate-mca-region`
+- [x] `validate-mca-region`
 - [ ] `validate-mca-survival-palette`
 - [ ] `inspect-mca-palettes`
 - [ ] `inspect-mca-biomes`
@@ -257,7 +257,7 @@ Covered MCA commands:
 - [ ] `repair-mca-post-final-water`
 - [ ] `rewrite-mca-status`
 Covered Linear commands:
-- [ ] `validate-linear-region`
+- [x] `validate-linear-region`
 - [ ] `validate-linear-survival-palette`
 - [ ] `inspect-linear-palettes`
 - [ ] `inspect-linear-biomes`
@@ -265,11 +265,11 @@ Covered Linear commands:
 - [ ] `inspect-linear-post-final-integrity`
 - [ ] `repair-linear-sandlike-surfaces`
 Covered cross-format commands:
-- [ ] `compare-mca-linear-region-payloads`
+- [x] `compare-mca-linear-region-payloads`
 - [ ] `convert-mca-region-to-linear`
 - [ ] `convert-mca-world-to-linear`
 Detailed progress:
-- [ ] Validation checks structural format invariants instead of byte-by-byte Java parity.
+- [x] Validation checks structural format invariants instead of byte-by-byte Java parity.
 - [ ] Inspectors emit stable CSV/text fields for scripts.
 - [ ] Repair tools are bounded to explicit target paths and never rewrite unrelated regions.
 - [ ] Converter preserves Minecraft-loadable chunk payloads and metadata required by the target format.
@@ -307,10 +307,10 @@ Detailed progress:
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Detailed progress:
-- [ ] `INITIAL_COMMANDS` reflects current implemented Rust commands.
+- [x] `INITIAL_COMMANDS` reflects current implemented Rust commands.
 - [ ] Deprecated Java-only commands are either listed as dropped or moved to this migration document.
-- [ ] `capabilities` output does not incorrectly label working Rust commands as `NotPortedYet`.
-- [ ] Command status update has tests or golden output checks.
+- [x] `capabilities` output does not incorrectly label working Rust commands as `NotPortedYet`.
+- [x] Command status update has tests or golden output checks.
 
 ## P1 Rust-Only Feature Parity
 

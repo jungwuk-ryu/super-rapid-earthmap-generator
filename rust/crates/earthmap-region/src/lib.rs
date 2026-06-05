@@ -128,6 +128,141 @@ pub struct RegionResumeValidation {
     pub file_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct McaRegionValidation {
+    pub chunk_count: usize,
+    pub total_sectors: usize,
+    pub file_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinearRegionValidation {
+    pub file_bytes: u64,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub grid_size: u8,
+    pub chunk_count: usize,
+    pub bitmap_chunk_count: usize,
+    pub bitmap_missing_payload_count: usize,
+    pub bitmap_extra_chunk_count: usize,
+}
+
+impl LinearRegionValidation {
+    pub fn bitmap_consistent(self) -> bool {
+        self.bitmap_missing_payload_count == 0 && self.bitmap_extra_chunk_count == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegionPayloadComparison {
+    pub compared_chunks: usize,
+    pub matching_chunks: usize,
+    pub mismatched_chunks: usize,
+    pub missing_in_mca: usize,
+    pub missing_in_linear: usize,
+    pub first_mismatch: Option<ChunkLocalPos>,
+}
+
+impl RegionPayloadComparison {
+    pub fn matches(self) -> bool {
+        self.mismatched_chunks == 0 && self.missing_in_mca == 0 && self.missing_in_linear == 0
+    }
+}
+
+pub fn validate_mca_region_file(path: impl AsRef<Path>) -> Result<McaRegionValidation> {
+    let path = path.as_ref();
+    let payloads = read_mca_region_payloads(path)?;
+    let validation = validate_region_file_for_resume(
+        path,
+        RegionFormat::Mca,
+        payloads.region_x,
+        payloads.region_z,
+        payloads.chunks.len(),
+    )?;
+    Ok(McaRegionValidation {
+        chunk_count: validation.chunk_count,
+        total_sectors: usize::try_from(validation.file_bytes).expect("file size fits usize")
+            / MCA_SECTOR_BYTES,
+        file_bytes: validation.file_bytes,
+    })
+}
+
+pub fn validate_linear_region_file(path: impl AsRef<Path>) -> Result<LinearRegionValidation> {
+    let path = path.as_ref();
+    let payloads = read_linear_region_payloads(path)?;
+    let validation = validate_region_file_for_resume(
+        path,
+        RegionFormat::Linear,
+        payloads.region_x,
+        payloads.region_z,
+        payloads.chunks.len(),
+    )?;
+    Ok(LinearRegionValidation {
+        file_bytes: validation.file_bytes,
+        region_x: validation.region_x,
+        region_z: validation.region_z,
+        grid_size: LINEAR_GRID_SIZE,
+        chunk_count: validation.chunk_count,
+        bitmap_chunk_count: validation.chunk_count,
+        bitmap_missing_payload_count: 0,
+        bitmap_extra_chunk_count: 0,
+    })
+}
+
+pub fn compare_mca_linear_region_payloads(
+    mca_region: impl AsRef<Path>,
+    linear_region: impl AsRef<Path>,
+) -> Result<RegionPayloadComparison> {
+    let mca = read_mca_region_payloads(mca_region.as_ref())?;
+    let linear = read_linear_region_payloads(linear_region.as_ref())?;
+
+    let mut compared_chunks = 0usize;
+    let mut matching_chunks = 0usize;
+    let mut mismatched_chunks = 0usize;
+    let mut missing_in_mca = 0usize;
+    let mut missing_in_linear = 0usize;
+    let mut first_mismatch = None;
+
+    for z in 0..REGION_CHUNK_WIDTH {
+        for x in 0..REGION_CHUNK_WIDTH {
+            let pos = ChunkLocalPos::new(x, z)?;
+            let mca_payload = mca.chunks.get(&pos);
+            let linear_payload = linear.chunks.get(&pos);
+            if mca_payload.is_none() && linear_payload.is_none() {
+                continue;
+            }
+            compared_chunks += 1;
+            match (mca_payload, linear_payload) {
+                (Some(left), Some(right)) if left == right => {
+                    matching_chunks += 1;
+                }
+                (Some(_), Some(_)) => {
+                    mismatched_chunks += 1;
+                    first_mismatch.get_or_insert(pos);
+                }
+                (None, Some(_)) => {
+                    missing_in_mca += 1;
+                    first_mismatch.get_or_insert(pos);
+                }
+                (Some(_), None) => {
+                    missing_in_linear += 1;
+                    first_mismatch.get_or_insert(pos);
+                }
+                (None, None) => unreachable!("empty positions are skipped"),
+            }
+        }
+    }
+
+    Ok(RegionPayloadComparison {
+        compared_chunks,
+        matching_chunks,
+        mismatched_chunks,
+        missing_in_mca,
+        missing_in_linear,
+        first_mismatch,
+    })
+}
+
 pub fn write_mca_region(
     path: impl AsRef<Path>,
     chunk_payloads: &BTreeMap<ChunkLocalPos, Vec<u8>>,

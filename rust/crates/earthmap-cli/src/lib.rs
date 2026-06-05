@@ -30,7 +30,8 @@ use earthmap_minecraft::{
     section_palette::bits_per_entry_for_palette_size,
 };
 use earthmap_region::{
-    read_region_payloads, validate_region_file_for_resume, ChunkLocalPos, RegionError,
+    compare_mca_linear_region_payloads, read_region_payloads, validate_linear_region_file,
+    validate_mca_region_file, validate_region_file_for_resume, ChunkLocalPos, RegionError,
     RegionFormat, REGION_CHUNKS_PER_REGION,
 };
 use earthmap_surface::{
@@ -327,6 +328,15 @@ where
         ),
         "compare-region-payload-manifest" if args.len() == 3 => write_result(
             compare_region_payload_manifest(stdout, stderr, &args[1], &args[2]),
+        ),
+        "validate-mca-region" if args.len() == 2 => {
+            write_result(validate_mca_region(stdout, stderr, &args[1]))
+        }
+        "validate-linear-region" if args.len() == 2 => {
+            write_result(validate_linear_region(stdout, stderr, &args[1]))
+        }
+        "compare-mca-linear-region-payloads" if args.len() == 3 => write_result(
+            compare_mca_linear_region_payloads_cli(stdout, stderr, &args[1], &args[2]),
         ),
         "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
             stdout, stderr, &args[1], &args[2], &args[3],
@@ -768,6 +778,12 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  compare-region-payload-manifest <manifestCsv> <regionFile>"
+    )?;
+    writeln!(out, "  validate-mca-region <path>")?;
+    writeln!(out, "  validate-linear-region <path>")?;
+    writeln!(
+        out,
+        "  compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"
     )?;
     writeln!(
         out,
@@ -5148,6 +5164,93 @@ fn compare_region_payload_manifest(
     }
 }
 
+fn validate_mca_region(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+) -> io::Result<i32> {
+    match validate_mca_region_file(region) {
+        Ok(report) => {
+            writeln!(out, "MCA region valid")?;
+            writeln!(out, "fileBytes={}", report.file_bytes)?;
+            writeln!(out, "totalSectors={}", report.total_sectors)?;
+            writeln!(out, "chunkCount={}", report.chunk_count)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "MCA region validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn validate_linear_region(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+) -> io::Result<i32> {
+    match validate_linear_region_file(region) {
+        Ok(report) => {
+            writeln!(out, "Linear V2 region valid")?;
+            writeln!(out, "fileBytes={}", report.file_bytes)?;
+            writeln!(out, "regionX={}", report.region_x)?;
+            writeln!(out, "regionZ={}", report.region_z)?;
+            writeln!(out, "gridSize={}", report.grid_size)?;
+            writeln!(out, "chunkCount={}", report.chunk_count)?;
+            writeln!(out, "bitmapChunkCount={}", report.bitmap_chunk_count)?;
+            writeln!(
+                out,
+                "bitmapMissingPayloadCount={}",
+                report.bitmap_missing_payload_count
+            )?;
+            writeln!(
+                out,
+                "bitmapExtraChunkCount={}",
+                report.bitmap_extra_chunk_count
+            )?;
+            writeln!(out, "bitmapConsistent={}", report.bitmap_consistent())?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Linear V2 region validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn compare_mca_linear_region_payloads_cli(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    mca_region: &str,
+    linear_region: &str,
+) -> io::Result<i32> {
+    match compare_mca_linear_region_payloads(mca_region, linear_region) {
+        Ok(report) => {
+            writeln!(out, "MCA/Linear payload parity compared")?;
+            writeln!(out, "matches={}", report.matches())?;
+            writeln!(out, "comparedChunks={}", report.compared_chunks)?;
+            writeln!(out, "matchingChunks={}", report.matching_chunks)?;
+            writeln!(out, "mismatchedChunks={}", report.mismatched_chunks)?;
+            writeln!(out, "missingInMca={}", report.missing_in_mca)?;
+            writeln!(out, "missingInLinear={}", report.missing_in_linear)?;
+            if let Some(pos) = report.first_mismatch {
+                writeln!(out, "firstMismatch={},{}", pos.x, pos.z)?;
+            } else {
+                writeln!(out, "firstMismatch=")?;
+            }
+            Ok(if report.matches() {
+                EXIT_OK
+            } else {
+                EXIT_USAGE
+            })
+        }
+        Err(error) => {
+            writeln!(err, "MCA/Linear payload parity failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
 fn summarize_region_chunk(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -6730,6 +6833,21 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_marks_basic_region_validation_commands_done() {
+        let (code, out, err) = run_capture(&["capabilities"]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("DONE rust.command.validate-mca-region - MCA region validator"));
+        assert!(
+            out.contains("DONE rust.command.validate-linear-region - Linear V2 region validator")
+        );
+        assert!(out.contains(
+            "DONE rust.command.compare-mca-linear-region-payloads - MCA/Linear payload comparator"
+        ));
+    }
+
+    #[test]
     fn vanilla_delegated_region_single_optional_raster_defaults_status_like_java() {
         let (code, out, err) = run_capture(&[
             "generate-vanilla-delegated-region",
@@ -6995,6 +7113,9 @@ mod tests {
         assert!(out.contains("write-sha256-manifest <root> <outputFile>"));
         assert!(out.contains("write-region-payload-manifest <regionFile> <outputCsv>"));
         assert!(out.contains("compare-region-payload-manifest <manifestCsv> <regionFile>"));
+        assert!(out.contains("validate-mca-region <path>"));
+        assert!(out.contains("validate-linear-region <path>"));
+        assert!(out.contains("compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"));
         assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
@@ -7381,6 +7502,70 @@ mod tests {
             err,
             "Flat test world generation failed: format must be mca or linear\n"
         );
+    }
+
+    #[test]
+    fn validate_mca_region_reports_flat_fixture() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat-mca");
+        generate_flat_test_world_impl(world.to_str().unwrap(), "mca").unwrap();
+        let region = world.join("region").join("r.0.0.mca");
+
+        let (code, out, err) = run_capture(&["validate-mca-region", region.to_str().unwrap()]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA region valid\n"));
+        assert!(out.contains("chunkCount=1024\n"));
+        assert!(out.contains("totalSectors="));
+        assert!(out.contains("fileBytes="));
+    }
+
+    #[test]
+    fn validate_linear_region_reports_flat_fixture() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat-linear");
+        generate_flat_test_world_impl(world.to_str().unwrap(), "linear").unwrap();
+        let region = world.join("region").join("r.0.0.linear");
+
+        let (code, out, err) = run_capture(&["validate-linear-region", region.to_str().unwrap()]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear V2 region valid\n"));
+        assert!(out.contains("regionX=0\n"));
+        assert!(out.contains("regionZ=0\n"));
+        assert!(out.contains("gridSize=8\n"));
+        assert!(out.contains("chunkCount=1024\n"));
+        assert!(out.contains("bitmapConsistent=true\n"));
+    }
+
+    #[test]
+    fn compare_mca_linear_region_payloads_reports_flat_fixture_match() {
+        let temp = tempdir().unwrap();
+        let mca_world = temp.path().join("flat-mca");
+        let linear_world = temp.path().join("flat-linear");
+        generate_flat_test_world_impl(mca_world.to_str().unwrap(), "mca").unwrap();
+        generate_flat_test_world_impl(linear_world.to_str().unwrap(), "linear").unwrap();
+        let mca_region = mca_world.join("region").join("r.0.0.mca");
+        let linear_region = linear_world.join("region").join("r.0.0.linear");
+
+        let (code, out, err) = run_capture(&[
+            "compare-mca-linear-region-payloads",
+            mca_region.to_str().unwrap(),
+            linear_region.to_str().unwrap(),
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA/Linear payload parity compared\n"));
+        assert!(out.contains("matches=true\n"));
+        assert!(out.contains("comparedChunks=1024\n"));
+        assert!(out.contains("matchingChunks=1024\n"));
+        assert!(out.contains("mismatchedChunks=0\n"));
+        assert!(out.contains("missingInMca=0\n"));
+        assert!(out.contains("missingInLinear=0\n"));
+        assert!(out.contains("firstMismatch=\n"));
     }
 
     #[test]
