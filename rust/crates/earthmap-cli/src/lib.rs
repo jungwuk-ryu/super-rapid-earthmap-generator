@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::time::Instant;
 
 use earthmap_core::build_info;
@@ -25,7 +29,10 @@ use earthmap_minecraft::{
     packed_long_array::PackedLongArray,
     section_palette::bits_per_entry_for_palette_size,
 };
-use earthmap_region::{read_region_payloads, ChunkLocalPos, RegionError};
+use earthmap_region::{
+    read_region_payloads, validate_region_file_for_resume, ChunkLocalPos, RegionError,
+    RegionFormat, REGION_CHUNKS_PER_REGION,
+};
 use earthmap_surface::{
     classify_surface, generate_surface_region_with_open_material_sampler,
     EarthDataSurfaceMaterialSampler, EarthSurfaceColumn, HeightOnlySettings,
@@ -34,6 +41,7 @@ use earthmap_surface::{
     WwfEcoregionSampler, DEFAULT_SURFACE_TILE_CACHE_ENTRIES, REGION_SIZE_BLOCKS, SEA_LEVEL_Y,
     SURVIVAL_MANIFEST_FILE_NAME,
 };
+use serde_json::{json, Value};
 
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
@@ -58,6 +66,10 @@ const SURFACE_TILE_CACHE_MAX_ENTRIES: usize = 32_768;
 const SURFACE_PHOTO_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
+const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
+const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+const VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME: &str = "earthmap-vanilla-delegated-resume.ndjson";
+const PARALLEL_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const FLAT_TEST_MCA_LEVEL_NAME: &str = "SR EarthMap Flat Test";
 const FLAT_TEST_LINEAR_LEVEL_NAME: &str = "SR EarthMap Linear Flat Test";
 const FLAT_TEST_MCA_SEED: i64 = 987654321;
@@ -2871,14 +2883,6 @@ fn generate_vanilla_delegated_region_impl(
     ))
 }
 
-#[derive(Debug)]
-struct VanillaDelegatedParallelRegionOutcome {
-    region_x: i32,
-    region_z: i32,
-    elapsed_millis: u128,
-    result: std::result::Result<SurfaceRegionReport, String>,
-}
-
 #[allow(clippy::too_many_arguments)]
 fn generate_vanilla_delegated_regions_parallel(
     out: &mut impl Write,
@@ -2897,6 +2901,7 @@ fn generate_vanilla_delegated_regions_parallel(
     extra_options: &[String],
 ) -> io::Result<i32> {
     match generate_vanilla_delegated_regions_parallel_impl(
+        out,
         heightmap_path,
         world_dir,
         scale_text,
@@ -2910,12 +2915,7 @@ fn generate_vanilla_delegated_regions_parallel(
         surface_raster_text,
         extra_options,
     ) {
-        Ok(lines) => {
-            for line in lines {
-                writeln!(out, "{line}")?;
-            }
-            Ok(EXIT_OK)
-        }
+        Ok(()) => Ok(EXIT_OK),
         Err(error) => {
             writeln!(
                 err,
@@ -2928,6 +2928,7 @@ fn generate_vanilla_delegated_regions_parallel(
 
 #[allow(clippy::too_many_arguments)]
 fn generate_vanilla_delegated_regions_parallel_impl(
+    out: &mut impl Write,
     heightmap_path: &str,
     world_dir: &str,
     scale_text: &str,
@@ -2940,7 +2941,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     status_text: &str,
     surface_raster_text: &str,
     extra_options: &[String],
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<(), String> {
     let total_start = Instant::now();
     let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
     let compression_options = parse_region_compression_options(format, extra_options)?;
@@ -2970,6 +2971,18 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let cache_rows = configured_heightmap_cache_rows(heightmap)?;
     let surface_tile_cache_entries =
         configured_surface_tile_cache_entries(Some(&surface_material_path))?;
+    let resume_fingerprint = vanilla_delegated_parallel_resume_fingerprint(
+        heightmap,
+        format,
+        scale,
+        start_region_x,
+        start_region_z,
+        cols,
+        rows,
+        status,
+        &surface_material_path,
+        compression_options,
+    );
 
     let worker_count = threads
         .min(region_count)
@@ -3006,12 +3019,45 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         &surface_material_path,
     )
     .map_err(|error| error.to_string())?;
+    let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
+    let stale_temp_files = cleanup_stale_region_temp_files(&world.join("region"));
     let surface_material_sampler = EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
         &surface_material_path,
         surface_tile_cache_entries,
     )
     .map_err(|error| error.to_string())?;
     let setup_millis = setup_start.elapsed().as_millis();
+
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "batchStarted",
+            "worldDir": normalized_path_display(world),
+            "format": format.java_name(),
+            "scale": scale,
+            "chunkStatus": status.id(),
+            "regionStartX": start_region_x,
+            "regionStartZ": start_region_z,
+            "regionCols": cols,
+            "regionRows": rows,
+            "regionCount": region_count,
+            "requestedThreads": threads,
+            "workerThreads": worker_count,
+            "resumeFingerprintMatched": resume.fingerprint_matched,
+            "resumeJournalRegions": resume.completed_regions.len(),
+            "resumeJournal": normalized_path_display(&resume.path),
+        }),
+    )?;
+    for warning in &resume.warnings {
+        writeln!(out, "resumeJournalWarning={}", csv_cell(warning))
+            .map_err(|error| error.to_string())?;
+    }
+    writeln!(
+        out,
+        "type,status,regionX,regionZ,elapsedMillis,chunks,outputBytes,regionFile,message"
+    )
+    .map_err(|error| error.to_string())?;
 
     let mut regions = VecDeque::with_capacity(region_count);
     for row in 0..rows {
@@ -3024,15 +3070,71 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     }
 
     let region_queue = Mutex::new(regions);
-    let outcomes = Mutex::new(Vec::<VanillaDelegatedParallelRegionOutcome>::with_capacity(
-        region_count,
-    ));
+    let stop_queueing = AtomicBool::new(false);
+    let resume_completed_regions = Arc::new(resume.completed_regions);
+    let resume_journal = resume.journal;
+    let (event_sender, event_receiver) =
+        mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
+    let mut stats = VanillaDelegatedParallelBatchStats::default();
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
-            scope.spawn(|| loop {
-                let Some((region_x, region_z)) =
-                    region_queue.lock().expect("queue lock").pop_front()
-                else {
+            let queue = &region_queue;
+            let stop_queueing = &stop_queueing;
+            let surface_material_sampler = &surface_material_sampler;
+            let surface_material_path = &surface_material_path;
+            let completed_regions = Arc::clone(&resume_completed_regions);
+            let journal = Arc::clone(&resume_journal);
+            let sender = event_sender.clone();
+            let fingerprint_matched = resume.fingerprint_matched;
+            scope.spawn(move || loop {
+                if stop_queueing.load(Ordering::SeqCst) {
+                    break;
+                }
+                let next_region = {
+                    let mut queue = queue.lock().expect("queue lock");
+                    if stop_queueing.load(Ordering::SeqCst) {
+                        None
+                    } else {
+                        queue.pop_front()
+                    }
+                };
+                let Some((region_x, region_z)) = next_region else {
+                    break;
+                };
+                let region_file = vanilla_delegated_region_file(world, format, region_x, region_z);
+                if fingerprint_matched && completed_regions.contains(&(region_x, region_z)) {
+                    let skip_start = Instant::now();
+                    if let Ok(validation) = validate_region_file_for_resume(
+                        &region_file,
+                        region_format_for_output(format),
+                        region_x,
+                        region_z,
+                        REGION_CHUNKS_PER_REGION,
+                    ) {
+                        if sender
+                            .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                region_x,
+                                region_z,
+                                elapsed_millis: skip_start.elapsed().as_millis(),
+                                chunks: validation.chunk_count,
+                                output_bytes: validation.file_bytes,
+                                region_file,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if sender
+                    .send(VanillaDelegatedParallelEvent::RegionStarted {
+                        region_x,
+                        region_z,
+                        region_file: region_file.clone(),
+                    })
+                    .is_err()
+                {
                     break;
                 };
                 let region_start = Instant::now();
@@ -3053,54 +3155,97 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                         SurfaceTextureMode::Photo,
                     )
                     .map_err(|error| error.to_string())?;
-                    settings.surface_material_path = Some(surface_material_path.clone());
+                    settings.surface_material_path = Some((*surface_material_path).clone());
                     settings.surface_tile_cache_entries = surface_tile_cache_entries;
                     settings.parallel_column_sampling = worker_count <= 4;
                     apply_region_compression_options(&mut settings, compression_options);
-                    generate_surface_region_with_open_material_sampler(
+                    let report = generate_surface_region_with_open_material_sampler(
                         &settings,
-                        Some(&surface_material_sampler),
+                        Some(surface_material_sampler),
                     )
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                    let output_bytes = std::fs::metadata(&report.region_file)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0);
+                    journal
+                        .lock()
+                        .map_err(|_| "resume journal lock poisoned".to_string())?
+                        .append_region_complete(
+                            report.region_x,
+                            report.region_z,
+                            format,
+                            report.chunk_count,
+                            output_bytes,
+                        )?;
+                    Ok(report)
                 })();
-                outcomes.lock().expect("outcomes lock").push(
-                    VanillaDelegatedParallelRegionOutcome {
-                        region_x,
-                        region_z,
-                        elapsed_millis: region_start.elapsed().as_millis(),
-                        result,
-                    },
-                );
+                match result {
+                    Ok(report) => {
+                        let output_bytes = std::fs::metadata(&report.region_file)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        if sender
+                            .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                elapsed_millis: region_start.elapsed().as_millis(),
+                                output_bytes,
+                                report,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(message) => {
+                        stop_queueing.store(true, Ordering::SeqCst);
+                        let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                            region_x,
+                            region_z,
+                            elapsed_millis: region_start.elapsed().as_millis(),
+                            region_file,
+                            message,
+                        });
+                        break;
+                    }
+                }
             });
         }
-    });
-    let mut outcomes = outcomes
-        .into_inner()
-        .map_err(|_| "parallel outcome lock poisoned".to_string())?;
-    outcomes.sort_by_key(|outcome| (outcome.region_z, outcome.region_x));
-
-    let errors =
-        outcomes
-            .iter()
-            .filter_map(|outcome| {
-                outcome.result.as_ref().err().map(|error| {
-                    format!("region {},{}: {error}", outcome.region_x, outcome.region_z)
-                })
-            })
-            .collect::<Vec<_>>();
-    if !errors.is_empty() {
-        return Err(errors.join("; "));
+        drop(event_sender);
+        while let Ok(event) = event_receiver.recv() {
+            handle_vanilla_delegated_parallel_event(out, &mut stats, event)?;
+        }
+        Ok::<(), String>(())
+    })?;
+    if let Ok(journal) = resume_journal.lock() {
+        journal.sync()?;
     }
-
     let elapsed_millis = total_start.elapsed().as_millis();
-    let mut phase_surface_sample_millis = 0;
-    let mut phase_chunk_build_millis = 0;
-    let mut phase_nbt_encode_millis = 0;
-    let mut phase_region_write_millis = 0;
-    let mut phase_metadata_millis = 0;
-    let mut phase_total_internal_millis = 0;
-    let mut generated_regions = 0usize;
-    let mut lines = vec![
+    let generated_regions_per_hour = if elapsed_millis == 0 {
+        0.0
+    } else {
+        (stats.generated_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
+    };
+    let completed_regions = stats.generated_regions + stats.skipped_regions;
+    let completed_regions_per_hour = if elapsed_millis == 0 {
+        0.0
+    } else {
+        (completed_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
+    };
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "batchSummary",
+            "elapsedMillis": u128_to_u64(elapsed_millis),
+            "generatedRegions": stats.generated_regions,
+            "skippedRegions": stats.skipped_regions,
+            "completedRegions": completed_regions,
+            "failedRegions": stats.failed_regions,
+            "allDone": stats.failed_regions == 0,
+            "generatedRegionsPerHour": generated_regions_per_hour,
+            "completedRegionsPerHour": completed_regions_per_hour,
+        }),
+    )?;
+    let lines = [
         "Resumable vanilla-delegated batch complete".to_string(),
         format!("worldDir={}", world.display()),
         format!("format={}", format.java_name()),
@@ -3120,52 +3265,639 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "surfaceMaterialPath={}",
             normalized_path_display(&surface_material_path)
         ),
+        format!("resumeJournal={}", resume.path.display()),
+        format!("resumeFingerprintMatched={}", resume.fingerprint_matched),
+        format!("resumeJournalRegions={}", resume_completed_regions.len()),
+        format!("staleTempRegionFilesRemoved={stale_temp_files}"),
         format!("setupMillis={setup_millis}"),
-        "type,status,regionX,regionZ,elapsedMillis,chunks,outputBytes,regionFile,message"
-            .to_string(),
+        format!(
+            "batchPhaseSummary.surfaceSampleMillis={}",
+            stats.phase_surface_sample_millis
+        ),
+        format!(
+            "batchPhaseSummary.chunkBuildMillis={}",
+            stats.phase_chunk_build_millis
+        ),
+        format!(
+            "batchPhaseSummary.nbtEncodeMillis={}",
+            stats.phase_nbt_encode_millis
+        ),
+        format!(
+            "batchPhaseSummary.regionWriteMillis={}",
+            stats.phase_region_write_millis
+        ),
+        format!(
+            "batchPhaseSummary.metadataMillis={}",
+            stats.phase_metadata_millis
+        ),
+        format!(
+            "batchPhaseSummary.totalInternalMillis={}",
+            stats.phase_total_internal_millis
+        ),
+        format!("elapsedMillis={elapsed_millis}"),
+        format!("generatedRegions={}", stats.generated_regions),
+        format!("skippedRegions={}", stats.skipped_regions),
+        format!("completedRegions={completed_regions}"),
+        format!("failedRegions={}", stats.failed_regions),
+        format!("generatedRegionsPerHour={generated_regions_per_hour:.2}"),
+        format!("completedRegionsPerHour={completed_regions_per_hour:.2}"),
+        format!("allDone={}", stats.failed_regions == 0),
+        format!("manifestFile={}", manifest_file.display()),
     ];
-    for outcome in &outcomes {
-        let report = outcome.result.as_ref().expect("errors were checked above");
-        generated_regions += 1;
-        phase_surface_sample_millis += millis(report.surface_sample_nanos);
-        phase_chunk_build_millis += millis(report.chunk_build_nanos);
-        phase_nbt_encode_millis += millis(report.nbt_encode_nanos);
-        phase_region_write_millis += millis(report.region_write_nanos);
-        phase_metadata_millis += millis(report.metadata_nanos);
-        phase_total_internal_millis += millis(report.total_nanos);
-        let output_bytes = std::fs::metadata(&report.region_file)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        lines.push(format!(
-            "region,generated,{},{},{},{},{},{},",
-            report.region_x,
-            report.region_z,
-            outcome.elapsed_millis,
-            report.chunk_count,
+    for line in lines {
+        writeln!(out, "{line}").map_err(|error| error.to_string())?;
+    }
+    if !stats.errors.is_empty() {
+        return Err(stats.errors.join("; "));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum VanillaDelegatedParallelEvent {
+    RegionStarted {
+        region_x: i32,
+        region_z: i32,
+        region_file: std::path::PathBuf,
+    },
+    RegionSkipped {
+        region_x: i32,
+        region_z: i32,
+        elapsed_millis: u128,
+        chunks: usize,
+        output_bytes: u64,
+        region_file: std::path::PathBuf,
+    },
+    RegionGenerated {
+        elapsed_millis: u128,
+        output_bytes: u64,
+        report: SurfaceRegionReport,
+    },
+    RegionFailed {
+        region_x: i32,
+        region_z: i32,
+        elapsed_millis: u128,
+        region_file: std::path::PathBuf,
+        message: String,
+    },
+}
+
+#[derive(Default)]
+struct VanillaDelegatedParallelBatchStats {
+    generated_regions: usize,
+    skipped_regions: usize,
+    failed_regions: usize,
+    phase_surface_sample_millis: u128,
+    phase_chunk_build_millis: u128,
+    phase_nbt_encode_millis: u128,
+    phase_region_write_millis: u128,
+    phase_metadata_millis: u128,
+    phase_total_internal_millis: u128,
+    errors: Vec<String>,
+}
+
+fn handle_vanilla_delegated_parallel_event(
+    out: &mut impl Write,
+    stats: &mut VanillaDelegatedParallelBatchStats,
+    event: VanillaDelegatedParallelEvent,
+) -> std::result::Result<(), String> {
+    match event {
+        VanillaDelegatedParallelEvent::RegionStarted {
+            region_x,
+            region_z,
+            region_file,
+        } => {
+            write_progress_event(
+                out,
+                json!({
+                    "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+                    "type": "regionStarted",
+                    "regionX": region_x,
+                    "regionZ": region_z,
+                    "regionFile": normalized_path_display(&region_file),
+                }),
+            )?;
+        }
+        VanillaDelegatedParallelEvent::RegionSkipped {
+            region_x,
+            region_z,
+            elapsed_millis,
+            chunks,
             output_bytes,
-            csv_cell(&report.region_file.display().to_string())
-        ));
+            region_file,
+        } => {
+            stats.skipped_regions += 1;
+            write_progress_event(
+                out,
+                json!({
+                    "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+                    "type": "regionSkipped",
+                    "regionX": region_x,
+                    "regionZ": region_z,
+                    "elapsedMillis": u128_to_u64(elapsed_millis),
+                    "chunks": chunks,
+                    "outputBytes": output_bytes,
+                    "regionFile": normalized_path_display(&region_file),
+                    "reason": "validResume",
+                }),
+            )?;
+            writeln!(
+                out,
+                "region,skipped,{region_x},{region_z},{elapsed_millis},{chunks},{output_bytes},{},validResume",
+                csv_cell(&region_file.display().to_string())
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        VanillaDelegatedParallelEvent::RegionGenerated {
+            elapsed_millis,
+            output_bytes,
+            report,
+        } => {
+            stats.generated_regions += 1;
+            stats.phase_surface_sample_millis += millis(report.surface_sample_nanos);
+            stats.phase_chunk_build_millis += millis(report.chunk_build_nanos);
+            stats.phase_nbt_encode_millis += millis(report.nbt_encode_nanos);
+            stats.phase_region_write_millis += millis(report.region_write_nanos);
+            stats.phase_metadata_millis += millis(report.metadata_nanos);
+            stats.phase_total_internal_millis += millis(report.total_nanos);
+            write_progress_event(
+                out,
+                json!({
+                    "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+                    "type": "regionGenerated",
+                    "regionX": report.region_x,
+                    "regionZ": report.region_z,
+                    "elapsedMillis": u128_to_u64(elapsed_millis),
+                    "chunks": report.chunk_count,
+                    "outputBytes": output_bytes,
+                    "regionFile": normalized_path_display(&report.region_file),
+                }),
+            )?;
+            writeln!(
+                out,
+                "region,generated,{},{},{},{},{},{},",
+                report.region_x,
+                report.region_z,
+                elapsed_millis,
+                report.chunk_count,
+                output_bytes,
+                csv_cell(&report.region_file.display().to_string())
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        VanillaDelegatedParallelEvent::RegionFailed {
+            region_x,
+            region_z,
+            elapsed_millis,
+            region_file,
+            message,
+        } => {
+            stats.failed_regions += 1;
+            stats
+                .errors
+                .push(format!("region {region_x},{region_z}: {message}"));
+            write_progress_event(
+                out,
+                json!({
+                    "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+                    "type": "regionFailed",
+                    "regionX": region_x,
+                    "regionZ": region_z,
+                    "elapsedMillis": u128_to_u64(elapsed_millis),
+                    "regionFile": normalized_path_display(&region_file),
+                    "message": message,
+                }),
+            )?;
+            writeln!(
+                out,
+                "region,failed,{region_x},{region_z},{elapsed_millis},0,0,{},{}",
+                csv_cell(&region_file.display().to_string()),
+                csv_cell(&message)
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn write_progress_event(out: &mut impl Write, value: Value) -> std::result::Result<(), String> {
+    writeln!(out, "event\t{value}").map_err(|error| error.to_string())
+}
+
+struct PreparedVanillaDelegatedResume {
+    fingerprint_matched: bool,
+    completed_regions: HashSet<(i32, i32)>,
+    journal: Arc<Mutex<VanillaDelegatedResumeJournal>>,
+    path: std::path::PathBuf,
+    warnings: Vec<String>,
+}
+
+struct VanillaDelegatedResumeJournal {
+    file: File,
+}
+
+impl VanillaDelegatedResumeJournal {
+    fn append_region_complete(
+        &mut self,
+        region_x: i32,
+        region_z: i32,
+        format: OutputFormat,
+        chunks: usize,
+        output_bytes: u64,
+    ) -> std::result::Result<(), String> {
+        let line = json!({
+            "schemaVersion": RESUME_FINGERPRINT_SCHEMA_VERSION,
+            "type": "regionComplete",
+            "regionX": region_x,
+            "regionZ": region_z,
+            "format": format.java_name(),
+            "chunks": chunks,
+            "outputBytes": output_bytes,
+        });
+        writeln!(self.file, "{line}").map_err(|error| error.to_string())
     }
 
-    let generated_regions_per_hour = if elapsed_millis == 0 {
-        0.0
-    } else {
-        (generated_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
+    fn sync(&self) -> std::result::Result<(), String> {
+        self.file.sync_data().map_err(|error| error.to_string())
+    }
+}
+
+fn prepare_vanilla_delegated_resume_journal(
+    world: &Path,
+    fingerprint: &Value,
+) -> std::result::Result<PreparedVanillaDelegatedResume, String> {
+    let path = world.join(VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME);
+    let mut warnings = Vec::new();
+    let loaded = match load_vanilla_delegated_resume_journal(&path, fingerprint) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            warnings.push(error);
+            None
+        }
     };
-    lines.extend([
-        format!("batchPhaseSummary.surfaceSampleMillis={phase_surface_sample_millis}"),
-        format!("batchPhaseSummary.chunkBuildMillis={phase_chunk_build_millis}"),
-        format!("batchPhaseSummary.nbtEncodeMillis={phase_nbt_encode_millis}"),
-        format!("batchPhaseSummary.regionWriteMillis={phase_region_write_millis}"),
-        format!("batchPhaseSummary.metadataMillis={phase_metadata_millis}"),
-        format!("batchPhaseSummary.totalInternalMillis={phase_total_internal_millis}"),
-        format!("elapsedMillis={elapsed_millis}"),
-        format!("generatedRegions={generated_regions}"),
-        format!("generatedRegionsPerHour={generated_regions_per_hour:.2}"),
-        "allDone=true".to_string(),
-        format!("manifestFile={}", manifest_file.display()),
-    ]);
-    Ok(lines)
+    let (fingerprint_matched, completed_regions, file) = if let Some(completed_regions) = loaded {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        (true, completed_regions, file)
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut file = File::create(&path).map_err(|error| error.to_string())?;
+        write_resume_fingerprint_header(&mut file, fingerprint)?;
+        file.sync_data().map_err(|error| error.to_string())?;
+        (false, HashSet::new(), file)
+    };
+    Ok(PreparedVanillaDelegatedResume {
+        fingerprint_matched,
+        completed_regions,
+        journal: Arc::new(Mutex::new(VanillaDelegatedResumeJournal { file })),
+        path,
+        warnings,
+    })
+}
+
+fn load_vanilla_delegated_resume_journal(
+    path: &Path,
+    fingerprint: &Value,
+) -> std::result::Result<Option<HashSet<(i32, i32)>>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read resume journal: {error}")),
+    };
+    let mut active_fingerprint_matches = false;
+    let mut saw_fingerprint = false;
+    let mut completed_regions = HashSet::new();
+    for (line_index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(line).map_err(|error| {
+            format!(
+                "resume journal parse error at line {}: {error}",
+                line_index + 1
+            )
+        })?;
+        match value.get("type").and_then(Value::as_str) {
+            Some("fingerprint") => {
+                saw_fingerprint = true;
+                active_fingerprint_matches = value.get("fingerprint") == Some(fingerprint);
+                completed_regions.clear();
+            }
+            Some("regionComplete") if active_fingerprint_matches => {
+                let Some(region_x) = value
+                    .get("regionX")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                else {
+                    continue;
+                };
+                let Some(region_z) = value
+                    .get("regionZ")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                else {
+                    continue;
+                };
+                completed_regions.insert((region_x, region_z));
+            }
+            _ => {}
+        }
+    }
+    if saw_fingerprint && active_fingerprint_matches {
+        Ok(Some(completed_regions))
+    } else {
+        Ok(None)
+    }
+}
+
+fn write_resume_fingerprint_header(
+    file: &mut File,
+    fingerprint: &Value,
+) -> std::result::Result<(), String> {
+    let line = json!({
+        "schemaVersion": RESUME_FINGERPRINT_SCHEMA_VERSION,
+        "type": "fingerprint",
+        "fingerprint": fingerprint,
+    });
+    writeln!(file, "{line}").map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vanilla_delegated_parallel_resume_fingerprint(
+    heightmap_path: &Path,
+    format: OutputFormat,
+    scale: i32,
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
+    status: ChunkGenerationStatus,
+    surface_material_path: &Path,
+    compression_options: RegionCompressionOptions,
+) -> Value {
+    json!({
+        "schemaVersion": RESUME_FINGERPRINT_SCHEMA_VERSION,
+        "generator": {
+            "name": build_info::NAME,
+            "version": build_info::VERSION,
+            "minecraftTarget": build_info::MINECRAFT_TARGET,
+            "rustPortPhase": build_info::RUST_PORT_PHASE,
+        },
+        "command": "generate-vanilla-delegated-regions-parallel",
+        "format": format.java_name(),
+        "scale": scale,
+        "startRegionX": start_region_x,
+        "startRegionZ": start_region_z,
+        "regionCols": cols,
+        "regionRows": rows,
+        "chunkStatus": status.id(),
+        "textureMode": "photo",
+        "verticalScale": "1.0",
+        "serverDelegation": true,
+        "directCaves": false,
+        "directOres": false,
+        "directVegetation": false,
+        "directStructures": false,
+        "directProgressionStructures": false,
+        "heightmap": file_identity_for_resume(heightmap_path),
+        "surfaceMaterial": file_identity_for_resume(surface_material_path),
+        "surfaceInputs": surface_input_identities_for_resume(surface_material_path),
+        "compression": {
+            "mca": compression_options.mca_compression_level,
+            "linear": compression_options.linear_compression_level,
+        },
+    })
+}
+
+fn surface_input_identities_for_resume(surface_material_path: &Path) -> Value {
+    let mut inputs = Vec::new();
+    push_resume_input_identity(&mut inputs, "terrain.trueMarble", surface_material_path);
+
+    let normalized = normalized_path(surface_material_path);
+    let terrain_dir = normalized.parent().map(Path::to_path_buf);
+    let tif_root = terrain_dir
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf);
+    if let Some(tif_root) = &tif_root {
+        for (label, path) in [
+            ("tifRoot.climate", tif_root.join("climate.tif")),
+            (
+                "tifRoot.oceanTemperature",
+                tif_root.join("ocean_temp_infill.tif"),
+            ),
+            ("tifRoot.bathymetry", tif_root.join("bathymetry.tif")),
+            ("tifRoot.slope", tif_root.join("slope.tif")),
+            (
+                "tifRoot.landShallowTopoWest",
+                tif_root.join("land_shallow_topo_west.tif"),
+            ),
+            (
+                "tifRoot.landShallowTopoEast",
+                tif_root.join("land_shallow_topo_east.tif"),
+            ),
+        ] {
+            push_resume_input_identity(&mut inputs, label, &path);
+        }
+        let vegetation = tif_root.join("vegetation");
+        for file_name in [
+            "EvergreenBroadleafTrees.tif",
+            "DeciduousBroadleafTrees.tif",
+            "EvergreenDeciduousNeedleleafTrees.tif",
+            "mixed.tif",
+            "HerbaceousVegetation.tif",
+            "Shrubs.tif",
+            "Snow.tif",
+            "Swamp.tif",
+        ] {
+            push_resume_input_identity(
+                &mut inputs,
+                &format!("vegetation.{file_name}"),
+                &vegetation.join(file_name),
+            );
+        }
+    }
+
+    for root in earth_data_candidate_roots(surface_material_path) {
+        push_resume_input_identity(&mut inputs, "earthData.root", &root);
+        let shape = root
+            .join("ShapeFiles")
+            .join("ecoregionsOrig")
+            .join("wwf_terr_ecos.shp");
+        push_resume_input_identity(&mut inputs, "ecoregions.shape", &shape);
+        push_resume_input_identity(&mut inputs, "ecoregions.dbf", &shape.with_extension("dbf"));
+        push_resume_input_identity(
+            &mut inputs,
+            "ecoregions.mapping",
+            &root.join("ecoregions.csv"),
+        );
+        collect_met_resume_identities(&mut inputs, &root);
+    }
+
+    Value::Array(inputs)
+}
+
+fn earth_data_candidate_roots(surface_material_path: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::with_capacity(4);
+    let normalized = normalized_path(surface_material_path);
+    if let Some(root) = normalized
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        push_distinct_resume_path(&mut roots, root.to_path_buf());
+    }
+    for root in [
+        Path::new("E:/earthmap"),
+        Path::new("D:/earthmap"),
+        Path::new("F:/earthmap"),
+    ] {
+        push_distinct_resume_path(&mut roots, normalized_path(root));
+    }
+    roots
+}
+
+fn push_distinct_resume_path(paths: &mut Vec<std::path::PathBuf>, path: std::path::PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn collect_met_resume_identities(inputs: &mut Vec<Value>, root: &Path) {
+    collect_met_image_export_resume_identities(inputs, &root.join("image_exports"));
+    collect_met_image_export_resume_identities(
+        inputs,
+        &root.join("met_work").join("image_exports"),
+    );
+    collect_nested_met_resume_identities(inputs, &root.join("met_shards"));
+    collect_nested_met_resume_identities(inputs, &root.join("met_turbo_temp"));
+}
+
+fn collect_nested_met_resume_identities(inputs: &mut Vec<Value>, parent: &Path) {
+    push_resume_input_identity(inputs, "met.nestedParent", parent);
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let mut children = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    children.sort();
+    for child in children {
+        collect_met_image_export_resume_identities(inputs, &child.join("image_exports"));
+    }
+}
+
+fn collect_met_image_export_resume_identities(inputs: &mut Vec<Value>, image_exports: &Path) {
+    push_resume_input_identity(inputs, "met.imageExports", image_exports);
+    let Ok(entries) = std::fs::read_dir(image_exports) else {
+        return;
+    };
+    let mut tile_dirs = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    tile_dirs.sort();
+    for tile_dir in tile_dirs {
+        push_resume_input_identity(inputs, "met.tileDir", &tile_dir);
+        let Some(tile_name) = tile_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for candidate in [
+            tile_dir.join(format!("{tile_name}_terrain_reduced_colors.png")),
+            tile_dir.join("terrain_reduced_colors.png"),
+            tile_dir.join(format!("{tile_name}_terrain.png")),
+            tile_dir.join("terrain.png"),
+            tile_dir
+                .join("heightmap")
+                .join(format!("{tile_name}_exported.png")),
+            tile_dir
+                .join("heightmap")
+                .join(format!("{tile_name}_exported.png.aux.xml")),
+        ] {
+            if candidate.is_file() {
+                push_resume_input_identity(inputs, "met.tileFile", &candidate);
+            }
+        }
+    }
+}
+
+fn push_resume_input_identity(inputs: &mut Vec<Value>, label: &str, path: &Path) {
+    inputs.push(json!({
+        "label": label,
+        "identity": file_identity_for_resume(path),
+    }));
+}
+
+fn file_identity_for_resume(path: &Path) -> Value {
+    let normalized_path = normalized_path_display(path);
+    match std::fs::metadata(path) {
+        Ok(metadata) => json!({
+            "path": normalized_path,
+            "exists": true,
+            "len": metadata.len(),
+            "modifiedMillis": metadata.modified().ok().and_then(system_time_millis),
+        }),
+        Err(error) => json!({
+            "path": normalized_path,
+            "exists": false,
+            "errorKind": format!("{:?}", error.kind()),
+        }),
+    }
+}
+
+fn system_time_millis(time: std::time::SystemTime) -> Option<u64> {
+    let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(duration.as_millis().try_into().unwrap_or(u64::MAX))
+}
+
+fn cleanup_stale_region_temp_files(region_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(region_dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        let is_region_temp = file_name.starts_with(".r.")
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"));
+        if is_region_temp && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn vanilla_delegated_region_file(
+    world: &Path,
+    format: OutputFormat,
+    region_x: i32,
+    region_z: i32,
+) -> std::path::PathBuf {
+    world.join("region").join(format!(
+        "r.{region_x}.{region_z}.{}",
+        region_format_for_output(format).extension()
+    ))
+}
+
+fn region_format_for_output(format: OutputFormat) -> RegionFormat {
+    match format {
+        OutputFormat::Mca => RegionFormat::Mca,
+        OutputFormat::LinearV2 => RegionFormat::Linear,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3856,6 +4588,10 @@ fn surface_phase_report_lines(report: &SurfaceRegionReport, world_dir: &str) -> 
 
 fn millis(nanos: u128) -> u128 {
     nanos / 1_000_000
+}
+
+fn u128_to_u64(value: u128) -> u64 {
+    value.try_into().unwrap_or(u64::MAX)
 }
 
 fn csv_cell(value: &str) -> String {
@@ -5757,6 +6493,204 @@ mod tests {
             String::from_utf8(out).expect("stdout must be UTF-8"),
             String::from_utf8(err).expect("stderr must be UTF-8"),
         )
+    }
+
+    #[test]
+    fn resume_journal_loads_completed_regions_for_matching_fingerprint() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("world");
+        let fingerprint = json!({"schemaVersion": 1, "test": "same"});
+
+        {
+            let prepared = prepare_vanilla_delegated_resume_journal(&world, &fingerprint).unwrap();
+            assert!(!prepared.fingerprint_matched);
+            assert!(prepared.completed_regions.is_empty());
+            prepared
+                .journal
+                .lock()
+                .unwrap()
+                .append_region_complete(1, 2, OutputFormat::LinearV2, 1024, 123)
+                .unwrap();
+            prepared
+                .journal
+                .lock()
+                .unwrap()
+                .append_region_complete(-3, 4, OutputFormat::LinearV2, 1024, 456)
+                .unwrap();
+            prepared.journal.lock().unwrap().sync().unwrap();
+        }
+
+        let prepared = prepare_vanilla_delegated_resume_journal(&world, &fingerprint).unwrap();
+        assert!(prepared.fingerprint_matched);
+        assert_eq!(prepared.completed_regions.len(), 2);
+        assert!(prepared.completed_regions.contains(&(1, 2)));
+        assert!(prepared.completed_regions.contains(&(-3, 4)));
+    }
+
+    #[test]
+    fn resume_journal_resets_completed_regions_for_mismatched_fingerprint() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("world");
+        let old_fingerprint = json!({"schemaVersion": 1, "test": "old"});
+        let new_fingerprint = json!({"schemaVersion": 1, "test": "new"});
+
+        {
+            let prepared =
+                prepare_vanilla_delegated_resume_journal(&world, &old_fingerprint).unwrap();
+            prepared
+                .journal
+                .lock()
+                .unwrap()
+                .append_region_complete(1, 2, OutputFormat::LinearV2, 1024, 123)
+                .unwrap();
+            prepared.journal.lock().unwrap().sync().unwrap();
+        }
+
+        let prepared = prepare_vanilla_delegated_resume_journal(&world, &new_fingerprint).unwrap();
+        assert!(!prepared.fingerprint_matched);
+        assert!(prepared.completed_regions.is_empty());
+        let journal =
+            fs::read_to_string(world.join(VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME)).unwrap();
+        assert!(!journal.contains("regionComplete"));
+        assert!(journal.contains("\"test\":\"new\""));
+    }
+
+    #[test]
+    fn resume_fingerprint_includes_surface_companion_raster_identities() {
+        let temp = tempdir().unwrap();
+        let tif_root = temp.path().join("TifFiles");
+        let terrain = tif_root.join("terrain");
+        let vegetation = tif_root.join("vegetation");
+        fs::create_dir_all(&terrain).unwrap();
+        fs::create_dir_all(&vegetation).unwrap();
+        let heightmap = temp.path().join("height.tif");
+        let true_marble = terrain.join("TrueMarble.vrt");
+        let climate = tif_root.join("climate.tif");
+        fs::write(&heightmap, b"height").unwrap();
+        fs::write(&true_marble, b"vrt").unwrap();
+        fs::write(&climate, b"climate-v1").unwrap();
+
+        let first = vanilla_delegated_parallel_resume_fingerprint(
+            &heightmap,
+            OutputFormat::LinearV2,
+            1000,
+            -40,
+            -20,
+            80,
+            40,
+            ChunkGenerationStatus::Surface,
+            &true_marble,
+            RegionCompressionOptions {
+                linear_compression_level: Some(4),
+                ..RegionCompressionOptions::default()
+            },
+        );
+        fs::write(&climate, b"climate-v2-with-different-length").unwrap();
+        let second = vanilla_delegated_parallel_resume_fingerprint(
+            &heightmap,
+            OutputFormat::LinearV2,
+            1000,
+            -40,
+            -20,
+            80,
+            40,
+            ChunkGenerationStatus::Surface,
+            &true_marble,
+            RegionCompressionOptions {
+                linear_compression_level: Some(4),
+                ..RegionCompressionOptions::default()
+            },
+        );
+
+        assert_ne!(first, second);
+        assert!(first.to_string().contains("tifRoot.climate"));
+    }
+
+    #[test]
+    fn resume_fingerprint_ignores_derived_ecoregion_cache_identity() {
+        let temp = tempdir().unwrap();
+        let tif_root = temp.path().join("TifFiles");
+        let terrain = tif_root.join("terrain");
+        let shape_dir = temp.path().join("ShapeFiles").join("ecoregionsOrig");
+        let cache_dir = temp.path().join(".earthmap-cache");
+        fs::create_dir_all(&terrain).unwrap();
+        fs::create_dir_all(&shape_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let heightmap = temp.path().join("height.tif");
+        let true_marble = terrain.join("TrueMarble.vrt");
+        fs::write(&heightmap, b"height").unwrap();
+        fs::write(&true_marble, b"vrt").unwrap();
+        fs::write(shape_dir.join("wwf_terr_ecos.shp"), b"shape").unwrap();
+        fs::write(shape_dir.join("wwf_terr_ecos.dbf"), b"dbf").unwrap();
+        fs::write(temp.path().join("ecoregions.csv"), b"name,biome\n").unwrap();
+
+        let first = vanilla_delegated_parallel_resume_fingerprint(
+            &heightmap,
+            OutputFormat::LinearV2,
+            1000,
+            -40,
+            -20,
+            80,
+            40,
+            ChunkGenerationStatus::Surface,
+            &true_marble,
+            RegionCompressionOptions::default(),
+        );
+        fs::write(cache_dir.join("wwf-ecoregions-v2.bin"), b"derived-cache").unwrap();
+        let second = vanilla_delegated_parallel_resume_fingerprint(
+            &heightmap,
+            OutputFormat::LinearV2,
+            1000,
+            -40,
+            -20,
+            80,
+            40,
+            ChunkGenerationStatus::Surface,
+            &true_marble,
+            RegionCompressionOptions::default(),
+        );
+
+        assert_eq!(first, second);
+        assert!(!first.to_string().contains("ecoregions.cache"));
+    }
+
+    #[test]
+    fn skipped_event_writes_json_event_and_legacy_csv_line() {
+        let temp = tempdir().unwrap();
+        let region_file = temp.path().join("region").join("r.1.2.linear");
+        let mut out = Vec::new();
+        let mut stats = VanillaDelegatedParallelBatchStats::default();
+
+        handle_vanilla_delegated_parallel_event(
+            &mut out,
+            &mut stats,
+            VanillaDelegatedParallelEvent::RegionSkipped {
+                region_x: 1,
+                region_z: 2,
+                elapsed_millis: 7,
+                chunks: 1024,
+                output_bytes: 2048,
+                region_file: region_file.clone(),
+            },
+        )
+        .unwrap();
+
+        let out = String::from_utf8(out).unwrap();
+        let mut lines = out.lines();
+        let event_line = lines.next().unwrap();
+        let event_json = event_line.strip_prefix("event\t").unwrap();
+        let event = serde_json::from_str::<Value>(event_json).unwrap();
+        assert_eq!(event["type"], "regionSkipped");
+        assert_eq!(event["regionX"], 1);
+        assert_eq!(event["regionZ"], 2);
+        assert_eq!(stats.skipped_regions, 1);
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "region,skipped,1,2,7,1024,2048,{},validResume",
+                region_file.display()
+            )
+        );
     }
 
     #[test]

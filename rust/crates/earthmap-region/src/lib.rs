@@ -3,8 +3,11 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -26,6 +29,10 @@ const LINEAR_GRID_SIZE: u8 = 8;
 const LINEAR_CHUNKS_PER_REGION: usize = 32 * 32;
 const LINEAR_BUCKET_COUNT: usize = 64;
 const LINEAR_DEFAULT_COMPRESSION_LEVEL: i32 = 4;
+
+pub const REGION_CHUNKS_PER_REGION: usize = LINEAR_CHUNKS_PER_REGION;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, RegionError>;
 
@@ -64,6 +71,10 @@ impl RegionFormat {
             RegionFormat::Mca => "mca",
             RegionFormat::Linear => "linear",
         }
+    }
+
+    pub fn extension(self) -> &'static str {
+        self.as_manifest_value()
     }
 }
 
@@ -106,6 +117,15 @@ pub struct RegionPayloads {
     pub region_x: i32,
     pub region_z: i32,
     pub chunks: BTreeMap<ChunkLocalPos, Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegionResumeValidation {
+    pub format: RegionFormat,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub chunk_count: usize,
+    pub file_bytes: u64,
 }
 
 pub fn write_mca_region(
@@ -273,6 +293,30 @@ pub fn read_region_payloads(path: impl AsRef<Path>) -> Result<RegionPayloads> {
     }
 }
 
+pub fn validate_region_file_for_resume(
+    path: impl AsRef<Path>,
+    expected_format: RegionFormat,
+    expected_region_x: i32,
+    expected_region_z: i32,
+    expected_chunks: usize,
+) -> Result<RegionResumeValidation> {
+    let path = path.as_ref();
+    let (region_x, region_z) = parse_region_coordinates(path, expected_format.extension())?;
+    if region_x != expected_region_x || region_z != expected_region_z {
+        return Err(RegionError::Invalid(format!(
+            "region coordinates differ from expected: file={region_x},{region_z} expected={expected_region_x},{expected_region_z}"
+        )));
+    }
+    match expected_format {
+        RegionFormat::Mca => {
+            validate_mca_region_for_resume(path, region_x, region_z, expected_chunks)
+        }
+        RegionFormat::Linear => {
+            validate_linear_region_for_resume(path, region_x, region_z, expected_chunks)
+        }
+    }
+}
+
 pub fn sectors_for(byte_count: usize) -> Result<usize> {
     if byte_count == 0 {
         return Err(RegionError::Invalid(
@@ -399,10 +443,299 @@ fn write_i32_be_at(output: &mut [u8], offset: usize, value: i32) -> Result<()> {
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, bytes)?;
+    let temp_path = unique_temp_file_path(path)?;
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // The temp file contents are durable before the final-name swap. Rust std
+        // does not expose portable parent-directory fsync, so after a crash the
+        // old or missing final file is acceptable; corrupt temp bytes under the
+        // final region name are not.
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        fs::rename(&temp_path, path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result?;
     Ok(())
+}
+
+fn unique_temp_file_path(path: &Path) -> Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        RegionError::Invalid(format!("region path has no parent: {}", path.display()))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            RegionError::Invalid(format!("region path has no file name: {}", path.display()))
+        })?;
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Ok(parent.join(format!(
+        ".{file_name}.{}.{}.{}.tmp",
+        std::process::id(),
+        counter,
+        nanos
+    )))
+}
+
+fn validate_mca_region_for_resume(
+    path: &Path,
+    region_x: i32,
+    region_z: i32,
+    expected_chunks: usize,
+) -> Result<RegionResumeValidation> {
+    let data = fs::read(path)?;
+    if data.len() < MCA_HEADER_BYTES {
+        return Err(RegionError::Invalid(format!(
+            "MCA file smaller than header: {}",
+            data.len()
+        )));
+    }
+    if data.len() % MCA_SECTOR_BYTES != 0 {
+        return Err(RegionError::Invalid(format!(
+            "MCA file is not sector aligned: {} bytes",
+            data.len()
+        )));
+    }
+    let total_sectors = data.len() / MCA_SECTOR_BYTES;
+    let mut occupied_sectors = vec![false; total_sectors];
+    for sector in 0..MCA_HEADER_SECTORS.min(total_sectors) {
+        occupied_sectors[sector] = true;
+    }
+
+    let mut chunk_count = 0usize;
+    for header_index in 0..LINEAR_CHUNKS_PER_REGION {
+        let location = read_u32_be(&data, header_index * 4)?;
+        if location == 0 {
+            continue;
+        }
+        chunk_count += 1;
+        let offset_sector = usize::try_from(location >> 8).expect("24-bit value fits usize");
+        let sector_count = usize::try_from(location & 0xff).expect("8-bit value fits usize");
+        if offset_sector < MCA_HEADER_SECTORS {
+            return Err(RegionError::Invalid(format!(
+                "MCA chunk offset points into header: {offset_sector}"
+            )));
+        }
+        if sector_count == 0 {
+            return Err(RegionError::Invalid(
+                "MCA chunk has zero sectors".to_string(),
+            ));
+        }
+        let end_sector = offset_sector
+            .checked_add(sector_count)
+            .ok_or_else(|| RegionError::Invalid("MCA sector range overflow".to_string()))?;
+        if end_sector > total_sectors {
+            return Err(RegionError::Invalid(
+                "MCA chunk points beyond file sectors".to_string(),
+            ));
+        }
+        for sector in offset_sector..end_sector {
+            if occupied_sectors[sector] {
+                return Err(RegionError::Invalid(format!(
+                    "MCA chunk sector overlap at sector {sector}"
+                )));
+            }
+            occupied_sectors[sector] = true;
+        }
+
+        let chunk_start = offset_sector * MCA_SECTOR_BYTES;
+        let chunk_length =
+            usize::try_from(read_u32_be(&data, chunk_start)?).expect("u32 chunk length fits usize");
+        let max_chunk_length = (sector_count * MCA_SECTOR_BYTES) - 4;
+        if chunk_length <= 1 || chunk_length > max_chunk_length {
+            return Err(RegionError::Invalid(format!(
+                "invalid MCA chunk length {chunk_length} at sector {offset_sector}"
+            )));
+        }
+        let compression = *data
+            .get(chunk_start + 4)
+            .ok_or_else(|| RegionError::Invalid("truncated MCA compression byte".to_string()))?;
+        if compression != MCA_COMPRESSION_ZLIB {
+            return Err(RegionError::Invalid(format!(
+                "unsupported MCA compression byte: {compression}"
+            )));
+        }
+        let compressed_end = chunk_start
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(chunk_length))
+            .ok_or_else(|| RegionError::Invalid("MCA payload range overflow".to_string()))?;
+        if compressed_end > data.len() {
+            return Err(RegionError::Invalid(format!(
+                "MCA chunk payload points beyond file at sector {offset_sector}"
+            )));
+        }
+    }
+    validate_expected_chunk_count(chunk_count, expected_chunks)?;
+    Ok(RegionResumeValidation {
+        format: RegionFormat::Mca,
+        region_x,
+        region_z,
+        chunk_count,
+        file_bytes: data.len() as u64,
+    })
+}
+
+fn validate_linear_region_for_resume(
+    path: &Path,
+    name_region_x: i32,
+    name_region_z: i32,
+    expected_chunks: usize,
+) -> Result<RegionResumeValidation> {
+    let data = fs::read(path)?;
+    let mut cursor = Cursor::new(&data);
+
+    let header_superblock = cursor.read_u64()?;
+    if header_superblock != LINEAR_SUPERBLOCK {
+        return Err(RegionError::Invalid(
+            "invalid Linear superblock".to_string(),
+        ));
+    }
+    let version = cursor.read_u8()?;
+    if version != LINEAR_VERSION {
+        return Err(RegionError::Invalid(format!(
+            "unsupported Linear version: {version}"
+        )));
+    }
+    let _timestamp = cursor.read_i64()?;
+    let grid_size = cursor.read_u8()?;
+    if grid_size != LINEAR_GRID_SIZE {
+        return Err(RegionError::Invalid(format!(
+            "unsupported Linear grid size: {grid_size}"
+        )));
+    }
+    let region_x = cursor.read_i32()?;
+    let region_z = cursor.read_i32()?;
+    if region_x != name_region_x || region_z != name_region_z {
+        return Err(RegionError::Invalid(format!(
+            "Linear region coordinates differ from file name: header={region_x},{region_z} file={name_region_x},{name_region_z}"
+        )));
+    }
+
+    let existence = read_linear_existence_bitmap(&mut cursor)?;
+    let chunk_count = existence.iter().filter(|exists| **exists).count();
+    validate_expected_chunk_count(chunk_count, expected_chunks)?;
+    skip_linear_features(&mut cursor)?;
+
+    let bucket_count = usize::from(grid_size) * usize::from(grid_size);
+    let mut bucket_sizes = Vec::with_capacity(bucket_count);
+    let mut bucket_hashes = Vec::with_capacity(bucket_count);
+    for index in 0..bucket_count {
+        let size = cursor.read_i32()?;
+        if size < 0 {
+            return Err(RegionError::Invalid(format!(
+                "negative Linear bucket size at {index}"
+            )));
+        }
+        let size = usize::try_from(size).expect("non-negative i32 fits usize");
+        bucket_sizes.push(size);
+        let compression_level = cursor.read_u8()?;
+        if size > 0 && !(1..=22).contains(&compression_level) {
+            return Err(RegionError::Invalid(format!(
+                "invalid Linear bucket compression level {compression_level} at {index}"
+            )));
+        }
+        let bucket_hash = cursor.read_i64()?;
+        if size == 0 && bucket_hash != 0 {
+            return Err(RegionError::Invalid(format!(
+                "Linear empty bucket has nonzero hash at {index}"
+            )));
+        }
+        bucket_hashes.push(bucket_hash);
+    }
+
+    for bucket_index in 0..bucket_count {
+        let size = bucket_sizes[bucket_index];
+        let bucket_has_bitmap_chunks =
+            linear_bucket_has_existing_chunk(bucket_index, grid_size, &existence);
+        if size == 0 {
+            if bucket_has_bitmap_chunks {
+                return Err(RegionError::Invalid(format!(
+                    "Linear bitmap is set but bucket is empty at {bucket_index}"
+                )));
+            }
+            continue;
+        }
+        if !bucket_has_bitmap_chunks {
+            return Err(RegionError::Invalid(format!(
+                "Linear bucket has bytes but no bitmap chunks at {bucket_index}"
+            )));
+        }
+        let bucket = cursor.read_bytes(size)?;
+        let actual_hash = xxh64(bucket, 0) as i64;
+        if actual_hash != bucket_hashes[bucket_index] {
+            return Err(RegionError::Invalid(format!(
+                "Linear bucket hash mismatch at {bucket_index}"
+            )));
+        }
+    }
+
+    let footer_superblock = cursor.read_u64()?;
+    if footer_superblock != LINEAR_SUPERBLOCK {
+        return Err(RegionError::Invalid(
+            "invalid Linear footer superblock".to_string(),
+        ));
+    }
+    if cursor.remaining() != 0 {
+        return Err(RegionError::Invalid(format!(
+            "unexpected trailing Linear bytes: {}",
+            cursor.remaining()
+        )));
+    }
+
+    Ok(RegionResumeValidation {
+        format: RegionFormat::Linear,
+        region_x,
+        region_z,
+        chunk_count,
+        file_bytes: data.len() as u64,
+    })
+}
+
+fn validate_expected_chunk_count(actual: usize, expected: usize) -> Result<()> {
+    if actual != expected {
+        return Err(RegionError::Invalid(format!(
+            "region has {actual} chunks, expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn linear_bucket_has_existing_chunk(
+    bucket_index: usize,
+    grid_size: u8,
+    existence: &[bool],
+) -> bool {
+    let cell_count = 32 / usize::from(grid_size);
+    let bucket_x = bucket_index / usize::from(grid_size);
+    let bucket_z = bucket_index % usize::from(grid_size);
+    for cell_x in 0..cell_count {
+        for cell_z in 0..cell_count {
+            let chunk_x = bucket_x * cell_count + cell_x;
+            let chunk_z = bucket_z * cell_count + cell_z;
+            let header_index = chunk_x + (chunk_z * usize::from(REGION_CHUNK_WIDTH));
+            if existence.get(header_index).copied().unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 struct McaChunkEntry {
@@ -857,6 +1190,31 @@ mod tests {
     }
 
     #[test]
+    fn validates_complete_mca_region_for_resume_without_decompression() {
+        let path = temp_region_path("r.4.-7.mca");
+        let payloads = full_region_payloads();
+
+        write_mca_region_with_compression(&path, &payloads, 42, 1)
+            .expect("complete MCA region should write");
+        let validation = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Mca,
+            4,
+            -7,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .expect("complete MCA region should validate");
+
+        assert_eq!(validation.format, RegionFormat::Mca);
+        assert_eq!(validation.region_x, 4);
+        assert_eq!(validation.region_z, -7);
+        assert_eq!(validation.chunk_count, REGION_CHUNKS_PER_REGION);
+        assert!(validation.file_bytes >= MCA_HEADER_BYTES as u64);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn rejects_mca_compression_outside_zlib_range() {
         let error = write_mca_region_with_compression(
             temp_region_path("r.0.1.mca"),
@@ -882,6 +1240,171 @@ mod tests {
         assert_eq!(region.region_x, -2);
         assert_eq!(region.region_z, 3);
         assert_eq!(region.chunks, payloads);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn validates_complete_linear_region_for_resume_without_decompression() {
+        let path = temp_region_path("r.-8.9.linear");
+        let payloads = full_region_payloads();
+
+        write_linear_v2_region_with_compression(&path, &payloads, 42, 1)
+            .expect("complete Linear region should write");
+        let validation = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Linear,
+            -8,
+            9,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .expect("complete Linear region should validate");
+
+        assert_eq!(validation.format, RegionFormat::Linear);
+        assert_eq!(validation.region_x, -8);
+        assert_eq!(validation.region_z, 9);
+        assert_eq!(validation.chunk_count, REGION_CHUNKS_PER_REGION);
+        assert!(validation.file_bytes > 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn atomic_region_write_replaces_existing_final_and_leaves_no_temp_file() {
+        let path = temp_region_path("r.5.6.linear");
+        let first = sample_payloads();
+        let second = full_region_payloads();
+
+        write_linear_v2_region(&path, &first, 42).expect("first Linear region should write");
+        write_linear_v2_region_with_compression(&path, &second, 43, 1)
+            .expect("second Linear region should replace the first");
+
+        let validation = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Linear,
+            5,
+            6,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .expect("replacement final region should validate");
+        assert_eq!(validation.chunk_count, REGION_CHUNKS_PER_REGION);
+
+        let temp_count = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"))
+            })
+            .count();
+        assert_eq!(temp_count, 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resume_validation_rejects_incomplete_region() {
+        let path = temp_region_path("r.0.0.linear");
+        write_linear_v2_region(&path, &sample_payloads(), 42).expect("Linear region should write");
+
+        let error = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Linear,
+            0,
+            0,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("expected 1024"), "error={error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resume_validation_rejects_wrong_coordinates_and_zero_byte_files() {
+        let wrong_coord = temp_region_path("r.1.2.linear");
+        write_linear_v2_region(&wrong_coord, &full_region_payloads(), 42)
+            .expect("Linear region should write");
+
+        let error = validate_region_file_for_resume(
+            &wrong_coord,
+            RegionFormat::Linear,
+            1,
+            3,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("expected=1,3"), "error={error}");
+
+        let zero = temp_region_path("r.0.0.mca");
+        std::fs::create_dir_all(zero.parent().unwrap()).unwrap();
+        std::fs::write(&zero, []).unwrap();
+        let error = validate_region_file_for_resume(
+            &zero,
+            RegionFormat::Mca,
+            0,
+            0,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("smaller than header"), "error={error}");
+
+        let _ = std::fs::remove_file(wrong_coord);
+        let _ = std::fs::remove_file(zero);
+    }
+
+    #[test]
+    fn resume_validation_rejects_linear_bucket_hash_mismatch() {
+        let path = temp_region_path("r.0.0.linear");
+        write_linear_v2_region_with_compression(&path, &full_region_payloads(), 42, 1)
+            .expect("complete Linear region should write");
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let first_bucket_offset = 8 + 1 + 8 + 1 + 4 + 4 + 128 + 1 + (LINEAR_BUCKET_COUNT * 13);
+        bytes[first_bucket_offset] ^= 0x5a;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Linear,
+            0,
+            0,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("hash mismatch"), "error={error}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resume_validation_rejects_mca_chunk_pointer_beyond_file() {
+        let path = temp_region_path("r.0.0.mca");
+        write_mca_region_with_compression(&path, &full_region_payloads(), 42, 1)
+            .expect("complete MCA region should write");
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let impossible_location = ((0x00ff_ffffu32) << 8) | 1;
+        bytes[0..4].copy_from_slice(&impossible_location.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Mca,
+            0,
+            0,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("beyond file sectors"), "error={error}");
 
         let _ = std::fs::remove_file(path);
     }
@@ -1010,6 +1533,19 @@ mod tests {
                 b"synthetic-region-writer-payload-0-1".to_vec(),
             ),
         ])
+    }
+
+    fn full_region_payloads() -> BTreeMap<ChunkLocalPos, Vec<u8>> {
+        let mut payloads = BTreeMap::new();
+        for z in 0..REGION_CHUNK_WIDTH {
+            for x in 0..REGION_CHUNK_WIDTH {
+                payloads.insert(
+                    ChunkLocalPos::new(x, z).unwrap(),
+                    format!("synthetic-complete-region-payload-{x}-{z}").into_bytes(),
+                );
+            }
+        }
+        payloads
     }
 
     fn write_minimal_mca(path: &Path, payload: &[u8]) {

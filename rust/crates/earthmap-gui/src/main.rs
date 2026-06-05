@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,9 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use earthmap_geo::EarthScaleMapping;
 use eframe::egui;
+use serde_json::Value;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -23,6 +25,18 @@ const DEFAULT_SURFACE_TILE_CACHE_ENTRIES: &str = "auto";
 const REGION_SIZE_BLOCKS: i32 = 512;
 const FULL_EARTH_MIN_LATITUDE: f64 = -90.0;
 const FULL_EARTH_MAX_LATITUDE: f64 = 90.0;
+const WORKER_EVENT_CHANNEL_CAPACITY: usize = 4096;
+const REGION_STATE_MISSING: u8 = 0;
+const REGION_STATE_QUEUED: u8 = 1;
+const REGION_STATE_RUNNING: u8 = 2;
+const REGION_STATE_SKIPPED: u8 = 3;
+const REGION_STATE_GENERATED: u8 = 4;
+const REGION_STATE_FAILED: u8 = 5;
+const ROLLING_SPEED_WINDOW: Duration = Duration::from_secs(60);
+const WORLD_MAP_TEXTURE_WIDTH: usize = 720;
+const WORLD_MAP_TEXTURE_HEIGHT: usize = 360;
+const MAX_STATUS_TEXTURE_DIMENSION: usize = 2048;
+const STATUS_TEXTURE_UPLOAD_INTERVAL: Duration = Duration::from_millis(250);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -425,29 +439,293 @@ fn path_status(label: &str, path: &str, file: bool) -> String {
     }
 }
 
-fn count_region_files(world_dir: &Path, extension: &str) -> usize {
+fn scan_existing_region_files(
+    world_dir: &Path,
+    extension: &str,
+    grid: RegionGrid,
+) -> Vec<(i32, i32)> {
     let region_dir = world_dir.join("region");
     let Ok(entries) = std::fs::read_dir(region_dir) else {
-        return 0;
+        return Vec::new();
     };
     entries
         .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|actual| actual.eq_ignore_ascii_case(extension))
-        })
-        .count()
+        .filter_map(|entry| parse_region_file_name(&entry.file_name().to_string_lossy(), extension))
+        .filter(|(region_x, region_z)| region_in_grid(*region_x, *region_z, grid))
+        .collect()
+}
+
+fn parse_region_file_name(file_name: &str, extension: &str) -> Option<(i32, i32)> {
+    let parts = file_name.split('.').collect::<Vec<_>>();
+    if parts.len() != 4 || parts[0] != "r" || !parts[3].eq_ignore_ascii_case(extension) {
+        return None;
+    }
+    let region_x = parts[1].parse::<i32>().ok()?;
+    let region_z = parts[2].parse::<i32>().ok()?;
+    Some((region_x, region_z))
+}
+
+fn region_in_grid(region_x: i32, region_z: i32, grid: RegionGrid) -> bool {
+    let end_x = grid.start_region_x.saturating_add(grid.cols.max(1));
+    let end_z = grid.start_region_z.saturating_add(grid.rows.max(1));
+    region_x >= grid.start_region_x
+        && region_x < end_x
+        && region_z >= grid.start_region_z
+        && region_z < end_z
+}
+
+#[derive(Clone, Debug)]
+struct RegionProgressGrid {
+    grid: RegionGrid,
+    states: Vec<u8>,
+    completed_regions: usize,
+    failed_regions: usize,
+}
+
+impl RegionProgressGrid {
+    fn new(grid: RegionGrid) -> Self {
+        debug_assert_eq!(REGION_STATE_MISSING, 0);
+        let cols = grid.cols.max(1) as usize;
+        let rows = grid.rows.max(1) as usize;
+        Self {
+            grid,
+            states: vec![REGION_STATE_QUEUED; cols.saturating_mul(rows)],
+            completed_regions: 0,
+            failed_regions: 0,
+        }
+    }
+
+    fn index(&self, region_x: i32, region_z: i32) -> Option<usize> {
+        if !region_in_grid(region_x, region_z, self.grid) {
+            return None;
+        }
+        let col = usize::try_from(region_x - self.grid.start_region_x).ok()?;
+        let row = usize::try_from(region_z - self.grid.start_region_z).ok()?;
+        Some(col + row * self.grid.cols.max(1) as usize)
+    }
+
+    fn mark(&mut self, region_x: i32, region_z: i32, state: u8) -> bool {
+        let Some(index) = self.index(region_x, region_z) else {
+            return false;
+        };
+        let previous = self.states[index];
+        if previous == state {
+            return false;
+        }
+        if is_completed_region_state(previous) {
+            self.completed_regions = self.completed_regions.saturating_sub(1);
+        }
+        if previous == REGION_STATE_FAILED {
+            self.failed_regions = self.failed_regions.saturating_sub(1);
+        }
+        self.states[index] = state;
+        if is_completed_region_state(state) {
+            self.completed_regions = self.completed_regions.saturating_add(1);
+        }
+        if state == REGION_STATE_FAILED {
+            self.failed_regions = self.failed_regions.saturating_add(1);
+        }
+        true
+    }
+}
+
+fn is_completed_region_state(state: u8) -> bool {
+    matches!(state, REGION_STATE_SKIPPED | REGION_STATE_GENERATED)
+}
+
+fn status_texture_layout(grid: RegionGrid) -> (usize, usize, usize) {
+    let cols = grid.cols.max(1) as usize;
+    let rows = grid.rows.max(1) as usize;
+    let scale = cols
+        .div_ceil(MAX_STATUS_TEXTURE_DIMENSION)
+        .max(rows.div_ceil(MAX_STATUS_TEXTURE_DIMENSION))
+        .max(1);
+    (cols.div_ceil(scale), rows.div_ceil(scale), scale)
+}
+
+fn status_overlay_pixels(
+    progress_grid: &RegionProgressGrid,
+    width: usize,
+    height: usize,
+    scale: usize,
+) -> Vec<egui::Color32> {
+    let mut pixels = vec![egui::Color32::TRANSPARENT; width.saturating_mul(height)];
+    let mut priorities = vec![0u8; pixels.len()];
+    let cols = progress_grid.grid.cols.max(1) as usize;
+    let rows = progress_grid.grid.rows.max(1) as usize;
+    for row in 0..rows {
+        for col in 0..cols {
+            let source_index = col + row * cols;
+            let Some(state) = progress_grid.states.get(source_index).copied() else {
+                continue;
+            };
+            let target_col = (col / scale).min(width.saturating_sub(1));
+            let target_row = (row / scale).min(height.saturating_sub(1));
+            let target_index = target_col + target_row * width;
+            let priority = region_state_priority(state);
+            if priority >= priorities[target_index] {
+                priorities[target_index] = priority;
+                pixels[target_index] = region_state_color(state);
+            }
+        }
+    }
+    pixels
+}
+
+fn region_state_priority(state: u8) -> u8 {
+    match state {
+        REGION_STATE_FAILED => 5,
+        REGION_STATE_RUNNING => 4,
+        REGION_STATE_GENERATED | REGION_STATE_SKIPPED => 3,
+        REGION_STATE_QUEUED => 1,
+        _ => 0,
+    }
+}
+
+fn region_state_color(state: u8) -> egui::Color32 {
+    match state {
+        REGION_STATE_RUNNING => egui::Color32::from_rgba_premultiplied(255, 210, 64, 210),
+        REGION_STATE_SKIPPED => egui::Color32::from_rgba_premultiplied(80, 170, 255, 145),
+        REGION_STATE_GENERATED => egui::Color32::from_rgba_premultiplied(64, 220, 120, 150),
+        REGION_STATE_FAILED => egui::Color32::from_rgba_premultiplied(235, 60, 60, 220),
+        _ => egui::Color32::TRANSPARENT,
+    }
+}
+
+fn target_region_rect(parent: egui::Rect, scale: i32, grid: RegionGrid) -> egui::Rect {
+    let full = full_earth_region_grid(scale.max(1));
+    let full_cols = full.cols.max(1) as f32;
+    let full_rows = full.rows.max(1) as f32;
+    let x0 = ((grid.start_region_x - full.start_region_x) as f32 / full_cols).clamp(0.0, 1.0);
+    let y0 = ((grid.start_region_z - full.start_region_z) as f32 / full_rows).clamp(0.0, 1.0);
+    let x1 = ((grid.start_region_x + grid.cols.max(1) - full.start_region_x) as f32 / full_cols)
+        .clamp(0.0, 1.0);
+    let y1 = ((grid.start_region_z + grid.rows.max(1) - full.start_region_z) as f32 / full_rows)
+        .clamp(0.0, 1.0);
+    egui::Rect::from_min_max(
+        egui::pos2(
+            parent.left() + parent.width() * x0,
+            parent.top() + parent.height() * y0,
+        ),
+        egui::pos2(
+            parent.left() + parent.width() * x1.max(x0),
+            parent.top() + parent.height() * y1.max(y0),
+        ),
+    )
+}
+
+fn draw_rect_outline(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.5, color);
+    painter.line_segment([rect.left_top(), rect.right_top()], stroke);
+    painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
+    painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
+    painter.line_segment([rect.left_bottom(), rect.left_top()], stroke);
+}
+
+fn world_map_background_image() -> egui::ColorImage {
+    let mut pixels = Vec::with_capacity(WORLD_MAP_TEXTURE_WIDTH * WORLD_MAP_TEXTURE_HEIGHT);
+    for y in 0..WORLD_MAP_TEXTURE_HEIGHT {
+        let latitude = 90.0 - ((y as f64 + 0.5) / WORLD_MAP_TEXTURE_HEIGHT as f64) * 180.0;
+        for x in 0..WORLD_MAP_TEXTURE_WIDTH {
+            let longitude = ((x as f64 + 0.5) / WORLD_MAP_TEXTURE_WIDTH as f64) * 360.0 - 180.0;
+            pixels.push(world_map_pixel(longitude, latitude));
+        }
+    }
+    egui::ColorImage::new([WORLD_MAP_TEXTURE_WIDTH, WORLD_MAP_TEXTURE_HEIGHT], pixels)
+}
+
+fn world_map_pixel(longitude: f64, latitude: f64) -> egui::Color32 {
+    if rough_world_land_mask(longitude, latitude) {
+        let dry = ((latitude.abs() / 90.0) * 0.25 + rough_noise(longitude, latitude) * 0.35)
+            .clamp(0.0, 1.0);
+        let green = (115.0 + (1.0 - dry) * 55.0) as u8;
+        let red = (85.0 + dry * 65.0) as u8;
+        let blue = (70.0 + (1.0 - dry) * 35.0) as u8;
+        egui::Color32::from_rgb(red, green, blue)
+    } else {
+        let depth =
+            (0.55 + (latitude.abs() / 90.0) * 0.20 + rough_noise(longitude, latitude) * 0.10)
+                .clamp(0.0, 1.0);
+        egui::Color32::from_rgb(
+            (22.0 + depth * 18.0) as u8,
+            (82.0 + depth * 34.0) as u8,
+            (132.0 + depth * 55.0) as u8,
+        )
+    }
+}
+
+fn rough_world_land_mask(lon: f64, lat: f64) -> bool {
+    in_ellipse(lon, lat, -105.0, 47.0, 58.0, 25.0)
+        || in_ellipse(lon, lat, -84.0, 20.0, 28.0, 18.0)
+        || in_ellipse(lon, lat, -60.0, -17.0, 27.0, 39.0)
+        || in_ellipse(lon, lat, 20.0, 2.0, 33.0, 36.0)
+        || in_ellipse(lon, lat, 70.0, 50.0, 78.0, 29.0)
+        || in_ellipse(lon, lat, 103.0, 25.0, 44.0, 25.0)
+        || in_ellipse(lon, lat, 134.0, -25.0, 24.0, 16.0)
+        || in_ellipse(lon, lat, 46.0, -20.0, 13.0, 16.0)
+        || in_ellipse(lon, lat, -42.0, 74.0, 20.0, 10.0)
+        || in_ellipse(lon, lat, 138.0, -42.0, 7.0, 4.0)
+        || in_ellipse(lon, lat, 140.0, 38.0, 8.0, 10.0)
+}
+
+fn in_ellipse(lon: f64, lat: f64, center_lon: f64, center_lat: f64, rx: f64, ry: f64) -> bool {
+    let dx = (lon - center_lon) / rx;
+    let dy = (lat - center_lat) / ry;
+    (dx * dx) + (dy * dy) <= 1.0
+}
+
+fn rough_noise(lon: f64, lat: f64) -> f64 {
+    let value = (lon.to_radians().sin() * 12.9898 + lat.to_radians().cos() * 78.233).sin();
+    (value + 1.0) * 0.5
+}
+
+#[derive(Debug)]
+enum GeneratorProgressEvent {
+    BatchStarted {
+        grid: RegionGrid,
+        total_regions: usize,
+        resume_fingerprint_matched: bool,
+        resume_journal_regions: usize,
+    },
+    RegionStarted {
+        region_x: i32,
+        region_z: i32,
+    },
+    RegionSkipped {
+        region_x: i32,
+        region_z: i32,
+        elapsed_millis: Option<u64>,
+    },
+    RegionGenerated {
+        region_x: i32,
+        region_z: i32,
+        elapsed_millis: Option<u64>,
+    },
+    RegionFailed {
+        region_x: i32,
+        region_z: i32,
+        message: String,
+    },
+    BatchSummary {
+        elapsed_millis: Option<u64>,
+        regions_per_hour: Option<f64>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyRegionStatus {
+    Generated,
+    Skipped,
 }
 
 #[derive(Debug)]
 enum WorkerEvent {
     Line(String),
+    Progress(GeneratorProgressEvent),
     RegionFinished {
-        region_x: String,
-        region_z: String,
+        status: LegacyRegionStatus,
+        region_x: i32,
+        region_z: i32,
         elapsed_millis: Option<u64>,
     },
     Summary {
@@ -466,9 +744,6 @@ struct GenerationRun {
     cancel: Arc<AtomicBool>,
     child: Arc<Mutex<Option<std::process::Child>>>,
     started_at: Instant,
-    world_dir: PathBuf,
-    region_extension: &'static str,
-    last_file_poll: Instant,
 }
 
 impl GenerationRun {
@@ -486,21 +761,108 @@ impl GenerationRun {
 struct ProgressState {
     completed_regions: usize,
     total_regions: usize,
+    failed_regions: usize,
     last_region: String,
     elapsed_millis: Option<u64>,
     regions_per_hour: Option<f64>,
+    rolling_regions_per_hour: Option<f64>,
     exit_code: Option<i32>,
     running: bool,
     failed: Option<String>,
+    grid: Option<RegionProgressGrid>,
+    recent_completions: VecDeque<Instant>,
+    resume_fingerprint_matched: Option<bool>,
+    resume_journal_regions: usize,
+}
+
+struct MapOverlayState {
+    enabled: bool,
+    background_texture: Option<egui::TextureHandle>,
+    status_texture: Option<egui::TextureHandle>,
+    status_texture_size: [usize; 2],
+    status_pixels: Vec<egui::Color32>,
+    status_dirty: bool,
+    last_status_upload: Option<Instant>,
+}
+
+impl Default for MapOverlayState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            background_texture: None,
+            status_texture: None,
+            status_texture_size: [0, 0],
+            status_pixels: Vec::new(),
+            status_dirty: true,
+            last_status_upload: None,
+        }
+    }
 }
 
 impl ProgressState {
-    fn reset(&mut self, total_regions: usize) {
+    fn reset(&mut self, grid: RegionGrid) {
         *self = Self {
-            total_regions,
+            total_regions: (grid.cols.max(1) as usize).saturating_mul(grid.rows.max(1) as usize),
             running: true,
+            grid: Some(RegionProgressGrid::new(grid)),
             ..Default::default()
         };
+    }
+
+    fn reset_from_batch(&mut self, grid: RegionGrid, total_regions: usize) {
+        self.total_regions = total_regions;
+        self.grid = Some(RegionProgressGrid::new(grid));
+        self.completed_regions = 0;
+        self.failed_regions = 0;
+    }
+
+    fn mark_existing_regions(&mut self, regions: impl IntoIterator<Item = (i32, i32)>) {
+        for (region_x, region_z) in regions {
+            if let Some(grid) = &mut self.grid {
+                grid.mark(region_x, region_z, REGION_STATE_GENERATED);
+            }
+        }
+        self.refresh_counts_from_grid();
+    }
+
+    fn mark_region(&mut self, region_x: i32, region_z: i32, state: u8) {
+        if let Some(grid) = &mut self.grid {
+            let changed = grid.mark(region_x, region_z, state);
+            if changed && is_completed_region_state(state) {
+                self.record_completion();
+            }
+        } else if is_completed_region_state(state) {
+            self.completed_regions = self.completed_regions.saturating_add(1);
+            self.record_completion();
+        }
+        self.refresh_counts_from_grid();
+        self.last_region = format!("r.{region_x}.{region_z}");
+    }
+
+    fn refresh_counts_from_grid(&mut self) {
+        if let Some(grid) = &self.grid {
+            self.completed_regions = grid.completed_regions.min(self.total_regions);
+            self.failed_regions = grid.failed_regions;
+        }
+    }
+
+    fn record_completion(&mut self) {
+        let now = Instant::now();
+        self.recent_completions.push_back(now);
+        while self
+            .recent_completions
+            .front()
+            .is_some_and(|instant| now.duration_since(*instant) > ROLLING_SPEED_WINDOW)
+        {
+            self.recent_completions.pop_front();
+        }
+        let window_secs = self
+            .recent_completions
+            .front()
+            .map(|instant| now.duration_since(*instant).as_secs_f64().max(1.0))
+            .unwrap_or(1.0);
+        self.rolling_regions_per_hour =
+            Some((self.recent_completions.len() as f64) * 3600.0 / window_secs);
     }
 
     fn progress_fraction(&self) -> f32 {
@@ -515,6 +877,7 @@ impl ProgressState {
 struct EarthMapGuiApp {
     options: GenerationOptions,
     progress: ProgressState,
+    map_overlay: MapOverlayState,
     run: Option<GenerationRun>,
     log_lines: Vec<String>,
 }
@@ -524,6 +887,7 @@ impl Default for EarthMapGuiApp {
         Self {
             options: GenerationOptions::default(),
             progress: ProgressState::default(),
+            map_overlay: MapOverlayState::default(),
             run: None,
             log_lines: Vec::new(),
         }
@@ -535,9 +899,17 @@ impl EarthMapGuiApp {
         if self.run.is_some() {
             return;
         }
-        self.progress.reset(self.options.region_count());
+        let grid = self.options.resolved_region_grid();
+        self.progress.reset(grid);
+        let existing_regions = scan_existing_region_files(
+            Path::new(self.options.world_dir.trim()),
+            self.options.format.region_extension(),
+            grid,
+        );
+        self.progress.mark_existing_regions(existing_regions);
+        self.map_overlay.status_dirty = true;
         self.log_lines.clear();
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(WORKER_EVENT_CHANNEL_CAPACITY);
         let cancel = Arc::new(AtomicBool::new(false));
         let child = Arc::new(Mutex::new(None));
         let args = build_generation_args(&self.options);
@@ -552,9 +924,6 @@ impl EarthMapGuiApp {
             cancel,
             child,
             started_at: Instant::now(),
-            world_dir: PathBuf::from(self.options.world_dir.trim()),
-            region_extension: self.options.format.region_extension(),
-            last_file_poll: Instant::now() - Duration::from_secs(2),
         });
     }
 
@@ -574,14 +943,19 @@ impl EarthMapGuiApp {
         for event in events {
             match event {
                 WorkerEvent::Line(line) => self.push_log_line(line),
+                WorkerEvent::Progress(event) => self.apply_progress_event(event),
                 WorkerEvent::RegionFinished {
+                    status,
                     region_x,
                     region_z,
                     elapsed_millis,
                 } => {
-                    self.progress.completed_regions =
-                        self.progress.completed_regions.saturating_add(1);
-                    self.progress.last_region = format!("r.{region_x}.{region_z}");
+                    let state = match status {
+                        LegacyRegionStatus::Generated => REGION_STATE_GENERATED,
+                        LegacyRegionStatus::Skipped => REGION_STATE_SKIPPED,
+                    };
+                    self.progress.mark_region(region_x, region_z, state);
+                    self.map_overlay.status_dirty = true;
                     if let Some(elapsed_millis) = elapsed_millis {
                         self.push_log_line(format!(
                             "region {} completed in {:.3}s",
@@ -622,18 +996,76 @@ impl EarthMapGuiApp {
         }
     }
 
-    fn poll_region_files(&mut self) {
-        let Some(run) = self.run.as_mut() else {
-            return;
-        };
-        if run.last_file_poll.elapsed() < Duration::from_secs(1) {
-            return;
-        }
-        run.last_file_poll = Instant::now();
-        let count = count_region_files(&run.world_dir, run.region_extension);
-        if count > self.progress.completed_regions {
-            self.progress.completed_regions = count.min(self.progress.total_regions);
-            self.progress.last_region = format!("{count} region files on disk");
+    fn apply_progress_event(&mut self, event: GeneratorProgressEvent) {
+        match event {
+            GeneratorProgressEvent::BatchStarted {
+                grid,
+                total_regions,
+                resume_fingerprint_matched,
+                resume_journal_regions,
+            } => {
+                self.progress.reset_from_batch(grid, total_regions);
+                self.progress.resume_fingerprint_matched = Some(resume_fingerprint_matched);
+                self.progress.resume_journal_regions = resume_journal_regions;
+                self.map_overlay.status_dirty = true;
+                self.push_log_line(format!(
+                    "batch started: {} regions, resume match={}, journal regions={}",
+                    total_regions, resume_fingerprint_matched, resume_journal_regions
+                ));
+            }
+            GeneratorProgressEvent::RegionStarted { region_x, region_z } => {
+                self.progress
+                    .mark_region(region_x, region_z, REGION_STATE_RUNNING);
+                self.map_overlay.status_dirty = true;
+            }
+            GeneratorProgressEvent::RegionSkipped {
+                region_x,
+                region_z,
+                elapsed_millis,
+            } => {
+                self.progress
+                    .mark_region(region_x, region_z, REGION_STATE_SKIPPED);
+                self.map_overlay.status_dirty = true;
+                if let Some(elapsed_millis) = elapsed_millis {
+                    self.push_log_line(format!(
+                        "region r.{region_x}.{region_z} resumed in {:.3}s",
+                        elapsed_millis as f64 / 1000.0
+                    ));
+                }
+            }
+            GeneratorProgressEvent::RegionGenerated {
+                region_x,
+                region_z,
+                elapsed_millis,
+            } => {
+                self.progress
+                    .mark_region(region_x, region_z, REGION_STATE_GENERATED);
+                self.map_overlay.status_dirty = true;
+                if let Some(elapsed_millis) = elapsed_millis {
+                    self.push_log_line(format!(
+                        "region r.{region_x}.{region_z} generated in {:.3}s",
+                        elapsed_millis as f64 / 1000.0
+                    ));
+                }
+            }
+            GeneratorProgressEvent::RegionFailed {
+                region_x,
+                region_z,
+                message,
+            } => {
+                self.progress
+                    .mark_region(region_x, region_z, REGION_STATE_FAILED);
+                self.map_overlay.status_dirty = true;
+                self.progress.failed = Some(message.clone());
+                self.push_log_line(format!("region r.{region_x}.{region_z} failed: {message}"));
+            }
+            GeneratorProgressEvent::BatchSummary {
+                elapsed_millis,
+                regions_per_hour,
+            } => {
+                self.progress.elapsed_millis = elapsed_millis;
+                self.progress.regions_per_hour = regions_per_hour;
+            }
         }
     }
 
@@ -657,6 +1089,11 @@ impl EarthMapGuiApp {
     }
 
     fn live_regions_per_hour(&self) -> f64 {
+        if self.run.is_some() {
+            if let Some(rolling_regions_per_hour) = self.progress.rolling_regions_per_hour {
+                return rolling_regions_per_hour;
+            }
+        }
         if let Some(regions_per_hour) = self.progress.regions_per_hour {
             return regions_per_hour;
         }
@@ -667,12 +1104,82 @@ impl EarthMapGuiApp {
             self.progress.completed_regions as f64 / elapsed_hours
         }
     }
+
+    fn show_map_overlay(&mut self, ui: &mut egui::Ui) {
+        if self.map_overlay.background_texture.is_none() {
+            let image = world_map_background_image();
+            self.map_overlay.background_texture = Some(ui.ctx().load_texture(
+                "earthmap-world-background",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        self.update_status_texture(ui.ctx());
+
+        let available_width = ui.available_width().max(320.0);
+        let desired_size = egui::vec2(available_width, (available_width * 0.5).clamp(180.0, 360.0));
+        let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let painter = ui.painter_at(rect);
+        if let Some(texture) = &self.map_overlay.background_texture {
+            painter.image(texture.id(), rect, uv, egui::Color32::WHITE);
+        }
+
+        let selected_grid = self
+            .progress
+            .grid
+            .as_ref()
+            .map(|grid| grid.grid)
+            .unwrap_or_else(|| self.options.resolved_region_grid());
+        let target_rect = target_region_rect(rect, self.options.scale, selected_grid);
+        if let Some(texture) = &self.map_overlay.status_texture {
+            painter.image(texture.id(), target_rect, uv, egui::Color32::WHITE);
+        }
+        draw_rect_outline(
+            &painter,
+            target_rect,
+            egui::Color32::from_rgba_premultiplied(255, 255, 255, 190),
+        );
+    }
+
+    fn update_status_texture(&mut self, ctx: &egui::Context) {
+        let Some(progress_grid) = self.progress.grid.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if !self.map_overlay.status_dirty
+            || self
+                .map_overlay
+                .last_status_upload
+                .is_some_and(|last| now.duration_since(last) < STATUS_TEXTURE_UPLOAD_INTERVAL)
+        {
+            return;
+        }
+        let (width, height, scale) = status_texture_layout(progress_grid.grid);
+        let pixels = status_overlay_pixels(progress_grid, width, height, scale);
+        let image = egui::ColorImage::new([width, height], pixels.clone());
+        if self.map_overlay.status_texture_size != [width, height] {
+            self.map_overlay.status_texture = None;
+            self.map_overlay.status_texture_size = [width, height];
+        }
+        if let Some(texture) = &mut self.map_overlay.status_texture {
+            texture.set(image, egui::TextureOptions::NEAREST);
+        } else {
+            self.map_overlay.status_texture = Some(ctx.load_texture(
+                "earthmap-region-status",
+                image,
+                egui::TextureOptions::NEAREST,
+            ));
+        }
+        self.map_overlay.status_pixels = pixels;
+        self.map_overlay.status_dirty = false;
+        self.map_overlay.last_status_upload = Some(now);
+    }
 }
 
 impl eframe::App for EarthMapGuiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_worker_events();
-        self.poll_region_files();
         let ctx = ui.ctx().clone();
         if self.run.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -694,6 +1201,8 @@ impl eframe::App for EarthMapGuiApp {
                 {
                     self.stop_generation();
                 }
+                ui.separator();
+                ui.checkbox(&mut self.map_overlay.enabled, "Map");
             });
         });
 
@@ -982,6 +1491,19 @@ impl eframe::App for EarthMapGuiApp {
             if !self.progress.last_region.is_empty() {
                 ui.label(format!("Last region: {}", self.progress.last_region));
             }
+            if self.progress.failed_regions > 0 {
+                ui.colored_label(
+                    egui::Color32::from_rgb(180, 30, 30),
+                    format!("Failed regions: {}", self.progress.failed_regions),
+                );
+            }
+            if let Some(matched) = self.progress.resume_fingerprint_matched {
+                ui.label(format!(
+                    "Resume: {} ({} journal regions)",
+                    if matched { "matched" } else { "fresh" },
+                    self.progress.resume_journal_regions
+                ));
+            }
             if let Some(code) = self.progress.exit_code {
                 ui.label(format!("Exit code: {code}"));
             }
@@ -989,6 +1511,10 @@ impl eframe::App for EarthMapGuiApp {
                 ui.colored_label(egui::Color32::from_rgb(180, 30, 30), error);
             }
             ui.separator();
+            if self.map_overlay.enabled {
+                self.show_map_overlay(ui);
+                ui.separator();
+            }
             ui.heading("Resolved Command");
             let args = build_generation_args(&self.options);
             ui.monospace(format!("earthmap-rs {}", args.join(" ")));
@@ -1107,14 +1633,20 @@ where
 }
 
 fn send_progress_events(sender: &Sender<WorkerEvent>, line: &str) {
-    let _ = sender.send(WorkerEvent::Line(line.to_string()));
-    if let Some((region_x, region_z, elapsed_millis)) = parse_region_line(line) {
+    if let Some(event) = parse_progress_event_line(line) {
+        let _ = sender.send(WorkerEvent::Progress(event));
+        return;
+    }
+    if let Some((status, region_x, region_z, elapsed_millis)) = parse_region_line(line) {
         let _ = sender.send(WorkerEvent::RegionFinished {
+            status,
             region_x,
             region_z,
             elapsed_millis,
         });
+        return;
     }
+    let _ = sender.send(WorkerEvent::Line(line.to_string()));
     if line.starts_with("elapsedMillis=") || line.starts_with("generatedRegionsPerHour=") {
         let elapsed_millis = line
             .strip_prefix("elapsedMillis=")
@@ -1129,17 +1661,98 @@ fn send_progress_events(sender: &Sender<WorkerEvent>, line: &str) {
     }
 }
 
-fn parse_region_line(line: &str) -> Option<(String, String, Option<u64>)> {
+fn parse_progress_event_line(line: &str) -> Option<GeneratorProgressEvent> {
+    let json = line.strip_prefix("event\t")?;
+    let value = serde_json::from_str::<Value>(json).ok()?;
+    match value.get("type").and_then(Value::as_str)? {
+        "batchStarted" => {
+            let start_region_x = json_i32(&value, "regionStartX")?;
+            let start_region_z = json_i32(&value, "regionStartZ")?;
+            let cols = json_i32(&value, "regionCols")?.max(1);
+            let rows = json_i32(&value, "regionRows")?.max(1);
+            let total_regions = value
+                .get("regionCount")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_else(|| (cols as usize).saturating_mul(rows as usize));
+            Some(GeneratorProgressEvent::BatchStarted {
+                grid: RegionGrid {
+                    start_region_x,
+                    start_region_z,
+                    cols,
+                    rows,
+                },
+                total_regions,
+                resume_fingerprint_matched: value
+                    .get("resumeFingerprintMatched")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                resume_journal_regions: value
+                    .get("resumeJournalRegions")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0),
+            })
+        }
+        "regionStarted" => Some(GeneratorProgressEvent::RegionStarted {
+            region_x: json_i32(&value, "regionX")?,
+            region_z: json_i32(&value, "regionZ")?,
+        }),
+        "regionSkipped" => Some(GeneratorProgressEvent::RegionSkipped {
+            region_x: json_i32(&value, "regionX")?,
+            region_z: json_i32(&value, "regionZ")?,
+            elapsed_millis: json_u64(&value, "elapsedMillis"),
+        }),
+        "regionGenerated" => Some(GeneratorProgressEvent::RegionGenerated {
+            region_x: json_i32(&value, "regionX")?,
+            region_z: json_i32(&value, "regionZ")?,
+            elapsed_millis: json_u64(&value, "elapsedMillis"),
+        }),
+        "regionFailed" => Some(GeneratorProgressEvent::RegionFailed {
+            region_x: json_i32(&value, "regionX")?,
+            region_z: json_i32(&value, "regionZ")?,
+            message: value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("region failed")
+                .to_string(),
+        }),
+        "batchSummary" => Some(GeneratorProgressEvent::BatchSummary {
+            elapsed_millis: json_u64(&value, "elapsedMillis"),
+            regions_per_hour: value
+                .get("completedRegionsPerHour")
+                .or_else(|| value.get("generatedRegionsPerHour"))
+                .and_then(Value::as_f64),
+        }),
+        _ => None,
+    }
+}
+
+fn json_i32(value: &Value, key: &str) -> Option<i32> {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
+}
+
+fn parse_region_line(line: &str) -> Option<(LegacyRegionStatus, i32, i32, Option<u64>)> {
     let parts: Vec<&str> = line.split(',').collect();
     if parts.len() < 8 || parts[0] != "region" {
         return None;
     }
-    let status = parts[1];
-    if status != "generated" && status != "skipped" {
-        return None;
-    }
+    let status = match parts[1] {
+        "generated" => LegacyRegionStatus::Generated,
+        "skipped" => LegacyRegionStatus::Skipped,
+        _ => return None,
+    };
+    let region_x = parts[2].parse::<i32>().ok()?;
+    let region_z = parts[3].parse::<i32>().ok()?;
     let elapsed_millis = parts[4].parse::<u64>().ok();
-    Some((parts[2].to_string(), parts[3].to_string(), elapsed_millis))
+    Some((status, region_x, region_z, elapsed_millis))
 }
 
 fn earthmap_cli_executable() -> PathBuf {
@@ -1226,9 +1839,9 @@ mod tests {
     }
 
     #[test]
-    fn count_region_files_counts_only_selected_format() {
+    fn startup_scan_filters_region_files_to_selected_grid() {
         let root = std::env::temp_dir().join(format!(
-            "earthmap-gui-region-count-{}-{}",
+            "earthmap-gui-region-scan-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1237,15 +1850,125 @@ mod tests {
         ));
         let region = root.join("region");
         std::fs::create_dir_all(&region).unwrap();
-        std::fs::write(region.join("r.0.0.linear"), b"linear").unwrap();
-        std::fs::write(region.join("r.0.1.linear"), b"linear").unwrap();
-        std::fs::write(region.join("r.0.0.mca"), b"mca").unwrap();
-        std::fs::write(region.join("notes.txt"), b"ignore").unwrap();
+        std::fs::write(region.join("r.10.20.linear"), b"linear").unwrap();
+        std::fs::write(region.join("r.11.20.linear"), b"linear").unwrap();
+        std::fs::write(region.join("r.12.20.linear"), b"outside").unwrap();
+        std::fs::write(region.join("r.10.20.mca"), b"wrong format").unwrap();
 
-        assert_eq!(count_region_files(&root, "linear"), 2);
-        assert_eq!(count_region_files(&root, "mca"), 1);
+        let mut scanned = scan_existing_region_files(
+            &root,
+            "linear",
+            RegionGrid {
+                start_region_x: 10,
+                start_region_z: 20,
+                cols: 2,
+                rows: 1,
+            },
+        );
+        scanned.sort();
 
+        assert_eq!(scanned, vec![(10, 20), (11, 20)]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn region_progress_grid_does_not_double_count_completed_region() {
+        let mut grid = RegionProgressGrid::new(RegionGrid {
+            start_region_x: 5,
+            start_region_z: -2,
+            cols: 2,
+            rows: 2,
+        });
+
+        assert!(grid.mark(5, -2, REGION_STATE_GENERATED));
+        assert_eq!(grid.completed_regions, 1);
+        assert!(!grid.mark(5, -2, REGION_STATE_GENERATED));
+        assert_eq!(grid.completed_regions, 1);
+        assert!(grid.mark(5, -2, REGION_STATE_RUNNING));
+        assert_eq!(grid.completed_regions, 0);
+        assert!(grid.mark(6, -1, REGION_STATE_FAILED));
+        assert_eq!(grid.failed_regions, 1);
+    }
+
+    #[test]
+    fn status_texture_layout_keeps_large_region_grids_capped() {
+        assert_eq!(
+            status_texture_layout(RegionGrid {
+                start_region_x: -200,
+                start_region_z: -100,
+                cols: 400,
+                rows: 200
+            }),
+            (400, 200, 1)
+        );
+        assert_eq!(
+            status_texture_layout(RegionGrid {
+                start_region_x: -400,
+                start_region_z: -200,
+                cols: 800,
+                rows: 400
+            }),
+            (800, 400, 1)
+        );
+        let (width, height, scale) = status_texture_layout(RegionGrid {
+            start_region_x: -1600,
+            start_region_z: -800,
+            cols: 3200,
+            rows: 1600,
+        });
+        assert_eq!(scale, 2);
+        assert_eq!((width, height), (1600, 800));
+    }
+
+    #[test]
+    fn status_overlay_pixels_aggregate_by_priority() {
+        let mut grid = RegionProgressGrid::new(RegionGrid {
+            start_region_x: 0,
+            start_region_z: 0,
+            cols: 4,
+            rows: 4,
+        });
+        grid.mark(0, 0, REGION_STATE_GENERATED);
+        grid.mark(1, 0, REGION_STATE_RUNNING);
+        grid.mark(0, 1, REGION_STATE_FAILED);
+
+        let pixels = status_overlay_pixels(&grid, 2, 2, 2);
+
+        assert_eq!(pixels[0], region_state_color(REGION_STATE_FAILED));
+    }
+
+    #[test]
+    fn status_overlay_pixels_handles_standard_large_grid_sizes() {
+        for (cols, rows) in [(80, 40), (400, 200), (800, 400)] {
+            let mut grid = RegionProgressGrid::new(RegionGrid {
+                start_region_x: -(cols / 2),
+                start_region_z: -(rows / 2),
+                cols,
+                rows,
+            });
+            for index in 0..grid.states.len() {
+                grid.states[index] = match index % 17 {
+                    0 => REGION_STATE_RUNNING,
+                    1 => REGION_STATE_FAILED,
+                    2..=8 => REGION_STATE_GENERATED,
+                    _ => REGION_STATE_QUEUED,
+                };
+            }
+            let (width, height, scale) = status_texture_layout(grid.grid);
+            let started = Instant::now();
+            let pixels = status_overlay_pixels(&grid, width, height, scale);
+            let elapsed = started.elapsed();
+
+            println!(
+                "status overlay {}x{} regions -> {}x{} texture in {:.3}ms",
+                cols,
+                rows,
+                width,
+                height,
+                elapsed.as_secs_f64() * 1000.0
+            );
+            assert_eq!(pixels.len(), width * height);
+        }
     }
 
     #[test]
@@ -1278,7 +2001,45 @@ mod tests {
         );
         assert_eq!(
             parsed,
-            Some(("27".to_string(), "-9".to_string(), Some(10977)))
+            Some((LegacyRegionStatus::Generated, 27, -9, Some(10977)))
         );
+    }
+
+    #[test]
+    fn parse_json_progress_event_extracts_batch_and_region_updates() {
+        let batch = parse_progress_event_line(
+            r#"event	{"schemaVersion":1,"type":"batchStarted","regionStartX":-40,"regionStartZ":-20,"regionCols":80,"regionRows":40,"regionCount":3200,"resumeFingerprintMatched":true,"resumeJournalRegions":12}"#,
+        )
+        .unwrap();
+        match batch {
+            GeneratorProgressEvent::BatchStarted {
+                grid,
+                total_regions,
+                resume_fingerprint_matched,
+                resume_journal_regions,
+            } => {
+                assert_eq!(grid.start_region_x, -40);
+                assert_eq!(grid.start_region_z, -20);
+                assert_eq!(grid.cols, 80);
+                assert_eq!(grid.rows, 40);
+                assert_eq!(total_regions, 3200);
+                assert!(resume_fingerprint_matched);
+                assert_eq!(resume_journal_regions, 12);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let generated = parse_progress_event_line(
+            r#"event	{"schemaVersion":1,"type":"regionGenerated","regionX":27,"regionZ":-9,"elapsedMillis":10977}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            generated,
+            GeneratorProgressEvent::RegionGenerated {
+                region_x: 27,
+                region_z: -9,
+                elapsed_millis: Some(10977)
+            }
+        ));
     }
 }
