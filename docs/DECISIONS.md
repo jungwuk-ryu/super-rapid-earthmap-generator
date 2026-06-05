@@ -22,3 +22,16 @@
 
 - `PhotoSurfaceSolver` is the shared decision contract.
 - `PhotoSurfaceMaterialClassifier.apply` is now a compatibility wrapper over the solver decision.
+
+## 2026-06-01: Natural Surface Contract
+
+- Production worlds are survival/wild terrain, not satellite pixel art.
+- Leaves must never be used as a terrain top/filler block. Leaf blocks are valid only as part of trees or canopy
+  features placed above a natural ground surface.
+- Concrete, terracotta color carriers, End/Quartz/Bone palette carriers, mud bricks, dripstone, and decorative
+  sandstone variants are harness/render candidates only unless a separate natural-structure rule explicitly places
+  them.
+- Dark vegetation is represented by biome tint and actual tree/canopy density, not by replacing grass with leaf
+  carpets or green terracotta.
+- Coastlines must prefer sand, gravel, clay, mud, or stone-family blocks. Dark or brown photo pixels on shorelines
+  must not become black/brown concrete or terracotta.

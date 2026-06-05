@@ -45,13 +45,20 @@ Any missing or false key blocks the survival-complete claim.
 ## Delegated Surface Progression
 
 Prewritten `minecraft:surface` and `minecraft:carvers` chunks cannot delegate vanilla `structure_starts` or
-`structure_references`, because those statuses are earlier in the Minecraft generation pipeline. Delegated EarthMap
-worlds therefore use `generation.progressionStrategy=delegated-surface-direct-stronghold-equivalent`: the generator
-places a land-safe underground End portal, stronghold loot chest, and blaze spawner directly, then encodes that chunk
-as `minecraft:carvers` before server finalization. In this mode `generation.directStructures=false` still means
-vanilla structure starts were not prewritten; `generation.directProgressionStructures=true` identifies the bounded
-EarthMap progression-room insertion.
+`structure_references`, because those statuses are earlier in the Minecraft generation pipeline. EarthMap therefore
+does not claim or inject stronghold-equivalent progression content during surface/world writing.
 
-This preserves the photo surface contract because the room is below the selected land surface. It is still not enough
-for `survival-complete` by itself; `reports.structureMetadata`, `evidence.serverBootSaveReboot`, and
-`evidence.spawnToEnd` must be produced by validation before the manifest can pass the gate.
+Generated exploration worlds must report:
+
+```properties
+generation.progressionStrategy=none
+generation.directProgressionStructures=false
+features.strongholdOrEquivalent=false
+features.endPortal=false
+features.netherProgression=false
+features.lootTables=false
+features.spawners=false
+```
+
+Any future survival-complete workflow must use a separate, explicit progression plan instead of hidden End portal,
+stronghold loot, or spawner insertion inside the EarthMap generator.

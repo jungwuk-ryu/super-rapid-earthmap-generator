@@ -23,6 +23,14 @@
 
 The wrapper preserves current behavior while making production and harness paths share a common decision object.
 
+## Production Surface Boundary
+
+The photo solver may evaluate render/harness carriers for metric research, but production chunk writers must pass final
+top and filler blocks through `NaturalSurfaceBlockPolicy` before emitting MCA or Linear chunks. This boundary forbids
+leaves-as-ground, concrete, terracotta color carriers, and decorative palette carriers on terrain surfaces. Vegetation
+darkening is handled by biome tint and actual tree/canopy generation above natural ground, never by replacing terrain
+with leaf blocks.
+
 ## Current Structural Boundaries
 
 - `EarthMapCli` remains the public command entrypoint.
