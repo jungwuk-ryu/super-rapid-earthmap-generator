@@ -256,7 +256,7 @@ Covered MCA commands:
 - [x] `inspect-mca-palettes`
 - [x] `inspect-mca-biomes`
 - [x] `inspect-mca-statuses`
-- [ ] `inspect-mca-post-final-integrity`
+- [x] `inspect-mca-post-final-integrity`
 - [ ] `repair-mca-post-final-water`
 - [ ] `rewrite-mca-status`
 Covered Linear commands:
@@ -265,7 +265,7 @@ Covered Linear commands:
 - [x] `inspect-linear-palettes`
 - [x] `inspect-linear-biomes`
 - [x] `inspect-linear-statuses`
-- [ ] `inspect-linear-post-final-integrity`
+- [x] `inspect-linear-post-final-integrity`
 - [ ] `repair-linear-sandlike-surfaces`
 Covered cross-format commands:
 - [x] `compare-mca-linear-region-payloads`

@@ -144,6 +144,16 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         status: CommandStatus::Implemented,
         note: "Linear chunk status scanner",
     },
+    CommandSpec {
+        name: "inspect-mca-post-final-integrity",
+        status: CommandStatus::Implemented,
+        note: "MCA post-final integrity scanner",
+    },
+    CommandSpec {
+        name: "inspect-linear-post-final-integrity",
+        status: CommandStatus::Implemented,
+        note: "Linear post-final integrity scanner",
+    },
 ];
 
 pub const SHELL_COMMANDS: &[CommandSpec] = &[

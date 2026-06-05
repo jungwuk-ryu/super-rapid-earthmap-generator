@@ -76,6 +76,8 @@ const PARALLEL_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const TOPDOWN_REGION_SIZE_BLOCKS: usize = 512;
 const TOPDOWN_AIR_BLOCK: &str = "minecraft:air";
 const TOPDOWN_DEFAULT_BIOME: &str = "minecraft:plains";
+const POST_FINAL_REGION_SIZE_BLOCKS: usize = 32 * CHUNK_WIDTH;
+const POST_FINAL_COAST_OFFENDER_LIMIT: usize = 32;
 const FLAT_TEST_MCA_LEVEL_NAME: &str = "SR EarthMap Flat Test";
 const FLAT_TEST_LINEAR_LEVEL_NAME: &str = "SR EarthMap Linear Flat Test";
 const FLAT_TEST_MCA_SEED: i64 = 987654321;
@@ -446,6 +448,26 @@ where
             "Linear statuses scanned",
             "Linear status inspection failed",
         )),
+        "inspect-mca-post-final-integrity" if args.len() == 2 => {
+            write_result(inspect_post_final_integrity(
+                stdout,
+                stderr,
+                &args[1],
+                RegionFormat::Mca,
+                "MCA post-final integrity scanned",
+                "MCA post-final integrity inspection failed",
+            ))
+        }
+        "inspect-linear-post-final-integrity" if args.len() == 2 => {
+            write_result(inspect_post_final_integrity(
+                stdout,
+                stderr,
+                &args[1],
+                RegionFormat::Linear,
+                "Linear post-final integrity scanned",
+                "Linear post-final integrity inspection failed",
+            ))
+        }
         "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
             stdout, stderr, &args[1], &args[2], &args[3],
         )),
@@ -921,6 +943,8 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out, "  inspect-linear-biomes <path>")?;
     writeln!(out, "  inspect-mca-statuses <path>")?;
     writeln!(out, "  inspect-linear-statuses <path>")?;
+    writeln!(out, "  inspect-mca-post-final-integrity <path>")?;
+    writeln!(out, "  inspect-linear-post-final-integrity <path>")?;
     writeln!(
         out,
         "  summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"
@@ -6988,6 +7012,441 @@ fn scan_statuses(region: &str) -> std::result::Result<StatusScan, String> {
     Ok(report)
 }
 
+#[derive(Clone, Debug, Default)]
+struct PostFinalIntegrityReport {
+    region_chunk_count: usize,
+    decoded_chunk_count: usize,
+    decoded_section_count: usize,
+    scanned_columns: u64,
+    land_columns: u64,
+    water_columns: u64,
+    dry_below_sea_columns: u64,
+    underwater_air_columns: u64,
+    tree_log_blocks: u64,
+    tree_leaf_blocks: u64,
+    tree_log_columns: u64,
+    tree_leaf_columns: u64,
+    coast_edge_samples: u64,
+    coast_land_above_sea_gt4_samples: u64,
+    coast_land_above_sea_gt8_samples: u64,
+    coast_land_above_sea_gt16_samples: u64,
+    max_coast_land_above_sea_delta: i32,
+    max_coast_floor_delta: i32,
+    top_terrain_block_hits: BTreeMap<String, u64>,
+    coast_offender_samples: Vec<CoastOffenderSample>,
+}
+
+impl PostFinalIntegrityReport {
+    fn underwater_air_column_ratio(&self) -> f64 {
+        if self.water_columns == 0 {
+            0.0
+        } else {
+            self.underwater_air_columns as f64 / self.water_columns as f64
+        }
+    }
+
+    fn tree_leaf_column_ratio(&self) -> f64 {
+        if self.land_columns == 0 {
+            0.0
+        } else {
+            self.tree_leaf_columns as f64 / self.land_columns as f64
+        }
+    }
+
+    fn dry_below_sea_column_ratio(&self) -> f64 {
+        if self.scanned_columns == 0 {
+            0.0
+        } else {
+            self.dry_below_sea_columns as f64 / self.scanned_columns as f64
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CoastOffenderSample {
+    land_local_block_x: usize,
+    land_local_block_z: usize,
+    water_local_block_x: usize,
+    water_local_block_z: usize,
+    land_surface_y: i32,
+    water_floor_y: i32,
+    land_surface_block: String,
+    water_floor_block: String,
+    land_above_sea: i32,
+    floor_delta: i32,
+}
+
+#[derive(Clone, Debug)]
+struct PostFinalColumnSnapshot {
+    region_local_x: usize,
+    region_local_z: usize,
+    terrain_surface_y: i32,
+    terrain_surface_block: String,
+    open_water_column: bool,
+}
+
+impl PostFinalColumnSnapshot {
+    fn has_terrain(&self) -> bool {
+        self.terrain_surface_y != i32::MIN
+    }
+
+    fn land_at_coast(&self) -> bool {
+        self.has_terrain() && !self.open_water_column && self.terrain_surface_y >= SEA_LEVEL_Y
+    }
+}
+
+fn inspect_post_final_integrity(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+    expected_format: RegionFormat,
+    title: &str,
+    error_prefix: &str,
+) -> io::Result<i32> {
+    match scan_post_final_integrity(region, expected_format) {
+        Ok(report) => {
+            writeln!(out, "{title}")?;
+            write_post_final_integrity_report(out, &report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "{error_prefix}: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn write_post_final_integrity_report(
+    out: &mut impl Write,
+    report: &PostFinalIntegrityReport,
+) -> io::Result<()> {
+    writeln!(out, "regionChunkCount={}", report.region_chunk_count)?;
+    writeln!(out, "decodedChunkCount={}", report.decoded_chunk_count)?;
+    writeln!(out, "decodedSectionCount={}", report.decoded_section_count)?;
+    writeln!(out, "scannedColumns={}", report.scanned_columns)?;
+    writeln!(out, "landColumns={}", report.land_columns)?;
+    writeln!(out, "waterColumns={}", report.water_columns)?;
+    writeln!(out, "dryBelowSeaColumns={}", report.dry_below_sea_columns)?;
+    writeln!(
+        out,
+        "dryBelowSeaColumnRatio={}",
+        java_double_string(report.dry_below_sea_column_ratio())
+    )?;
+    writeln!(
+        out,
+        "underwaterAirColumns={}",
+        report.underwater_air_columns
+    )?;
+    writeln!(
+        out,
+        "underwaterAirColumnRatio={}",
+        java_double_string(report.underwater_air_column_ratio())
+    )?;
+    writeln!(out, "treeLogBlocks={}", report.tree_log_blocks)?;
+    writeln!(out, "treeLeafBlocks={}", report.tree_leaf_blocks)?;
+    writeln!(out, "treeLogColumns={}", report.tree_log_columns)?;
+    writeln!(out, "treeLeafColumns={}", report.tree_leaf_columns)?;
+    writeln!(
+        out,
+        "treeLeafColumnRatio={}",
+        java_double_string(report.tree_leaf_column_ratio())
+    )?;
+    writeln!(out, "coastEdgeSamples={}", report.coast_edge_samples)?;
+    writeln!(
+        out,
+        "coastLandAboveSeaGt4Samples={}",
+        report.coast_land_above_sea_gt4_samples
+    )?;
+    writeln!(
+        out,
+        "coastLandAboveSeaGt8Samples={}",
+        report.coast_land_above_sea_gt8_samples
+    )?;
+    writeln!(
+        out,
+        "coastLandAboveSeaGt16Samples={}",
+        report.coast_land_above_sea_gt16_samples
+    )?;
+    writeln!(
+        out,
+        "maxCoastLandAboveSeaDelta={}",
+        report.max_coast_land_above_sea_delta
+    )?;
+    writeln!(out, "maxCoastFloorDelta={}", report.max_coast_floor_delta)?;
+    for (block, count) in &report.top_terrain_block_hits {
+        writeln!(out, "topTerrainBlockHits.{block}={count}")?;
+    }
+    for (index, sample) in report.coast_offender_samples.iter().enumerate() {
+        writeln!(
+            out,
+            "coastOffender.{index}.landLocalBlockX={}",
+            sample.land_local_block_x
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.landLocalBlockZ={}",
+            sample.land_local_block_z
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.waterLocalBlockX={}",
+            sample.water_local_block_x
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.waterLocalBlockZ={}",
+            sample.water_local_block_z
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.landSurfaceY={}",
+            sample.land_surface_y
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.waterFloorY={}",
+            sample.water_floor_y
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.landSurfaceBlock={}",
+            sample.land_surface_block
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.waterFloorBlock={}",
+            sample.water_floor_block
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.landAboveSea={}",
+            sample.land_above_sea
+        )?;
+        writeln!(
+            out,
+            "coastOffender.{index}.floorDelta={}",
+            sample.floor_delta
+        )?;
+    }
+    Ok(())
+}
+
+fn scan_post_final_integrity(
+    region: &str,
+    expected_format: RegionFormat,
+) -> std::result::Result<PostFinalIntegrityReport, String> {
+    let payloads = read_region_payloads(region).map_err(|error| error.to_string())?;
+    if payloads.format != expected_format {
+        return Err(format!(
+            "region format mismatch: expected {} got {}",
+            expected_format.as_manifest_value(),
+            payloads.format.as_manifest_value()
+        ));
+    }
+    let mut report = PostFinalIntegrityReport {
+        region_chunk_count: payloads.chunks.len(),
+        ..PostFinalIntegrityReport::default()
+    };
+    let mut columns = vec![None; POST_FINAL_REGION_SIZE_BLOCKS * POST_FINAL_REGION_SIZE_BLOCKS];
+    for local_z in 0..32u8 {
+        for local_x in 0..32u8 {
+            let pos = ChunkLocalPos::new(local_x, local_z).map_err(|error| error.to_string())?;
+            let Some(payload) = payloads.chunks.get(&pos) else {
+                continue;
+            };
+            scan_post_final_chunk(&pos, payload, &mut report, &mut columns)?;
+        }
+    }
+    sample_post_final_coast_edges(&mut report, &columns);
+    Ok(report)
+}
+
+fn scan_post_final_chunk(
+    pos: &ChunkLocalPos,
+    payload: &[u8],
+    report: &mut PostFinalIntegrityReport,
+    columns: &mut [Option<PostFinalColumnSnapshot>],
+) -> std::result::Result<(), String> {
+    let chunk = TopdownChunk::decode(payload)?;
+    report.decoded_chunk_count += 1;
+    report.decoded_section_count += chunk.sections.len();
+    for local_z in 0..CHUNK_WIDTH {
+        for local_x in 0..CHUNK_WIDTH {
+            let column = scan_post_final_column(pos, &chunk, local_x, local_z, report)?;
+            let index = post_final_column_index(column.region_local_x, column.region_local_z);
+            columns[index] = Some(column);
+        }
+    }
+    Ok(())
+}
+
+fn scan_post_final_column(
+    pos: &ChunkLocalPos,
+    chunk: &TopdownChunk,
+    local_x: usize,
+    local_z: usize,
+    report: &mut PostFinalIntegrityReport,
+) -> std::result::Result<PostFinalColumnSnapshot, String> {
+    let mut terrain_surface_y = i32::MIN;
+    let mut terrain_surface_block = String::new();
+    let mut water_at_sea_level = false;
+    let mut has_underwater_air = false;
+    let mut has_log = false;
+    let mut has_leaves = false;
+
+    for y in OVERWORLD_1_21_11.min_y()..=OVERWORLD_1_21_11.max_y_inclusive() {
+        let block_name = chunk.block_name_at(local_x, y, local_z)?;
+        if y == SEA_LEVEL_Y && is_water_like_block(&block_name) {
+            water_at_sea_level = true;
+        }
+        if is_log_block(&block_name) {
+            report.tree_log_blocks += 1;
+            has_log = true;
+        } else if is_leaf_block_name(&block_name) {
+            report.tree_leaf_blocks += 1;
+            has_leaves = true;
+        }
+        if is_post_final_terrain_surface_candidate(&block_name) {
+            terrain_surface_y = y;
+            terrain_surface_block = block_name;
+        }
+    }
+
+    report.scanned_columns += 1;
+    if has_log {
+        report.tree_log_columns += 1;
+    }
+    if has_leaves {
+        report.tree_leaf_columns += 1;
+    }
+    let open_water_column = water_at_sea_level && terrain_surface_y < SEA_LEVEL_Y;
+    if terrain_surface_y >= SEA_LEVEL_Y {
+        report.land_columns += 1;
+    } else if open_water_column {
+        report.water_columns += 1;
+    } else if terrain_surface_y != i32::MIN {
+        report.dry_below_sea_columns += 1;
+    }
+
+    if !terrain_surface_block.is_empty() {
+        *report
+            .top_terrain_block_hits
+            .entry(terrain_surface_block.clone())
+            .or_insert(0) += 1;
+    }
+
+    if open_water_column {
+        let bottom = if terrain_surface_y == i32::MIN {
+            OVERWORLD_1_21_11.min_y()
+        } else {
+            terrain_surface_y + 1
+        };
+        for y in bottom..=SEA_LEVEL_Y {
+            if is_air_block(&chunk.block_name_at(local_x, y, local_z)?) {
+                has_underwater_air = true;
+                break;
+            }
+        }
+    }
+    if has_underwater_air {
+        report.underwater_air_columns += 1;
+    }
+
+    Ok(PostFinalColumnSnapshot {
+        region_local_x: usize::from(pos.x) * CHUNK_WIDTH + local_x,
+        region_local_z: usize::from(pos.z) * CHUNK_WIDTH + local_z,
+        terrain_surface_y,
+        terrain_surface_block,
+        open_water_column,
+    })
+}
+
+fn is_post_final_terrain_surface_candidate(block_name: &str) -> bool {
+    !is_air_block(block_name)
+        && !is_water_like_block(block_name)
+        && block_name != "minecraft:lava"
+        && !is_log_block(block_name)
+        && !is_leaf_block_name(block_name)
+        && !is_plant_like_block(block_name)
+}
+
+fn sample_post_final_coast_edges(
+    report: &mut PostFinalIntegrityReport,
+    columns: &[Option<PostFinalColumnSnapshot>],
+) {
+    for z in 0..POST_FINAL_REGION_SIZE_BLOCKS {
+        for x in 0..POST_FINAL_REGION_SIZE_BLOCKS {
+            let Some(column) = columns[post_final_column_index(x, z)].as_ref() else {
+                continue;
+            };
+            if x + 1 < POST_FINAL_REGION_SIZE_BLOCKS {
+                if let Some(next) = columns[post_final_column_index(x + 1, z)].as_ref() {
+                    add_post_final_coast_sample(report, column, next);
+                }
+            }
+            if z + 1 < POST_FINAL_REGION_SIZE_BLOCKS {
+                if let Some(next) = columns[post_final_column_index(x, z + 1)].as_ref() {
+                    add_post_final_coast_sample(report, column, next);
+                }
+            }
+        }
+    }
+}
+
+fn add_post_final_coast_sample(
+    report: &mut PostFinalIntegrityReport,
+    a: &PostFinalColumnSnapshot,
+    b: &PostFinalColumnSnapshot,
+) {
+    if a.land_at_coast() == b.land_at_coast() || a.open_water_column == b.open_water_column {
+        return;
+    }
+    let land = if a.land_at_coast() { a } else { b };
+    let water = if a.open_water_column { a } else { b };
+    if !land.land_at_coast() || !water.open_water_column || !water.has_terrain() {
+        return;
+    }
+    report.coast_edge_samples += 1;
+    let land_above_sea = (land.terrain_surface_y - SEA_LEVEL_Y).max(0);
+    let floor_delta = if land_above_sea > 4 {
+        (land.terrain_surface_y - water.terrain_surface_y).max(0)
+    } else {
+        0
+    };
+    report.max_coast_land_above_sea_delta =
+        report.max_coast_land_above_sea_delta.max(land_above_sea);
+    report.max_coast_floor_delta = report.max_coast_floor_delta.max(floor_delta);
+    if (land_above_sea > 16 || floor_delta > 32)
+        && report.coast_offender_samples.len() < POST_FINAL_COAST_OFFENDER_LIMIT
+    {
+        report.coast_offender_samples.push(CoastOffenderSample {
+            land_local_block_x: land.region_local_x,
+            land_local_block_z: land.region_local_z,
+            water_local_block_x: water.region_local_x,
+            water_local_block_z: water.region_local_z,
+            land_surface_y: land.terrain_surface_y,
+            water_floor_y: water.terrain_surface_y,
+            land_surface_block: land.terrain_surface_block.clone(),
+            water_floor_block: water.terrain_surface_block.clone(),
+            land_above_sea,
+            floor_delta,
+        });
+    }
+    if land_above_sea > 4 {
+        report.coast_land_above_sea_gt4_samples += 1;
+    }
+    if land_above_sea > 8 {
+        report.coast_land_above_sea_gt8_samples += 1;
+    }
+    if land_above_sea > 16 {
+        report.coast_land_above_sea_gt16_samples += 1;
+    }
+}
+
+fn post_final_column_index(x: usize, z: usize) -> usize {
+    (z * POST_FINAL_REGION_SIZE_BLOCKS) + x
+}
+
 fn chunk_root(payload: &[u8]) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
     let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
     let Tag::Compound(root) = named.into_tag() else {
@@ -8407,6 +8866,51 @@ mod tests {
         assert_eq!(&pixels[offset..offset + 3], &color);
     }
 
+    fn write_post_final_integrity_fixture_region(region: &Path, format: RegionFormat) {
+        fs::create_dir_all(region.parent().unwrap()).unwrap();
+        let mut chunk = ChunkModel::overworld(0, 0);
+        for z in 0..CHUNK_WIDTH {
+            for x in 0..CHUNK_WIDTH {
+                let x = x as i32;
+                let z = z as i32;
+                chunk
+                    .set_block_state_id(x, -64, z, block_state_ids::BEDROCK)
+                    .unwrap();
+                chunk
+                    .fill_column(x, z, -63, 58, block_state_ids::STONE)
+                    .unwrap();
+                chunk
+                    .fill_column(x, z, 59, SEA_LEVEL_Y, block_state_ids::WATER)
+                    .unwrap();
+            }
+        }
+        chunk
+            .set_block_state_id(0, SEA_LEVEL_Y - 1, 0, block_state_ids::AIR)
+            .unwrap();
+        chunk
+            .fill_column(1, 0, 59, 74, block_state_ids::DIRT)
+            .unwrap();
+        chunk
+            .set_block_state_id(1, 75, 0, block_state_ids::GRASS_BLOCK)
+            .unwrap();
+        chunk
+            .set_block_state_id(2, 76, 0, block_state_ids::OAK_LOG)
+            .unwrap();
+        chunk
+            .set_block_state_id(2, 77, 0, block_state_ids::OAK_LEAVES)
+            .unwrap();
+
+        let mut payloads = BTreeMap::new();
+        let payload = chunk_nbt_encoder::encode_to_bytes(&chunk, 0).unwrap();
+        payloads.insert(ChunkLocalPos::new(0, 0).unwrap(), payload);
+        match format {
+            RegionFormat::Mca => earthmap_region::write_mca_region(region, &payloads, 0).unwrap(),
+            RegionFormat::Linear => {
+                earthmap_region::write_linear_v2_region(region, &payloads, 0).unwrap()
+            }
+        }
+    }
+
     #[test]
     fn resume_journal_loads_completed_regions_for_matching_fingerprint() {
         let temp = tempdir().unwrap();
@@ -8685,6 +9189,12 @@ mod tests {
         assert!(out.contains("DONE rust.command.mca-topdown-render - MCA top-down render"));
         assert!(out.contains("DONE rust.command.linear-topdown-render - Linear V2 top-down render"));
         assert!(out.contains("DONE rust.command.dynmap-tile-mosaic - Dynmap tile mosaic builder"));
+        assert!(out.contains(
+            "DONE rust.command.inspect-mca-post-final-integrity - MCA post-final integrity scanner"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.inspect-linear-post-final-integrity - Linear post-final integrity scanner"
+        ));
     }
 
     #[test]
@@ -8969,6 +9479,8 @@ mod tests {
         assert!(out.contains("inspect-linear-biomes <path>"));
         assert!(out.contains("inspect-mca-statuses <path>"));
         assert!(out.contains("inspect-linear-statuses <path>"));
+        assert!(out.contains("inspect-mca-post-final-integrity <path>"));
+        assert!(out.contains("inspect-linear-post-final-integrity <path>"));
         assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
@@ -9569,6 +10081,56 @@ mod tests {
         let (width, height, pixels) = read_png_rgb(&output);
         assert_eq!((width, height), (2, 2));
         assert_png_pixel(&pixels, width, 0, 0, [0, 255, 255]);
+    }
+
+    #[test]
+    fn inspect_mca_post_final_integrity_reports_water_tree_and_coast_fixture() {
+        let temp = tempdir().unwrap();
+        let region = temp.path().join("r.0.0.mca");
+        write_post_final_integrity_fixture_region(&region, RegionFormat::Mca);
+
+        let (code, out, err) =
+            run_capture(&["inspect-mca-post-final-integrity", region.to_str().unwrap()]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA post-final integrity scanned\n"));
+        assert!(out.contains("regionChunkCount=1\n"));
+        assert!(out.contains("decodedChunkCount=1\n"));
+        assert!(out.contains("scannedColumns=256\n"));
+        assert!(out.contains("landColumns=1\n"));
+        assert!(out.contains("waterColumns=255\n"));
+        assert!(out.contains("dryBelowSeaColumns=0\n"));
+        assert!(out.contains("underwaterAirColumns=1\n"));
+        assert!(out.contains("treeLogBlocks=1\n"));
+        assert!(out.contains("treeLeafBlocks=1\n"));
+        assert!(out.contains("treeLogColumns=1\n"));
+        assert!(out.contains("treeLeafColumns=1\n"));
+        assert!(out.contains("topTerrainBlockHits.minecraft:grass_block=1\n"));
+        assert!(out.contains("topTerrainBlockHits.minecraft:stone=255\n"));
+        assert!(out.contains("coastEdgeSamples="));
+        assert!(out.contains("maxCoastLandAboveSeaDelta=12\n"));
+    }
+
+    #[test]
+    fn inspect_linear_post_final_integrity_reads_linear_region() {
+        let temp = tempdir().unwrap();
+        let region = temp.path().join("r.0.0.linear");
+        write_post_final_integrity_fixture_region(&region, RegionFormat::Linear);
+
+        let (code, out, err) = run_capture(&[
+            "inspect-linear-post-final-integrity",
+            region.to_str().unwrap(),
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear post-final integrity scanned\n"));
+        assert!(out.contains("regionChunkCount=1\n"));
+        assert!(out.contains("decodedChunkCount=1\n"));
+        assert!(out.contains("scannedColumns=256\n"));
+        assert!(out.contains("underwaterAirColumns=1\n"));
+        assert!(out.contains("topTerrainBlockHits.minecraft:grass_block=1\n"));
     }
 
     #[test]
