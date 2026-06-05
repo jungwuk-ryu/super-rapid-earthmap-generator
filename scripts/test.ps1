@@ -43,6 +43,9 @@ if ($List) {
     return
 }
 
+if (Test-Path -LiteralPath $testOut) {
+    Remove-Item -LiteralPath $testOut -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $testOut, $buildDir | Out-Null
 try {
     Get-ChildItem -Path $testSrc -Recurse -Filter '*.java' | ForEach-Object {

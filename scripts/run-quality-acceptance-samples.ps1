@@ -17,6 +17,7 @@ param(
     [switch]$SkipGeneration,
     [switch]$PhotoParityEvidenceOnly,
     [string]$ProductionSamplesCsv = "",
+    [string]$ProductionPreviewDebug = "off",
     [switch]$LegacyPerSample
 )
 
@@ -62,27 +63,6 @@ if ($sampleDefinitions.Count -eq 0) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
-
-if (-not [string]::IsNullOrWhiteSpace($ProductionSamplesCsv) -and -not $LegacyPerSample) {
-    Write-Host "qualityAcceptance.batchMode=quality-production-sample-batch"
-    & $run quality-production-sample-batch `
-        $ProductionSamplesCsv `
-        $Heightmap `
-        $OutputRoot `
-        $Scale `
-        $Format `
-        $Threads `
-        "cacheRows=$CacheRows" `
-        "prefetchRows=$PrefetchRows" `
-        "verticalScale=$VerticalScale" `
-        "textureMode=$TextureMode" `
-        "surfaceRaster=auto" `
-        "chunkStatus=surface"
-    if ($LASTEXITCODE -ne 0) {
-        throw "quality-production-sample-batch failed with exit code $LASTEXITCODE"
-    }
-    return
-}
 
 function Format-Elapsed {
     param([TimeSpan]$Elapsed)
@@ -1066,6 +1046,178 @@ function Assert-PhotoParityMetric {
     if ($Mode -eq "min" -and $actual -lt $Limit) {
         throw ("photo parity failed: {0}={1:N6} < {2:N6}" -f $Key, $actual, $Limit)
     }
+}
+
+function Try-ReadPhotoMetricSection {
+    param(
+        [string]$MetricsPath,
+        [string]$SectionName
+    )
+    try {
+        return Read-PhotoMetricSection -MetricsPath $MetricsPath -SectionName $SectionName
+    } catch {
+        return $null
+    }
+}
+
+function Assert-ProductionBatchArtifact {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+    if (!(Test-Path -LiteralPath $Path)) {
+        throw "$Label missing: $Path"
+    }
+    $item = Get-Item -LiteralPath $Path
+    if ($item.Length -le 0) {
+        throw "$Label is empty: $Path"
+    }
+}
+
+function Add-ProductionBatchMetricFailure {
+    param(
+        [System.Collections.Generic.List[string]]$Failures,
+        [hashtable]$Values,
+        [string]$Sample,
+        [string]$Key,
+        [double]$Limit,
+        [ValidateSet("max", "min")]
+        [string]$Mode
+    )
+    if (!$Values.ContainsKey($Key)) {
+        $Failures.Add("sample=$Sample metric missing: $Key")
+        return
+    }
+    $actual = [double]$Values[$Key]
+    if ($Mode -eq "max" -and $actual -gt $Limit) {
+        $Failures.Add(("sample={0} {1}={2:N6} > {3:N6}" -f $Sample, $Key, $actual, $Limit))
+    }
+    if ($Mode -eq "min" -and $actual -lt $Limit) {
+        $Failures.Add(("sample={0} {1}={2:N6} < {3:N6}" -f $Sample, $Key, $actual, $Limit))
+    }
+}
+
+function Assert-ProductionBatchMetricGate {
+    param(
+        [string]$BatchOutputRoot
+    )
+    $summaryCsv = Join-Path $BatchOutputRoot "quality-production-sample-summary.csv"
+    $contactSheet = Join-Path $BatchOutputRoot "quality-production-sample-contact-sheet.png"
+    Assert-ProductionBatchArtifact -Path $summaryCsv -Label "quality production sample summary"
+    Assert-ProductionBatchArtifact -Path $contactSheet -Label "quality production sample contact sheet"
+    $rows = @(Import-Csv -LiteralPath $summaryCsv)
+    if ($rows.Count -eq 0) {
+        throw "quality production sample summary has no samples: $summaryCsv"
+    }
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $rows) {
+        $sample = [string]$row.sample
+        if ([string]::IsNullOrWhiteSpace($sample)) {
+            $failures.Add("summary row has empty sample name")
+            continue
+        }
+        $metricDirectory = [string]$row.metricDirectory
+        if ([string]::IsNullOrWhiteSpace($metricDirectory)) {
+            $metricDirectory = Join-Path (Join-Path $BatchOutputRoot $sample) "photo-parity\metric-land"
+        }
+        $metricsPath = Join-Path $metricDirectory "metrics.txt"
+        Assert-ProductionBatchArtifact -Path $metricsPath -Label "quality production sample metrics for $sample"
+        $metrics = Read-PhotoMetricSection -MetricsPath $metricsPath -SectionName "current-vs-expected"
+        $localAverageMetrics = Try-ReadPhotoMetricSection -MetricsPath $metricsPath `
+            -SectionName "current-local-average-4x4-vs-expected-local-average-4x4"
+        $sourceMetrics = Try-ReadPhotoMetricSection -MetricsPath $metricsPath -SectionName "source-vs-expected"
+        Write-Host ("qualityAcceptance.batchSample.metrics=sample={0},meanDeltaE2000={1:N6},p95DeltaE2000={2:N6},globalLumaSsim={3:N9},deltaEOver10Percent={4:N6},deltaEOver20Percent={5:N6},deltaEOver30Percent={6:N6},metrics={7}" -f `
+                $sample,
+                [double]$metrics["meanDeltaE2000"],
+                [double]$metrics["p95DeltaE2000"],
+                [double]$metrics["globalLumaSsim"],
+                [double]$metrics["deltaEOver10.percent"],
+                [double]$metrics["deltaEOver20.percent"],
+                [double]$metrics["deltaEOver30.percent"],
+                $metricsPath)
+        if ($null -ne $localAverageMetrics) {
+            Write-Host ("qualityAcceptance.batchSample.localAverageMetrics=sample={0},meanDeltaE2000={1:N6},p95DeltaE2000={2:N6},globalLumaSsim={3:N9},deltaEOver10Percent={4:N6},deltaEOver20Percent={5:N6},deltaEOver30Percent={6:N6}" -f `
+                    $sample,
+                    [double]$localAverageMetrics["meanDeltaE2000"],
+                    [double]$localAverageMetrics["p95DeltaE2000"],
+                    [double]$localAverageMetrics["globalLumaSsim"],
+                    [double]$localAverageMetrics["deltaEOver10.percent"],
+                    [double]$localAverageMetrics["deltaEOver20.percent"],
+                    [double]$localAverageMetrics["deltaEOver30.percent"])
+        }
+        if ($null -ne $sourceMetrics) {
+            Write-Host ("qualityAcceptance.batchSample.sourceBaseline=sample={0},meanDeltaE2000={1:N6},p95DeltaE2000={2:N6},globalLumaSsim={3:N9}" -f `
+                    $sample,
+                    [double]$sourceMetrics["meanDeltaE2000"],
+                    [double]$sourceMetrics["p95DeltaE2000"],
+                    [double]$sourceMetrics["globalLumaSsim"])
+        }
+        if (![string]::IsNullOrWhiteSpace([string]$row.productionSourceVsReferenceMean) `
+                -and [string]$row.productionSourceVsReferenceMean -ne "nan") {
+            Write-Host ("qualityAcceptance.batchSample.productionSource=sample={0},sourceVsReferenceMean={1},sourceVsExpectedMean={2},sourceDebug={3}" -f `
+                    $sample,
+                    [string]$row.productionSourceVsReferenceMean,
+                    [string]$row.productionSourceVsExpectedMean,
+                    [string]$row.productionSourceDebug)
+        }
+        Add-ProductionBatchMetricFailure -Failures $failures -Values $metrics -Sample $sample `
+            -Key "meanDeltaE2000" -Limit 6.40 -Mode max
+        Add-ProductionBatchMetricFailure -Failures $failures -Values $metrics -Sample $sample `
+            -Key "p95DeltaE2000" -Limit 10.20 -Mode max
+        Add-ProductionBatchMetricFailure -Failures $failures -Values $metrics -Sample $sample `
+            -Key "globalLumaSsim" -Limit 0.9700 -Mode min
+        Add-ProductionBatchMetricFailure -Failures $failures -Values $metrics -Sample $sample `
+            -Key "deltaEOver10.percent" -Limit 12.0 -Mode max
+        Add-ProductionBatchMetricFailure -Failures $failures -Values $metrics -Sample $sample `
+            -Key "deltaEOver20.percent" -Limit 0.12 -Mode max
+        Add-ProductionBatchMetricFailure -Failures $failures -Values $metrics -Sample $sample `
+            -Key "deltaEOver30.percent" -Limit 0.0 -Mode max
+    }
+    if ($failures.Count -gt 0) {
+        foreach ($failure in $failures) {
+            Write-Host "qualityAcceptance.batchGate.failure=$failure"
+        }
+        Write-Host ("qualityAcceptance.batchGate=fail,failures={0},summary={1},contactSheet={2}" -f `
+                $failures.Count, $summaryCsv, $contactSheet)
+        throw "quality-production-sample-batch quality gate failed; failures=$($failures.Count)"
+    }
+    Write-Host ("qualityAcceptance.batchGate=pass,samples={0},summary={1},contactSheet={2}" -f `
+            $rows.Count, $summaryCsv, $contactSheet)
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ProductionSamplesCsv) -and -not $LegacyPerSample) {
+    Write-Host "qualityAcceptance.batchMode=quality-production-sample-batch"
+    if (!$SkipGeneration) {
+        & $run quality-production-sample-batch `
+            $ProductionSamplesCsv `
+            $Heightmap `
+            $OutputRoot `
+            $Scale `
+            $Format `
+            $Threads `
+            "cacheRows=$CacheRows" `
+            "prefetchRows=$PrefetchRows" `
+            "verticalScale=$VerticalScale" `
+            "textureMode=$TextureMode" `
+            "surfaceRaster=auto" `
+            "chunkStatus=surface" `
+            "metricMode=current-only" `
+            "previewDebug=$ProductionPreviewDebug"
+        if ($LASTEXITCODE -ne 0) {
+            throw "quality-production-sample-batch failed with exit code $LASTEXITCODE"
+        }
+    } else {
+        Write-Host "qualityAcceptance.batchGeneration=skipped,reason=SkipGeneration"
+    }
+    if (!$NoQualityGate) {
+        Assert-ProductionBatchMetricGate -BatchOutputRoot $OutputRoot
+    } else {
+        Write-Host "qualityAcceptance.batchGate=skipped,reason=NoQualityGate"
+    }
+    if ($SkipGeneration) {
+        throw "quality acceptance sample gate is NO-GO because -SkipGeneration was used; rerun without -SkipGeneration for fresh evidence"
+    }
+    return
 }
 
 function Invoke-SamplePhotoParityGate {
