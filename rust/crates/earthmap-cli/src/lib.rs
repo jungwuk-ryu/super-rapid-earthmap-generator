@@ -474,6 +474,9 @@ where
         "repair-mca-post-final-water" if args.len() == 2 => {
             write_result(repair_mca_post_final_water(stdout, stderr, &args[1]))
         }
+        "repair-linear-sandlike-surfaces" if args.len() == 2 => {
+            write_result(repair_linear_sandlike_surfaces(stdout, stderr, &args[1]))
+        }
         "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
             stdout, stderr, &args[1], &args[2], &args[3],
         )),
@@ -958,6 +961,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  repair-mca-post-final-water <mcaRegion|regionDir|worldDir>"
+    )?;
+    writeln!(
+        out,
+        "  repair-linear-sandlike-surfaces <linearRegion|regionDir|worldDir>"
     )?;
     writeln!(
         out,
@@ -8163,6 +8170,510 @@ fn mca_water_section_sort_key(tag: &Tag) -> i32 {
     section.get_byte("Y").map(i32::from).unwrap_or(i32::MAX)
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LinearSandlikeSurfaceRepairReport {
+    region_file_count: usize,
+    chunk_count: usize,
+    repaired_region_count: usize,
+    repaired_chunk_count: usize,
+    replaced_block_count: u64,
+}
+
+fn repair_linear_sandlike_surfaces(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+) -> io::Result<i32> {
+    match repair_linear_sandlike_surfaces_impl(Path::new(path)) {
+        Ok(report) => {
+            writeln!(out, "Linear sandlike surfaces repaired")?;
+            writeln!(out, "regionFileCount={}", report.region_file_count)?;
+            writeln!(out, "chunkCount={}", report.chunk_count)?;
+            writeln!(out, "repairedRegionCount={}", report.repaired_region_count)?;
+            writeln!(out, "repairedChunkCount={}", report.repaired_chunk_count)?;
+            writeln!(out, "replacedBlockCount={}", report.replaced_block_count)?;
+            writeln!(out, "changed={}", report.replaced_block_count > 0)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Linear sandlike surface repair failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn repair_linear_sandlike_surfaces_impl(
+    path: &Path,
+) -> std::result::Result<LinearSandlikeSurfaceRepairReport, String> {
+    let region_files = linear_region_files_for_target(path)?;
+    let mut report = LinearSandlikeSurfaceRepairReport::default();
+    for region_file in region_files {
+        let region_report = repair_linear_sandlike_region(&region_file)?;
+        report.region_file_count += region_report.region_file_count;
+        report.chunk_count += region_report.chunk_count;
+        report.repaired_region_count += region_report.repaired_region_count;
+        report.repaired_chunk_count += region_report.repaired_chunk_count;
+        report.replaced_block_count += region_report.replaced_block_count;
+    }
+    Ok(report)
+}
+
+fn linear_region_files_for_target(
+    path: &Path,
+) -> std::result::Result<Vec<std::path::PathBuf>, String> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let region_dir = if path.join("region").is_dir() {
+        path.join("region")
+    } else {
+        path.to_path_buf()
+    };
+    let mut regions = std::fs::read_dir(&region_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("linear"))
+        })
+        .collect::<Vec<_>>();
+    regions.sort();
+    if regions.is_empty() {
+        return Err(format!(
+            "no Linear region files found in {}",
+            region_dir.display()
+        ));
+    }
+    Ok(regions)
+}
+
+fn repair_linear_sandlike_region(
+    region_file: &Path,
+) -> std::result::Result<LinearSandlikeSurfaceRepairReport, String> {
+    let payloads = read_region_payloads(region_file).map_err(|error| error.to_string())?;
+    if payloads.format != RegionFormat::Linear {
+        return Err(format!(
+            "region format mismatch: expected linear got {}",
+            payloads.format.as_manifest_value()
+        ));
+    }
+    let mut repaired_chunks = 0usize;
+    let mut replaced_blocks = 0u64;
+    let mut updated_payloads = BTreeMap::new();
+    for (pos, payload) in &payloads.chunks {
+        let result = repair_linear_sandlike_chunk(payload)?;
+        if result.replaced_block_count > 0 {
+            repaired_chunks += 1;
+            replaced_blocks += result.replaced_block_count;
+        }
+        updated_payloads.insert(*pos, result.payload);
+    }
+    if replaced_blocks > 0 {
+        earthmap_region::write_linear_v2_region(
+            region_file,
+            &updated_payloads,
+            i64::from(current_mca_timestamp()),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(LinearSandlikeSurfaceRepairReport {
+        region_file_count: 1,
+        chunk_count: payloads.chunks.len(),
+        repaired_region_count: usize::from(replaced_blocks > 0),
+        repaired_chunk_count: repaired_chunks,
+        replaced_block_count: replaced_blocks,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct LinearSandlikeChunkRepairResult {
+    payload: Vec<u8>,
+    replaced_block_count: u64,
+}
+
+fn repair_linear_sandlike_chunk(
+    payload: &[u8],
+) -> std::result::Result<LinearSandlikeChunkRepairResult, String> {
+    let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
+    let root_name = named.name().to_string();
+    let Tag::Compound(root) = named.into_tag() else {
+        return Err("chunk root is not an NBT compound".to_string());
+    };
+    let mut chunk = MutableLinearSandlikeChunk::decode(root)?;
+    let replaced_block_count = chunk.replace_sandlike_surfaces()?;
+    if replaced_block_count == 0 {
+        return Ok(LinearSandlikeChunkRepairResult {
+            payload: payload.to_vec(),
+            replaced_block_count: 0,
+        });
+    }
+    let root = chunk.flush()?;
+    let payload = nbt::write_to_bytes(&root_name, &root).map_err(|error| error.to_string())?;
+    Ok(LinearSandlikeChunkRepairResult {
+        payload,
+        replaced_block_count,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct MutableLinearSandlikeChunk {
+    root: earthmap_minecraft::nbt::Compound,
+    section_tags: Vec<Tag>,
+    sections: BTreeMap<i32, MutableLinearSandlikeSection>,
+}
+
+impl MutableLinearSandlikeChunk {
+    fn decode(root: earthmap_minecraft::nbt::Compound) -> std::result::Result<Self, String> {
+        let section_tags = root
+            .get_list("sections")
+            .map_err(|error| error.to_string())?
+            .values()
+            .to_vec();
+        let mut sections = BTreeMap::new();
+        for (tag_index, section_tag) in section_tags.iter().enumerate() {
+            let Tag::Compound(section) = section_tag else {
+                return Err("chunk section is not an NBT compound".to_string());
+            };
+            if !section.contains("block_states") {
+                continue;
+            }
+            let section = MutableLinearSandlikeSection::decode(section.clone(), tag_index)?;
+            sections.insert(section.section_y, section);
+        }
+        Ok(Self {
+            root,
+            section_tags,
+            sections,
+        })
+    }
+
+    fn replace_sandlike_surfaces(&mut self) -> std::result::Result<u64, String> {
+        let mut replaced = 0u64;
+        for y in OVERWORLD_1_21_11.min_y()..=OVERWORLD_1_21_11.max_y_inclusive() {
+            let section_y = y.div_euclid(SECTION_HEIGHT);
+            let should_scan = self
+                .sections
+                .get(&section_y)
+                .is_some_and(MutableLinearSandlikeSection::contains_sandlike);
+            if !should_scan {
+                continue;
+            }
+            for local_z in 0..CHUNK_WIDTH {
+                for local_x in 0..CHUNK_WIDTH {
+                    let block_name = self.block_name_at(local_x, y, local_z)?;
+                    if is_linear_sandlike_block(&block_name) {
+                        let replacement = self.replacement_for(local_x, y, local_z)?;
+                        self.sections
+                            .get_mut(&section_y)
+                            .ok_or_else(|| {
+                                format!("missing section during replacement: {section_y}")
+                            })?
+                            .set_block_name_at(local_x, y, local_z, &replacement)?;
+                        replaced += 1;
+                    }
+                }
+            }
+        }
+        Ok(replaced)
+    }
+
+    fn replacement_for(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        if y <= SEA_LEVEL_Y
+            || (self.column_has_water_at_sea(local_x, local_z)?
+                && is_water_like_block(&self.block_name_at(
+                    local_x,
+                    SEA_LEVEL_Y.min(y + 1),
+                    local_z,
+                )?))
+        {
+            return Ok("minecraft:clay".to_string());
+        }
+        let above = if y >= OVERWORLD_1_21_11.max_y_inclusive() {
+            TOPDOWN_AIR_BLOCK.to_string()
+        } else {
+            self.block_name_at(local_x, y + 1, local_z)?
+        };
+        if is_air_block(&above)
+            || is_water_like_block(&above)
+            || is_linear_sandlike_plant_like_block(&above)
+        {
+            Ok("minecraft:grass_block".to_string())
+        } else {
+            Ok("minecraft:dirt".to_string())
+        }
+    }
+
+    fn column_has_water_at_sea(
+        &self,
+        local_x: usize,
+        local_z: usize,
+    ) -> std::result::Result<bool, String> {
+        Ok(is_water_like_block(&self.block_name_at(
+            local_x,
+            SEA_LEVEL_Y,
+            local_z,
+        )?))
+    }
+
+    fn block_name_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let section_y = y.div_euclid(SECTION_HEIGHT);
+        let Some(section) = self.sections.get(&section_y) else {
+            return Ok(TOPDOWN_AIR_BLOCK.to_string());
+        };
+        section.block_name_at(local_x, y, local_z)
+    }
+
+    fn flush(mut self) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
+        let mut changed = false;
+        for section in self.sections.values_mut() {
+            if section.flush()? {
+                self.section_tags[section.tag_index] = Tag::Compound(section.section_tag.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            self.root
+                .put(
+                    "sections",
+                    Tag::List(
+                        nbt::list(nbt::TAG_COMPOUND, self.section_tags)
+                            .map_err(|error| error.to_string())?,
+                    ),
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(self.root)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MutableLinearSandlikeSection {
+    section_y: i32,
+    tag_index: usize,
+    section_tag: earthmap_minecraft::nbt::Compound,
+    palette_tags: Vec<Tag>,
+    palette_names: Vec<String>,
+    palette_indices: Vec<usize>,
+    changed: bool,
+    has_sandlike: bool,
+}
+
+impl MutableLinearSandlikeSection {
+    fn decode(
+        section_tag: earthmap_minecraft::nbt::Compound,
+        tag_index: usize,
+    ) -> std::result::Result<Self, String> {
+        let section_y = i32::from(
+            section_tag
+                .get_byte("Y")
+                .map_err(|error| error.to_string())?,
+        );
+        let block_states = section_tag
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?;
+        if !block_states.contains("palette") {
+            return Err("chunk section block_states missing palette".to_string());
+        }
+        let palette_tags = block_states
+            .get_list("palette")
+            .map_err(|error| error.to_string())?
+            .values()
+            .to_vec();
+        if palette_tags.is_empty() {
+            return Err("chunk section block state palette is empty".to_string());
+        }
+        let mut palette_names = Vec::with_capacity(palette_tags.len());
+        let mut has_sandlike = false;
+        for palette_tag in &palette_tags {
+            let Tag::Compound(block_state) = palette_tag else {
+                return Err("block state palette entry is not an NBT compound".to_string());
+            };
+            let name = block_state
+                .get_string("Name")
+                .map_err(|error| error.to_string())?
+                .to_string();
+            has_sandlike |= is_linear_sandlike_block(&name);
+            palette_names.push(name);
+        }
+        let palette_indices =
+            decode_palette_values(block_states, palette_tags.len(), SECTION_BLOCK_COUNT)?;
+        Ok(Self {
+            section_y,
+            tag_index,
+            section_tag,
+            palette_tags,
+            palette_names,
+            palette_indices,
+            changed: false,
+            has_sandlike,
+        })
+    }
+
+    fn contains_sandlike(&self) -> bool {
+        self.has_sandlike
+    }
+
+    fn block_name_at(
+        &self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+    ) -> std::result::Result<String, String> {
+        let block_index = mca_water_block_index(local_x, y, local_z);
+        let palette_index = self
+            .palette_indices
+            .get(block_index)
+            .copied()
+            .ok_or_else(|| format!("missing palette index at {block_index}"))?;
+        self.palette_names
+            .get(palette_index)
+            .cloned()
+            .ok_or_else(|| format!("packed palette index outside palette: {palette_index}"))
+    }
+
+    fn set_block_name_at(
+        &mut self,
+        local_x: usize,
+        y: i32,
+        local_z: usize,
+        block_name: &str,
+    ) -> std::result::Result<(), String> {
+        let block_index = mca_water_block_index(local_x, y, local_z);
+        let palette_index = self.palette_index(block_name)?;
+        self.palette_indices[block_index] = palette_index;
+        self.changed = true;
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::result::Result<bool, String> {
+        if !self.changed {
+            return Ok(false);
+        }
+        self.compact_palette();
+        let mut block_states = self
+            .section_tag
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?
+            .clone();
+        block_states
+            .put(
+                "palette",
+                Tag::List(
+                    nbt::list(nbt::TAG_COMPOUND, self.palette_tags.clone())
+                        .map_err(|error| error.to_string())?,
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+        let bits_per_entry = bits_per_entry_for_palette_size(self.palette_tags.len())
+            .map_err(|error| error.to_string())?;
+        if bits_per_entry == 0 {
+            block_states
+                .remove("data")
+                .map_err(|error| error.to_string())?;
+        } else {
+            let packed = PackedLongArray::pack(SECTION_BLOCK_COUNT, bits_per_entry, |index| {
+                self.palette_indices[index] as i32
+            })
+            .map_err(|error| error.to_string())?;
+            block_states
+                .put_long_array("data", packed.copy_data())
+                .map_err(|error| error.to_string())?;
+        }
+        self.section_tag
+            .put_compound("block_states", block_states)
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
+    fn compact_palette(&mut self) {
+        let mut remap = Vec::<(usize, usize)>::new();
+        let mut compact_tags = Vec::<Tag>::new();
+        let mut compact_names = Vec::<String>::new();
+        for palette_index in &mut self.palette_indices {
+            if let Some((_, new_index)) = remap
+                .iter()
+                .find(|(old_index, _)| *old_index == *palette_index)
+            {
+                *palette_index = *new_index;
+                continue;
+            }
+            let new_index = compact_tags.len();
+            remap.push((*palette_index, new_index));
+            compact_tags.push(self.palette_tags[*palette_index].clone());
+            compact_names.push(self.palette_names[*palette_index].clone());
+            *palette_index = new_index;
+        }
+        self.palette_tags = compact_tags;
+        self.palette_names = compact_names;
+        self.has_sandlike = self
+            .palette_names
+            .iter()
+            .any(|name| is_linear_sandlike_block(name));
+    }
+
+    fn palette_index(&mut self, block_name: &str) -> std::result::Result<usize, String> {
+        if let Some(index) = self
+            .palette_names
+            .iter()
+            .position(|existing| existing == block_name)
+        {
+            return Ok(index);
+        }
+        let index = self.palette_names.len();
+        self.palette_names.push(block_name.to_string());
+        self.palette_tags.push(simple_block_state_tag(block_name)?);
+        Ok(index)
+    }
+}
+
+fn is_linear_sandlike_block(block_name: &str) -> bool {
+    matches!(
+        block_name,
+        "minecraft:sand"
+            | "minecraft:red_sand"
+            | "minecraft:sandstone"
+            | "minecraft:smooth_sandstone"
+            | "minecraft:cut_sandstone"
+            | "minecraft:chiseled_sandstone"
+            | "minecraft:smooth_red_sandstone"
+            | "minecraft:cut_red_sandstone"
+            | "minecraft:chiseled_red_sandstone"
+    )
+}
+
+fn is_linear_sandlike_plant_like_block(block_name: &str) -> bool {
+    block_name.ends_with("_grass")
+        || block_name.ends_with("_fern")
+        || block_name.ends_with("_flower")
+        || block_name.ends_with("_sapling")
+        || block_name.ends_with("_bush")
+        || matches!(block_name, "minecraft:fern" | "minecraft:bush")
+        || block_name.contains("roots")
+        || block_name.contains("vines")
+        || block_name.contains("vine")
+        || block_name.contains("mushroom")
+}
+
+fn simple_block_state_tag(block_name: &str) -> std::result::Result<Tag, String> {
+    let mut block = nbt::compound();
+    block
+        .put_string("Name", block_name)
+        .map_err(|error| error.to_string())?;
+    Ok(Tag::Compound(block))
+}
+
 fn chunk_root(payload: &[u8]) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
     let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
     let Tag::Compound(root) = named.into_tag() else {
@@ -9633,6 +10144,29 @@ mod tests {
         }
     }
 
+    fn write_linear_sandlike_repair_fixture(region: &Path) {
+        fs::create_dir_all(region.parent().unwrap()).unwrap();
+        let mut chunk = ChunkModel::overworld(0, 0);
+        fill_flat_base_terrain(&mut chunk, FLAT_TEST_SURFACE_Y).unwrap();
+        chunk
+            .set_block_state_id(0, SEA_LEVEL_Y, 0, block_state_ids::SAND)
+            .unwrap();
+        chunk
+            .set_block_state_id(1, SEA_LEVEL_Y + 7, 0, block_state_ids::SAND)
+            .unwrap();
+        chunk
+            .set_block_state_id(2, SEA_LEVEL_Y + 7, 0, block_state_ids::SAND)
+            .unwrap();
+        chunk
+            .set_block_state_id(2, SEA_LEVEL_Y + 8, 0, block_state_ids::STONE)
+            .unwrap();
+
+        let mut payloads = BTreeMap::new();
+        let payload = chunk_nbt_encoder::encode_to_bytes(&chunk, 0).unwrap();
+        payloads.insert(ChunkLocalPos::new(0, 0).unwrap(), payload);
+        earthmap_region::write_linear_v2_region(region, &payloads, 0).unwrap();
+    }
+
     #[test]
     fn resume_journal_loads_completed_regions_for_matching_fingerprint() {
         let temp = tempdir().unwrap();
@@ -9920,6 +10454,9 @@ mod tests {
         ));
         assert!(out.contains(
             "DONE rust.command.inspect-linear-post-final-integrity - Linear post-final integrity scanner"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.repair-linear-sandlike-surfaces - Linear sandlike surface repairer"
         ));
     }
 
@@ -10209,6 +10746,7 @@ mod tests {
         assert!(out.contains("inspect-linear-post-final-integrity <path>"));
         assert!(out.contains("rewrite-mca-status <mcaRegion|regionDir|worldDir>"));
         assert!(out.contains("repair-mca-post-final-water <mcaRegion|regionDir|worldDir>"));
+        assert!(out.contains("repair-linear-sandlike-surfaces <linearRegion|regionDir|worldDir>"));
         assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
@@ -10927,6 +11465,44 @@ mod tests {
         assert!(err.is_empty());
         assert!(out.contains("underwaterAirColumns=0\n"));
         assert!(out.contains("waterColumns=255\n"));
+    }
+
+    #[test]
+    fn repair_linear_sandlike_surfaces_rewrites_only_sandlike_palette_entries() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("linear-world");
+        let region = world.join("region").join("r.0.0.linear");
+        write_linear_sandlike_repair_fixture(&region);
+
+        let (code, out, err) =
+            run_capture(&["repair-linear-sandlike-surfaces", world.to_str().unwrap()]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear sandlike surfaces repaired\n"));
+        assert!(out.contains("regionFileCount=1\n"));
+        assert!(out.contains("chunkCount=1\n"));
+        assert!(out.contains("repairedRegionCount=1\n"));
+        assert!(out.contains("repairedChunkCount=1\n"));
+        assert!(out.contains("replacedBlockCount=3\n"));
+        assert!(out.contains("changed=true\n"));
+
+        let (code, out, err) = run_capture(&["inspect-linear-palettes", region.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(!out.contains("paletteHits.minecraft:sand="));
+        assert!(out.contains("paletteHits.minecraft:clay="));
+        assert!(out.contains("paletteHits.minecraft:grass_block="));
+        assert!(out.contains("paletteHits.minecraft:dirt="));
+
+        let (code, out, err) =
+            run_capture(&["repair-linear-sandlike-surfaces", region.to_str().unwrap()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("repairedRegionCount=0\n"));
+        assert!(out.contains("repairedChunkCount=0\n"));
+        assert!(out.contains("replacedBlockCount=0\n"));
+        assert!(out.contains("changed=false\n"));
     }
 
     #[test]

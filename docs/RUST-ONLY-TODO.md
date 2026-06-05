@@ -241,10 +241,10 @@ Detailed progress:
 Spec: `earthmap-rs dynmap-tile-mosaic <dynmapTileDir> <outputPng> [base|z|zz...]`; recursively reads `.png|.jpg|.jpeg` tiles, writes RGB PNG plus sibling `.properties`, and exits 0 on success or 2 on validation/render failure.
 
 ### Rust region validators, inspectors, converters, and repair tools
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
@@ -266,7 +266,7 @@ Covered Linear commands:
 - [x] `inspect-linear-biomes`
 - [x] `inspect-linear-statuses`
 - [x] `inspect-linear-post-final-integrity`
-- [ ] `repair-linear-sandlike-surfaces`
+- [x] `repair-linear-sandlike-surfaces`
 Covered cross-format commands:
 - [x] `compare-mca-linear-region-payloads`
 - [x] `convert-mca-region-to-linear`
@@ -274,7 +274,7 @@ Covered cross-format commands:
 Detailed progress:
 - [x] Validation checks structural format invariants instead of byte-by-byte Java parity.
 - [x] Inspectors emit stable CSV/text fields for scripts.
-- [ ] Repair tools are bounded to explicit target paths and never rewrite unrelated regions.
+- [x] Repair tools are bounded to explicit target paths and never rewrite unrelated regions.
 - [x] Converter preserves Minecraft-loadable chunk payloads and metadata required by the target format.
 
 ### PowerShell quality wrappers switched from Java to Rust

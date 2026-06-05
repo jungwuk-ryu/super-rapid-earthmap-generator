@@ -164,6 +164,11 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         status: CommandStatus::Implemented,
         note: "Linear post-final integrity scanner",
     },
+    CommandSpec {
+        name: "repair-linear-sandlike-surfaces",
+        status: CommandStatus::Implemented,
+        note: "Linear sandlike surface repairer",
+    },
 ];
 
 pub const SHELL_COMMANDS: &[CommandSpec] = &[
