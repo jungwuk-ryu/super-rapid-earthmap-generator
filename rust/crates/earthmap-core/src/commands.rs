@@ -65,6 +65,21 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "quality gate sample batch",
     },
     CommandSpec {
+        name: "photo-compare-crop",
+        status: CommandStatus::Implemented,
+        note: "PNG crop metric comparator",
+    },
+    CommandSpec {
+        name: "photo-parity-metric-crop",
+        status: CommandStatus::Implemented,
+        note: "PNG crop photo metric reporter",
+    },
+    CommandSpec {
+        name: "photo-parity-metric-batch",
+        status: CommandStatus::Implemented,
+        note: "parallel PNG crop photo metric batch",
+    },
+    CommandSpec {
         name: "dynmap-tile-mosaic",
         status: CommandStatus::Implemented,
         note: "Dynmap tile mosaic builder",

@@ -845,6 +845,7 @@ dependencies = [
  "earthmap-geo",
  "earthmap-minecraft",
  "earthmap-parity",
+ "earthmap-quality",
  "earthmap-region",
  "earthmap-surface",
  "image",
@@ -916,6 +917,8 @@ version = "0.0.0-phase0"
 dependencies = [
  "earthmap-core",
  "earthmap-region",
+ "image",
+ "rayon",
 ]
 
 [[package]]

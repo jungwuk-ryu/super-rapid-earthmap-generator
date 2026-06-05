@@ -174,15 +174,15 @@ Detailed progress:
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Covered commands:
 - [ ] `photo-parity-crop`
-- [ ] `photo-compare-crop`
-- [ ] `photo-parity-metric-crop`
-- [ ] `photo-parity-metric-batch`
+- [x] `photo-compare-crop`
+- [x] `photo-parity-metric-crop`
+- [x] `photo-parity-metric-batch`
 Detailed progress:
-- [ ] Reads PNG inputs without Java.
-- [ ] Supports mask modes `all|nonzero|white|land-water-debug`.
-- [ ] Computes mean DeltaE2000, p95 DeltaE2000, SSIM, threshold percentages, and local-average diagnostics.
-- [ ] Writes metrics text with stable field names for wrappers.
-- [ ] Batch mode uses worker threads without unbounded memory growth.
+- [x] Reads PNG inputs without Java.
+- [x] Supports mask modes `all|nonzero|white|land-water-debug`.
+- [x] Computes mean DeltaE2000, p95 DeltaE2000, SSIM, threshold percentages, and local-average diagnostics.
+- [x] Writes metrics text with stable field names for wrappers.
+- [x] Batch mode uses worker threads without unbounded memory growth.
 
 ### Rust Standard remap parity tools
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented

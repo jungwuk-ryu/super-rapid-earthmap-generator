@@ -9,6 +9,7 @@ earthmap-core = { path = "../earthmap-core" }
 earthmap-geo = { path = "../earthmap-geo" }
 earthmap-minecraft = { path = "../earthmap-minecraft" }
 earthmap-parity = { path = "../earthmap-parity" }
+earthmap-quality = { path = "../earthmap-quality" }
 earthmap-region = { path = "../earthmap-region" }
 earthmap-surface = { path = "../earthmap-surface" }
 image.workspace = true

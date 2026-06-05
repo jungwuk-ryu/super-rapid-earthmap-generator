@@ -31,6 +31,7 @@ use earthmap_minecraft::{
     packed_long_array::PackedLongArray,
     section_palette::bits_per_entry_for_palette_size,
 };
+use earthmap_quality::{self as quality};
 use earthmap_region::{
     compare_mca_linear_region_payloads, read_region_payloads, validate_linear_region_file,
     validate_mca_region_file, validate_region_file_for_resume, ChunkLocalPos, RegionError,
@@ -195,6 +196,44 @@ where
         }
         "sample-vrt-rgb" if args.len() == 4 => {
             write_result(sample_vrt_rgb(stdout, stderr, &args[1], &args[2], &args[3]))
+        }
+        "photo-compare-crop" if (8..=10).contains(&args.len()) => write_result(photo_compare_crop(
+            stdout,
+            stderr,
+            &args[1],
+            &args[2],
+            &args[3],
+            &args[4],
+            &args[5],
+            &args[6],
+            &args[7],
+            args.get(8).map(String::as_str),
+            args.get(9).map(String::as_str).unwrap_or("all"),
+        )),
+        "photo-parity-metric-crop" if (9..=11).contains(&args.len()) => {
+            write_result(photo_parity_metric_crop(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                &args[6],
+                &args[7],
+                &args[8],
+                args.get(9).map(String::as_str),
+                args.get(10).map(String::as_str).unwrap_or("all"),
+            ))
+        }
+        "photo-parity-metric-batch" if args.len() == 3 || args.len() == 4 => {
+            write_result(photo_parity_metric_batch(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                args.get(3).map(String::as_str).unwrap_or("auto"),
+            ))
         }
         "generate-height-region" if args.len() == 7 => write_result(generate_height_region(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
@@ -530,6 +569,191 @@ fn write_result(result: io::Result<i32>) -> i32 {
             let _ = writeln!(io::stderr(), "I/O error: {error}");
             1
         }
+    }
+}
+
+fn photo_compare_crop(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    actual_path: &str,
+    expected_path: &str,
+    output_directory: &str,
+    crop_x: &str,
+    crop_y: &str,
+    crop_width: &str,
+    crop_height: &str,
+    mask_path: Option<&str>,
+    mask_mode: &str,
+) -> io::Result<i32> {
+    match parse_photo_crop(crop_x, crop_y, crop_width, crop_height).and_then(
+        |(crop_x, crop_y, crop_width, crop_height)| {
+            let mask_path = parse_optional_cli_path(mask_path);
+            quality::write_compare_report(
+                Path::new(actual_path),
+                Path::new(expected_path),
+                Path::new(output_directory),
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+                mask_path.as_deref(),
+                mask_mode,
+            )
+        },
+    ) {
+        Ok(report) => {
+            writeln!(out, "Photo compare crop written")?;
+            writeln!(
+                out,
+                "outputDirectory={}",
+                cli_path_display(&report.output_directory)
+            )?;
+            write!(out, "{}", report.text)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo compare crop failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn photo_parity_metric_crop(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    source_path: &str,
+    expected_path: &str,
+    current_surface_path: &str,
+    output_directory: &str,
+    crop_x: &str,
+    crop_y: &str,
+    crop_width: &str,
+    crop_height: &str,
+    mask_path: Option<&str>,
+    mask_mode: &str,
+) -> io::Result<i32> {
+    match parse_photo_crop(crop_x, crop_y, crop_width, crop_height).and_then(
+        |(crop_x, crop_y, crop_width, crop_height)| {
+            let mask_path = parse_optional_cli_path(mask_path);
+            quality::write_metric_crop_report(
+                Path::new(source_path),
+                Path::new(expected_path),
+                Path::new(current_surface_path),
+                Path::new(output_directory),
+                crop_x,
+                crop_y,
+                crop_width,
+                crop_height,
+                mask_path.as_deref(),
+                mask_mode,
+            )
+        },
+    ) {
+        Ok(report) => {
+            writeln!(out, "Photo parity metric crop written")?;
+            writeln!(
+                out,
+                "outputDirectory={}",
+                cli_path_display(&report.output_directory)
+            )?;
+            write!(out, "{}", report.text)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo parity metric crop failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn photo_parity_metric_batch(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    jobs_csv: &str,
+    output_root: &str,
+    threads: &str,
+) -> io::Result<i32> {
+    match quality::run_photo_metric_batch(Path::new(jobs_csv), Path::new(output_root), threads) {
+        Ok(report) => {
+            writeln!(out, "Photo parity metric batch written")?;
+            writeln!(out, "jobsCsv={}", cli_path_display(&report.jobs_csv))?;
+            writeln!(out, "outputRoot={}", cli_path_display(&report.output_root))?;
+            writeln!(out, "jobs={}", report.jobs)?;
+            writeln!(out, "threads={}", report.threads)?;
+            writeln!(out, "elapsedMillis={}", report.elapsed_millis)?;
+            writeln!(
+                out,
+                "sample,elapsedMillis,pixels,currentVsExpectedMean,currentVsSourceMean,\
+sourceVsExpectedMean,canopyVsExpectedMean,canopyVsSourceMean,\
+selectiveCanopyVsExpectedMean,selectiveCanopyVsSourceMean,outputDirectory"
+            )?;
+            for result in report.results {
+                writeln!(
+                    out,
+                    "{},{},{},{},{},{},{},{},{},{},{}",
+                    result.sample,
+                    result.elapsed_millis,
+                    result.pixels,
+                    metric_text(result.current_vs_expected_mean),
+                    metric_text(result.current_vs_source_mean),
+                    metric_text(result.source_vs_expected_mean),
+                    metric_text(result.canopy_vs_expected_mean),
+                    metric_text(result.canopy_vs_source_mean),
+                    metric_text(result.selective_canopy_vs_expected_mean),
+                    metric_text(result.selective_canopy_vs_source_mean),
+                    cli_path_display(&result.output_directory)
+                )?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Photo parity metric batch failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn parse_photo_crop(
+    crop_x: &str,
+    crop_y: &str,
+    crop_width: &str,
+    crop_height: &str,
+) -> Result<(u32, u32, u32, u32), String> {
+    let crop_x = crop_x.parse::<u32>().map_err(|error| error.to_string())?;
+    let crop_y = crop_y.parse::<u32>().map_err(|error| error.to_string())?;
+    let crop_width = crop_width
+        .parse::<u32>()
+        .map_err(|error| error.to_string())?;
+    let crop_height = crop_height
+        .parse::<u32>()
+        .map_err(|error| error.to_string())?;
+    if crop_width == 0 || crop_height == 0 {
+        return Err("crop width and height must be positive".to_string());
+    }
+    Ok((crop_x, crop_y, crop_width, crop_height))
+}
+
+fn parse_optional_cli_path(path: Option<&str>) -> Option<std::path::PathBuf> {
+    let path = path?.trim();
+    if path.is_empty() || path.eq_ignore_ascii_case("none") || path.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
+    }
+}
+
+fn cli_path_display(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn metric_text(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.6}")
+    } else {
+        "NaN".to_string()
     }
 }
 
@@ -1013,6 +1237,18 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(out, "  raster-smoke [heightmap] <scale> <outputJson>")?;
     writeln!(out, "  sample-vrt-rgb <terrainVrt> <longitude> <latitude>")?;
+    writeln!(
+        out,
+        "  photo-compare-crop <actualPng> <expectedPng> <outputDir> <x> <y> <width> <height> [maskPng|none] [all|nonzero|white|land-water-debug]"
+    )?;
+    writeln!(
+        out,
+        "  photo-parity-metric-crop <sourcePng> <expectedPng> <currentSurfacePng> <outputDir> <x> <y> <width> <height> [maskPng|none] [all|nonzero|white|land-water-debug]"
+    )?;
+    writeln!(
+        out,
+        "  photo-parity-metric-batch <jobsCsv> <outputRoot> [threads|auto]"
+    )?;
     for name in commands::INITIAL_COMMANDS
         .iter()
         .map(|command| command.name)
@@ -10086,6 +10322,23 @@ mod tests {
         write_rgb_png(path, 2, 2, &pixels).unwrap();
     }
 
+    fn write_metric_test_png(path: &Path, inverted: bool) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut pixels = vec![0u8; 4 * 4 * 3];
+        for y in 0..4 {
+            for x in 0..4 {
+                let mut bright = (x + y) % 2 == 0;
+                if inverted {
+                    bright = !bright;
+                }
+                let value = if bright { 255 } else { 0 };
+                let offset = ((y * 4 + x) * 3) as usize;
+                pixels[offset..offset + 3].copy_from_slice(&[value, value, value]);
+            }
+        }
+        write_rgb_png(path, 4, 4, &pixels).unwrap();
+    }
+
     fn assert_png_pixel(pixels: &[u8], width: u32, x: u32, y: u32, color: [u8; 3]) {
         let offset = ((usize::try_from(y).unwrap() * usize::try_from(width).unwrap())
             + usize::try_from(x).unwrap())
@@ -10445,6 +10698,13 @@ mod tests {
         assert!(out.contains("DONE rust.command.mca-topdown-render - MCA top-down render"));
         assert!(out.contains("DONE rust.command.linear-topdown-render - Linear V2 top-down render"));
         assert!(out.contains("DONE rust.command.dynmap-tile-mosaic - Dynmap tile mosaic builder"));
+        assert!(out.contains("DONE rust.command.photo-compare-crop - PNG crop metric comparator"));
+        assert!(out.contains(
+            "DONE rust.command.photo-parity-metric-crop - PNG crop photo metric reporter"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.photo-parity-metric-batch - parallel PNG crop photo metric batch"
+        ));
         assert!(out.contains(
             "DONE rust.command.inspect-mca-post-final-integrity - MCA post-final integrity scanner"
         ));
@@ -10766,6 +11026,9 @@ mod tests {
         assert!(out.contains("classify-surface-point [heightmap] <scale> <longitude> <latitude>"));
         assert!(out.contains("raster-smoke [heightmap] <scale> <outputJson>"));
         assert!(out.contains("sample-vrt-rgb <terrainVrt> <longitude> <latitude>"));
+        assert!(out.contains("photo-compare-crop <actualPng> <expectedPng>"));
+        assert!(out.contains("photo-parity-metric-crop <sourcePng> <expectedPng>"));
+        assert!(out.contains("photo-parity-metric-batch <jobsCsv> <outputRoot>"));
     }
 
     #[test]
@@ -11347,6 +11610,130 @@ mod tests {
         let (width, height, pixels) = read_png_rgb(&output);
         assert_eq!((width, height), (2, 2));
         assert_png_pixel(&pixels, width, 0, 0, [0, 255, 255]);
+    }
+
+    #[test]
+    fn photo_parity_metric_crop_writes_rust_metrics_and_artifacts() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let expected = temp.path().join("expected.png");
+        let current = temp.path().join("current.png");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&expected, false);
+        write_metric_test_png(&current, true);
+        let output = temp.path().join("metric");
+
+        let (code, out, err) = run_capture(&[
+            "photo-parity-metric-crop",
+            source.to_str().unwrap(),
+            expected.to_str().unwrap(),
+            current.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "0",
+            "0",
+            "4",
+            "4",
+            "none",
+            "all",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo parity metric crop written\n"));
+        assert!(out.contains("[current-vs-expected]\n"));
+        assert!(out.contains("meanDeltaE2000="));
+        assert!(output.join("source-crop.png").is_file());
+        assert!(output.join("expected-crop.png").is_file());
+        assert!(output.join("current-surface-crop.png").is_file());
+        assert!(output.join("current-vs-expected-error.png").is_file());
+        assert!(output.join("current-vs-expected-top-errors.csv").is_file());
+        assert!(output
+            .join("current-vs-expected-palette-summary.txt")
+            .is_file());
+        assert!(output.join("candidate-canopy-density-4x4.png").is_file());
+        let metrics = fs::read_to_string(output.join("metrics.txt")).unwrap();
+        assert!(metrics.contains("[candidate-canopy-density-4x4-vs-expected]\n"));
+    }
+
+    #[test]
+    fn photo_compare_crop_writes_metric_report_without_java() {
+        let temp = tempdir().unwrap();
+        let actual = temp.path().join("actual.png");
+        let expected = temp.path().join("expected.png");
+        write_metric_test_png(&actual, true);
+        write_metric_test_png(&expected, false);
+        let output = temp.path().join("compare");
+
+        let (code, out, err) = run_capture(&[
+            "photo-compare-crop",
+            actual.to_str().unwrap(),
+            expected.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "0",
+            "0",
+            "4",
+            "4",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo compare crop written\n"));
+        assert!(out.contains("[actual-vs-expected]\n"));
+        assert!(output.join("actual-crop.png").is_file());
+        assert!(output.join("actual-vs-expected-error.png").is_file());
+        assert!(output.join("actual-vs-expected-top-errors.csv").is_file());
+    }
+
+    #[test]
+    fn photo_parity_metric_batch_runs_multiple_jobs_in_one_rust_call() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source.png");
+        let expected = temp.path().join("expected.png");
+        let current = temp.path().join("current.png");
+        write_metric_test_png(&source, false);
+        write_metric_test_png(&expected, false);
+        write_metric_test_png(&current, true);
+        let jobs = temp.path().join("jobs.csv");
+        fs::write(
+            &jobs,
+            format!(
+                "sample,source,expected,current,cropX,cropY,cropWidth,cropHeight,mask,maskMode\n\
+alpha,{},{},{},0,0,4,4,none,all\n\
+beta,{},{},{},1,1,2,2,none,all\n",
+                source.display(),
+                expected.display(),
+                current.display(),
+                source.display(),
+                expected.display(),
+                current.display()
+            ),
+        )
+        .unwrap();
+        let output_root = temp.path().join("out");
+
+        let (code, out, err) = run_capture(&[
+            "photo-parity-metric-batch",
+            jobs.to_str().unwrap(),
+            output_root.to_str().unwrap(),
+            "2",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Photo parity metric batch written\n"));
+        assert!(out.contains("jobs=2\n"));
+        assert!(out.contains("threads=2\n"));
+        assert!(out.contains("sample,elapsedMillis,pixels,currentVsExpectedMean"));
+        assert!(output_root
+            .join("alpha")
+            .join("metric-land")
+            .join("source-crop.png")
+            .is_file());
+        assert!(output_root
+            .join("beta")
+            .join("metric-land")
+            .join("candidate-canopy-density-4x4.png")
+            .is_file());
     }
 
     #[test]
