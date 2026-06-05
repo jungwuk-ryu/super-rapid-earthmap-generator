@@ -338,6 +338,12 @@ where
         "compare-mca-linear-region-payloads" if args.len() == 3 => write_result(
             compare_mca_linear_region_payloads_cli(stdout, stderr, &args[1], &args[2]),
         ),
+        "convert-mca-region-to-linear" if args.len() == 3 => write_result(
+            convert_mca_region_to_linear(stdout, stderr, &args[1], &args[2]),
+        ),
+        "convert-mca-world-to-linear" if args.len() == 3 => write_result(
+            convert_mca_world_to_linear(stdout, stderr, &args[1], &args[2]),
+        ),
         "inspect-mca-palettes" if args.len() == 2 => write_result(inspect_block_palettes(
             stdout,
             stderr,
@@ -826,6 +832,14 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"
+    )?;
+    writeln!(
+        out,
+        "  convert-mca-region-to-linear <mcaRegion> <linearRegion>"
+    )?;
+    writeln!(
+        out,
+        "  convert-mca-world-to-linear <mcaWorldDir> <linearWorldDir>"
     )?;
     writeln!(out, "  inspect-mca-palettes <path>")?;
     writeln!(out, "  inspect-linear-palettes <path>")?;
@@ -5299,6 +5313,204 @@ fn compare_mca_linear_region_payloads_cli(
     }
 }
 
+fn convert_mca_region_to_linear(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    mca_region: &str,
+    linear_region: &str,
+) -> io::Result<i32> {
+    match convert_mca_region_to_linear_impl(Path::new(mca_region), Path::new(linear_region)) {
+        Ok(report) => {
+            writeln!(out, "MCA region converted to Linear V2")?;
+            writeln!(
+                out,
+                "mcaRegion={}",
+                normalized_path_display(&report.mca_region)
+            )?;
+            writeln!(
+                out,
+                "linearRegion={}",
+                normalized_path_display(&report.linear_region)
+            )?;
+            writeln!(out, "chunkCount={}", report.chunk_count)?;
+            writeln!(out, "linearChunkCount={}", report.linear_chunk_count)?;
+            writeln!(out, "linearFileBytes={}", report.linear_file_bytes)?;
+            Ok(if report.chunk_count == report.linear_chunk_count {
+                EXIT_OK
+            } else {
+                EXIT_USAGE
+            })
+        }
+        Err(error) => {
+            writeln!(err, "MCA to Linear conversion failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn convert_mca_world_to_linear(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    mca_world: &str,
+    linear_world: &str,
+) -> io::Result<i32> {
+    match convert_mca_world_to_linear_impl(Path::new(mca_world), Path::new(linear_world)) {
+        Ok(report) => {
+            writeln!(out, "MCA world converted to Linear V2")?;
+            writeln!(
+                out,
+                "sourceWorld={}",
+                normalized_path_display(&report.source_world)
+            )?;
+            writeln!(
+                out,
+                "linearWorld={}",
+                normalized_path_display(&report.linear_world)
+            )?;
+            writeln!(out, "regions={}", report.regions)?;
+            writeln!(out, "chunks={}", report.chunks)?;
+            writeln!(
+                out,
+                "regionDir={}",
+                normalized_path_display(&report.region_dir)
+            )?;
+            Ok(if report.regions > 0 {
+                EXIT_OK
+            } else {
+                EXIT_USAGE
+            })
+        }
+        Err(error) => {
+            writeln!(err, "MCA world to Linear conversion failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConvertRegionReport {
+    mca_region: std::path::PathBuf,
+    linear_region: std::path::PathBuf,
+    chunk_count: usize,
+    linear_chunk_count: usize,
+    linear_file_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ConvertWorldReport {
+    source_world: std::path::PathBuf,
+    linear_world: std::path::PathBuf,
+    regions: usize,
+    chunks: usize,
+    region_dir: std::path::PathBuf,
+}
+
+fn convert_mca_region_to_linear_impl(
+    mca_region: &Path,
+    linear_region: &Path,
+) -> std::result::Result<ConvertRegionReport, String> {
+    let payloads = read_region_payloads(mca_region).map_err(|error| error.to_string())?;
+    if payloads.format != RegionFormat::Mca {
+        return Err(format!(
+            "source region must be MCA: {}",
+            mca_region.display()
+        ));
+    }
+    earthmap_region::write_linear_v2_region(linear_region, &payloads.chunks, 0)
+        .map_err(|error| error.to_string())?;
+    let validation =
+        validate_linear_region_file(linear_region).map_err(|error| error.to_string())?;
+    Ok(ConvertRegionReport {
+        mca_region: mca_region.to_path_buf(),
+        linear_region: linear_region.to_path_buf(),
+        chunk_count: payloads.chunks.len(),
+        linear_chunk_count: validation.chunk_count,
+        linear_file_bytes: validation.file_bytes,
+    })
+}
+
+fn convert_mca_world_to_linear_impl(
+    source_world: &Path,
+    linear_world: &Path,
+) -> std::result::Result<ConvertWorldReport, String> {
+    let source_region_dir = source_world.join("region");
+    if !source_region_dir.is_dir() {
+        return Err(format!(
+            "source world has no region directory: {}",
+            source_region_dir.display()
+        ));
+    }
+    let target_region_dir = linear_world.join("region");
+    std::fs::create_dir_all(&target_region_dir).map_err(|error| error.to_string())?;
+    copy_if_regular(
+        &source_world.join("level.dat"),
+        &linear_world.join("level.dat"),
+    )?;
+    copy_if_regular(
+        &source_world.join(SURVIVAL_MANIFEST_FILE_NAME),
+        &linear_world.join(SURVIVAL_MANIFEST_FILE_NAME),
+    )?;
+    copy_if_regular(
+        &source_world.join("earthmap-region-batch.properties"),
+        &linear_world.join("earthmap-region-batch.properties"),
+    )?;
+    copy_if_regular(
+        &source_world.join("earthmap-region-progress.csv"),
+        &linear_world.join("earthmap-region-progress.csv"),
+    )?;
+
+    let mut mca_regions = std::fs::read_dir(&source_region_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mca"))
+        })
+        .collect::<Vec<_>>();
+    mca_regions.sort();
+
+    let mut regions = 0usize;
+    let mut chunks = 0usize;
+    for mca_region in mca_regions {
+        let file_name = mca_region
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("region path has no file name: {}", mca_region.display()))?;
+        let linear_file_name = format!("{}.linear", file_name.trim_end_matches(".mca"));
+        let linear_region = target_region_dir.join(linear_file_name);
+        let report = convert_mca_region_to_linear_impl(&mca_region, &linear_region)?;
+        if report.linear_chunk_count != report.chunk_count {
+            return Err(format!(
+                "converted region chunk count mismatch: {}",
+                linear_region.display()
+            ));
+        }
+        regions += 1;
+        chunks += report.chunk_count;
+    }
+
+    Ok(ConvertWorldReport {
+        source_world: source_world.to_path_buf(),
+        linear_world: linear_world.to_path_buf(),
+        regions,
+        chunks,
+        region_dir: target_region_dir,
+    })
+}
+
+fn copy_if_regular(source: &Path, target: &Path) -> std::result::Result<(), String> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::copy(source, target).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default)]
 struct BlockPaletteScan {
     region_chunk_count: usize,
@@ -7104,6 +7316,12 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.compare-mca-linear-region-payloads - MCA/Linear payload comparator"
         ));
+        assert!(out.contains(
+            "DONE rust.command.convert-mca-region-to-linear - single MCA region to Linear V2 converter"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.convert-mca-world-to-linear - MCA world to Linear V2 converter"
+        ));
         assert!(out.contains("DONE rust.command.inspect-mca-palettes - MCA block palette scanner"));
         assert!(out
             .contains("DONE rust.command.inspect-linear-palettes - Linear block palette scanner"));
@@ -7386,6 +7604,8 @@ mod tests {
         assert!(out.contains("validate-mca-region <path>"));
         assert!(out.contains("validate-linear-region <path>"));
         assert!(out.contains("compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"));
+        assert!(out.contains("convert-mca-region-to-linear <mcaRegion> <linearRegion>"));
+        assert!(out.contains("convert-mca-world-to-linear <mcaWorldDir> <linearWorldDir>"));
         assert!(out.contains("inspect-mca-palettes <path>"));
         assert!(out.contains("inspect-linear-palettes <path>"));
         assert!(out.contains("inspect-mca-biomes <path>"));
@@ -7842,6 +8062,57 @@ mod tests {
         assert!(out.contains("missingInMca=0\n"));
         assert!(out.contains("missingInLinear=0\n"));
         assert!(out.contains("firstMismatch=\n"));
+    }
+
+    #[test]
+    fn convert_mca_region_to_linear_writes_matching_payloads() {
+        let temp = tempdir().unwrap();
+        let mca_world = temp.path().join("flat-mca");
+        generate_flat_test_world_impl(mca_world.to_str().unwrap(), "mca").unwrap();
+        let mca_region = mca_world.join("region").join("r.0.0.mca");
+        let linear_region = temp.path().join("converted").join("r.0.0.linear");
+
+        let (code, out, err) = run_capture(&[
+            "convert-mca-region-to-linear",
+            mca_region.to_str().unwrap(),
+            linear_region.to_str().unwrap(),
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA region converted to Linear V2\n"));
+        assert!(out.contains("chunkCount=1024\n"));
+        assert!(out.contains("linearChunkCount=1024\n"));
+        assert!(linear_region.is_file());
+
+        let comparison = compare_mca_linear_region_payloads(&mca_region, &linear_region).unwrap();
+        assert!(comparison.matches());
+        assert_eq!(comparison.compared_chunks, REGION_CHUNKS_PER_REGION);
+    }
+
+    #[test]
+    fn convert_mca_world_to_linear_copies_metadata_and_regions() {
+        let temp = tempdir().unwrap();
+        let mca_world = temp.path().join("flat-mca");
+        let linear_world = temp.path().join("flat-linear");
+        generate_flat_test_world_impl(mca_world.to_str().unwrap(), "mca").unwrap();
+        fs::write(mca_world.join("earthmap-region-progress.csv"), b"progress").unwrap();
+
+        let (code, out, err) = run_capture(&[
+            "convert-mca-world-to-linear",
+            mca_world.to_str().unwrap(),
+            linear_world.to_str().unwrap(),
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA world converted to Linear V2\n"));
+        assert!(out.contains("regions=1\n"));
+        assert!(out.contains("chunks=1024\n"));
+        assert!(linear_world.join("level.dat").is_file());
+        assert!(linear_world.join(SURVIVAL_MANIFEST_FILE_NAME).is_file());
+        assert!(linear_world.join("earthmap-region-progress.csv").is_file());
+        assert!(linear_world.join("region").join("r.0.0.linear").is_file());
     }
 
     #[test]

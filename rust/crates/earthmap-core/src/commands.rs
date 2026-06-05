@@ -85,6 +85,16 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "MCA/Linear payload comparator",
     },
     CommandSpec {
+        name: "convert-mca-region-to-linear",
+        status: CommandStatus::Implemented,
+        note: "single MCA region to Linear V2 converter",
+    },
+    CommandSpec {
+        name: "convert-mca-world-to-linear",
+        status: CommandStatus::Implemented,
+        note: "MCA world to Linear V2 converter",
+    },
+    CommandSpec {
         name: "inspect-mca-palettes",
         status: CommandStatus::Implemented,
         note: "MCA block palette scanner",

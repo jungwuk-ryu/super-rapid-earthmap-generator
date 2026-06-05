@@ -266,13 +266,13 @@ Covered Linear commands:
 - [ ] `repair-linear-sandlike-surfaces`
 Covered cross-format commands:
 - [x] `compare-mca-linear-region-payloads`
-- [ ] `convert-mca-region-to-linear`
-- [ ] `convert-mca-world-to-linear`
+- [x] `convert-mca-region-to-linear`
+- [x] `convert-mca-world-to-linear`
 Detailed progress:
 - [x] Validation checks structural format invariants instead of byte-by-byte Java parity.
 - [x] Inspectors emit stable CSV/text fields for scripts.
 - [ ] Repair tools are bounded to explicit target paths and never rewrite unrelated regions.
-- [ ] Converter preserves Minecraft-loadable chunk payloads and metadata required by the target format.
+- [x] Converter preserves Minecraft-loadable chunk payloads and metadata required by the target format.
 
 ### PowerShell quality wrappers switched from Java to Rust
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
