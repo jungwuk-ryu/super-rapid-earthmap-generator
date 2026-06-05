@@ -110,12 +110,12 @@ pub const SHELL_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "doctor",
         status: CommandStatus::ImplementedShellOnly,
-        note: "print Rust-port runtime assumptions",
+        note: "print Rust runtime assumptions",
     },
     CommandSpec {
         name: "capabilities",
         status: CommandStatus::ImplementedShellOnly,
-        note: "print Rust-port capability status",
+        note: "print Rust runtime capability status",
     },
     CommandSpec {
         name: "inspect-heightmap",

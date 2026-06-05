@@ -594,7 +594,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out)?;
     writeln!(
         out,
-        "Status: Rust port active prototype. Java remains the oracle and fallback; see docs/RUST-PORT-PLAN.md."
+        "Status: Rust runtime active prototype. Java remains the compatibility oracle and fallback."
     )?;
     writeln!(out)?;
     writeln!(out, "Commands:")?;
@@ -602,9 +602,12 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out, "  --version       Show version and targets.")?;
     writeln!(
         out,
-        "  doctor          Check local Rust-port runtime assumptions."
+        "  doctor          Check local Rust runtime assumptions."
     )?;
-    writeln!(out, "  capabilities    Show Rust-port capability status.")?;
+    writeln!(
+        out,
+        "  capabilities    Show Rust runtime capability status."
+    )?;
     writeln!(out, "  write-sha256-manifest <root> <outputFile>")?;
     writeln!(
         out,

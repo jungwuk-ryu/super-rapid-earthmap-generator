@@ -16,6 +16,16 @@
 .\scripts\run.ps1 --help
 ```
 
+Rust GUI:
+
+```powershell
+cargo run --manifest-path rust/Cargo.toml -p earthmap-gui --bin earthmap-gui
+cargo run --manifest-path rust/Cargo.toml -p earthmap-gui --bin earthmap-gui -- --cli version
+```
+
+The GUI launches `earthmap-rs` as a separate generator process and reads progress from stdout. Keep preview rendering
+out of the GUI path; generation speed must remain governed by the CLI process.
+
 Fast filtered test:
 
 ```powershell
