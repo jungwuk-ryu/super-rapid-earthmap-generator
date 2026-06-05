@@ -338,6 +338,48 @@ where
         "compare-mca-linear-region-payloads" if args.len() == 3 => write_result(
             compare_mca_linear_region_payloads_cli(stdout, stderr, &args[1], &args[2]),
         ),
+        "inspect-mca-palettes" if args.len() == 2 => write_result(inspect_block_palettes(
+            stdout,
+            stderr,
+            &args[1],
+            "MCA palettes scanned",
+            "MCA palette inspection failed",
+        )),
+        "inspect-linear-palettes" if args.len() == 2 => write_result(inspect_block_palettes(
+            stdout,
+            stderr,
+            &args[1],
+            "Linear palettes scanned",
+            "Linear palette inspection failed",
+        )),
+        "inspect-mca-biomes" if args.len() == 2 => write_result(inspect_biomes(
+            stdout,
+            stderr,
+            &args[1],
+            "MCA biomes scanned",
+            "MCA biome inspection failed",
+        )),
+        "inspect-linear-biomes" if args.len() == 2 => write_result(inspect_biomes(
+            stdout,
+            stderr,
+            &args[1],
+            "Linear biomes scanned",
+            "Linear biome inspection failed",
+        )),
+        "inspect-mca-statuses" if args.len() == 2 => write_result(inspect_statuses(
+            stdout,
+            stderr,
+            &args[1],
+            "MCA statuses scanned",
+            "MCA status inspection failed",
+        )),
+        "inspect-linear-statuses" if args.len() == 2 => write_result(inspect_statuses(
+            stdout,
+            stderr,
+            &args[1],
+            "Linear statuses scanned",
+            "Linear status inspection failed",
+        )),
         "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
             stdout, stderr, &args[1], &args[2], &args[3],
         )),
@@ -785,6 +827,12 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         out,
         "  compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"
     )?;
+    writeln!(out, "  inspect-mca-palettes <path>")?;
+    writeln!(out, "  inspect-linear-palettes <path>")?;
+    writeln!(out, "  inspect-mca-biomes <path>")?;
+    writeln!(out, "  inspect-linear-biomes <path>")?;
+    writeln!(out, "  inspect-mca-statuses <path>")?;
+    writeln!(out, "  inspect-linear-statuses <path>")?;
     writeln!(
         out,
         "  summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"
@@ -5251,6 +5299,217 @@ fn compare_mca_linear_region_payloads_cli(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct BlockPaletteScan {
+    region_chunk_count: usize,
+    decoded_chunk_count: usize,
+    decoded_section_count: usize,
+    palette_entry_count: usize,
+    hits: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BiomePaletteScan {
+    region_chunk_count: usize,
+    decoded_chunk_count: usize,
+    decoded_section_count: usize,
+    biome_palette_entry_count: usize,
+    mixed_biome_section_count: usize,
+    hits: BTreeMap<String, usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StatusScan {
+    region_chunk_count: usize,
+    decoded_chunk_count: usize,
+    counts: BTreeMap<String, usize>,
+}
+
+fn inspect_block_palettes(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+    title: &str,
+    error_prefix: &str,
+) -> io::Result<i32> {
+    match scan_block_palettes(region) {
+        Ok(report) => {
+            writeln!(out, "{title}")?;
+            writeln!(out, "regionChunkCount={}", report.region_chunk_count)?;
+            writeln!(out, "decodedChunkCount={}", report.decoded_chunk_count)?;
+            writeln!(out, "decodedSectionCount={}", report.decoded_section_count)?;
+            writeln!(out, "paletteEntryCount={}", report.palette_entry_count)?;
+            for (name, count) in report.hits {
+                writeln!(out, "paletteHits.{name}={count}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "{error_prefix}: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn inspect_biomes(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+    title: &str,
+    error_prefix: &str,
+) -> io::Result<i32> {
+    match scan_biomes(region) {
+        Ok(report) => {
+            writeln!(out, "{title}")?;
+            writeln!(out, "regionChunkCount={}", report.region_chunk_count)?;
+            writeln!(out, "decodedChunkCount={}", report.decoded_chunk_count)?;
+            writeln!(out, "decodedSectionCount={}", report.decoded_section_count)?;
+            writeln!(
+                out,
+                "biomePaletteEntryCount={}",
+                report.biome_palette_entry_count
+            )?;
+            writeln!(
+                out,
+                "mixedBiomeSectionCount={}",
+                report.mixed_biome_section_count
+            )?;
+            for (name, count) in report.hits {
+                writeln!(out, "biomePaletteHits.{name}={count}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "{error_prefix}: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn inspect_statuses(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    region: &str,
+    title: &str,
+    error_prefix: &str,
+) -> io::Result<i32> {
+    match scan_statuses(region) {
+        Ok(report) => {
+            writeln!(out, "{title}")?;
+            writeln!(out, "regionChunkCount={}", report.region_chunk_count)?;
+            writeln!(out, "decodedChunkCount={}", report.decoded_chunk_count)?;
+            for (status, count) in report.counts {
+                writeln!(out, "status.{status}={count}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "{error_prefix}: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn scan_block_palettes(region: &str) -> std::result::Result<BlockPaletteScan, String> {
+    let payloads = read_region_payloads(region).map_err(|error| error.to_string())?;
+    let mut report = BlockPaletteScan {
+        region_chunk_count: payloads.chunks.len(),
+        ..BlockPaletteScan::default()
+    };
+    for payload in payloads.chunks.values() {
+        let root = chunk_root(payload)?;
+        report.decoded_chunk_count += 1;
+        let sections = root
+            .get_list("sections")
+            .map_err(|error| error.to_string())?;
+        for section_tag in sections.values() {
+            let Tag::Compound(section) = section_tag else {
+                return Err("chunk section is not an NBT compound".to_string());
+            };
+            if !section.contains("block_states") {
+                continue;
+            }
+            let block_states = section
+                .get_compound("block_states")
+                .map_err(|error| error.to_string())?;
+            if !block_states.contains("palette") {
+                continue;
+            }
+            report.decoded_section_count += 1;
+            for name in block_state_palette_names(block_states)? {
+                *report.hits.entry(name).or_insert(0) += 1;
+                report.palette_entry_count += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn scan_biomes(region: &str) -> std::result::Result<BiomePaletteScan, String> {
+    let payloads = read_region_payloads(region).map_err(|error| error.to_string())?;
+    let mut report = BiomePaletteScan {
+        region_chunk_count: payloads.chunks.len(),
+        ..BiomePaletteScan::default()
+    };
+    for payload in payloads.chunks.values() {
+        let root = chunk_root(payload)?;
+        report.decoded_chunk_count += 1;
+        let sections = root
+            .get_list("sections")
+            .map_err(|error| error.to_string())?;
+        for section_tag in sections.values() {
+            let Tag::Compound(section) = section_tag else {
+                return Err("chunk section is not an NBT compound".to_string());
+            };
+            if !section.contains("biomes") {
+                continue;
+            }
+            let biomes = section
+                .get_compound("biomes")
+                .map_err(|error| error.to_string())?;
+            if !biomes.contains("palette") {
+                continue;
+            }
+            report.decoded_section_count += 1;
+            let palette = biome_palette_names(biomes)?;
+            if palette.len() > 1 {
+                report.mixed_biome_section_count += 1;
+            }
+            for name in palette {
+                *report.hits.entry(name).or_insert(0) += 1;
+                report.biome_palette_entry_count += 1;
+            }
+        }
+    }
+    Ok(report)
+}
+
+fn scan_statuses(region: &str) -> std::result::Result<StatusScan, String> {
+    let payloads = read_region_payloads(region).map_err(|error| error.to_string())?;
+    let mut report = StatusScan {
+        region_chunk_count: payloads.chunks.len(),
+        ..StatusScan::default()
+    };
+    for payload in payloads.chunks.values() {
+        let root = chunk_root(payload)?;
+        report.decoded_chunk_count += 1;
+        let status = root
+            .get_string("Status")
+            .map_err(|error| error.to_string())?
+            .to_string();
+        *report.counts.entry(status).or_insert(0) += 1;
+    }
+    Ok(report)
+}
+
+fn chunk_root(payload: &[u8]) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
+    let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
+    let Tag::Compound(root) = named.into_tag() else {
+        return Err("chunk root is not an NBT compound".to_string());
+    };
+    Ok(root)
+}
+
 fn summarize_region_chunk(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -6845,6 +7104,17 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.compare-mca-linear-region-payloads - MCA/Linear payload comparator"
         ));
+        assert!(out.contains("DONE rust.command.inspect-mca-palettes - MCA block palette scanner"));
+        assert!(out
+            .contains("DONE rust.command.inspect-linear-palettes - Linear block palette scanner"));
+        assert!(out.contains("DONE rust.command.inspect-mca-biomes - MCA biome palette scanner"));
+        assert!(
+            out.contains("DONE rust.command.inspect-linear-biomes - Linear biome palette scanner")
+        );
+        assert!(out.contains("DONE rust.command.inspect-mca-statuses - MCA chunk status scanner"));
+        assert!(
+            out.contains("DONE rust.command.inspect-linear-statuses - Linear chunk status scanner")
+        );
     }
 
     #[test]
@@ -7116,6 +7386,12 @@ mod tests {
         assert!(out.contains("validate-mca-region <path>"));
         assert!(out.contains("validate-linear-region <path>"));
         assert!(out.contains("compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"));
+        assert!(out.contains("inspect-mca-palettes <path>"));
+        assert!(out.contains("inspect-linear-palettes <path>"));
+        assert!(out.contains("inspect-mca-biomes <path>"));
+        assert!(out.contains("inspect-linear-biomes <path>"));
+        assert!(out.contains("inspect-mca-statuses <path>"));
+        assert!(out.contains("inspect-linear-statuses <path>"));
         assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
@@ -7566,6 +7842,72 @@ mod tests {
         assert!(out.contains("missingInMca=0\n"));
         assert!(out.contains("missingInLinear=0\n"));
         assert!(out.contains("firstMismatch=\n"));
+    }
+
+    #[test]
+    fn inspect_mca_region_scanners_report_flat_fixture() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat-mca");
+        generate_flat_test_world_impl(world.to_str().unwrap(), "mca").unwrap();
+        let region = world.join("region").join("r.0.0.mca");
+        let region = region.to_str().unwrap();
+
+        let (code, out, err) = run_capture(&["inspect-mca-palettes", region]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA palettes scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("decodedChunkCount=1024\n"));
+        assert!(out.contains("paletteHits.minecraft:grass_block="));
+
+        let (code, out, err) = run_capture(&["inspect-mca-biomes", region]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA biomes scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("biomePaletteEntryCount="));
+        assert!(out.contains("biomePaletteHits."));
+
+        let (code, out, err) = run_capture(&["inspect-mca-statuses", region]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA statuses scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("decodedChunkCount=1024\n"));
+        assert!(out.contains("status.minecraft:full=1024\n"));
+    }
+
+    #[test]
+    fn inspect_linear_region_scanners_report_flat_fixture() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat-linear");
+        generate_flat_test_world_impl(world.to_str().unwrap(), "linear").unwrap();
+        let region = world.join("region").join("r.0.0.linear");
+        let region = region.to_str().unwrap();
+
+        let (code, out, err) = run_capture(&["inspect-linear-palettes", region]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear palettes scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("decodedChunkCount=1024\n"));
+        assert!(out.contains("paletteHits.minecraft:grass_block="));
+
+        let (code, out, err) = run_capture(&["inspect-linear-biomes", region]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear biomes scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("biomePaletteEntryCount="));
+        assert!(out.contains("biomePaletteHits."));
+
+        let (code, out, err) = run_capture(&["inspect-linear-statuses", region]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Linear statuses scanned\n"));
+        assert!(out.contains("regionChunkCount=1024\n"));
+        assert!(out.contains("decodedChunkCount=1024\n"));
+        assert!(out.contains("status.minecraft:full=1024\n"));
     }
 
     #[test]

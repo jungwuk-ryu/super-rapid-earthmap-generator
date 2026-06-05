@@ -86,22 +86,32 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "inspect-mca-palettes",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "MCA block palette scanner",
     },
     CommandSpec {
         name: "inspect-linear-palettes",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "Linear block palette scanner",
     },
     CommandSpec {
+        name: "inspect-mca-biomes",
+        status: CommandStatus::Implemented,
+        note: "MCA biome palette scanner",
+    },
+    CommandSpec {
+        name: "inspect-linear-biomes",
+        status: CommandStatus::Implemented,
+        note: "Linear biome palette scanner",
+    },
+    CommandSpec {
         name: "inspect-mca-statuses",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "MCA chunk status scanner",
     },
     CommandSpec {
         name: "inspect-linear-statuses",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "Linear chunk status scanner",
     },
 ];

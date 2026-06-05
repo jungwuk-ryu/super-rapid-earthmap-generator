@@ -250,18 +250,18 @@ Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workloa
 Covered MCA commands:
 - [x] `validate-mca-region`
 - [ ] `validate-mca-survival-palette`
-- [ ] `inspect-mca-palettes`
-- [ ] `inspect-mca-biomes`
-- [ ] `inspect-mca-statuses`
+- [x] `inspect-mca-palettes`
+- [x] `inspect-mca-biomes`
+- [x] `inspect-mca-statuses`
 - [ ] `inspect-mca-post-final-integrity`
 - [ ] `repair-mca-post-final-water`
 - [ ] `rewrite-mca-status`
 Covered Linear commands:
 - [x] `validate-linear-region`
 - [ ] `validate-linear-survival-palette`
-- [ ] `inspect-linear-palettes`
-- [ ] `inspect-linear-biomes`
-- [ ] `inspect-linear-statuses`
+- [x] `inspect-linear-palettes`
+- [x] `inspect-linear-biomes`
+- [x] `inspect-linear-statuses`
 - [ ] `inspect-linear-post-final-integrity`
 - [ ] `repair-linear-sandlike-surfaces`
 Covered cross-format commands:
@@ -270,7 +270,7 @@ Covered cross-format commands:
 - [ ] `convert-mca-world-to-linear`
 Detailed progress:
 - [x] Validation checks structural format invariants instead of byte-by-byte Java parity.
-- [ ] Inspectors emit stable CSV/text fields for scripts.
+- [x] Inspectors emit stable CSV/text fields for scripts.
 - [ ] Repair tools are bounded to explicit target paths and never rewrite unrelated regions.
 - [ ] Converter preserves Minecraft-loadable chunk payloads and metadata required by the target format.
 
