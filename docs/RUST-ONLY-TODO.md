@@ -417,18 +417,18 @@ Specs:
 Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-osm --locked` and `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli osm_ --locked` passed.
 
 ### Gameplay and finalization validators
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
+- [x] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust command-contract and crate tests covered; speedup TBD; peak memory TBD; output survival manifest, cave/ore/fluid stdout, global resource fairness report/CSV, loot economy report/CSV; workload synthetic/fixture Linear worlds.
 Covered commands:
-- [ ] `validate-global-resource-fairness`
-- [ ] `validate-loot-economy`
+- [x] `validate-global-resource-fairness`
+- [x] `validate-loot-economy`
 - [x] `validate-survival-manifest`
 - [x] `apply-survival-evidence`
 - [x] `validate-cave-density`
@@ -436,7 +436,7 @@ Covered commands:
 - [x] `validate-ore-histogram-synthetic`
 - [x] `validate-underground-fluid-synthetic`
 Detailed progress:
-- [ ] Validators read generated artifacts directly without Java.
+- [x] Validators read generated artifacts directly without Java.
 - [x] Reports preserve fields consumed by finalization scripts.
 - [ ] Benchmarks focus on validator wall time and peak memory.
 Partial specs:
@@ -445,26 +445,30 @@ Partial specs:
 - `earthmap-rs validate-cave-density <seed> <minBlockX> <minBlockZ> <sizeBlocks>` reports deterministic cave density statistics.
 - `earthmap-rs validate-cave-connectivity <seed> <minBlockX> <minBlockZ> <sizeBlocks>` reports deterministic cave component connectivity statistics.
 - `earthmap-rs validate-ore-histogram-synthetic` and `earthmap-rs validate-underground-fluid-synthetic` run Java-free synthetic gameplay smoke gates.
-Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-gameplay --locked` plus targeted CLI survival/cave/ore/fluid tests passed.
+- `earthmap-rs validate-global-resource-fairness <worldDir> <outputDir>` scans Linear region payloads, writes `earthmap-global-resource-fairness.properties`, and writes `earthmap-global-resource-fairness-missing.csv`.
+- `earthmap-rs validate-loot-economy <worldDir> <outputDir>` scans Linear region payloads for progression evidence, writes `earthmap-loot-economy.properties`, and writes `earthmap-loot-economy-issues.csv`.
+Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-gameplay --locked` plus targeted CLI survival/cave/ore/fluid and gameplay report validator tests passed.
 
 ### Nation-war readiness and finalization reports
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
+- [x] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust command-contract test covered; speedup TBD; peak memory TBD; output readiness properties, faction starts CSV, operator launch markdown; workload synthetic GeoTIFF readiness smoke.
 Covered commands:
-- [ ] `generate-nation-war-readiness-report`
+- [x] `generate-nation-war-readiness-report`
 - [x] `write-vanilla-finalization-commands`
 Detailed progress:
-- [ ] Report schema remains readable by existing acceptance gates or those gates are updated.
+- [x] Report schema remains readable by existing acceptance gates or those gates are updated.
 - [x] Output commands target Rust/vanilla workflows, not Java scripts.
-Spec: `earthmap-rs write-vanilla-finalization-commands <outputCommands> <startRegionX> <startRegionZ> <cols> <rows> [windowChunks] [waitMs]`; writes a force-load/save/remove command file; exits 0 on success and 2 on invalid dimensions or write failure.
-Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli write_vanilla_finalization_commands --locked` passed.
+Specs:
+- `earthmap-rs generate-nation-war-readiness-report <heightmap> <scale> <outputDir> <factionCount> <safeZoneRadiusBlocks> [globalResourceFairnessReport] [lootEconomyReport] [pluginStackReport] [chunkLoadStressReport]` writes readiness properties, faction starts CSV, and operator launch markdown.
+- `earthmap-rs write-vanilla-finalization-commands <outputCommands> <startRegionX> <startRegionZ> <cols> <rows> [windowChunks] [waitMs]`; writes a force-load/save/remove command file; exits 0 on success and 2 on invalid dimensions or write failure.
+Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli nation_war_readiness_report_dispatches_without_java --locked` plus the existing `write_vanilla_finalization_commands` targeted coverage passed.
 
 ### Representative planning, earth-grid, spawn, and seam tools
 - [x] Spec: CLI args, outputs, exit codes, artifact paths documented

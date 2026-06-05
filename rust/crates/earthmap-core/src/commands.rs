@@ -115,6 +115,21 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "synthetic underground fluid validator",
     },
     CommandSpec {
+        name: "validate-global-resource-fairness",
+        status: CommandStatus::Implemented,
+        note: "Linear world global resource fairness validator",
+    },
+    CommandSpec {
+        name: "validate-loot-economy",
+        status: CommandStatus::Implemented,
+        note: "Linear world loot economy validator",
+    },
+    CommandSpec {
+        name: "generate-nation-war-readiness-report",
+        status: CommandStatus::Implemented,
+        note: "nation-war readiness report generator",
+    },
+    CommandSpec {
         name: "scan-osm-pbf",
         status: CommandStatus::Implemented,
         note: "OSM PBF prefix scanner",

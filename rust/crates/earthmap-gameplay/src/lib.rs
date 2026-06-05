@@ -3,7 +3,8 @@
 use earthmap_core::build_info;
 use earthmap_minecraft::block_state_ids;
 use earthmap_minecraft::chunk_model::{ChunkModel, CHUNK_WIDTH};
-use std::collections::{BTreeMap, VecDeque};
+use earthmap_region::{read_region_payloads, RegionFormat, REGION_CHUNKS_PER_REGION};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 pub const MODULE_STATUS: &str = "phase1-rust-gameplay-validators";
@@ -13,6 +14,22 @@ pub const MANIFEST_VERSION: &str = "1";
 pub const CLAIM_EXPLORATION_ONLY: &str = "exploration-only";
 pub const CLAIM_SURVIVAL_CANDIDATE: &str = "survival-candidate";
 pub const CLAIM_SURVIVAL_COMPLETE: &str = "survival-complete";
+pub const GLOBAL_RESOURCE_FAIRNESS_REPORT_FILE_NAME: &str =
+    "earthmap-global-resource-fairness.properties";
+pub const GLOBAL_RESOURCE_FAIRNESS_MISSING_CSV_FILE_NAME: &str =
+    "earthmap-global-resource-fairness-missing.csv";
+pub const LOOT_ECONOMY_REPORT_FILE_NAME: &str = "earthmap-loot-economy.properties";
+pub const LOOT_ECONOMY_ISSUES_CSV_FILE_NAME: &str = "earthmap-loot-economy-issues.csv";
+pub const EVIDENCE_SCHEMA_VERSION: &str = "1";
+pub const STABLE_GENERATED_AT_UTC: &str = "1970-01-01T00:00:00Z";
+
+pub const STRONGHOLD_LOOT_TABLE: &str = "minecraft:chests/stronghold_corridor";
+pub const BLAZE_ENTITY: &str = "minecraft:blaze";
+pub const CHEST_BLOCK_ENTITY: &str = "minecraft:chest";
+pub const SPAWNER_BLOCK_ENTITY: &str = "minecraft:mob_spawner";
+pub const SPAWNER_BLOCK: &str = "minecraft:spawner";
+pub const END_PORTAL_BLOCK: &str = "minecraft:end_portal";
+pub const END_PORTAL_FRAME_BLOCK: &str = "minecraft:end_portal_frame";
 
 const SERVER_CLEAN_MARKER: &str = "Server run completed cleanly.";
 const COMMAND_CLEAN_MARKER: &str = "Server command run completed cleanly.";
@@ -26,6 +43,270 @@ const BAD_SERVER_MARKERS: &[&str] = &[
     "could not load",
     "world files may be corrupted",
 ];
+
+pub fn validate_global_resource_fairness_linear_world(
+    world_dir: &Path,
+    output_dir: &Path,
+) -> Result<GlobalResourceFairnessReport, String> {
+    let start = std::time::Instant::now();
+    let region_files = linear_region_files(world_dir)?;
+    std::fs::create_dir_all(output_dir).map_err(|error| error.to_string())?;
+    let report_path = output_dir.join(GLOBAL_RESOURCE_FAIRNESS_REPORT_FILE_NAME);
+    let missing_csv = output_dir.join(GLOBAL_RESOURCE_FAIRNESS_MISSING_CSV_FILE_NAME);
+    let mut missing_rows = Vec::new();
+    let mut missing_by_ore = critical_ore_zero_counts();
+    let mut scanned_regions = 0usize;
+    let mut complete_regions = 0usize;
+    let mut full_chunk_regions = 0usize;
+    let mut partial_chunk_regions = 0usize;
+    let mut invalid_regions = 0usize;
+    let bitmap_diagnostic_regions = 0usize;
+
+    for region_file in &region_files {
+        scanned_regions += 1;
+        match scan_resource_region(region_file) {
+            Ok(scan) => {
+                if scan.full_payload {
+                    full_chunk_regions += 1;
+                    complete_regions += 1;
+                } else {
+                    partial_chunk_regions += 1;
+                }
+                let missing = missing_critical_ores(&scan.present_names);
+                if !scan.full_payload || !missing.is_empty() {
+                    let status = if scan.full_payload {
+                        "MISSING_ORE"
+                    } else {
+                        "PARTIAL_REGION"
+                    };
+                    for kind in &missing {
+                        *missing_by_ore.entry(*kind).or_default() += 1;
+                    }
+                    missing_rows.push(ResourceMissingRow {
+                        status: status.to_string(),
+                        region_x: scan.region_x,
+                        region_z: scan.region_z,
+                        region_file: region_file.clone(),
+                        missing_critical_ores: missing,
+                        error: String::new(),
+                    });
+                }
+            }
+            Err(error) => {
+                invalid_regions += 1;
+                missing_rows.push(ResourceMissingRow {
+                    status: "INVALID_REGION".to_string(),
+                    region_x: 0,
+                    region_z: 0,
+                    region_file: region_file.clone(),
+                    missing_critical_ores: Vec::new(),
+                    error: sanitize_text(&error),
+                });
+            }
+        }
+    }
+
+    let elapsed_millis = elapsed_millis_u128(start);
+    let regions_missing_critical_ores = missing_rows
+        .iter()
+        .filter(|row| row.status == "MISSING_ORE")
+        .count();
+    let pass = invalid_regions == 0
+        && complete_regions == scanned_regions
+        && regions_missing_critical_ores == 0;
+    write_resource_missing_csv(&missing_csv, &missing_rows)?;
+    write_global_resource_fairness_properties(
+        &report_path,
+        world_dir,
+        scanned_regions,
+        complete_regions,
+        invalid_regions,
+        missing_rows.len(),
+        full_chunk_regions,
+        partial_chunk_regions,
+        bitmap_diagnostic_regions,
+        regions_missing_critical_ores,
+        &missing_by_ore,
+        elapsed_millis,
+        pass,
+    )?;
+    Ok(GlobalResourceFairnessReport {
+        report_path,
+        missing_regions_csv: missing_csv,
+        scanned_regions,
+        complete_regions,
+        full_chunk_regions,
+        partial_chunk_regions,
+        invalid_regions,
+        bitmap_diagnostic_regions,
+        regions_missing_critical_ores,
+        missing_region_counts_by_ore: missing_by_ore,
+        elapsed_millis,
+        pass,
+    })
+}
+
+pub fn validate_loot_economy_linear_world(
+    world_dir: &Path,
+    output_dir: &Path,
+) -> Result<LootEconomyReport, String> {
+    let start = std::time::Instant::now();
+    let region_files = linear_region_files(world_dir)?;
+    std::fs::create_dir_all(output_dir).map_err(|error| error.to_string())?;
+    let report_path = output_dir.join(LOOT_ECONOMY_REPORT_FILE_NAME);
+    let issues_csv = output_dir.join(LOOT_ECONOMY_ISSUES_CSV_FILE_NAME);
+    let mut issue_rows = Vec::new();
+    let mut scanned_regions = 0usize;
+    let mut complete_regions = 0usize;
+    let mut full_chunk_regions = 0usize;
+    let mut partial_chunk_regions = 0usize;
+    let mut invalid_regions = 0usize;
+    let bitmap_diagnostic_regions = 0usize;
+    let mut regions_with_stronghold_loot_chest = 0usize;
+    let mut regions_with_blaze_spawner = 0usize;
+    let mut regions_with_end_portal = 0usize;
+    let mut regions_with_end_portal_frame = 0usize;
+    let mut regions_with_spawner_block = 0usize;
+    let mut regions_with_complete_progression = 0usize;
+    let mut candidate_chunks = 0usize;
+    let mut structured_progression_chunks = 0usize;
+
+    for region_file in &region_files {
+        scanned_regions += 1;
+        match scan_loot_region(region_file) {
+            Ok(scan) => {
+                if scan.full_payload {
+                    full_chunk_regions += 1;
+                    complete_regions += 1;
+                } else {
+                    partial_chunk_regions += 1;
+                }
+                if scan.stronghold_loot_chest {
+                    regions_with_stronghold_loot_chest += 1;
+                }
+                if scan.blaze_spawner {
+                    regions_with_blaze_spawner += 1;
+                }
+                if scan.end_portal {
+                    regions_with_end_portal += 1;
+                }
+                if scan.end_portal_frame {
+                    regions_with_end_portal_frame += 1;
+                }
+                if scan.spawner_block {
+                    regions_with_spawner_block += 1;
+                }
+                if scan.progression_complete() {
+                    regions_with_complete_progression += 1;
+                }
+                candidate_chunks += scan.candidate_chunks;
+                structured_progression_chunks += scan.structured_progression_chunks;
+                let missing = scan.missing_evidence();
+                if !scan.full_payload || !missing.is_empty() {
+                    issue_rows.push(LootIssueRow {
+                        status: if scan.full_payload {
+                            "MISSING_PROGRESSION".to_string()
+                        } else {
+                            "PARTIAL_REGION".to_string()
+                        },
+                        region_x: scan.region_x,
+                        region_z: scan.region_z,
+                        region_file: region_file.clone(),
+                        missing_evidence: missing,
+                        error: String::new(),
+                    });
+                }
+            }
+            Err(error) => {
+                invalid_regions += 1;
+                issue_rows.push(LootIssueRow {
+                    status: "INVALID_REGION".to_string(),
+                    region_x: 0,
+                    region_z: 0,
+                    region_file: region_file.clone(),
+                    missing_evidence: Vec::new(),
+                    error: sanitize_text(&error),
+                });
+            }
+        }
+    }
+
+    let elapsed_millis = elapsed_millis_u128(start);
+    let pass = invalid_regions == 0
+        && complete_regions == scanned_regions
+        && regions_with_complete_progression == scanned_regions
+        && issue_rows.is_empty();
+    write_loot_issues_csv(&issues_csv, &issue_rows)?;
+    write_loot_economy_properties(
+        &report_path,
+        world_dir,
+        scanned_regions,
+        complete_regions,
+        full_chunk_regions,
+        partial_chunk_regions,
+        invalid_regions,
+        bitmap_diagnostic_regions,
+        regions_with_stronghold_loot_chest,
+        regions_with_blaze_spawner,
+        regions_with_end_portal,
+        regions_with_end_portal_frame,
+        regions_with_spawner_block,
+        regions_with_complete_progression,
+        candidate_chunks,
+        structured_progression_chunks,
+        issue_rows.len(),
+        elapsed_millis,
+        pass,
+    )?;
+    Ok(LootEconomyReport {
+        report_path,
+        issues_csv,
+        scanned_regions,
+        complete_regions,
+        full_chunk_regions,
+        partial_chunk_regions,
+        invalid_regions,
+        bitmap_diagnostic_regions,
+        regions_with_stronghold_loot_chest,
+        regions_with_blaze_spawner,
+        regions_with_end_portal,
+        regions_with_end_portal_frame,
+        regions_with_spawner_block,
+        regions_with_complete_progression,
+        candidate_chunks,
+        structured_progression_chunks,
+        issue_regions: issue_rows.len(),
+        elapsed_millis,
+        pass,
+    })
+}
+
+pub fn global_resource_fairness_report_pass(report_path: &Path) -> Result<bool, String> {
+    let properties = load_properties(report_path)?;
+    Ok(
+        properties.get("report.type").map(String::as_str) == Some("global-resource-fairness")
+            && properties.get("feature.pass").map(String::as_str) == Some("true")
+            && evidence_metadata_pass(&properties, "linear-world-global-resource-fairness", true),
+    )
+}
+
+pub fn loot_economy_report_pass(report_path: &Path) -> Result<bool, String> {
+    let properties = load_properties(report_path)?;
+    Ok(
+        properties.get("report.type").map(String::as_str) == Some("loot-economy")
+            && properties.get("feature.pass").map(String::as_str) == Some("true")
+            && evidence_metadata_pass(&properties, "linear-world-loot-economy", true),
+    )
+}
+
+pub fn evidence_report_pass(report_path: &Path, expected_type: &str) -> Result<bool, String> {
+    let properties = load_properties(report_path)?;
+    Ok(
+        properties.get("report.type").map(String::as_str) == Some(expected_type)
+            && properties.get("feature.pass").map(String::as_str) == Some("true")
+            && evidence_metadata_pass(&properties, "", false),
+    )
+}
 
 pub const REQUIRED_BOOLEAN_KEYS: &[&str] = &[
     "evidence.serverBootSaveReboot",
@@ -272,6 +553,480 @@ fn file_name_string(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+fn linear_region_files(world_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let region_dir = world_dir.join("region");
+    if !region_dir.is_dir() {
+        return Err(format!(
+            "missing region directory: {}",
+            region_dir.display()
+        ));
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&region_dir).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("linear"))
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    if files.is_empty() {
+        return Err(format!(
+            "no Linear region files found in {}",
+            region_dir.display()
+        ));
+    }
+    Ok(files)
+}
+
+fn scan_resource_region(path: &Path) -> Result<ResourceRegionScan, String> {
+    let payloads = read_region_payloads(path).map_err(|error| error.to_string())?;
+    if payloads.format != RegionFormat::Linear {
+        return Err(format!("not a Linear region: {}", path.display()));
+    }
+    let mut present_names = BTreeSet::new();
+    for payload in payloads.chunks.values() {
+        for kind in OreKind::ALL {
+            if !kind.survival_critical() {
+                continue;
+            }
+            let stone = stone_ore_name(kind);
+            let deepslate = deepslate_ore_name(kind);
+            if payload_contains_nbt_string(payload, &stone) {
+                present_names.insert(stone);
+            }
+            if payload_contains_nbt_string(payload, &deepslate) {
+                present_names.insert(deepslate);
+            }
+        }
+    }
+    Ok(ResourceRegionScan {
+        region_x: payloads.region_x,
+        region_z: payloads.region_z,
+        full_payload: payloads.chunks.len() == REGION_CHUNKS_PER_REGION,
+        present_names,
+    })
+}
+
+fn scan_loot_region(path: &Path) -> Result<LootRegionScan, String> {
+    let payloads = read_region_payloads(path).map_err(|error| error.to_string())?;
+    if payloads.format != RegionFormat::Linear {
+        return Err(format!("not a Linear region: {}", path.display()));
+    }
+    let mut scan = LootRegionScan {
+        region_x: payloads.region_x,
+        region_z: payloads.region_z,
+        full_payload: payloads.chunks.len() == REGION_CHUNKS_PER_REGION,
+        stronghold_loot_chest: false,
+        blaze_spawner: false,
+        end_portal: false,
+        end_portal_frame: false,
+        spawner_block: false,
+        candidate_chunks: 0,
+        structured_progression_chunks: 0,
+    };
+    for payload in payloads.chunks.values() {
+        let stronghold_loot_chest = payload_contains_nbt_string(payload, CHEST_BLOCK_ENTITY)
+            && payload_contains_nbt_string(payload, STRONGHOLD_LOOT_TABLE);
+        let blaze_spawner = payload_contains_nbt_string(payload, SPAWNER_BLOCK_ENTITY)
+            && payload_contains_nbt_string(payload, BLAZE_ENTITY);
+        let end_portal = payload_contains_nbt_string(payload, END_PORTAL_BLOCK);
+        let end_portal_frame = payload_contains_nbt_string(payload, END_PORTAL_FRAME_BLOCK);
+        let spawner_block = payload_contains_nbt_string(payload, SPAWNER_BLOCK);
+        if stronghold_loot_chest {
+            scan.candidate_chunks += 1;
+        }
+        if stronghold_loot_chest || blaze_spawner || end_portal || end_portal_frame || spawner_block
+        {
+            scan.structured_progression_chunks += 1;
+        }
+        scan.stronghold_loot_chest |= stronghold_loot_chest;
+        scan.blaze_spawner |= blaze_spawner;
+        scan.end_portal |= end_portal;
+        scan.end_portal_frame |= end_portal_frame;
+        scan.spawner_block |= spawner_block;
+    }
+    Ok(scan)
+}
+
+fn missing_critical_ores(present_names: &BTreeSet<String>) -> Vec<OreKind> {
+    OreKind::ALL
+        .into_iter()
+        .filter(|kind| {
+            kind.survival_critical()
+                && !present_names.contains(&stone_ore_name(*kind))
+                && !present_names.contains(&deepslate_ore_name(*kind))
+        })
+        .collect()
+}
+
+fn critical_ore_zero_counts() -> BTreeMap<OreKind, usize> {
+    OreKind::ALL
+        .into_iter()
+        .filter(|kind| kind.survival_critical())
+        .map(|kind| (kind, 0))
+        .collect()
+}
+
+fn stone_ore_name(kind: OreKind) -> String {
+    format!("minecraft:{}_ore", kind.id())
+}
+
+fn deepslate_ore_name(kind: OreKind) -> String {
+    format!("minecraft:deepslate_{}_ore", kind.id())
+}
+
+fn payload_contains_nbt_string(payload: &[u8], value: &str) -> bool {
+    if value.len() > u16::MAX as usize {
+        return false;
+    }
+    let mut needle = Vec::with_capacity(value.len() + 2);
+    needle.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    needle.extend_from_slice(value.as_bytes());
+    contains_bytes(payload, &needle)
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && needle.len() <= haystack.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn write_resource_missing_csv(path: &Path, rows: &[ResourceMissingRow]) -> Result<(), String> {
+    let mut text = "status,regionX,regionZ,regionFile,missingCriticalOres,error\n".to_string();
+    for row in rows {
+        text.push_str(&row.status);
+        text.push(',');
+        text.push_str(&row.region_x.to_string());
+        text.push(',');
+        text.push_str(&row.region_z.to_string());
+        text.push(',');
+        text.push_str(&csv_escape(&row.region_file.display().to_string()));
+        text.push(',');
+        text.push_str(&csv_escape(&missing_ore_text(&row.missing_critical_ores)));
+        text.push(',');
+        text.push_str(&csv_escape(&row.error));
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+fn write_loot_issues_csv(path: &Path, rows: &[LootIssueRow]) -> Result<(), String> {
+    let mut text = "status,regionX,regionZ,regionFile,missingEvidence,error\n".to_string();
+    for row in rows {
+        text.push_str(&row.status);
+        text.push(',');
+        text.push_str(&row.region_x.to_string());
+        text.push(',');
+        text.push_str(&row.region_z.to_string());
+        text.push(',');
+        text.push_str(&csv_escape(&row.region_file.display().to_string()));
+        text.push(',');
+        text.push_str(&csv_escape(&row.missing_evidence.join("|")));
+        text.push(',');
+        text.push_str(&csv_escape(&row.error));
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_global_resource_fairness_properties(
+    report_path: &Path,
+    world_dir: &Path,
+    scanned_regions: usize,
+    complete_regions: usize,
+    invalid_regions: usize,
+    issue_regions: usize,
+    full_chunk_regions: usize,
+    partial_chunk_regions: usize,
+    bitmap_diagnostic_regions: usize,
+    regions_missing_critical_ores: usize,
+    missing_by_ore: &BTreeMap<OreKind, usize>,
+    elapsed_millis: u128,
+    pass: bool,
+) -> Result<(), String> {
+    let mut values = evidence_properties(
+        "global-resource-fairness",
+        "linear-world-global-resource-fairness",
+        world_dir,
+    );
+    values.insert("region.sizeBlocks".to_string(), "512".to_string());
+    values.insert(
+        "region.fullRegionChunks".to_string(),
+        REGION_CHUNKS_PER_REGION.to_string(),
+    );
+    values.insert("regions.scanned".to_string(), scanned_regions.to_string());
+    values.insert("regions.complete".to_string(), complete_regions.to_string());
+    values.insert(
+        "regions.completeDefinition".to_string(),
+        "linear-payload-count-1024".to_string(),
+    );
+    values.insert(
+        "regions.fullChunkRegions".to_string(),
+        full_chunk_regions.to_string(),
+    );
+    values.insert(
+        "regions.partialChunkRegions".to_string(),
+        partial_chunk_regions.to_string(),
+    );
+    values.insert("regions.invalid".to_string(), invalid_regions.to_string());
+    values.insert(
+        "regions.bitmapDiagnostics".to_string(),
+        bitmap_diagnostic_regions.to_string(),
+    );
+    values.insert(
+        "regions.missingCriticalOres".to_string(),
+        regions_missing_critical_ores.to_string(),
+    );
+    values.insert(
+        "regions.withAnyIssue".to_string(),
+        issue_regions.to_string(),
+    );
+    values.insert(
+        "missingRegionsCsv".to_string(),
+        GLOBAL_RESOURCE_FAIRNESS_MISSING_CSV_FILE_NAME.to_string(),
+    );
+    for kind in OreKind::ALL {
+        if kind.survival_critical() {
+            values.insert(
+                format!("ore.{}.missingRegionCount", kind.id()),
+                missing_by_ore.get(&kind).copied().unwrap_or(0).to_string(),
+            );
+        }
+    }
+    values.insert("elapsedMillis".to_string(), elapsed_millis.to_string());
+    values.insert("feature.pass".to_string(), pass.to_string());
+    write_properties(
+        report_path,
+        &values,
+        "SR EarthMap global resource fairness report",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_loot_economy_properties(
+    report_path: &Path,
+    world_dir: &Path,
+    scanned_regions: usize,
+    complete_regions: usize,
+    full_chunk_regions: usize,
+    partial_chunk_regions: usize,
+    invalid_regions: usize,
+    bitmap_diagnostic_regions: usize,
+    regions_with_stronghold_loot_chest: usize,
+    regions_with_blaze_spawner: usize,
+    regions_with_end_portal: usize,
+    regions_with_end_portal_frame: usize,
+    regions_with_spawner_block: usize,
+    regions_with_complete_progression: usize,
+    candidate_chunks: usize,
+    structured_progression_chunks: usize,
+    issue_regions: usize,
+    elapsed_millis: u128,
+    pass: bool,
+) -> Result<(), String> {
+    let mut values = evidence_properties("loot-economy", "linear-world-loot-economy", world_dir);
+    values.insert("region.sizeBlocks".to_string(), "512".to_string());
+    values.insert(
+        "region.fullRegionChunks".to_string(),
+        REGION_CHUNKS_PER_REGION.to_string(),
+    );
+    values.insert("regions.scanned".to_string(), scanned_regions.to_string());
+    values.insert("regions.complete".to_string(), complete_regions.to_string());
+    values.insert(
+        "regions.completeDefinition".to_string(),
+        "linear-payload-and-bitmap-count-1024".to_string(),
+    );
+    values.insert(
+        "regions.fullChunkRegions".to_string(),
+        full_chunk_regions.to_string(),
+    );
+    values.insert(
+        "regions.partialChunkRegions".to_string(),
+        partial_chunk_regions.to_string(),
+    );
+    values.insert("regions.invalid".to_string(), invalid_regions.to_string());
+    values.insert(
+        "regions.bitmapDiagnostics".to_string(),
+        bitmap_diagnostic_regions.to_string(),
+    );
+    values.insert(
+        "regions.withStrongholdLootChest".to_string(),
+        regions_with_stronghold_loot_chest.to_string(),
+    );
+    values.insert(
+        "regions.withBlazeSpawner".to_string(),
+        regions_with_blaze_spawner.to_string(),
+    );
+    values.insert(
+        "regions.withEndPortal".to_string(),
+        regions_with_end_portal.to_string(),
+    );
+    values.insert(
+        "regions.withEndPortalFrame".to_string(),
+        regions_with_end_portal_frame.to_string(),
+    );
+    values.insert(
+        "regions.withSpawnerBlock".to_string(),
+        regions_with_spawner_block.to_string(),
+    );
+    values.insert(
+        "regions.withCompleteProgression".to_string(),
+        regions_with_complete_progression.to_string(),
+    );
+    values.insert(
+        "regions.withAnyIssue".to_string(),
+        issue_regions.to_string(),
+    );
+    values.insert(
+        "chunks.candidateProgression".to_string(),
+        candidate_chunks.to_string(),
+    );
+    values.insert(
+        "chunks.structuredProgression".to_string(),
+        structured_progression_chunks.to_string(),
+    );
+    values.insert(
+        "loot.requiredTable".to_string(),
+        STRONGHOLD_LOOT_TABLE.to_string(),
+    );
+    values.insert(
+        "loot.requiredChestBlockEntity".to_string(),
+        CHEST_BLOCK_ENTITY.to_string(),
+    );
+    values.insert(
+        "spawner.requiredBlockEntity".to_string(),
+        SPAWNER_BLOCK_ENTITY.to_string(),
+    );
+    values.insert(
+        "spawner.requiredEntity".to_string(),
+        BLAZE_ENTITY.to_string(),
+    );
+    values.insert(
+        "progression.requiredEndPortalBlock".to_string(),
+        END_PORTAL_BLOCK.to_string(),
+    );
+    values.insert(
+        "progression.requiredEndPortalFrameBlock".to_string(),
+        END_PORTAL_FRAME_BLOCK.to_string(),
+    );
+    values.insert(
+        "issuesCsv".to_string(),
+        LOOT_ECONOMY_ISSUES_CSV_FILE_NAME.to_string(),
+    );
+    values.insert("elapsedMillis".to_string(), elapsed_millis.to_string());
+    values.insert("feature.pass".to_string(), pass.to_string());
+    write_properties(report_path, &values, "SR EarthMap loot economy report")
+}
+
+fn evidence_properties(
+    report_type: &str,
+    evidence_scope: &str,
+    world_dir: &Path,
+) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    values.insert("report.type".to_string(), report_type.to_string());
+    values.insert(
+        "evidence.schemaVersion".to_string(),
+        EVIDENCE_SCHEMA_VERSION.to_string(),
+    );
+    values.insert(
+        "generatedAtUtc".to_string(),
+        STABLE_GENERATED_AT_UTC.to_string(),
+    );
+    values.insert("evidence.scope".to_string(), evidence_scope.to_string());
+    values.insert(
+        "minecraft.version".to_string(),
+        build_info::MINECRAFT_TARGET.to_string(),
+    );
+    values.insert("worldDir".to_string(), normalized_path_display(world_dir));
+    values
+}
+
+fn evidence_metadata_pass(
+    properties: &BTreeMap<String, String>,
+    expected_scope: &str,
+    require_expected_scope: bool,
+) -> bool {
+    if properties.get("minecraft.version").map(String::as_str) != Some(build_info::MINECRAFT_TARGET)
+    {
+        return false;
+    }
+    if properties.get("evidence.schemaVersion").map(String::as_str) != Some(EVIDENCE_SCHEMA_VERSION)
+    {
+        return false;
+    }
+    if !parseable_instant(properties.get("generatedAtUtc").map(String::as_str)) {
+        return false;
+    }
+    let scope = properties
+        .get("evidence.scope")
+        .map(|value| value.trim())
+        .unwrap_or_default();
+    if require_expected_scope {
+        if scope != expected_scope {
+            return false;
+        }
+    } else if scope.is_empty() {
+        return false;
+    }
+    let world_dir = properties
+        .get("worldDir")
+        .map(|value| value.trim())
+        .unwrap_or_default();
+    !world_dir.is_empty() && Path::new(world_dir).is_dir()
+}
+
+fn parseable_instant(value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let value = value.trim();
+    value.len() >= "1970-01-01T00:00:00Z".len()
+        && value.contains('T')
+        && (value.ends_with('Z') || value.contains('+'))
+}
+
+fn normalized_path_display(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn missing_ore_text(missing: &[OreKind]) -> String {
+    missing
+        .iter()
+        .map(|kind| kind.id())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn csv_escape(value: &str) -> String {
+    let quote =
+        value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r');
+    let escaped = value.replace('"', "\"\"");
+    if quote {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+
+fn sanitize_text(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
+}
+
+fn elapsed_millis_u128(start: std::time::Instant) -> u128 {
+    start.elapsed().as_millis()
 }
 
 pub fn validate_cave_density(
@@ -874,6 +1629,118 @@ struct CaveComponent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlobalResourceFairnessReport {
+    pub report_path: PathBuf,
+    pub missing_regions_csv: PathBuf,
+    pub scanned_regions: usize,
+    pub complete_regions: usize,
+    pub full_chunk_regions: usize,
+    pub partial_chunk_regions: usize,
+    pub invalid_regions: usize,
+    pub bitmap_diagnostic_regions: usize,
+    pub regions_missing_critical_ores: usize,
+    pub missing_region_counts_by_ore: BTreeMap<OreKind, usize>,
+    pub elapsed_millis: u128,
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LootEconomyReport {
+    pub report_path: PathBuf,
+    pub issues_csv: PathBuf,
+    pub scanned_regions: usize,
+    pub complete_regions: usize,
+    pub full_chunk_regions: usize,
+    pub partial_chunk_regions: usize,
+    pub invalid_regions: usize,
+    pub bitmap_diagnostic_regions: usize,
+    pub regions_with_stronghold_loot_chest: usize,
+    pub regions_with_blaze_spawner: usize,
+    pub regions_with_end_portal: usize,
+    pub regions_with_end_portal_frame: usize,
+    pub regions_with_spawner_block: usize,
+    pub regions_with_complete_progression: usize,
+    pub candidate_chunks: usize,
+    pub structured_progression_chunks: usize,
+    pub issue_regions: usize,
+    pub elapsed_millis: u128,
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResourceRegionScan {
+    region_x: i32,
+    region_z: i32,
+    full_payload: bool,
+    present_names: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResourceMissingRow {
+    status: String,
+    region_x: i32,
+    region_z: i32,
+    region_file: PathBuf,
+    missing_critical_ores: Vec<OreKind>,
+    error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LootRegionScan {
+    region_x: i32,
+    region_z: i32,
+    full_payload: bool,
+    stronghold_loot_chest: bool,
+    blaze_spawner: bool,
+    end_portal: bool,
+    end_portal_frame: bool,
+    spawner_block: bool,
+    candidate_chunks: usize,
+    structured_progression_chunks: usize,
+}
+
+impl LootRegionScan {
+    fn progression_complete(&self) -> bool {
+        self.full_payload
+            && self.stronghold_loot_chest
+            && self.blaze_spawner
+            && self.end_portal
+            && self.end_portal_frame
+            && self.spawner_block
+    }
+
+    fn missing_evidence(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        if !self.stronghold_loot_chest {
+            missing.push("stronghold_loot_chest".to_string());
+        }
+        if !self.blaze_spawner {
+            missing.push("blaze_spawner_block_entity".to_string());
+        }
+        if !self.end_portal {
+            missing.push("end_portal_block".to_string());
+        }
+        if !self.end_portal_frame {
+            missing.push("end_portal_frame_block".to_string());
+        }
+        if !self.spawner_block {
+            missing.push("spawner_block".to_string());
+        }
+        missing
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LootIssueRow {
+    status: String,
+    region_x: i32,
+    region_z: i32,
+    region_file: PathBuf,
+    missing_evidence: Vec<String>,
+    error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SurvivalGateReport {
     pub manifest_valid: bool,
     pub survival_complete_allowed: bool,
@@ -1059,6 +1926,8 @@ fn floor_mod_i64(value: i64, modulus: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use earthmap_minecraft::{chunk_nbt_encoder, nbt};
+    use earthmap_region::{write_linear_v2_region, ChunkLocalPos};
     use tempfile::tempdir;
 
     #[test]
@@ -1188,5 +2057,173 @@ mod tests {
             natural_opening_column(42, 181, 362)
         );
         assert_eq!(carve_candidate(42, 0, MIN_CAVE_Y - 1, 0), false);
+    }
+
+    #[test]
+    fn global_resource_fairness_validates_complete_and_partial_linear_worlds() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("resource-world");
+        let region = world.join("region").join("r.0.0.linear");
+        std::fs::create_dir_all(region.parent().unwrap()).unwrap();
+        write_complete_linear_region(&region, resource_payload());
+
+        let output = temp.path().join("resource-report");
+        let report = validate_global_resource_fairness_linear_world(&world, &output).unwrap();
+
+        assert!(report.pass);
+        assert_eq!(report.scanned_regions, 1);
+        assert_eq!(report.complete_regions, 1);
+        assert_eq!(report.full_chunk_regions, 1);
+        assert_eq!(report.partial_chunk_regions, 0);
+        assert_eq!(report.regions_missing_critical_ores, 0);
+        assert!(global_resource_fairness_report_pass(&report.report_path).unwrap());
+        assert!(std::fs::read_to_string(&report.missing_regions_csv)
+            .unwrap()
+            .starts_with("status,regionX,regionZ,regionFile,missingCriticalOres,error\n"));
+
+        let partial_world = temp.path().join("partial-resource-world");
+        let partial_region = partial_world.join("region").join("r.1.1.linear");
+        std::fs::create_dir_all(partial_region.parent().unwrap()).unwrap();
+        write_single_chunk_linear_region(&partial_region, resource_payload());
+        let partial = validate_global_resource_fairness_linear_world(
+            &partial_world,
+            &temp.path().join("partial-resource-report"),
+        )
+        .unwrap();
+        assert!(!partial.pass);
+        assert_eq!(partial.complete_regions, 0);
+        assert_eq!(partial.partial_chunk_regions, 1);
+    }
+
+    #[test]
+    fn loot_economy_validates_complete_and_missing_linear_worlds() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("loot-world");
+        let region = world.join("region").join("r.0.0.linear");
+        std::fs::create_dir_all(region.parent().unwrap()).unwrap();
+        write_complete_linear_region(&region, progression_payload());
+
+        let output = temp.path().join("loot-report");
+        let report = validate_loot_economy_linear_world(&world, &output).unwrap();
+
+        assert!(report.pass);
+        assert_eq!(report.scanned_regions, 1);
+        assert_eq!(report.complete_regions, 1);
+        assert_eq!(report.regions_with_complete_progression, 1);
+        assert_eq!(report.issue_regions, 0);
+        assert!(loot_economy_report_pass(&report.report_path).unwrap());
+        assert!(std::fs::read_to_string(&report.issues_csv)
+            .unwrap()
+            .starts_with("status,regionX,regionZ,regionFile,missingEvidence,error\n"));
+
+        let missing_world = temp.path().join("missing-loot-world");
+        let missing_region = missing_world.join("region").join("r.1.1.linear");
+        std::fs::create_dir_all(missing_region.parent().unwrap()).unwrap();
+        write_single_chunk_linear_region(&missing_region, empty_payload());
+        let missing = validate_loot_economy_linear_world(
+            &missing_world,
+            &temp.path().join("missing-loot-report"),
+        )
+        .unwrap();
+        assert!(!missing.pass);
+        assert_eq!(missing.partial_chunk_regions, 1);
+        assert_eq!(missing.issue_regions, 1);
+    }
+
+    fn write_complete_linear_region(path: &Path, payload: Vec<u8>) {
+        let mut chunks = BTreeMap::new();
+        for z in 0..32u8 {
+            for x in 0..32u8 {
+                chunks.insert(ChunkLocalPos::new(x, z).unwrap(), payload.clone());
+            }
+        }
+        write_linear_v2_region(path, &chunks, 0).unwrap();
+    }
+
+    fn write_single_chunk_linear_region(path: &Path, payload: Vec<u8>) {
+        let mut chunks = BTreeMap::new();
+        chunks.insert(ChunkLocalPos::new(0, 0).unwrap(), payload);
+        write_linear_v2_region(path, &chunks, 0).unwrap();
+    }
+
+    fn resource_payload() -> Vec<u8> {
+        let mut chunk = ChunkModel::overworld(0, 0);
+        for (index, kind) in OreKind::ALL
+            .into_iter()
+            .filter(|kind| kind.survival_critical())
+            .enumerate()
+        {
+            chunk
+                .set_block_state_id(index as i32, -54, 0, kind.deepslate_block_state_id())
+                .unwrap();
+        }
+        chunk_nbt_encoder::encode_to_bytes(&chunk, 0).unwrap()
+    }
+
+    fn progression_payload() -> Vec<u8> {
+        let mut chest = nbt::compound();
+        chest.put_string("id", CHEST_BLOCK_ENTITY).unwrap();
+        chest
+            .put_string("LootTable", STRONGHOLD_LOOT_TABLE)
+            .unwrap();
+        let mut spawn_entity = nbt::compound();
+        spawn_entity.put_string("id", BLAZE_ENTITY).unwrap();
+        let mut spawn_data = nbt::compound();
+        spawn_data.put_compound("entity", spawn_entity).unwrap();
+        let mut spawner = nbt::compound();
+        spawner.put_string("id", SPAWNER_BLOCK_ENTITY).unwrap();
+        spawner.put_compound("SpawnData", spawn_data).unwrap();
+
+        let mut end_portal = nbt::compound();
+        end_portal.put_string("Name", END_PORTAL_BLOCK).unwrap();
+        let mut end_portal_frame = nbt::compound();
+        end_portal_frame
+            .put_string("Name", END_PORTAL_FRAME_BLOCK)
+            .unwrap();
+        let mut spawner_block = nbt::compound();
+        spawner_block.put_string("Name", SPAWNER_BLOCK).unwrap();
+        let palette = nbt::list(
+            nbt::TAG_COMPOUND,
+            vec![
+                nbt::Tag::Compound(end_portal),
+                nbt::Tag::Compound(end_portal_frame),
+                nbt::Tag::Compound(spawner_block),
+            ],
+        )
+        .unwrap();
+        let mut block_states = nbt::compound();
+        block_states
+            .put("palette", nbt::Tag::List(palette))
+            .unwrap();
+        let mut section = nbt::compound();
+        section.put_compound("block_states", block_states).unwrap();
+
+        let mut root = nbt::compound();
+        root.put_int("xPos", 0).unwrap();
+        root.put_int("zPos", 0).unwrap();
+        root.put(
+            "block_entities",
+            nbt::Tag::List(
+                nbt::list(
+                    nbt::TAG_COMPOUND,
+                    vec![nbt::Tag::Compound(chest), nbt::Tag::Compound(spawner)],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        root.put(
+            "sections",
+            nbt::Tag::List(
+                nbt::list(nbt::TAG_COMPOUND, vec![nbt::Tag::Compound(section)]).unwrap(),
+            ),
+        )
+        .unwrap();
+        nbt::write_to_bytes("", &root).unwrap()
+    }
+
+    fn empty_payload() -> Vec<u8> {
+        let chunk = ChunkModel::overworld(0, 0);
+        chunk_nbt_encoder::encode_to_bytes(&chunk, 0).unwrap()
     }
 }

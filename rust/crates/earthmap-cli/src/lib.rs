@@ -543,6 +543,27 @@ where
         "validate-underground-fluid-synthetic" if args.len() == 1 => {
             write_result(validate_underground_fluid_synthetic(stdout, stderr))
         }
+        "validate-global-resource-fairness" if args.len() == 3 => write_result(
+            validate_global_resource_fairness(stdout, stderr, &args[1], &args[2]),
+        ),
+        "validate-loot-economy" if args.len() == 3 => {
+            write_result(validate_loot_economy(stdout, stderr, &args[1], &args[2]))
+        }
+        "generate-nation-war-readiness-report" if (6..=10).contains(&args.len()) => {
+            write_result(generate_nation_war_readiness_report(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                &args[3],
+                &args[4],
+                &args[5],
+                args.get(6).map(String::as_str),
+                args.get(7).map(String::as_str),
+                args.get(8).map(String::as_str),
+                args.get(9).map(String::as_str),
+            ))
+        }
         "scan-osm-pbf" if args.len() == 3 => {
             write_result(scan_osm_pbf(stdout, stderr, &args[1], &args[2]))
         }
@@ -2794,6 +2815,15 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(out, "  validate-ore-histogram-synthetic")?;
     writeln!(out, "  validate-underground-fluid-synthetic")?;
+    writeln!(
+        out,
+        "  validate-global-resource-fairness <worldDir> <outputDir>"
+    )?;
+    writeln!(out, "  validate-loot-economy <worldDir> <outputDir>")?;
+    writeln!(
+        out,
+        "  generate-nation-war-readiness-report <heightmap> <scale> <outputDir> <factionCount> <safeZoneRadiusBlocks> [globalResourceFairnessReport] [lootEconomyReport] [pluginStackReport] [chunkLoadStressReport]"
+    )?;
     writeln!(out, "  scan-osm-pbf <path> <maxBlobs>")?;
     writeln!(out, "  scan-osm-pbf-range <path> <skipBlobs> <maxBlobs>")?;
     writeln!(out, "  validate-osm-pbf <path> <maxBlobs>")?;
@@ -4100,6 +4130,950 @@ fn validate_underground_fluid_synthetic(
     }
 }
 
+fn validate_global_resource_fairness(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    world_dir: &str,
+    output_dir: &str,
+) -> io::Result<i32> {
+    match earthmap_gameplay::validate_global_resource_fairness_linear_world(
+        Path::new(world_dir),
+        Path::new(output_dir),
+    ) {
+        Ok(report) => {
+            writeln!(out, "Global resource fairness validated")?;
+            writeln!(out, "reportFile={}", report.report_path.display())?;
+            writeln!(
+                out,
+                "missingRegionsCsv={}",
+                report.missing_regions_csv.display()
+            )?;
+            writeln!(out, "scannedRegions={}", report.scanned_regions)?;
+            writeln!(out, "completeRegions={}", report.complete_regions)?;
+            writeln!(out, "fullChunkRegions={}", report.full_chunk_regions)?;
+            writeln!(out, "partialChunkRegions={}", report.partial_chunk_regions)?;
+            writeln!(out, "invalidRegions={}", report.invalid_regions)?;
+            writeln!(
+                out,
+                "bitmapDiagnosticRegions={}",
+                report.bitmap_diagnostic_regions
+            )?;
+            writeln!(
+                out,
+                "regionsMissingCriticalOres={}",
+                report.regions_missing_critical_ores
+            )?;
+            for (kind, count) in &report.missing_region_counts_by_ore {
+                writeln!(out, "ore.{}.missingRegionCount={}", kind.id(), count)?;
+            }
+            writeln!(out, "elapsedMillis={}", report.elapsed_millis)?;
+            writeln!(out, "resourceFairnessPass={}", report.pass)?;
+            Ok(if report.pass { EXIT_OK } else { EXIT_USAGE })
+        }
+        Err(error) => {
+            writeln!(err, "Global resource fairness validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn validate_loot_economy(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    world_dir: &str,
+    output_dir: &str,
+) -> io::Result<i32> {
+    match earthmap_gameplay::validate_loot_economy_linear_world(
+        Path::new(world_dir),
+        Path::new(output_dir),
+    ) {
+        Ok(report) => {
+            writeln!(out, "Loot economy validated")?;
+            writeln!(out, "reportFile={}", report.report_path.display())?;
+            writeln!(out, "issuesCsv={}", report.issues_csv.display())?;
+            writeln!(out, "scannedRegions={}", report.scanned_regions)?;
+            writeln!(out, "completeRegions={}", report.complete_regions)?;
+            writeln!(out, "fullChunkRegions={}", report.full_chunk_regions)?;
+            writeln!(out, "partialChunkRegions={}", report.partial_chunk_regions)?;
+            writeln!(out, "invalidRegions={}", report.invalid_regions)?;
+            writeln!(
+                out,
+                "bitmapDiagnosticRegions={}",
+                report.bitmap_diagnostic_regions
+            )?;
+            writeln!(
+                out,
+                "regionsWithStrongholdLootChest={}",
+                report.regions_with_stronghold_loot_chest
+            )?;
+            writeln!(
+                out,
+                "regionsWithBlazeSpawner={}",
+                report.regions_with_blaze_spawner
+            )?;
+            writeln!(
+                out,
+                "regionsWithEndPortal={}",
+                report.regions_with_end_portal
+            )?;
+            writeln!(
+                out,
+                "regionsWithEndPortalFrame={}",
+                report.regions_with_end_portal_frame
+            )?;
+            writeln!(
+                out,
+                "regionsWithSpawnerBlock={}",
+                report.regions_with_spawner_block
+            )?;
+            writeln!(
+                out,
+                "regionsWithCompleteProgression={}",
+                report.regions_with_complete_progression
+            )?;
+            writeln!(out, "candidateChunks={}", report.candidate_chunks)?;
+            writeln!(
+                out,
+                "structuredProgressionChunks={}",
+                report.structured_progression_chunks
+            )?;
+            writeln!(out, "issueRegions={}", report.issue_regions)?;
+            writeln!(out, "elapsedMillis={}", report.elapsed_millis)?;
+            writeln!(out, "lootEconomyPass={}", report.pass)?;
+            Ok(if report.pass { EXIT_OK } else { EXIT_USAGE })
+        }
+        Err(error) => {
+            writeln!(err, "Loot economy validation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_nation_war_readiness_report(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    output_dir: &str,
+    faction_count_text: &str,
+    safe_zone_radius_text: &str,
+    global_resource_fairness_report: Option<&str>,
+    loot_economy_report: Option<&str>,
+    plugin_stack_report: Option<&str>,
+    chunk_load_stress_report: Option<&str>,
+) -> io::Result<i32> {
+    match generate_nation_war_readiness_report_impl(
+        heightmap_path,
+        scale_text,
+        output_dir,
+        faction_count_text,
+        safe_zone_radius_text,
+        global_resource_fairness_report,
+        loot_economy_report,
+        plugin_stack_report,
+        chunk_load_stress_report,
+    ) {
+        Ok(report) => {
+            writeln!(out, "Nation-war readiness report generated")?;
+            writeln!(out, "reportFile={}", report.report_path.display())?;
+            writeln!(
+                out,
+                "factionStartsCsv={}",
+                report.faction_starts_csv.display()
+            )?;
+            writeln!(
+                out,
+                "operatorLaunchReport={}",
+                report.operator_launch_report.display()
+            )?;
+            writeln!(out, "scale=1:{}", report.scale_denominator)?;
+            writeln!(
+                out,
+                "factionCountRequested={}",
+                report.faction_count_requested
+            )?;
+            writeln!(out, "factionCountSelected={}", report.faction_starts.len())?;
+            writeln!(
+                out,
+                "safeZoneRadiusBlocks={}",
+                report.safe_zone_radius_blocks
+            )?;
+            writeln!(
+                out,
+                "worldBorderCenterX={}",
+                java_double_string(report.world_border.center_x)
+            )?;
+            writeln!(
+                out,
+                "worldBorderCenterZ={}",
+                java_double_string(report.world_border.center_z)
+            )?;
+            writeln!(
+                out,
+                "worldBorderDiameterBlocks={}",
+                java_double_string(report.world_border.diameter_blocks)
+            )?;
+            writeln!(
+                out,
+                "worldBorderIncludesFullEarth={}",
+                report.world_border.includes_earth()
+            )?;
+            writeln!(out, "spawnPolicyPass={}", report.spawn_policy_pass)?;
+            writeln!(
+                out,
+                "resourceFairnessModelPass={}",
+                report.resource_fairness_model_pass
+            )?;
+            writeln!(
+                out,
+                "globalResourceFairnessPass={}",
+                report.global_resource_fairness_pass
+            )?;
+            writeln!(
+                out,
+                "progressionInsideBorderPass={}",
+                report.progression_inside_border_pass
+            )?;
+            writeln!(
+                out,
+                "multipleFactionProgressionPass={}",
+                report.multiple_faction_progression_pass
+            )?;
+            writeln!(out, "lootEconomyPass={}", report.loot_economy_pass)?;
+            writeln!(out, "pluginStackPass={}", report.plugin_stack_pass)?;
+            writeln!(out, "chunkLoadStressPass={}", report.chunk_load_stress_pass)?;
+            writeln!(out, "overallPass={}", report.overall_pass)?;
+            writeln!(out, "nationWarReady={}", report.overall_pass)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(
+                err,
+                "Nation-war readiness report generation failed: {error}"
+            )?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_nation_war_readiness_report_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    output_dir: &str,
+    faction_count_text: &str,
+    safe_zone_radius_text: &str,
+    global_resource_fairness_report: Option<&str>,
+    loot_economy_report: Option<&str>,
+    plugin_stack_report: Option<&str>,
+    chunk_load_stress_report: Option<&str>,
+) -> std::result::Result<NationWarReadinessReport, String> {
+    let scale = parse_i32_string(scale_text)?;
+    let faction_count = parse_positive_i32_string("factionCount", faction_count_text)?;
+    let safe_zone_radius_blocks =
+        parse_positive_i32_string("safeZoneRadiusBlocks", safe_zone_radius_text)?;
+    let output_dir = Path::new(output_dir);
+    std::fs::create_dir_all(output_dir).map_err(|error| error.to_string())?;
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))
+        .map_err(|error| error.to_string())?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let bounds = RegionGridBounds::for_mapping(&mapping);
+    let world_border = nation_war_world_border(&mapping);
+    let representative_plan = nation_war_representative_plan(heightmap_path, scale, faction_count)?;
+    let faction_starts = select_nation_war_faction_starts(
+        &representative_plan.selected,
+        faction_count,
+        safe_zone_radius_blocks,
+        world_border,
+    );
+    let spawn_policy_pass = faction_starts.len() == faction_count as usize
+        && min_nation_war_start_distance(&faction_starts)
+            >= f64::from(safe_zone_radius_blocks) * 2.0;
+    let selected_starts_inside_border =
+        !faction_starts.is_empty() && faction_starts.iter().all(|start| start.inside_border);
+    let resource_fairness_model_pass = selected_starts_inside_border
+        && !faction_starts.is_empty()
+        && faction_starts
+            .iter()
+            .all(nation_war_start_resource_eligible);
+    let global_resource_fairness_pass = global_resource_fairness_report
+        .map(|path| earthmap_gameplay::global_resource_fairness_report_pass(Path::new(path)))
+        .transpose()?
+        .unwrap_or(false);
+    let loot_economy_pass = loot_economy_report
+        .map(|path| earthmap_gameplay::loot_economy_report_pass(Path::new(path)))
+        .transpose()?
+        .unwrap_or(false);
+    let plugin_stack_pass = plugin_stack_report
+        .map(|path| earthmap_gameplay::evidence_report_pass(Path::new(path), "plugin-stack"))
+        .transpose()?
+        .unwrap_or(false);
+    let chunk_load_stress_pass = chunk_load_stress_report
+        .map(|path| earthmap_gameplay::evidence_report_pass(Path::new(path), "chunk-load-stress"))
+        .transpose()?
+        .unwrap_or(false);
+    let progression_inside_border_pass =
+        world_border.includes_earth() && selected_starts_inside_border;
+    let multiple_faction_progression_pass =
+        progression_inside_border_pass && faction_starts.len() > 1;
+    let overall_pass = spawn_policy_pass
+        && resource_fairness_model_pass
+        && global_resource_fairness_pass
+        && progression_inside_border_pass
+        && multiple_faction_progression_pass
+        && world_border.includes_earth()
+        && plugin_stack_pass
+        && chunk_load_stress_pass
+        && loot_economy_pass;
+    let report_path = output_dir.join("earthmap-nation-war-readiness.properties");
+    let faction_starts_csv = output_dir.join("earthmap-faction-starts.csv");
+    let operator_launch_report = output_dir.join("earthmap-operator-launch-report.md");
+    write_nation_war_faction_starts_csv(&faction_starts_csv, &faction_starts)?;
+    write_nation_war_properties(
+        &report_path,
+        Path::new(heightmap_path),
+        &mapping,
+        bounds,
+        world_border,
+        &representative_plan,
+        &faction_starts_csv,
+        &operator_launch_report,
+        faction_count,
+        safe_zone_radius_blocks,
+        &faction_starts,
+        global_resource_fairness_report,
+        loot_economy_report,
+        plugin_stack_report,
+        chunk_load_stress_report,
+        spawn_policy_pass,
+        resource_fairness_model_pass,
+        global_resource_fairness_pass,
+        progression_inside_border_pass,
+        multiple_faction_progression_pass,
+        loot_economy_pass,
+        plugin_stack_pass,
+        chunk_load_stress_pass,
+        overall_pass,
+    )?;
+    write_nation_war_operator_report(
+        &operator_launch_report,
+        &report_path,
+        &faction_starts_csv,
+        world_border,
+        faction_count,
+        safe_zone_radius_blocks,
+        &faction_starts,
+        spawn_policy_pass,
+        resource_fairness_model_pass,
+        global_resource_fairness_pass,
+        progression_inside_border_pass,
+        multiple_faction_progression_pass,
+        loot_economy_pass,
+        plugin_stack_pass,
+        chunk_load_stress_pass,
+        overall_pass,
+    )?;
+    Ok(NationWarReadinessReport {
+        report_path,
+        faction_starts_csv,
+        operator_launch_report,
+        scale_denominator: scale,
+        faction_count_requested: faction_count,
+        safe_zone_radius_blocks,
+        faction_starts,
+        world_border,
+        spawn_policy_pass,
+        resource_fairness_model_pass,
+        global_resource_fairness_pass,
+        progression_inside_border_pass,
+        multiple_faction_progression_pass,
+        loot_economy_pass,
+        plugin_stack_pass,
+        chunk_load_stress_pass,
+        overall_pass,
+    })
+}
+
+fn nation_war_representative_plan(
+    heightmap_path: &str,
+    scale: i32,
+    faction_count: i32,
+) -> std::result::Result<RepresentativeRegionPlanReport, String> {
+    let target_regions = 32usize.max(faction_count as usize * 12);
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))
+        .map_err(|error| error.to_string())?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let cache = GeoTiffRowCache::new(&reader, 64).map_err(|error| error.to_string())?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let bounds = RegionGridBounds::for_mapping(&mapping);
+    let mut candidates = Vec::new();
+    for region_z in bounds.min_region_z..=bounds.max_region_z {
+        for region_x in bounds.min_region_x..=bounds.max_region_x {
+            candidates.push(classify_representative_region(
+                &mapping, &sampler, region_x, region_z,
+            )?);
+        }
+    }
+    let selected = select_representative_regions(&candidates, target_regions);
+    Ok(RepresentativeRegionPlanReport {
+        scale_denominator: scale,
+        width_blocks: mapping.width_blocks,
+        height_blocks: mapping.height_blocks,
+        candidate_regions: candidates.len(),
+        selected,
+    })
+}
+
+fn select_nation_war_faction_starts(
+    candidates: &[RegionCandidate],
+    faction_count: i32,
+    safe_zone_radius_blocks: i32,
+    world_border: NationWarWorldBorderPlan,
+) -> Vec<NationWarFactionStart> {
+    let mut viable = Vec::new();
+    for candidate in candidates {
+        if candidate.region_class == RepresentativeRegionClass::Ocean
+            || candidate.water_ratio > 0.25
+            || candidate.max_ground_y < SEA_LEVEL_Y
+        {
+            continue;
+        }
+        let global_x = (candidate.region_x * REGION_SIZE_BLOCKS) + (REGION_SIZE_BLOCKS / 2);
+        let global_z = (candidate.region_z * REGION_SIZE_BLOCKS) + (REGION_SIZE_BLOCKS / 2);
+        viable.push(NationWarFactionStart {
+            index: viable.len(),
+            region_x: candidate.region_x,
+            region_z: candidate.region_z,
+            global_x,
+            global_z,
+            region_class: candidate.region_class,
+            water_ratio: candidate.water_ratio,
+            min_ground_y: candidate.min_ground_y,
+            max_ground_y: candidate.max_ground_y,
+            dominant_biome: candidate.dominant_biome.clone(),
+            inside_border: world_border.contains(f64::from(global_x), f64::from(global_z)),
+        });
+    }
+    viable.sort_by(|left, right| {
+        distance_from_origin(left)
+            .total_cmp(&distance_from_origin(right))
+            .then(left.region_z.cmp(&right.region_z))
+            .then(left.region_x.cmp(&right.region_x))
+    });
+    let min_distance = f64::from(safe_zone_radius_blocks) * 2.0;
+    let min_distance_squared = min_distance * min_distance;
+    let mut selected = Vec::new();
+    while selected.len() < faction_count as usize {
+        let mut best: Option<NationWarFactionStart> = None;
+        let mut best_score = -1.0;
+        for candidate in &viable {
+            if selected.iter().any(|selected: &NationWarFactionStart| {
+                selected.region_x == candidate.region_x && selected.region_z == candidate.region_z
+            }) {
+                continue;
+            }
+            let score = if selected.is_empty() {
+                f64::MAX
+            } else {
+                min_distance_squared_to_selected(candidate, &selected)
+            };
+            if score < min_distance_squared {
+                continue;
+            }
+            if score > best_score {
+                best = Some(candidate.clone());
+                best_score = score;
+            }
+        }
+        let Some(mut best) = best else {
+            break;
+        };
+        best.index = selected.len();
+        selected.push(best);
+    }
+    selected
+}
+
+fn nation_war_world_border(mapping: &EarthScaleMapping) -> NationWarWorldBorderPlan {
+    let min_block_x = -(mapping.width_blocks / 2);
+    let max_block_x = mapping.width_blocks - (mapping.width_blocks / 2) - 1;
+    let min_block_z = -(mapping.height_blocks / 2);
+    let max_block_z = mapping.height_blocks - (mapping.height_blocks / 2) - 1;
+    let center_x = f64::from(min_block_x + max_block_x) / 2.0;
+    let center_z = f64::from(min_block_z + max_block_z) / 2.0;
+    let span_x = max_block_x - min_block_x + 1;
+    let span_z = max_block_z - min_block_z + 1;
+    let diameter_blocks = f64::from(span_x.max(span_z));
+    let mut border = NationWarWorldBorderPlan {
+        center_x,
+        center_z,
+        diameter_blocks,
+        earth_min_block_x: min_block_x,
+        earth_max_block_x: max_block_x,
+        earth_min_block_z: min_block_z,
+        earth_max_block_z: max_block_z,
+    };
+    if !border.includes_earth() {
+        border.diameter_blocks += 1.0;
+    }
+    border
+}
+
+fn nation_war_start_resource_eligible(start: &NationWarFactionStart) -> bool {
+    start.region_class != RepresentativeRegionClass::Ocean
+        && start.water_ratio <= 0.25
+        && start.max_ground_y >= SEA_LEVEL_Y
+}
+
+fn distance_from_origin(start: &NationWarFactionStart) -> f64 {
+    f64::from(start.global_x).hypot(f64::from(start.global_z))
+}
+
+fn min_distance_squared_to_selected(
+    candidate: &NationWarFactionStart,
+    selected: &[NationWarFactionStart],
+) -> f64 {
+    selected
+        .iter()
+        .map(|existing| {
+            let dx = f64::from(candidate.global_x - existing.global_x);
+            let dz = f64::from(candidate.global_z - existing.global_z);
+            (dx * dx) + (dz * dz)
+        })
+        .fold(f64::MAX, f64::min)
+}
+
+fn min_nation_war_start_distance(starts: &[NationWarFactionStart]) -> f64 {
+    if starts.len() < 2 {
+        return 0.0;
+    }
+    let mut best = f64::MAX;
+    for left in 0..starts.len() {
+        for right in left + 1..starts.len() {
+            let dx = f64::from(starts[left].global_x - starts[right].global_x);
+            let dz = f64::from(starts[left].global_z - starts[right].global_z);
+            best = best.min(dx.hypot(dz));
+        }
+    }
+    best
+}
+
+fn write_nation_war_faction_starts_csv(
+    path: &Path,
+    starts: &[NationWarFactionStart],
+) -> std::result::Result<(), String> {
+    let mut text = "index,regionX,regionZ,globalX,globalZ,class,waterRatio,minGroundY,maxGroundY,dominantBiome,insideBorder,progressionModel\n".to_string();
+    for start in starts {
+        text.push_str(&format!(
+            "{},{},{},{},{},{},{:.4},{},{},{},{},stronghold-equivalent-per-generated-survival-region\n",
+            start.index,
+            start.region_x,
+            start.region_z,
+            start.global_x,
+            start.global_z,
+            start.region_class.as_str(),
+            start.water_ratio,
+            start.min_ground_y,
+            start.max_ground_y,
+            start.dominant_biome,
+            start.inside_border,
+        ));
+    }
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_nation_war_properties(
+    path: &Path,
+    heightmap_path: &Path,
+    mapping: &EarthScaleMapping,
+    bounds: RegionGridBounds,
+    border: NationWarWorldBorderPlan,
+    representative_plan: &RepresentativeRegionPlanReport,
+    starts_path: &Path,
+    operator_report_path: &Path,
+    faction_count: i32,
+    safe_zone_radius_blocks: i32,
+    starts: &[NationWarFactionStart],
+    global_resource_fairness_report: Option<&str>,
+    loot_economy_report: Option<&str>,
+    plugin_stack_report: Option<&str>,
+    chunk_load_stress_report: Option<&str>,
+    spawn_policy_pass: bool,
+    resource_fairness_model_pass: bool,
+    global_resource_fairness_pass: bool,
+    progression_inside_border_pass: bool,
+    multiple_faction_progression_pass: bool,
+    loot_economy_pass: bool,
+    plugin_stack_pass: bool,
+    chunk_load_stress_pass: bool,
+    overall_pass: bool,
+) -> std::result::Result<(), String> {
+    let mut values = BTreeMap::new();
+    values.insert(
+        "report.type".to_string(),
+        "nation-war-readiness".to_string(),
+    );
+    values.insert(
+        "evidence.schemaVersion".to_string(),
+        earthmap_gameplay::EVIDENCE_SCHEMA_VERSION.to_string(),
+    );
+    values.insert(
+        "generatedAtUtc".to_string(),
+        earthmap_gameplay::STABLE_GENERATED_AT_UTC.to_string(),
+    );
+    values.insert(
+        "evidence.scope".to_string(),
+        "nation-war-readiness-preflight".to_string(),
+    );
+    values.insert(
+        "minecraft.version".to_string(),
+        build_info::MINECRAFT_TARGET.to_string(),
+    );
+    values.insert(
+        "server.profile".to_string(),
+        build_info::SERVER_PROFILE.to_string(),
+    );
+    values.insert(
+        "heightmap.path".to_string(),
+        normalized_path_display(heightmap_path),
+    );
+    values.insert(
+        "generation.scaleDenominator".to_string(),
+        mapping.denominator.to_string(),
+    );
+    values.insert(
+        "generation.widthBlocks".to_string(),
+        mapping.width_blocks.to_string(),
+    );
+    values.insert(
+        "generation.heightBlocks".to_string(),
+        mapping.height_blocks.to_string(),
+    );
+    values.insert(
+        "generation.regionCount".to_string(),
+        bounds.region_count().to_string(),
+    );
+    values.insert(
+        "generation.regionCols".to_string(),
+        bounds.columns().to_string(),
+    );
+    values.insert(
+        "generation.regionRows".to_string(),
+        bounds.rows().to_string(),
+    );
+    values.insert(
+        "assumption.worldType".to_string(),
+        "earth-survival-nation-war".to_string(),
+    );
+    values.insert(
+        "assumption.progressionModel".to_string(),
+        "stronghold-equivalent-per-generated-survival-region".to_string(),
+    );
+    values.insert(
+        "assumption.vanillaStrongholdDistributionComplete".to_string(),
+        "false".to_string(),
+    );
+    values.insert(
+        "spawn.safeZoneRadiusBlocks".to_string(),
+        safe_zone_radius_blocks.to_string(),
+    );
+    values.insert(
+        "spawn.factionCountRequested".to_string(),
+        faction_count.to_string(),
+    );
+    values.insert(
+        "spawn.factionCountSelected".to_string(),
+        starts.len().to_string(),
+    );
+    values.insert(
+        "spawn.minDistanceBlocks".to_string(),
+        java_double_string(min_nation_war_start_distance(starts)),
+    );
+    values.insert(
+        "spawn.policyPass".to_string(),
+        spawn_policy_pass.to_string(),
+    );
+    values.insert(
+        "spawn.factionStartsCsv".to_string(),
+        file_name_string(starts_path),
+    );
+    values.insert(
+        "resources.model".to_string(),
+        "deterministic-ore-forced-coverage-per-full-region".to_string(),
+    );
+    values.insert(
+        "resources.deterministicCoverageModelAvailable".to_string(),
+        "true".to_string(),
+    );
+    values.insert(
+        "resources.selectedFactionStartModelPass".to_string(),
+        resource_fairness_model_pass.to_string(),
+    );
+    values.insert(
+        "resources.fairnessModelPass".to_string(),
+        resource_fairness_model_pass.to_string(),
+    );
+    values.insert(
+        "resources.globalFairnessProven".to_string(),
+        global_resource_fairness_pass.to_string(),
+    );
+    values.insert(
+        "resources.globalFairnessReportProvided".to_string(),
+        global_resource_fairness_report.is_some().to_string(),
+    );
+    if let Some(path) = global_resource_fairness_report {
+        values.insert(
+            "resources.globalFairnessReportFile".to_string(),
+            normalized_path_display(Path::new(path)),
+        );
+    }
+    values.insert(
+        "stronghold.model".to_string(),
+        "one-stronghold-equivalent-in-region-center-chunk".to_string(),
+    );
+    values.insert(
+        "stronghold.distributionModelAvailable".to_string(),
+        (starts.len() == faction_count as usize).to_string(),
+    );
+    values.insert(
+        "stronghold.distributionReportPass".to_string(),
+        multiple_faction_progression_pass.to_string(),
+    );
+    values.insert(
+        "nether.model".to_string(),
+        "overworld-blaze-spawner-equivalent".to_string(),
+    );
+    values.insert(
+        "nether.accessDistributionModelAvailable".to_string(),
+        (starts.len() == faction_count as usize).to_string(),
+    );
+    values.insert(
+        "nether.accessDistributionPass".to_string(),
+        multiple_faction_progression_pass.to_string(),
+    );
+    values.insert(
+        "loot.model".to_string(),
+        "generated-stronghold-loot-chest-and-progression-block-entity-scan".to_string(),
+    );
+    values.insert(
+        "loot.economyPass".to_string(),
+        loot_economy_pass.to_string(),
+    );
+    values.insert(
+        "loot.economyReportProvided".to_string(),
+        loot_economy_report.is_some().to_string(),
+    );
+    if let Some(path) = loot_economy_report {
+        values.insert(
+            "loot.economyReportFile".to_string(),
+            normalized_path_display(Path::new(path)),
+        );
+    }
+    values.insert(
+        "worldBorder.centerX".to_string(),
+        java_double_string(border.center_x),
+    );
+    values.insert(
+        "worldBorder.centerZ".to_string(),
+        java_double_string(border.center_z),
+    );
+    values.insert(
+        "worldBorder.diameterBlocks".to_string(),
+        java_double_string(border.diameter_blocks),
+    );
+    values.insert(
+        "worldBorder.includesFullEarth".to_string(),
+        border.includes_earth().to_string(),
+    );
+    values.insert(
+        "progression.requiredInsideBorderModelAvailable".to_string(),
+        border.includes_earth().to_string(),
+    );
+    values.insert(
+        "progression.requiredInsideBorder".to_string(),
+        progression_inside_border_pass.to_string(),
+    );
+    values.insert(
+        "progression.selectedFactionStartModelPass".to_string(),
+        multiple_faction_progression_pass.to_string(),
+    );
+    values.insert(
+        "pluginStack.tested".to_string(),
+        plugin_stack_pass.to_string(),
+    );
+    values.insert(
+        "pluginStack.reportProvided".to_string(),
+        plugin_stack_report.is_some().to_string(),
+    );
+    if let Some(path) = plugin_stack_report {
+        values.insert(
+            "pluginStack.reportFile".to_string(),
+            normalized_path_display(Path::new(path)),
+        );
+    }
+    values.insert(
+        "chunkLoadStress.tested".to_string(),
+        chunk_load_stress_pass.to_string(),
+    );
+    values.insert(
+        "chunkLoadStress.reportProvided".to_string(),
+        chunk_load_stress_report.is_some().to_string(),
+    );
+    if let Some(path) = chunk_load_stress_report {
+        values.insert(
+            "chunkLoadStress.reportFile".to_string(),
+            normalized_path_display(Path::new(path)),
+        );
+    }
+    values.insert(
+        "representative.candidateRegions".to_string(),
+        representative_plan.candidate_regions.to_string(),
+    );
+    values.insert(
+        "representative.selectedForSampling".to_string(),
+        representative_plan.selected.len().to_string(),
+    );
+    values.insert(
+        "operatorLaunchReport.generated".to_string(),
+        "true".to_string(),
+    );
+    values.insert(
+        "operatorLaunchReport.file".to_string(),
+        file_name_string(operator_report_path),
+    );
+    values.insert(
+        "gate.multipleFactionRegionsHaveViableProgression".to_string(),
+        multiple_faction_progression_pass.to_string(),
+    );
+    values.insert(
+        "gate.worldBorderDoesNotExcludeRequiredProgression".to_string(),
+        (progression_inside_border_pass && border.includes_earth()).to_string(),
+    );
+    values.insert(
+        "gate.serverStressTestPass".to_string(),
+        chunk_load_stress_pass.to_string(),
+    );
+    values.insert(
+        "gate.nationWarValidationReportPass".to_string(),
+        overall_pass.to_string(),
+    );
+    earthmap_gameplay::write_properties(path, &values, "SR EarthMap nation-war readiness report")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_nation_war_operator_report(
+    path: &Path,
+    report_path: &Path,
+    starts_path: &Path,
+    border: NationWarWorldBorderPlan,
+    faction_count: i32,
+    safe_zone_radius_blocks: i32,
+    starts: &[NationWarFactionStart],
+    spawn_policy_pass: bool,
+    resource_fairness_model_pass: bool,
+    global_resource_fairness_pass: bool,
+    progression_inside_border_pass: bool,
+    multiple_faction_progression_pass: bool,
+    loot_economy_pass: bool,
+    plugin_stack_pass: bool,
+    chunk_load_stress_pass: bool,
+    overall_pass: bool,
+) -> std::result::Result<(), String> {
+    let mut text = String::new();
+    text.push_str("# EarthMap Nation-War Operator Launch Report\n\n");
+    text.push_str("Status: ");
+    text.push_str(if overall_pass { "READY" } else { "NOT_READY" });
+    text.push_str("\n\n");
+    text.push_str("This report is an operator-facing checklist. It is not a production approval unless status is READY.\n\n");
+    text.push_str("## Files\n\n");
+    text.push_str(&format!(
+        "- Readiness properties: {}\n",
+        file_name_string(report_path)
+    ));
+    text.push_str(&format!(
+        "- Faction starts CSV: {}\n\n",
+        file_name_string(starts_path)
+    ));
+    text.push_str("## World Border Commands\n\n```text\n");
+    text.push_str(&format!(
+        "/worldborder center {} {}\n/worldborder set {}\n",
+        java_double_string(border.center_x),
+        java_double_string(border.center_z),
+        java_double_string(border.diameter_blocks)
+    ));
+    text.push_str("```\n\n## Spawn Policy\n\n");
+    text.push_str(&format!("- Requested factions: {faction_count}\n"));
+    text.push_str(&format!("- Selected starts: {}\n", starts.len()));
+    text.push_str(&format!(
+        "- Safe-zone radius blocks: {safe_zone_radius_blocks}\n"
+    ));
+    text.push_str(&format!("- Spawn policy pass: {spawn_policy_pass}\n\n"));
+    text.push_str("## Required Gates\n\n");
+    append_checklist_line(
+        &mut text,
+        "Selected-start deterministic resource model",
+        resource_fairness_model_pass,
+    );
+    append_checklist_line(
+        &mut text,
+        "Global resource fairness report",
+        global_resource_fairness_pass,
+    );
+    append_checklist_line(
+        &mut text,
+        "Progression inside border",
+        progression_inside_border_pass,
+    );
+    append_checklist_line(
+        &mut text,
+        "Multiple faction progression distribution",
+        multiple_faction_progression_pass,
+    );
+    append_checklist_line(&mut text, "Loot economy report", loot_economy_pass);
+    append_checklist_line(&mut text, "Target plugin stack test", plugin_stack_pass);
+    append_checklist_line(&mut text, "Chunk-load stress test", chunk_load_stress_pass);
+    text.push_str("\n## Current Blockers\n\n");
+    if !resource_fairness_model_pass {
+        text.push_str("- Select faction starts that are land, inside the border, and covered by the deterministic resource model.\n");
+    }
+    if !global_resource_fairness_pass {
+        text.push_str(
+            "- Generate and aggregate real continent-scale/global resource fairness evidence.\n",
+        );
+    }
+    if !progression_inside_border_pass || !multiple_faction_progression_pass {
+        text.push_str(
+            "- Map generated structure/progression metadata to each selected faction start.\n",
+        );
+    }
+    if !loot_economy_pass {
+        text.push_str("- Validate loot economy beyond block-entity smoke evidence.\n");
+    }
+    if !plugin_stack_pass {
+        text.push_str("- Pin and boot the target nation-war plugin stack.\n");
+    }
+    if !chunk_load_stress_pass {
+        text.push_str("- Run chunk-load stress under the target server stack.\n");
+    }
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+fn append_checklist_line(text: &mut String, label: &str, pass: bool) {
+    text.push_str("- [");
+    text.push_str(if pass { "x" } else { " " });
+    text.push_str("] ");
+    text.push_str(label);
+    text.push('\n');
+}
+
+fn file_name_string(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn scan_osm_pbf(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -4803,6 +5777,79 @@ struct VanillaFinalizationCommandReport {
     window_chunks: i32,
     wait_ms: i32,
     windows: i32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NationWarReadinessReport {
+    report_path: std::path::PathBuf,
+    faction_starts_csv: std::path::PathBuf,
+    operator_launch_report: std::path::PathBuf,
+    scale_denominator: i32,
+    faction_count_requested: i32,
+    safe_zone_radius_blocks: i32,
+    faction_starts: Vec<NationWarFactionStart>,
+    world_border: NationWarWorldBorderPlan,
+    spawn_policy_pass: bool,
+    resource_fairness_model_pass: bool,
+    global_resource_fairness_pass: bool,
+    progression_inside_border_pass: bool,
+    multiple_faction_progression_pass: bool,
+    loot_economy_pass: bool,
+    plugin_stack_pass: bool,
+    chunk_load_stress_pass: bool,
+    overall_pass: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NationWarFactionStart {
+    index: usize,
+    region_x: i32,
+    region_z: i32,
+    global_x: i32,
+    global_z: i32,
+    region_class: RepresentativeRegionClass,
+    water_ratio: f64,
+    min_ground_y: i32,
+    max_ground_y: i32,
+    dominant_biome: String,
+    inside_border: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct NationWarWorldBorderPlan {
+    center_x: f64,
+    center_z: f64,
+    diameter_blocks: f64,
+    earth_min_block_x: i32,
+    earth_max_block_x: i32,
+    earth_min_block_z: i32,
+    earth_max_block_z: i32,
+}
+
+impl NationWarWorldBorderPlan {
+    fn contains(self, x: f64, z: f64) -> bool {
+        let radius = self.diameter_blocks / 2.0;
+        x >= self.center_x - radius
+            && x <= self.center_x + radius
+            && z >= self.center_z - radius
+            && z <= self.center_z + radius
+    }
+
+    fn includes_earth(self) -> bool {
+        self.contains(
+            f64::from(self.earth_min_block_x),
+            f64::from(self.earth_min_block_z),
+        ) && self.contains(
+            f64::from(self.earth_min_block_x),
+            f64::from(self.earth_max_block_z),
+        ) && self.contains(
+            f64::from(self.earth_max_block_x),
+            f64::from(self.earth_min_block_z),
+        ) && self.contains(
+            f64::from(self.earth_max_block_x),
+            f64::from(self.earth_max_block_z),
+        )
+    }
 }
 
 const REPRESENTATIVE_SAMPLE_OFFSETS: [i32; 4] = [64, 192, 320, 448];
@@ -14318,6 +15365,7 @@ fn region_writer_fixture_payloads() -> earthmap_region::Result<BTreeMap<ChunkLoc
 mod tests {
     use super::*;
     use earthmap_geo::RgbColor;
+    use earthmap_minecraft::nbt;
     use earthmap_surface::TerrainTokenSource;
     use std::fs;
 
@@ -14773,6 +15821,15 @@ mod tests {
         ));
         assert!(out.contains(
             "DONE rust.command.validate-underground-fluid-synthetic - synthetic underground fluid validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-global-resource-fairness - Linear world global resource fairness validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.validate-loot-economy - Linear world loot economy validator"
+        ));
+        assert!(out.contains(
+            "DONE rust.command.generate-nation-war-readiness-report - nation-war readiness report generator"
         ));
         assert!(out.contains("DONE rust.command.scan-osm-pbf - OSM PBF prefix scanner"));
         assert!(
@@ -15554,6 +16611,9 @@ mod tests {
         assert!(out.contains("validate-cave-connectivity <seed> <minBlockX>"));
         assert!(out.contains("validate-ore-histogram-synthetic"));
         assert!(out.contains("validate-underground-fluid-synthetic"));
+        assert!(out.contains("validate-global-resource-fairness <worldDir> <outputDir>"));
+        assert!(out.contains("validate-loot-economy <worldDir> <outputDir>"));
+        assert!(out.contains("generate-nation-war-readiness-report <heightmap> <scale>"));
         assert!(out.contains("scan-osm-pbf <path> <maxBlobs>"));
         assert!(out.contains("scan-osm-pbf-range <path> <skipBlobs> <maxBlobs>"));
         assert!(out.contains("validate-osm-pbf <path> <maxBlobs>"));
@@ -15722,6 +16782,87 @@ mod tests {
         assert!(out.contains("osmDirectory="));
         assert!(out.contains("indexedFeatures=1"));
         assert!(out.contains("roadFeatures=1"));
+    }
+
+    #[test]
+    fn gameplay_report_validators_dispatch_without_java() {
+        let temp = tempdir().unwrap();
+        let resource_world = temp.path().join("resource-world");
+        let resource_region = resource_world.join("region").join("r.0.0.linear");
+        fs::create_dir_all(resource_region.parent().unwrap()).unwrap();
+        write_cli_single_chunk_linear_region(&resource_region, cli_resource_payload());
+        let resource_output = temp.path().join("resource-output");
+
+        let (code, out, err) = run_capture(&[
+            "validate-global-resource-fairness",
+            resource_world.to_str().unwrap(),
+            resource_output.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err.is_empty());
+        assert!(out.contains("Global resource fairness validated"));
+        assert!(out.contains("scannedRegions=1"));
+        assert!(out.contains("partialChunkRegions=1"));
+        assert!(out.contains("resourceFairnessPass=false"));
+        assert!(resource_output
+            .join(earthmap_gameplay::GLOBAL_RESOURCE_FAIRNESS_REPORT_FILE_NAME)
+            .is_file());
+
+        let loot_world = temp.path().join("loot-world");
+        let loot_region = loot_world.join("region").join("r.0.0.linear");
+        fs::create_dir_all(loot_region.parent().unwrap()).unwrap();
+        write_cli_single_chunk_linear_region(&loot_region, cli_progression_payload());
+        let loot_output = temp.path().join("loot-output");
+
+        let (code, out, err) = run_capture(&[
+            "validate-loot-economy",
+            loot_world.to_str().unwrap(),
+            loot_output.to_str().unwrap(),
+        ]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(err.is_empty());
+        assert!(out.contains("Loot economy validated"));
+        assert!(out.contains("scannedRegions=1"));
+        assert!(out.contains("partialChunkRegions=1"));
+        assert!(out.contains("regionsWithCompleteProgression=0"));
+        assert!(out.contains("lootEconomyPass=false"));
+        assert!(loot_output
+            .join(earthmap_gameplay::LOOT_ECONOMY_REPORT_FILE_NAME)
+            .is_file());
+    }
+
+    #[test]
+    fn nation_war_readiness_report_dispatches_without_java() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("tiny-heightmap.tif");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+        let output = temp.path().join("nation-war");
+
+        let (code, out, err) = run_capture(&[
+            "generate-nation-war-readiness-report",
+            heightmap.to_str().unwrap(),
+            "10000",
+            output.to_str().unwrap(),
+            "1",
+            "1",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Nation-war readiness report generated"));
+        assert!(out.contains("factionCountRequested=1"));
+        assert!(out.contains("overallPass=false"));
+        assert!(out.contains("nationWarReady=false"));
+        assert!(output
+            .join("earthmap-nation-war-readiness.properties")
+            .is_file());
+        assert!(output.join("earthmap-faction-starts.csv").is_file());
+        assert!(output.join("earthmap-operator-launch-report.md").is_file());
+        let report =
+            fs::read_to_string(output.join("earthmap-nation-war-readiness.properties")).unwrap();
+        assert!(report.contains("report.type=nation-war-readiness\n"));
+        assert!(report.contains("pluginStack.tested=false\n"));
+        assert!(report.contains("chunkLoadStress.tested=false\n"));
     }
 
     #[test]
@@ -17864,6 +19005,101 @@ manifestFile={}\n",
             value >>= 7;
         }
         out.push(value as u8);
+    }
+
+    fn write_cli_single_chunk_linear_region(path: &Path, payload: Vec<u8>) {
+        let mut chunks = BTreeMap::new();
+        chunks.insert(ChunkLocalPos::new(0, 0).unwrap(), payload);
+        earthmap_region::write_linear_v2_region(path, &chunks, 0).unwrap();
+    }
+
+    fn cli_resource_payload() -> Vec<u8> {
+        let mut chunk = ChunkModel::overworld(0, 0);
+        for (index, kind) in earthmap_gameplay::OreKind::ALL
+            .into_iter()
+            .filter(|kind| kind.survival_critical())
+            .enumerate()
+        {
+            chunk
+                .set_block_state_id(index as i32, -54, 0, kind.deepslate_block_state_id())
+                .unwrap();
+        }
+        chunk_nbt_encoder::encode_to_bytes(&chunk, 0).unwrap()
+    }
+
+    fn cli_progression_payload() -> Vec<u8> {
+        let mut chest = nbt::compound();
+        chest
+            .put_string("id", earthmap_gameplay::CHEST_BLOCK_ENTITY)
+            .unwrap();
+        chest
+            .put_string("LootTable", earthmap_gameplay::STRONGHOLD_LOOT_TABLE)
+            .unwrap();
+        let mut spawn_entity = nbt::compound();
+        spawn_entity
+            .put_string("id", earthmap_gameplay::BLAZE_ENTITY)
+            .unwrap();
+        let mut spawn_data = nbt::compound();
+        spawn_data.put_compound("entity", spawn_entity).unwrap();
+        let mut spawner = nbt::compound();
+        spawner
+            .put_string("id", earthmap_gameplay::SPAWNER_BLOCK_ENTITY)
+            .unwrap();
+        spawner.put_compound("SpawnData", spawn_data).unwrap();
+
+        let mut end_portal = nbt::compound();
+        end_portal
+            .put_string("Name", earthmap_gameplay::END_PORTAL_BLOCK)
+            .unwrap();
+        let mut end_portal_frame = nbt::compound();
+        end_portal_frame
+            .put_string("Name", earthmap_gameplay::END_PORTAL_FRAME_BLOCK)
+            .unwrap();
+        let mut spawner_block = nbt::compound();
+        spawner_block
+            .put_string("Name", earthmap_gameplay::SPAWNER_BLOCK)
+            .unwrap();
+        let mut block_states = nbt::compound();
+        block_states
+            .put(
+                "palette",
+                nbt::Tag::List(
+                    nbt::list(
+                        nbt::TAG_COMPOUND,
+                        vec![
+                            nbt::Tag::Compound(end_portal),
+                            nbt::Tag::Compound(end_portal_frame),
+                            nbt::Tag::Compound(spawner_block),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        let mut section = nbt::compound();
+        section.put_compound("block_states", block_states).unwrap();
+        let mut root = nbt::compound();
+        root.put_int("xPos", 0).unwrap();
+        root.put_int("zPos", 0).unwrap();
+        root.put(
+            "block_entities",
+            nbt::Tag::List(
+                nbt::list(
+                    nbt::TAG_COMPOUND,
+                    vec![nbt::Tag::Compound(chest), nbt::Tag::Compound(spawner)],
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        root.put(
+            "sections",
+            nbt::Tag::List(
+                nbt::list(nbt::TAG_COMPOUND, vec![nbt::Tag::Compound(section)]).unwrap(),
+            ),
+        )
+        .unwrap();
+        nbt::write_to_bytes("", &root).unwrap()
     }
 
     fn synthetic_bigtiff_heightmap() -> Vec<u8> {
