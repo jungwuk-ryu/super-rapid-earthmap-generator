@@ -380,6 +380,28 @@ where
         "playability-smoke" if args.len() == 3 => {
             write_result(playability_smoke(stdout, stderr, &args[1], &args[2]))
         }
+        "generate"
+            if args.len() >= 10 && vanilla_delegated_regions_parallel_args(&args).is_some() =>
+        {
+            let parsed = vanilla_delegated_regions_parallel_args(&args)
+                .expect("validated generate alias args");
+            write_result(generate_vanilla_delegated_regions_parallel(
+                stdout,
+                stderr,
+                parsed.heightmap_path,
+                parsed.world_dir,
+                parsed.scale,
+                parsed.start_region_x,
+                parsed.start_region_z,
+                parsed.cols,
+                parsed.rows,
+                parsed.format,
+                parsed.threads,
+                parsed.status,
+                parsed.surface_raster,
+                parsed.extra_options,
+            ))
+        }
         "generate-vanilla-delegated-region"
             if args.len() >= 6 && vanilla_delegated_args(&args).is_some() =>
         {
@@ -2556,6 +2578,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  quality-candidate [heightmap] <worldDir> <scale> <regionX> <regionZ> <mca|linear> [surfaceRaster=auto|path|none] [sampleGrid=64]"
+    )?;
+    writeln!(
+        out,
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(
         out,
@@ -12027,6 +12053,9 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.generate-vanilla-delegated-regions-parallel - parallel vanilla-delegated region generation"
         ));
+        assert!(out.contains(
+            "DONE rust.command.generate - production alias for vanilla-delegated parallel generation"
+        ));
     }
 
     #[test]
@@ -12124,6 +12153,28 @@ mod tests {
         assert!(out.is_empty());
         assert!(err.contains("default textureMode=photo requires a TrueMarble surface raster"));
         assert!(!err.contains("chunk generation status"));
+    }
+
+    #[test]
+    fn generate_alias_dispatches_to_vanilla_delegated_parallel() {
+        let (code, out, err) = run_capture(&[
+            "generate",
+            "missing-heightmap.tif",
+            "world",
+            "1000",
+            "0",
+            "0",
+            "1",
+            "1",
+            "linear",
+            "1",
+            "surfaceRaster=none",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert!(err.contains("default textureMode=photo requires a TrueMarble surface raster"));
+        assert!(!err.contains("not implemented yet"));
     }
 
     #[test]
@@ -12404,6 +12455,7 @@ mod tests {
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
         assert!(out.contains("quality-candidate [heightmap] <worldDir>"));
+        assert!(out.contains("generate <heightmap> <worldDir> <scale> <startRegionX>"));
         assert!(out.contains("benchmark-region-writers <outputDir> [iterations=3]"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));

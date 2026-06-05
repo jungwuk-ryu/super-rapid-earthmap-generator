@@ -16,7 +16,7 @@ pub struct CommandSpec {
 pub const INITIAL_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "generate",
-        status: CommandStatus::NotPortedYet,
+        status: CommandStatus::Implemented,
         note: "production alias for vanilla-delegated parallel generation",
     },
     CommandSpec {

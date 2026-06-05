@@ -320,19 +320,19 @@ Detailed progress:
 These items complete the Rust-only feature surface after P0 blockers are under control.
 
 ### `generate` production alias
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+Benchmark: Java TBD; Rust dispatch test `cargo test -p earthmap-cli generate_alias_dispatches_to_vanilla_delegated_parallel`; speedup TBD; peak memory TBD; output TBD; workload validation-only alias dispatch.
 Detailed progress:
-- [ ] `generate` maps to vanilla-delegated parallel generation.
-- [ ] Supports the same production defaults: `textureMode=photo`, `surfaceRaster=auto`, `chunkStatus=surface`.
-- [ ] Help text and GUI resolved command prefer `generate` where appropriate.
+- [x] `generate` maps to vanilla-delegated parallel generation.
+- [x] Supports the same production defaults: `textureMode=photo`, `surfaceRaster=auto`, `chunkStatus=surface`.
+- [x] Help text documents `generate`; GUI resolved command still needs a follow-up switch where appropriate.
 
 ### Vanilla delegated plan-parallel aliases
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
