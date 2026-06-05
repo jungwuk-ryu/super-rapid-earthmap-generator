@@ -258,7 +258,7 @@ Covered MCA commands:
 - [x] `inspect-mca-statuses`
 - [x] `inspect-mca-post-final-integrity`
 - [ ] `repair-mca-post-final-water`
-- [ ] `rewrite-mca-status`
+- [x] `rewrite-mca-status`
 Covered Linear commands:
 - [x] `validate-linear-region`
 - [x] `validate-linear-survival-palette`

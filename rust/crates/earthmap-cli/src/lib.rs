@@ -468,6 +468,9 @@ where
                 "Linear post-final integrity inspection failed",
             ))
         }
+        "rewrite-mca-status" if args.len() == 3 => {
+            write_result(rewrite_mca_status(stdout, stderr, &args[1], &args[2]))
+        }
         "summarize-region-chunk" if args.len() == 4 => write_result(summarize_region_chunk(
             stdout, stderr, &args[1], &args[2], &args[3],
         )),
@@ -945,6 +948,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out, "  inspect-linear-statuses <path>")?;
     writeln!(out, "  inspect-mca-post-final-integrity <path>")?;
     writeln!(out, "  inspect-linear-post-final-integrity <path>")?;
+    writeln!(
+        out,
+        "  rewrite-mca-status <mcaRegion|regionDir|worldDir> <full|surface|carvers>"
+    )?;
     writeln!(
         out,
         "  summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"
@@ -7447,6 +7454,172 @@ fn post_final_column_index(x: usize, z: usize) -> usize {
     (z * POST_FINAL_REGION_SIZE_BLOCKS) + x
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct McaStatusRewriteReport {
+    target_status: String,
+    region_file_count: usize,
+    chunk_count: usize,
+    rewritten_region_count: usize,
+    rewritten_chunk_count: usize,
+}
+
+fn rewrite_mca_status(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    path: &str,
+    status_text: &str,
+) -> io::Result<i32> {
+    match rewrite_mca_status_impl(Path::new(path), status_text) {
+        Ok(report) => {
+            writeln!(out, "MCA chunk statuses rewritten")?;
+            writeln!(out, "targetStatus={}", report.target_status)?;
+            writeln!(out, "regionFileCount={}", report.region_file_count)?;
+            writeln!(out, "chunkCount={}", report.chunk_count)?;
+            writeln!(
+                out,
+                "rewrittenRegionCount={}",
+                report.rewritten_region_count
+            )?;
+            writeln!(out, "rewrittenChunkCount={}", report.rewritten_chunk_count)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "MCA chunk status rewrite failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn rewrite_mca_status_impl(
+    path: &Path,
+    status_text: &str,
+) -> std::result::Result<McaStatusRewriteReport, String> {
+    let target_status =
+        ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
+    let region_files = mca_region_files_for_target(path)?;
+    let mut report = McaStatusRewriteReport {
+        target_status: target_status.id().to_string(),
+        region_file_count: 0,
+        chunk_count: 0,
+        rewritten_region_count: 0,
+        rewritten_chunk_count: 0,
+    };
+    for region_file in region_files {
+        let region_report = rewrite_mca_status_region(&region_file, target_status)?;
+        report.region_file_count += region_report.region_file_count;
+        report.chunk_count += region_report.chunk_count;
+        report.rewritten_region_count += region_report.rewritten_region_count;
+        report.rewritten_chunk_count += region_report.rewritten_chunk_count;
+    }
+    Ok(report)
+}
+
+fn mca_region_files_for_target(
+    path: &Path,
+) -> std::result::Result<Vec<std::path::PathBuf>, String> {
+    if !path.is_dir() {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let region_dir = if path.join("region").is_dir() {
+        path.join("region")
+    } else {
+        path.to_path_buf()
+    };
+    let mut regions = std::fs::read_dir(&region_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mca"))
+        })
+        .collect::<Vec<_>>();
+    regions.sort();
+    if regions.is_empty() {
+        return Err(format!(
+            "no MCA region files found in {}",
+            region_dir.display()
+        ));
+    }
+    Ok(regions)
+}
+
+fn rewrite_mca_status_region(
+    region_file: &Path,
+    target_status: ChunkGenerationStatus,
+) -> std::result::Result<McaStatusRewriteReport, String> {
+    let payloads = read_region_payloads(region_file).map_err(|error| error.to_string())?;
+    if payloads.format != RegionFormat::Mca {
+        return Err(format!(
+            "region format mismatch: expected mca got {}",
+            payloads.format.as_manifest_value()
+        ));
+    }
+    let mut rewritten_chunks = 0usize;
+    let mut updated_payloads = BTreeMap::new();
+    for (pos, payload) in &payloads.chunks {
+        let (updated, rewritten) = rewrite_mca_status_chunk(payload, target_status)?;
+        updated_payloads.insert(*pos, updated);
+        if rewritten {
+            rewritten_chunks += 1;
+        }
+    }
+    if rewritten_chunks > 0 {
+        earthmap_region::write_mca_region(region_file, &updated_payloads, current_mca_timestamp())
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(McaStatusRewriteReport {
+        target_status: target_status.id().to_string(),
+        region_file_count: 1,
+        chunk_count: payloads.chunks.len(),
+        rewritten_region_count: usize::from(rewritten_chunks > 0),
+        rewritten_chunk_count: rewritten_chunks,
+    })
+}
+
+fn rewrite_mca_status_chunk(
+    payload: &[u8],
+    target_status: ChunkGenerationStatus,
+) -> std::result::Result<(Vec<u8>, bool), String> {
+    let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
+    let root_name = named.name().to_string();
+    let Tag::Compound(mut root) = named.into_tag() else {
+        return Err("chunk root is not an NBT compound".to_string());
+    };
+    let previous_status = if root.contains("Status") {
+        root.get_string("Status")
+            .map_err(|error| error.to_string())?
+            .to_string()
+    } else {
+        String::new()
+    };
+    let previous_light = if root.contains("isLightOn") {
+        root.get_byte("isLightOn")
+            .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let next_light = if target_status.light_on() { 1 } else { 0 };
+    if previous_status == target_status.id() && previous_light == next_light {
+        return Ok((payload.to_vec(), false));
+    }
+    root.put_string("Status", target_status.id())
+        .map_err(|error| error.to_string())?;
+    root.put_byte("isLightOn", i32::from(next_light))
+        .map_err(|error| error.to_string())?;
+    let updated = nbt::write_to_bytes(&root_name, &root).map_err(|error| error.to_string())?;
+    Ok((updated, true))
+}
+
+fn current_mca_timestamp() -> i32 {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    i32::try_from(seconds.min(i32::MAX as u64)).unwrap_or(i32::MAX)
+}
+
 fn chunk_root(payload: &[u8]) -> std::result::Result<earthmap_minecraft::nbt::Compound, String> {
     let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
     let Tag::Compound(root) = named.into_tag() else {
@@ -9192,6 +9365,7 @@ mod tests {
         assert!(out.contains(
             "DONE rust.command.inspect-mca-post-final-integrity - MCA post-final integrity scanner"
         ));
+        assert!(out.contains("DONE rust.command.rewrite-mca-status - MCA chunk status rewriter"));
         assert!(out.contains(
             "DONE rust.command.inspect-linear-post-final-integrity - Linear post-final integrity scanner"
         ));
@@ -9481,6 +9655,7 @@ mod tests {
         assert!(out.contains("inspect-linear-statuses <path>"));
         assert!(out.contains("inspect-mca-post-final-integrity <path>"));
         assert!(out.contains("inspect-linear-post-final-integrity <path>"));
+        assert!(out.contains("rewrite-mca-status <mcaRegion|regionDir|worldDir>"));
         assert!(out.contains("summarize-region-chunk <regionFile> <localChunkX> <localChunkZ>"));
         assert!(
             out.contains("compare-region-chunk-details <expectedRegionFile> <actualRegionFile>")
@@ -10131,6 +10306,40 @@ mod tests {
         assert!(out.contains("scannedColumns=256\n"));
         assert!(out.contains("underwaterAirColumns=1\n"));
         assert!(out.contains("topTerrainBlockHits.minecraft:grass_block=1\n"));
+    }
+
+    #[test]
+    fn rewrite_mca_status_updates_world_regions_and_is_idempotent() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("flat-mca");
+        generate_single_chunk_render_world(&world, TopdownFormat::Mca);
+        let region = world.join("region").join("r.0.0.mca");
+
+        let (code, out, err) =
+            run_capture(&["rewrite-mca-status", world.to_str().unwrap(), "surface"]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("MCA chunk statuses rewritten\n"));
+        assert!(out.contains("targetStatus=minecraft:surface\n"));
+        assert!(out.contains("regionFileCount=1\n"));
+        assert!(out.contains("chunkCount=1\n"));
+        assert!(out.contains("rewrittenRegionCount=1\n"));
+        assert!(out.contains("rewrittenChunkCount=1\n"));
+
+        let (code, out, err) =
+            run_capture(&["summarize-region-chunk", region.to_str().unwrap(), "0", "0"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("status=minecraft:surface\n"));
+        assert!(out.contains("isLightOn=0\n"));
+
+        let (code, out, err) =
+            run_capture(&["rewrite-mca-status", region.to_str().unwrap(), "surface"]);
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("rewrittenRegionCount=0\n"));
+        assert!(out.contains("rewrittenChunkCount=0\n"));
     }
 
     #[test]

@@ -150,6 +150,11 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "MCA post-final integrity scanner",
     },
     CommandSpec {
+        name: "rewrite-mca-status",
+        status: CommandStatus::Implemented,
+        note: "MCA chunk status rewriter",
+    },
+    CommandSpec {
         name: "inspect-linear-post-final-integrity",
         status: CommandStatus::Implemented,
         note: "Linear post-final integrity scanner",
