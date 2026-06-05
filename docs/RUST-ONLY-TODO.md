@@ -223,21 +223,22 @@ Detailed progress:
 - [ ] Benchmark records cold-start and per-crop runtime.
 
 ### Rust `dynmap-tile-mosaic`
-- [ ] Spec: CLI args, outputs, exit codes, artifact paths documented
-- [ ] Rust implementation exists
-- [ ] Java is no longer called by normal workflow
-- [ ] Correctness gate passes without byte-by-byte Java requirement
+- [x] Spec: CLI args, outputs, exit codes, artifact paths documented
+- [x] Rust implementation exists
+- [x] Java is no longer called by normal workflow
+- [x] Correctness gate passes without byte-by-byte Java requirement
 - [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
 - [ ] Rust is faster than Java on the target workload
 - [ ] Scripts and docs use Rust command
 - [ ] Accepted for Java deletion
 Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
 Detailed progress:
-- [ ] Reads Dynmap tile directories without Java.
-- [ ] Supports `base|z|zz...` tile levels.
-- [ ] Writes PNG mosaic and reports missing/empty tiles.
-- [ ] Streams or tiles large mosaics without loading unnecessary images.
+- [x] Reads Dynmap tile directories without Java.
+- [x] Supports `base|z|zz...` tile levels.
+- [x] Writes PNG mosaic and reports missing/empty tiles.
+- [x] Streams or tiles large mosaics without loading unnecessary images.
 - [ ] Benchmark covers a small crop and a large continent tile set.
+Spec: `earthmap-rs dynmap-tile-mosaic <dynmapTileDir> <outputPng> [base|z|zz...]`; recursively reads `.png|.jpg|.jpeg` tiles, writes RGB PNG plus sibling `.properties`, and exits 0 on success or 2 on validation/render failure.
 
 ### Rust region validators, inspectors, converters, and repair tools
 - [ ] Spec: CLI args, outputs, exit codes, artifact paths documented

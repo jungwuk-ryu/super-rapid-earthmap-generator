@@ -31,6 +31,7 @@ eframe = "0.34.3"
 flate2 = { version = "1", default-features = false, features = ["zlib-default"] }
 geo = "0.30"
 geo-types = "0.7"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 memmap2 = "0.9"
 mimalloc = "0.1"
 parking_lot = "0.12"

@@ -65,6 +65,11 @@ pub const INITIAL_COMMANDS: &[CommandSpec] = &[
         note: "quality gate sample batch",
     },
     CommandSpec {
+        name: "dynmap-tile-mosaic",
+        status: CommandStatus::Implemented,
+        note: "Dynmap tile mosaic builder",
+    },
+    CommandSpec {
         name: "mca-topdown-render",
         status: CommandStatus::Implemented,
         note: "MCA top-down render",

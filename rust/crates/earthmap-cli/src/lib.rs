@@ -371,6 +371,15 @@ where
                 args.get(7).map(String::as_str),
             ))
         }
+        "dynmap-tile-mosaic" if args.len() == 3 || args.len() == 4 => {
+            write_result(dynmap_tile_mosaic_cli(
+                stdout,
+                stderr,
+                &args[1],
+                &args[2],
+                args.get(3).map(String::as_str).unwrap_or("base"),
+            ))
+        }
         "convert-mca-region-to-linear" if args.len() == 3 => write_result(
             convert_mca_region_to_linear(stdout, stderr, &args[1], &args[2]),
         ),
@@ -891,6 +900,10 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "  linear-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]"
+    )?;
+    writeln!(
+        out,
+        "  dynmap-tile-mosaic <dynmapTileDir> <outputPng> [base|z|zz...]"
     )?;
     writeln!(
         out,
@@ -5374,6 +5387,370 @@ fn compare_mca_linear_region_payloads_cli(
     }
 }
 
+#[derive(Clone, Debug)]
+struct DynmapTileMosaicReport {
+    tile_directory: std::path::PathBuf,
+    output_path: std::path::PathBuf,
+    metadata_path: std::path::PathBuf,
+    level_prefix: String,
+    tile_count: usize,
+    tile_width: u32,
+    tile_height: u32,
+    min_tile_x: i32,
+    max_tile_x: i32,
+    min_tile_y: i32,
+    max_tile_y: i32,
+    width: u32,
+    height: u32,
+    missing_tile_count: usize,
+    empty_tile_count: usize,
+}
+
+impl DynmapTileMosaicReport {
+    fn properties_text(&self) -> String {
+        format!(
+            concat!(
+                "tileDirectory={}\n",
+                "outputPath={}\n",
+                "metadataPath={}\n",
+                "levelPrefix={}\n",
+                "tileCount={}\n",
+                "tileWidth={}\n",
+                "tileHeight={}\n",
+                "minTileX={}\n",
+                "maxTileX={}\n",
+                "minTileY={}\n",
+                "maxTileY={}\n",
+                "width={}\n",
+                "height={}\n",
+                "missingTileCount={}\n",
+                "emptyTileCount={}\n"
+            ),
+            normalized_path_display(&self.tile_directory),
+            normalized_path_display(&self.output_path),
+            normalized_path_display(&self.metadata_path),
+            self.level_prefix,
+            self.tile_count,
+            self.tile_width,
+            self.tile_height,
+            self.min_tile_x,
+            self.max_tile_x,
+            self.min_tile_y,
+            self.max_tile_y,
+            self.width,
+            self.height,
+            self.missing_tile_count,
+            self.empty_tile_count
+        )
+    }
+}
+
+fn dynmap_tile_mosaic_cli(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    tile_directory: &str,
+    output_path: &str,
+    level_prefix: &str,
+) -> io::Result<i32> {
+    match dynmap_tile_mosaic_impl(
+        Path::new(tile_directory),
+        Path::new(output_path),
+        level_prefix,
+    ) {
+        Ok(report) => {
+            writeln!(out, "Dynmap tile mosaic written")?;
+            write_dynmap_tile_mosaic_report(out, &report)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Dynmap tile mosaic failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn write_dynmap_tile_mosaic_report(
+    out: &mut impl Write,
+    report: &DynmapTileMosaicReport,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "tileDirectory={}",
+        normalized_path_display(&report.tile_directory)
+    )?;
+    writeln!(
+        out,
+        "outputPath={}",
+        normalized_path_display(&report.output_path)
+    )?;
+    writeln!(
+        out,
+        "metadataPath={}",
+        normalized_path_display(&report.metadata_path)
+    )?;
+    writeln!(out, "levelPrefix={}", report.level_prefix)?;
+    writeln!(out, "tileCount={}", report.tile_count)?;
+    writeln!(out, "tileWidth={}", report.tile_width)?;
+    writeln!(out, "tileHeight={}", report.tile_height)?;
+    writeln!(out, "minTileX={}", report.min_tile_x)?;
+    writeln!(out, "maxTileX={}", report.max_tile_x)?;
+    writeln!(out, "minTileY={}", report.min_tile_y)?;
+    writeln!(out, "maxTileY={}", report.max_tile_y)?;
+    writeln!(out, "width={}", report.width)?;
+    writeln!(out, "height={}", report.height)?;
+    writeln!(out, "missingTileCount={}", report.missing_tile_count)?;
+    writeln!(out, "emptyTileCount={}", report.empty_tile_count)
+}
+
+fn dynmap_tile_mosaic_impl(
+    tile_directory: &Path,
+    output_path: &Path,
+    level_prefix: &str,
+) -> std::result::Result<DynmapTileMosaicReport, String> {
+    if !tile_directory.is_dir() {
+        return Err(format!(
+            "tile directory not found: {}",
+            tile_directory.display()
+        ));
+    }
+    let normalized_prefix = normalize_dynmap_level_prefix(level_prefix);
+    let mut tiles = BTreeMap::<(i32, i32), std::path::PathBuf>::new();
+    collect_dynmap_tiles(tile_directory, &normalized_prefix, &mut tiles)?;
+    if tiles.is_empty() {
+        return Err(format!(
+            "no Dynmap tiles matched prefix '{}' under {}",
+            normalized_prefix,
+            tile_directory.display()
+        ));
+    }
+
+    let min_tile_x = tiles.keys().map(|coord| coord.0).min().unwrap();
+    let max_tile_x = tiles.keys().map(|coord| coord.0).max().unwrap();
+    let min_tile_y = tiles.keys().map(|coord| coord.1).min().unwrap();
+    let max_tile_y = tiles.keys().map(|coord| coord.1).max().unwrap();
+    let first_tile = read_dynmap_tile_image(tiles.values().next().unwrap())?;
+    let tile_width = first_tile.width;
+    let tile_height = first_tile.height;
+    if tile_width == 0 || tile_height == 0 {
+        return Err("invalid tile size".to_string());
+    }
+    let span_x = dynmap_tile_span(min_tile_x, max_tile_x, "x")?;
+    let span_y = dynmap_tile_span(min_tile_y, max_tile_y, "y")?;
+    let width = checked_u32_product(span_x, tile_width, "mosaic width")?;
+    let height = checked_u32_product(span_y, tile_height, "mosaic height")?;
+    let pixel_bytes = usize::try_from(width)
+        .expect("u32 width fits usize")
+        .checked_mul(usize::try_from(height).expect("u32 height fits usize"))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| "Dynmap mosaic is too large".to_string())?;
+    let mut pixels = vec![0u8; pixel_bytes];
+
+    for ((tile_x, tile_y), path) in &tiles {
+        let tile = read_dynmap_tile_image(path)?;
+        if tile.width != tile_width || tile.height != tile_height {
+            return Err(format!(
+                "mixed Dynmap tile sizes: expected {}x{} but got {}x{} at {}",
+                tile_width,
+                tile_height,
+                tile.width,
+                tile.height,
+                path.display()
+            ));
+        }
+        let mosaic_x = u32::try_from(*tile_x - min_tile_x)
+            .expect("tile x offset is non-negative")
+            .checked_mul(tile_width)
+            .ok_or_else(|| "tile x offset is too large".to_string())?;
+        let mosaic_y = u32::try_from(*tile_y - min_tile_y)
+            .expect("tile y offset is non-negative")
+            .checked_mul(tile_height)
+            .ok_or_else(|| "tile y offset is too large".to_string())?;
+        copy_dynmap_tile_rgb(
+            &mut pixels,
+            width,
+            mosaic_x,
+            mosaic_y,
+            &tile.pixels,
+            tile_width,
+            tile_height,
+        );
+    }
+
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    write_rgb_png(output_path, width, height, &pixels)?;
+    let metadata_path = dynmap_metadata_path(output_path);
+    let total_tile_slots = span_x
+        .checked_mul(span_y)
+        .ok_or_else(|| "Dynmap tile span is too large".to_string())?;
+    let report = DynmapTileMosaicReport {
+        tile_directory: tile_directory.to_path_buf(),
+        output_path: output_path.to_path_buf(),
+        metadata_path,
+        level_prefix: normalized_prefix,
+        tile_count: tiles.len(),
+        tile_width,
+        tile_height,
+        min_tile_x,
+        max_tile_x,
+        min_tile_y,
+        max_tile_y,
+        width,
+        height,
+        missing_tile_count: total_tile_slots.saturating_sub(tiles.len()),
+        empty_tile_count: 0,
+    };
+    std::fs::write(&report.metadata_path, report.properties_text())
+        .map_err(|error| error.to_string())?;
+    Ok(report)
+}
+
+fn normalize_dynmap_level_prefix(level_prefix: &str) -> String {
+    let trimmed = level_prefix.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("base")
+        || trimmed.eq_ignore_ascii_case("native")
+    {
+        return "base".to_string();
+    }
+    trimmed
+        .to_ascii_lowercase()
+        .trim_end_matches('_')
+        .to_string()
+}
+
+fn collect_dynmap_tiles(
+    directory: &Path,
+    level_prefix: &str,
+    tiles: &mut BTreeMap<(i32, i32), std::path::PathBuf>,
+) -> std::result::Result<(), String> {
+    let entries = std::fs::read_dir(directory).map_err(|error| error.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            collect_dynmap_tiles(&path, level_prefix, tiles)?;
+        } else if file_type.is_file() && is_supported_dynmap_image(&path) {
+            collect_dynmap_tile_path(&path, level_prefix, tiles)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_dynmap_tile_path(
+    path: &Path,
+    level_prefix: &str,
+    tiles: &mut BTreeMap<(i32, i32), std::path::PathBuf>,
+) -> std::result::Result<(), String> {
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return Ok(());
+    };
+    let Some(coord) = parse_dynmap_tile_coord(stem, level_prefix) else {
+        return Ok(());
+    };
+    if let Some(previous) = tiles.insert(coord, path.to_path_buf()) {
+        return Err(format!(
+            "duplicate Dynmap tile coordinate {},{}: {} and {}",
+            coord.0,
+            coord.1,
+            previous.display(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn parse_dynmap_tile_coord(stem: &str, level_prefix: &str) -> Option<(i32, i32)> {
+    let coord_text = if level_prefix == "base" {
+        stem
+    } else {
+        stem.strip_prefix(&format!("{level_prefix}_"))?
+    };
+    let mut parts = coord_text.split('_');
+    let x = parts.next()?.parse::<i32>().ok()?;
+    let y = parts.next()?.parse::<i32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((x, y))
+}
+
+fn is_supported_dynmap_image(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")
+        })
+        .unwrap_or(false)
+}
+
+fn dynmap_tile_span(min: i32, max: i32, axis: &str) -> std::result::Result<usize, String> {
+    let span = i64::from(max) - i64::from(min) + 1;
+    usize::try_from(span).map_err(|_| format!("Dynmap tile {axis} span is too large"))
+}
+
+fn checked_u32_product(count: usize, size: u32, label: &str) -> std::result::Result<u32, String> {
+    let product = count
+        .checked_mul(usize::try_from(size).expect("u32 tile size fits usize"))
+        .ok_or_else(|| format!("{label} is too large"))?;
+    u32::try_from(product).map_err(|_| format!("{label} is too large"))
+}
+
+fn dynmap_metadata_path(output_path: &Path) -> std::path::PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("dynmap-mosaic.png");
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name);
+    output_path.with_file_name(format!("{stem}.properties"))
+}
+
+#[derive(Clone, Debug)]
+struct DynmapTileImage {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+fn read_dynmap_tile_image(path: &Path) -> std::result::Result<DynmapTileImage, String> {
+    let image = image::open(path)
+        .map_err(|error| format!("unsupported image: {} ({error})", path.display()))?
+        .to_rgb8();
+    Ok(DynmapTileImage {
+        width: image.width(),
+        height: image.height(),
+        pixels: image.into_raw(),
+    })
+}
+
+fn copy_dynmap_tile_rgb(
+    mosaic: &mut [u8],
+    mosaic_width: u32,
+    x: u32,
+    y: u32,
+    tile_pixels: &[u8],
+    tile_width: u32,
+    tile_height: u32,
+) {
+    let mosaic_width = usize::try_from(mosaic_width).expect("mosaic width fits usize");
+    let x = usize::try_from(x).expect("tile x fits usize");
+    let y = usize::try_from(y).expect("tile y fits usize");
+    let tile_width = usize::try_from(tile_width).expect("tile width fits usize");
+    let tile_height = usize::try_from(tile_height).expect("tile height fits usize");
+    for row in 0..tile_height {
+        let source_offset = row * tile_width * 3;
+        let target_offset = (((y + row) * mosaic_width) + x) * 3;
+        mosaic[target_offset..target_offset + (tile_width * 3)]
+            .copy_from_slice(&tile_pixels[source_offset..source_offset + (tile_width * 3)]);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TopdownFormat {
     Mca,
@@ -8014,6 +8391,22 @@ mod tests {
         }
     }
 
+    fn write_solid_png_tile(path: &Path, color: [u8; 3]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut pixels = vec![0u8; 2 * 2 * 3];
+        for pixel in pixels.chunks_exact_mut(3) {
+            pixel.copy_from_slice(&color);
+        }
+        write_rgb_png(path, 2, 2, &pixels).unwrap();
+    }
+
+    fn assert_png_pixel(pixels: &[u8], width: u32, x: u32, y: u32, color: [u8; 3]) {
+        let offset = ((usize::try_from(y).unwrap() * usize::try_from(width).unwrap())
+            + usize::try_from(x).unwrap())
+            * 3;
+        assert_eq!(&pixels[offset..offset + 3], &color);
+    }
+
     #[test]
     fn resume_journal_loads_completed_regions_for_matching_fingerprint() {
         let temp = tempdir().unwrap();
@@ -8291,6 +8684,7 @@ mod tests {
         );
         assert!(out.contains("DONE rust.command.mca-topdown-render - MCA top-down render"));
         assert!(out.contains("DONE rust.command.linear-topdown-render - Linear V2 top-down render"));
+        assert!(out.contains("DONE rust.command.dynmap-tile-mosaic - Dynmap tile mosaic builder"));
     }
 
     #[test]
@@ -8562,6 +8956,9 @@ mod tests {
         assert!(out.contains("validate-mca-region <path>"));
         assert!(out.contains("validate-linear-region <path>"));
         assert!(out.contains("compare-mca-linear-region-payloads <mcaRegion> <linearRegion>"));
+        assert!(out.contains("mca-topdown-render <worldDir> <outputPng>"));
+        assert!(out.contains("linear-topdown-render <worldDir> <outputPng>"));
+        assert!(out.contains("dynmap-tile-mosaic <dynmapTileDir> <outputPng>"));
         assert!(out.contains("convert-mca-region-to-linear <mcaRegion> <linearRegion>"));
         assert!(out.contains("convert-mca-world-to-linear <mcaWorldDir> <linearWorldDir>"));
         assert!(out.contains("inspect-mca-palettes <path>"));
@@ -9104,6 +9501,74 @@ mod tests {
             &pixels[((CHUNK_WIDTH * 512) * 3)..((CHUNK_WIDTH * 512) * 3 + 3)],
             &[0, 0, 0]
         );
+    }
+
+    #[test]
+    fn dynmap_tile_mosaic_builds_base_mosaic() {
+        let temp = tempdir().unwrap();
+        let tiles = temp.path().join("tiles");
+        let output = temp.path().join("base.png");
+        write_solid_png_tile(&tiles.join("0_0.png"), [255, 0, 0]);
+        write_solid_png_tile(&tiles.join("1_0.png"), [0, 255, 0]);
+        write_solid_png_tile(&tiles.join("nested").join("0_1.png"), [0, 0, 255]);
+        write_solid_png_tile(&tiles.join("nested").join("1_1.png"), [255, 255, 0]);
+        write_solid_png_tile(&tiles.join("z_0_0.png"), [255, 0, 255]);
+        write_solid_png_tile(&tiles.join("not-a-tile.png"), [0, 0, 0]);
+
+        let (code, out, err) = run_capture(&[
+            "dynmap-tile-mosaic",
+            tiles.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "base",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("Dynmap tile mosaic written\n"));
+        assert!(out.contains("levelPrefix=base\n"));
+        assert!(out.contains("tileCount=4\n"));
+        assert!(out.contains("tileWidth=2\n"));
+        assert!(out.contains("tileHeight=2\n"));
+        assert!(out.contains("minTileX=0\n"));
+        assert!(out.contains("maxTileX=1\n"));
+        assert!(out.contains("minTileY=0\n"));
+        assert!(out.contains("maxTileY=1\n"));
+        assert!(out.contains("width=4\n"));
+        assert!(out.contains("height=4\n"));
+        assert!(out.contains("missingTileCount=0\n"));
+        assert!(out.contains("emptyTileCount=0\n"));
+        let metadata = fs::read_to_string(temp.path().join("base.properties")).unwrap();
+        assert!(metadata.contains("levelPrefix=base\n"));
+        let (width, height, pixels) = read_png_rgb(&output);
+        assert_eq!((width, height), (4, 4));
+        assert_png_pixel(&pixels, width, 0, 0, [255, 0, 0]);
+        assert_png_pixel(&pixels, width, 3, 0, [0, 255, 0]);
+        assert_png_pixel(&pixels, width, 0, 3, [0, 0, 255]);
+        assert_png_pixel(&pixels, width, 3, 3, [255, 255, 0]);
+    }
+
+    #[test]
+    fn dynmap_tile_mosaic_filters_zoom_prefix() {
+        let temp = tempdir().unwrap();
+        let tiles = temp.path().join("tiles");
+        let output = temp.path().join("z.png");
+        write_solid_png_tile(&tiles.join("0_0.png"), [255, 0, 0]);
+        write_solid_png_tile(&tiles.join("z_0_0.png"), [0, 255, 255]);
+
+        let (code, out, err) = run_capture(&[
+            "dynmap-tile-mosaic",
+            tiles.to_str().unwrap(),
+            output.to_str().unwrap(),
+            "z_",
+        ]);
+
+        assert_eq!(code, EXIT_OK);
+        assert!(err.is_empty());
+        assert!(out.contains("levelPrefix=z\n"));
+        assert!(out.contains("tileCount=1\n"));
+        let (width, height, pixels) = read_png_rgb(&output);
+        assert_eq!((width, height), (2, 2));
+        assert_png_pixel(&pixels, width, 0, 0, [0, 255, 255]);
     }
 
     #[test]
