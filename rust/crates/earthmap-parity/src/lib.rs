@@ -83,7 +83,7 @@ pub fn write_sha256_manifest(root: impl AsRef<Path>, output: impl AsRef<Path>) -
             continue;
         }
         let relative = normalize_relative_path(root, path)?;
-        rows.push((relative, sha256_file(path)?));
+        rows.push((relative, sha256_file_hex(path)?));
     }
 
     rows.sort_by(|left, right| left.0.cmp(&right.0));
@@ -143,7 +143,7 @@ pub fn compare_region_payload_manifest(
     for pos in expected_positions.union(&actual_positions) {
         match (expected.get(pos), region.chunks.get(pos)) {
             (Some(expected), Some(actual)) => {
-                let actual_hash = sha256_bytes(actual);
+                let actual_hash = sha256_bytes_hex(actual);
                 if expected.payload_bytes == actual.len() && expected.payload_sha256 == actual_hash
                 {
                     matching_chunks += 1;
@@ -195,7 +195,7 @@ fn write_region_payload_manifest_to(
             pos.x,
             pos.z,
             payload.len(),
-            sha256_bytes(payload)
+            sha256_bytes_hex(payload)
         )?;
     }
     Ok(())
@@ -248,11 +248,11 @@ fn read_manifest_rows(
     Ok(rows)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    Ok(sha256_bytes(&std::fs::read(path)?))
+pub fn sha256_file_hex(path: impl AsRef<Path>) -> Result<String> {
+    Ok(sha256_bytes_hex(&std::fs::read(path)?))
 }
 
-fn sha256_bytes(bytes: &[u8]) -> String {
+pub fn sha256_bytes_hex(bytes: &[u8]) -> String {
     hex_lower(Sha256::digest(bytes).as_slice())
 }
 

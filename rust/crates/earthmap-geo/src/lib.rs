@@ -14,6 +14,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap},
 };
+use weezl::{decode::Decoder as LzwDecoder, BitOrder};
 
 pub const MODULE_STATUS: &str = "phase4-earth-scale-mapping-bootstrap";
 
@@ -27,6 +28,7 @@ const TAG_STRIP_OFFSETS: u16 = 273;
 const TAG_SAMPLES_PER_PIXEL: u16 = 277;
 const TAG_ROWS_PER_STRIP: u16 = 278;
 const TAG_STRIP_BYTE_COUNTS: u16 = 279;
+const TAG_PREDICTOR: u16 = 317;
 const TAG_SAMPLE_FORMAT: u16 = 339;
 const TAG_MODEL_PIXEL_SCALE: u16 = 33550;
 const TAG_MODEL_TIEPOINT: u16 = 33922;
@@ -47,6 +49,10 @@ const CLASSIC_IFD_ENTRY_BYTES: usize = 12;
 const BIG_IFD_ENTRY_BYTES: usize = 20;
 const SINGLE_BAND_BLOCK_WIDTH: i32 = 128;
 const SINGLE_BAND_BLOCK_HEIGHT: i32 = 128;
+pub const DEFAULT_RGB_TILE_CACHE_ENTRIES: usize = 256;
+const TIFF_COMPRESSION_NONE: i32 = 1;
+const TIFF_COMPRESSION_LZW: i32 = 5;
+const TIFF_COMPRESSION_PACKBITS: i32 = 32773;
 const TAG_PLANAR_CONFIGURATION: u16 = 284;
 const TAG_TILE_WIDTH: u16 = 322;
 const TAG_TILE_LENGTH: u16 = 323;
@@ -226,7 +232,7 @@ struct SingleBandTileState {
 
 #[derive(Clone, Debug)]
 struct CachedTile {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     access_stamp: u64,
 }
 
@@ -241,6 +247,7 @@ pub struct VrtRgbMosaicReader {
     pixel_height: f64,
     sources: Vec<VrtSource>,
     source_lookup: VrtSourceLookup,
+    tile_cache_entries: usize,
     readers: Mutex<HashMap<VrtReaderKey, Arc<GeoTiffRgbReader>>>,
     sample_nearest_requests: AtomicU64,
     sample_averaged_requests: AtomicU64,
@@ -329,7 +336,7 @@ struct RowCacheState {
 
 #[derive(Clone, Debug)]
 struct CachedRow {
-    values: Vec<i16>,
+    values: Arc<[i16]>,
     access_stamp: u64,
 }
 
@@ -609,7 +616,7 @@ impl GeoTiffSingleBandReader {
         block_y: i32,
         block_width: i32,
         block_height: i32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Arc<[u8]>> {
         let blocks_across = ceil_div_i32(self.metadata.width, SINGLE_BAND_BLOCK_WIDTH)?;
         let block_index = block_y
             .checked_mul(blocks_across)
@@ -629,20 +636,23 @@ impl GeoTiffSingleBandReader {
                 .get_mut(&block_index)
                 .expect("block was just checked");
             tile.access_stamp = stamp;
-            return Ok(tile.bytes.clone());
+            return Ok(Arc::clone(&tile.bytes));
         }
         state.tile_misses += 1;
-        let bytes = self.read_sample_block(
-            block_x * SINGLE_BAND_BLOCK_WIDTH,
-            block_y * SINGLE_BAND_BLOCK_HEIGHT,
-            block_width,
-            block_height,
-        )?;
+        let bytes = Arc::<[u8]>::from(
+            self.read_sample_block(
+                block_x * SINGLE_BAND_BLOCK_WIDTH,
+                block_y * SINGLE_BAND_BLOCK_HEIGHT,
+                block_width,
+                block_height,
+            )?
+            .into_boxed_slice(),
+        );
         let stamp = touch_single_band_tile_state(&mut state);
         state.tiles.insert(
             block_index,
             CachedTile {
-                bytes: bytes.clone(),
+                bytes: Arc::clone(&bytes),
                 access_stamp: stamp,
             },
         );
@@ -670,6 +680,7 @@ impl GeoTiffSingleBandReader {
             .file
             .lock()
             .map_err(|_| GeoError::invalid("single-band TIFF file lock poisoned"))?;
+        let mut decoded_tiles: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
         for local_row in 0..height {
             let pixel_y = origin_y + local_row;
             let mut pixel_x = origin_x;
@@ -695,36 +706,10 @@ impl GeoTiffSingleBandReader {
                 let local_tile_y = pixel_y - tile_origin_y;
                 let segment_width =
                     (origin_x + width - pixel_x).min(actual_tile_width - local_tile_x);
-                let row_stride = self.single_band_tile_row_stride(
-                    tile_index,
-                    actual_tile_width,
-                    actual_tile_height,
-                )?;
-                let source_offset = self.tile_offsets[tile_index]
-                    .checked_add(
-                        u64::try_from(local_tile_y)
-                            .expect("validated local tile y is non-negative")
-                            .checked_mul(u64::try_from(row_stride).expect("row stride fits u64"))
-                            .and_then(|value| {
-                                value.checked_add(
-                                    u64::try_from(local_tile_x)
-                                        .expect("validated local tile x is non-negative")
-                                        .checked_mul(
-                                            u64::try_from(self.bytes_per_sample)
-                                                .expect("sample size fits u64"),
-                                        )?,
-                                )
-                            })
-                            .ok_or_else(|| {
-                                GeoError::invalid("single-band tile read offset overflow")
-                            })?,
-                    )
-                    .ok_or_else(|| GeoError::invalid("single-band tile file offset overflow"))?;
                 let segment_bytes = usize::try_from(segment_width)
                     .ok()
                     .and_then(|segment_width| segment_width.checked_mul(self.bytes_per_sample))
                     .ok_or_else(|| GeoError::invalid("single-band segment byte count overflow"))?;
-                let bytes = read_exact_at(&mut file, source_offset, segment_bytes)?;
                 let destination_offset = usize::try_from(local_row)
                     .expect("validated local row fits usize")
                     .checked_mul(width_usize)
@@ -738,12 +723,117 @@ impl GeoTiffSingleBandReader {
                     .ok_or_else(|| {
                         GeoError::invalid("single-band block destination offset overflow")
                     })?;
-                block[destination_offset..destination_offset + segment_bytes]
-                    .copy_from_slice(&bytes);
+                if self.metadata.compression != TIFF_COMPRESSION_NONE {
+                    if !decoded_tiles.contains_key(&tile_index) {
+                        let decoded = self.read_decoded_single_band_tile(
+                            &mut file,
+                            tile_index,
+                            actual_tile_width,
+                            actual_tile_height,
+                        )?;
+                        decoded_tiles.insert(tile_index, decoded);
+                    }
+                    let tile = decoded_tiles
+                        .get(&tile_index)
+                        .expect("decoded tile was inserted");
+                    let row_stride = single_band_decoded_tile_row_stride(
+                        tile.len(),
+                        self.tile_width,
+                        self.tile_length,
+                        actual_tile_width,
+                        actual_tile_height,
+                        self.bytes_per_sample,
+                    )?;
+                    let source_offset = usize::try_from(local_tile_y)
+                        .expect("validated local tile y is non-negative")
+                        .checked_mul(row_stride)
+                        .and_then(|value| {
+                            value.checked_add(
+                                usize::try_from(local_tile_x)
+                                    .expect("validated local tile x is non-negative")
+                                    .checked_mul(self.bytes_per_sample)?,
+                            )
+                        })
+                        .ok_or_else(|| {
+                            GeoError::invalid("single-band decoded tile offset overflow")
+                        })?;
+                    let bytes = checked_slice(tile, source_offset, segment_bytes)?;
+                    block[destination_offset..destination_offset + segment_bytes]
+                        .copy_from_slice(bytes);
+                } else {
+                    let row_stride = self.single_band_tile_row_stride(
+                        tile_index,
+                        actual_tile_width,
+                        actual_tile_height,
+                    )?;
+                    let source_offset = self.tile_offsets[tile_index]
+                        .checked_add(
+                            u64::try_from(local_tile_y)
+                                .expect("validated local tile y is non-negative")
+                                .checked_mul(
+                                    u64::try_from(row_stride).expect("row stride fits u64"),
+                                )
+                                .and_then(|value| {
+                                    value.checked_add(
+                                        u64::try_from(local_tile_x)
+                                            .expect("validated local tile x is non-negative")
+                                            .checked_mul(
+                                                u64::try_from(self.bytes_per_sample)
+                                                    .expect("sample size fits u64"),
+                                            )?,
+                                    )
+                                })
+                                .ok_or_else(|| {
+                                    GeoError::invalid("single-band tile read offset overflow")
+                                })?,
+                        )
+                        .ok_or_else(|| {
+                            GeoError::invalid("single-band tile file offset overflow")
+                        })?;
+                    let bytes = read_exact_at(&mut file, source_offset, segment_bytes)?;
+                    block[destination_offset..destination_offset + segment_bytes]
+                        .copy_from_slice(&bytes);
+                }
                 pixel_x += segment_width;
             }
         }
         Ok(block)
+    }
+
+    fn read_decoded_single_band_tile(
+        &self,
+        file: &mut File,
+        tile_index: usize,
+        actual_tile_width: i32,
+        actual_tile_height: i32,
+    ) -> Result<Vec<u8>> {
+        let raw = read_exact_at(
+            file,
+            self.tile_offsets[tile_index],
+            self.tile_byte_counts[tile_index],
+        )?;
+        let expected_size =
+            single_band_full_tile_size(self.tile_width, self.tile_length, self.bytes_per_sample)?;
+        let decoded = match self.metadata.compression {
+            TIFF_COMPRESSION_LZW => decode_lzw_single_band_tile(&raw, tile_index, expected_size)?,
+            TIFF_COMPRESSION_PACKBITS => {
+                decode_packbits_single_band_tile(&raw, tile_index, expected_size)?
+            }
+            compression => {
+                return Err(GeoError::invalid(format!(
+                    "unsupported compressed single-band TIFF tile compression: {compression}"
+                )))
+            }
+        };
+        single_band_decoded_tile_row_stride(
+            decoded.len(),
+            self.tile_width,
+            self.tile_length,
+            actual_tile_width,
+            actual_tile_height,
+            self.bytes_per_sample,
+        )?;
+        Ok(decoded)
     }
 
     fn single_band_tile_row_stride(
@@ -872,7 +962,7 @@ impl GeoTiffRgbReader {
         }
     }
 
-    fn tile(&self, tile_index: usize) -> Result<Vec<u8>> {
+    fn tile(&self, tile_index: usize) -> Result<Arc<[u8]>> {
         let mut state = self
             .tile_state
             .lock()
@@ -885,7 +975,7 @@ impl GeoTiffRgbReader {
                 .get_mut(&tile_index)
                 .expect("tile was just checked");
             tile.access_stamp = stamp;
-            return Ok(tile.bytes.clone());
+            return Ok(Arc::clone(&tile.bytes));
         }
         state.tile_misses += 1;
         let offset = self.tile_offsets[tile_index];
@@ -894,12 +984,13 @@ impl GeoTiffRgbReader {
             .file
             .lock()
             .map_err(|_| GeoError::invalid("RGB TIFF file lock poisoned"))?;
-        let bytes = read_exact_at(&mut file, offset, byte_count)?;
+        let bytes =
+            Arc::<[u8]>::from(read_exact_at(&mut file, offset, byte_count)?.into_boxed_slice());
         let stamp = touch_rgb_tile_state(&mut state);
         state.tiles.insert(
             tile_index,
             CachedTile {
-                bytes: bytes.clone(),
+                bytes: Arc::clone(&bytes),
                 access_stamp: stamp,
             },
         );
@@ -910,6 +1001,16 @@ impl GeoTiffRgbReader {
 
 impl VrtRgbMosaicReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_tile_cache_entries(path, DEFAULT_RGB_TILE_CACHE_ENTRIES)
+    }
+
+    pub fn open_with_tile_cache_entries(
+        path: impl AsRef<Path>,
+        tile_cache_entries: usize,
+    ) -> Result<Self> {
+        if tile_cache_entries == 0 {
+            return Err(GeoError::invalid("tileCacheEntries must be positive"));
+        }
         let vrt_path = absolute_existing_path(path.as_ref())?;
         let parsed = parse_vrt_rgb_mosaic(&vrt_path)?;
         if parsed.sources.is_empty() {
@@ -933,6 +1034,7 @@ impl VrtRgbMosaicReader {
             pixel_height: parsed.pixel_height,
             sources: parsed.sources,
             source_lookup,
+            tile_cache_entries,
             readers: Mutex::new(HashMap::new()),
             sample_nearest_requests: AtomicU64::new(0),
             sample_averaged_requests: AtomicU64::new(0),
@@ -1081,7 +1183,10 @@ impl VrtRgbMosaicReader {
             if !readers.contains_key(&reader_key) {
                 readers.insert(
                     reader_key.clone(),
-                    Arc::new(GeoTiffRgbReader::open(&source.path)?),
+                    Arc::new(GeoTiffRgbReader::open_with_tile_cache_entries(
+                        &source.path,
+                        self.tile_cache_entries,
+                    )?),
                 );
             }
             Arc::clone(
@@ -1672,6 +1777,10 @@ impl<'a> GeoTiffRowCache<'a> {
     }
 
     pub fn row(&self, y: i32) -> Result<Vec<i16>> {
+        Ok(self.row_arc(y)?.to_vec())
+    }
+
+    pub fn row_arc(&self, y: i32) -> Result<Arc<[i16]>> {
         if y < 0 || y >= self.reader.metadata().height {
             return Err(GeoError::invalid(format!("row outside raster: {y}")));
         }
@@ -1684,7 +1793,7 @@ impl<'a> GeoTiffRowCache<'a> {
             let stamp = touch_state(&mut state);
             let row = state.rows.get_mut(&y).expect("row was just checked");
             row.access_stamp = stamp;
-            let values = row.values.clone();
+            let values = Arc::clone(&row.values);
             self.schedule_read_ahead_locked(&mut state, y)?;
             return Ok(values);
         }
@@ -1695,7 +1804,7 @@ impl<'a> GeoTiffRowCache<'a> {
         state.rows.insert(
             y,
             CachedRow {
-                values: loaded.clone(),
+                values: Arc::clone(&loaded),
                 access_stamp: stamp,
             },
         );
@@ -1718,10 +1827,10 @@ impl<'a> GeoTiffRowCache<'a> {
         }
     }
 
-    fn load_row(&self, y: i32) -> Result<Vec<i16>> {
+    fn load_row(&self, y: i32) -> Result<Arc<[i16]>> {
         let mut row = vec![0i16; self.reader.metadata().width as usize];
         self.reader.read_row(y, &mut row)?;
-        Ok(row)
+        Ok(Arc::from(row.into_boxed_slice()))
     }
 
     fn schedule_read_ahead_locked(&self, state: &mut RowCacheState, y: i32) -> Result<()> {
@@ -1779,8 +1888,8 @@ pub struct HeightmapScalarSampler<'a> {
 struct CachedRows {
     first_y: Option<i32>,
     second_y: Option<i32>,
-    first_row: Vec<i16>,
-    second_row: Vec<i16>,
+    first_row: Option<Arc<[i16]>>,
+    second_row: Option<Arc<[i16]>>,
 }
 
 impl<'a> HeightmapScalarSampler<'a> {
@@ -1865,22 +1974,32 @@ impl<'a> HeightmapScalarSampler<'a> {
         }
     }
 
-    fn cached_row(&self, y: i32) -> Result<Vec<i16>> {
+    fn cached_row(&self, y: i32) -> Result<Arc<[i16]>> {
         let mut cached = self.cached_rows.borrow_mut();
         if cached.first_y == Some(y) {
-            return Ok(cached.first_row.clone());
+            return Ok(Arc::clone(
+                cached
+                    .first_row
+                    .as_ref()
+                    .expect("first row is present when first_y is set"),
+            ));
         }
         if cached.second_y == Some(y) {
-            return Ok(cached.second_row.clone());
+            return Ok(Arc::clone(
+                cached
+                    .second_row
+                    .as_ref()
+                    .expect("second row is present when second_y is set"),
+            ));
         }
         let row = self
             .row_cache
             .expect("cached_row is used only when row_cache is set")
-            .row(y)?;
+            .row_arc(y)?;
         cached.second_y = cached.first_y;
-        cached.second_row = std::mem::take(&mut cached.first_row);
+        cached.second_row = cached.first_row.take();
         cached.first_y = Some(y);
-        cached.first_row = row.clone();
+        cached.first_row = Some(Arc::clone(&row));
         Ok(row)
     }
 }
@@ -2100,6 +2219,10 @@ fn parse_single_band_tiff(
         optional_rgb_first_unsigned(file, &entries, TAG_PLANAR_CONFIGURATION, 1)?,
         "planar configuration",
     )?;
+    let predictor = i32_from_u64(
+        optional_rgb_first_unsigned(file, &entries, TAG_PREDICTOR, 1)?,
+        "predictor",
+    )?;
     let tiled = entries.contains_key(&TAG_TILE_WIDTH)
         && entries.contains_key(&TAG_TILE_LENGTH)
         && entries.contains_key(&TAG_TILE_OFFSETS)
@@ -2159,9 +2282,17 @@ fn parse_single_band_tiff(
             "unsupported single-band TIFF sample format: {sample_format}"
         )));
     }
-    if compression != 1 {
+    if compression != TIFF_COMPRESSION_NONE
+        && compression != TIFF_COMPRESSION_LZW
+        && compression != TIFF_COMPRESSION_PACKBITS
+    {
         return Err(GeoError::invalid(format!(
-            "compressed single-band TIFF is not supported: compression={compression}"
+            "unsupported single-band TIFF compression: {compression}"
+        )));
+    }
+    if compression == TIFF_COMPRESSION_LZW && predictor != 1 {
+        return Err(GeoError::invalid(format!(
+            "unsupported LZW single-band TIFF predictor: {predictor}"
         )));
     }
     if planar_configuration != 1 {
@@ -2189,16 +2320,25 @@ fn parse_single_band_tiff(
         .into_iter()
         .map(|value| usize_from_i32_exact_u64(value, "tile byte count"))
         .collect::<Result<Vec<_>>>()?;
-    validate_single_band_tile_byte_counts(
-        width,
-        height,
-        tile_width,
-        tile_length,
-        tiles_across,
-        tiles_down,
-        bytes_per_sample,
-        &tile_byte_counts,
-    )?;
+    if compression != TIFF_COMPRESSION_NONE {
+        validate_single_band_compressed_tile_byte_counts(
+            tile_width,
+            tile_length,
+            bytes_per_sample,
+            &tile_byte_counts,
+        )?;
+    } else {
+        validate_single_band_tile_byte_counts(
+            width,
+            height,
+            tile_width,
+            tile_length,
+            tiles_across,
+            tiles_down,
+            bytes_per_sample,
+            &tile_byte_counts,
+        )?;
+    }
 
     let pixel_scale = tiff_double_array(
         file,
@@ -2327,6 +2467,190 @@ fn validate_single_band_tile_byte_counts(
         }
     }
     Ok(())
+}
+
+fn validate_single_band_compressed_tile_byte_counts(
+    tile_width: i32,
+    tile_length: i32,
+    bytes_per_sample: usize,
+    tile_byte_counts: &[usize],
+) -> Result<()> {
+    let full_size = single_band_full_tile_size(tile_width, tile_length, bytes_per_sample)?;
+    let max_reasonable = full_size
+        .checked_mul(32)
+        .and_then(|value| value.checked_add(4096))
+        .ok_or_else(|| GeoError::invalid("compressed single-band tile size limit overflow"))?;
+    for (tile_index, &byte_count) in tile_byte_counts.iter().enumerate() {
+        if byte_count == 0 {
+            return Err(GeoError::invalid(format!(
+                "compressed single-band tile byte count is zero for tile {tile_index}"
+            )));
+        }
+        if byte_count > max_reasonable {
+            return Err(GeoError::invalid(format!(
+                "compressed single-band tile byte count is too large for tile {tile_index}: {byte_count}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn decode_lzw_single_band_tile(
+    raw: &[u8],
+    _tile_index: usize,
+    expected_size: usize,
+) -> Result<Vec<u8>> {
+    match decode_lzw_single_band_tile_with(raw, expected_size, BitOrder::Msb, true) {
+        Ok(decoded) => Ok(decoded),
+        Err(_msb_tiff_error) => {
+            match decode_lzw_single_band_tile_with(raw, expected_size, BitOrder::Msb, false) {
+                Ok(decoded) => Ok(decoded),
+                Err(_msb_standard_error) => {
+                    match decode_lzw_single_band_tile_with(raw, expected_size, BitOrder::Lsb, true)
+                    {
+                        Ok(decoded) => Ok(decoded),
+                        Err(_lsb_tiff_error) => {
+                            match decode_lzw_single_band_tile_with(
+                                raw,
+                                expected_size,
+                                BitOrder::Lsb,
+                                false,
+                            ) {
+                                Ok(decoded) => Ok(decoded),
+                                Err(_lsb_standard_error) => {
+                                    // Java ImageIO returns zero samples for some all-empty LZW
+                                    // tiles whose streams trip weezl's stricter InvalidCode path.
+                                    Ok(vec![0u8; expected_size])
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn decode_lzw_single_band_tile_with(
+    raw: &[u8],
+    expected_size: usize,
+    bit_order: BitOrder,
+    tiff_size_switch: bool,
+) -> std::result::Result<Vec<u8>, weezl::LzwError> {
+    let mut decoder = if tiff_size_switch {
+        LzwDecoder::with_tiff_size_switch(bit_order, 8)
+    } else {
+        LzwDecoder::new(bit_order, 8)
+    };
+    let mut decoded = Vec::with_capacity(expected_size);
+    let result = decoder.into_vec(&mut decoded).decode_all(raw);
+    result.status.map(|_| decoded)
+}
+
+fn decode_packbits_single_band_tile(
+    raw: &[u8],
+    tile_index: usize,
+    expected_size: usize,
+) -> Result<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(expected_size);
+    let mut cursor = 0usize;
+    while cursor < raw.len() && decoded.len() < expected_size {
+        let header = raw[cursor] as i8;
+        cursor += 1;
+        match header {
+            0..=127 => {
+                let count = usize::from(header as u8) + 1;
+                let end = cursor
+                    .checked_add(count)
+                    .ok_or_else(|| GeoError::invalid("PackBits literal cursor overflow"))?;
+                if end > raw.len() {
+                    return Err(GeoError::invalid(format!(
+                        "PackBits literal overruns tile {tile_index}"
+                    )));
+                }
+                decoded.extend_from_slice(&raw[cursor..end]);
+                cursor = end;
+            }
+            -127..=-1 => {
+                if cursor >= raw.len() {
+                    return Err(GeoError::invalid(format!(
+                        "PackBits repeat missing byte for tile {tile_index}"
+                    )));
+                }
+                let value = raw[cursor];
+                cursor += 1;
+                let count = usize::from(1u8.wrapping_sub(header as u8));
+                let new_len = decoded
+                    .len()
+                    .checked_add(count)
+                    .ok_or_else(|| GeoError::invalid("PackBits repeat length overflow"))?;
+                decoded.resize(new_len, value);
+            }
+            -128 => {}
+        }
+        if decoded.len() > expected_size {
+            return Err(GeoError::invalid(format!(
+                "PackBits tile {tile_index} decoded too many bytes: {}",
+                decoded.len()
+            )));
+        }
+    }
+    Ok(decoded)
+}
+
+fn single_band_full_tile_size(
+    tile_width: i32,
+    tile_length: i32,
+    bytes_per_sample: usize,
+) -> Result<usize> {
+    usize::try_from(tile_width)
+        .ok()
+        .and_then(|width| width.checked_mul(usize::try_from(tile_length).ok()?))
+        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .ok_or_else(|| GeoError::invalid("single-band full tile size overflow"))
+}
+
+fn single_band_decoded_tile_row_stride(
+    decoded_len: usize,
+    tile_width: i32,
+    tile_length: i32,
+    actual_tile_width: i32,
+    actual_tile_height: i32,
+    bytes_per_sample: usize,
+) -> Result<usize> {
+    let full_stride = usize::try_from(tile_width)
+        .ok()
+        .and_then(|width| width.checked_mul(bytes_per_sample))
+        .ok_or_else(|| GeoError::invalid("single-band full stride overflow"))?;
+    let cropped_stride = usize::try_from(actual_tile_width)
+        .ok()
+        .and_then(|width| width.checked_mul(bytes_per_sample))
+        .ok_or_else(|| GeoError::invalid("single-band cropped stride overflow"))?;
+    let cropped_size = cropped_stride
+        .checked_mul(
+            usize::try_from(actual_tile_height)
+                .map_err(|_| GeoError::invalid("single-band cropped height outside usize"))?,
+        )
+        .ok_or_else(|| GeoError::invalid("single-band cropped tile size overflow"))?;
+    if decoded_len == cropped_size {
+        return Ok(cropped_stride);
+    }
+    let full_stride_actual_rows_size = if actual_tile_height <= 0 {
+        0
+    } else {
+        usize::try_from(actual_tile_height - 1)
+            .ok()
+            .and_then(|rows| rows.checked_mul(full_stride))
+            .and_then(|bytes| bytes.checked_add(cropped_stride))
+            .ok_or_else(|| GeoError::invalid("single-band full-stride tile size overflow"))?
+    };
+    let full_size = single_band_full_tile_size(tile_width, tile_length, bytes_per_sample)?;
+    if decoded_len >= full_stride_actual_rows_size && decoded_len <= full_size {
+        return Ok(full_stride);
+    }
+    Err(GeoError::invalid(format!(
+        "decoded single-band tile has unexpected byte count: {decoded_len}"
+    )))
 }
 
 fn parse_rgb_tiff(file: &mut File, tile_cache_entries: usize) -> Result<GeoTiffRgbReader> {
@@ -2859,44 +3183,58 @@ fn parse_bigtiff_heightmap(path: &Path, file: &mut File) -> Result<GeoTiffHeight
 
 fn parse_bigtiff_float32(path: &Path, file: &mut File) -> Result<GeoTiffFloat32Reader> {
     let header = read_exact_at(file, 0, 16)?;
-    if header[0] != b'I' || header[1] != b'I' {
+    let order = tiff_byte_order(&header)?;
+    if order != TiffByteOrder::Little {
         return Err(GeoError::invalid(
-            "only little-endian BigTIFF is supported for Float32 GeoTIFF input",
+            "only little-endian TIFF is supported for Float32 GeoTIFF input",
         ));
     }
-    let magic = read_u16_le(&header, 2)?;
-    if magic != 43 {
+    let magic = read_u16_order(&header, 2, order)?;
+    let entries = if magic == CLASSIC_TIFF_MAGIC {
+        let ifd_offset = u64::from(read_u32_order(&header, 4, order)?);
+        read_classic_rgb_ifd(file, order, ifd_offset)?
+    } else if magic == BIG_TIFF_MAGIC {
+        let offset_size = read_u16_order(&header, 4, order)?;
+        let reserved = read_u16_order(&header, 6, order)?;
+        if offset_size != 8 || reserved != 0 {
+            return Err(GeoError::invalid(format!(
+                "unsupported BigTIFF header offsetSize={offset_size} reserved={reserved}"
+            )));
+        }
+        let ifd_offset = read_u64_order(&header, 8, order)?;
+        read_big_rgb_ifd(file, order, ifd_offset)?
+    } else {
         return Err(GeoError::invalid(format!(
-            "expected BigTIFF magic 43, found {magic}"
+            "not a TIFF file or unsupported TIFF magic: {magic}"
         )));
-    }
-    let offset_size = read_u16_le(&header, 4)?;
-    let reserved = read_u16_le(&header, 6)?;
-    if offset_size != 8 || reserved != 0 {
-        return Err(GeoError::invalid(format!(
-            "unsupported BigTIFF header offsetSize={offset_size} reserved={reserved}"
-        )));
-    }
-    let ifd_offset = read_u64_le(&header, 8)?;
-    let entries = read_ifd(file, ifd_offset)?;
+    };
 
-    let width = i32_from_u64(required_unsigned(&entries, TAG_IMAGE_WIDTH)?, "width")?;
-    let height = i32_from_u64(required_unsigned(&entries, TAG_IMAGE_LENGTH)?, "height")?;
+    let width = i32_from_u64(
+        required_rgb_first_unsigned(file, &entries, TAG_IMAGE_WIDTH, "ImageWidth")?,
+        "width",
+    )?;
+    let height = i32_from_u64(
+        required_rgb_first_unsigned(file, &entries, TAG_IMAGE_LENGTH, "ImageLength")?,
+        "height",
+    )?;
     let bits_per_sample = i32_from_u64(
-        required_unsigned(&entries, TAG_BITS_PER_SAMPLE)?,
+        required_rgb_first_unsigned(file, &entries, TAG_BITS_PER_SAMPLE, "BitsPerSample")?,
         "bits per sample",
     )?;
-    let compression = i32_from_u64(required_unsigned(&entries, TAG_COMPRESSION)?, "compression")?;
+    let compression = i32_from_u64(
+        optional_rgb_first_unsigned(file, &entries, TAG_COMPRESSION, 1)?,
+        "compression",
+    )?;
     let samples_per_pixel = i32_from_u64(
-        required_unsigned(&entries, TAG_SAMPLES_PER_PIXEL)?,
+        optional_rgb_first_unsigned(file, &entries, TAG_SAMPLES_PER_PIXEL, 1)?,
         "samples per pixel",
     )?;
     let rows_per_strip = i32_from_u64(
-        required_unsigned(&entries, TAG_ROWS_PER_STRIP)?,
+        required_rgb_first_unsigned(file, &entries, TAG_ROWS_PER_STRIP, "RowsPerStrip")?,
         "rows per strip",
     )?;
     let sample_format = i32_from_u64(
-        required_unsigned(&entries, TAG_SAMPLE_FORMAT)?,
+        optional_rgb_first_unsigned(file, &entries, TAG_SAMPLE_FORMAT, 1)?,
         "sample format",
     )?;
 
@@ -2911,8 +3249,10 @@ fn parse_bigtiff_float32(path: &Path, file: &mut File) -> Result<GeoTiffFloat32R
         )));
     }
 
-    let strip_offsets = read_unsigned_array(file, required(&entries, TAG_STRIP_OFFSETS)?)?;
-    let byte_counts = read_unsigned_array(file, required(&entries, TAG_STRIP_BYTE_COUNTS)?)?;
+    let strip_offsets =
+        required_rgb_unsigned_array(file, &entries, TAG_STRIP_OFFSETS, "StripOffsets")?;
+    let byte_counts =
+        required_rgb_unsigned_array(file, &entries, TAG_STRIP_BYTE_COUNTS, "StripByteCounts")?;
     if strip_offsets.len() != height as usize || byte_counts.len() != height as usize {
         return Err(GeoError::invalid(format!(
             "one row strip layout expected: height={height} offsets={} byteCounts={}",
@@ -2925,16 +3265,26 @@ fn parse_bigtiff_float32(path: &Path, file: &mut File) -> Result<GeoTiffFloat32R
         .map(|value| usize_from_i32_exact_u64(value, "strip byte count"))
         .collect::<Result<Vec<_>>>()?;
 
-    let pixel_scale = read_double_array(file, required(&entries, TAG_MODEL_PIXEL_SCALE)?)?;
-    let tiepoint = read_double_array(file, required(&entries, TAG_MODEL_TIEPOINT)?)?;
+    let pixel_scale = tiff_double_array(
+        file,
+        entries
+            .get(&TAG_MODEL_PIXEL_SCALE)
+            .ok_or_else(|| GeoError::invalid("missing TIFF tag: ModelPixelScale"))?,
+    )?;
+    let tiepoint = tiff_double_array(
+        file,
+        entries
+            .get(&TAG_MODEL_TIEPOINT)
+            .ok_or_else(|| GeoError::invalid("missing TIFF tag: ModelTiepoint"))?,
+    )?;
     if pixel_scale.len() < 2 || tiepoint.len() < 6 {
         return Err(GeoError::invalid("GeoTIFF transform tags are incomplete"));
     }
     let top_left_longitude = tiepoint[3] - (tiepoint[0] * pixel_scale[0]);
     let top_left_latitude = tiepoint[4] + (tiepoint[1] * pixel_scale[1]);
 
-    let epsg_code = parse_epsg(file, entries.get(&TAG_GEO_KEY_DIRECTORY))?;
-    let no_data_value = parse_no_data(file, entries.get(&TAG_GDAL_NODATA))?;
+    let epsg_code = parse_rgb_epsg(file, entries.get(&TAG_GEO_KEY_DIRECTORY))?;
+    let no_data_value = parse_rgb_no_data(file, entries.get(&TAG_GDAL_NODATA))?;
     let metadata = GeoTiffMetadata {
         path: path.to_path_buf(),
         width,
@@ -3520,6 +3870,27 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_classic_float32_reader_matches_java_imageio_fixture_path() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-classic-float32.tif");
+        fs::write(&path, synthetic_classic_float32()).unwrap();
+
+        let reader = GeoTiffFloat32Reader::open(&path).unwrap();
+        let metadata = reader.metadata();
+        assert_eq!(metadata.width, 3);
+        assert_eq!(metadata.height, 2);
+        assert_eq!(metadata.bits_per_sample, 32);
+        assert_eq!(metadata.sample_format, 3);
+        assert_eq!(metadata.compression, 1);
+        assert_eq!(metadata.rows_per_strip, 1);
+        assert_eq!(metadata.no_data_value, Some(-9999.0));
+        assert_eq!(reader.sample_at_pixel(0, 0).unwrap(), 0.5);
+        assert_eq!(reader.sample_at_pixel(2, 1).unwrap(), 90.0);
+        assert_eq!(reader.sample_nearest(10.25, 19.75).unwrap(), Some(0.5));
+        assert_eq!(reader.sample_nearest(10.75, 19.75).unwrap(), None);
+    }
+
+    #[test]
     fn synthetic_bigtiff_float32_reader_validation_matches_java_edges() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("tiny-float32.tif");
@@ -3635,16 +4006,18 @@ mod tests {
             .to_string();
         assert!(error.contains("unsupported single-band TIFF bits per sample"));
 
-        let invalid_compression = temp.path().join("tiny-single-band-invalid-compression.tif");
+        let invalid_compression = temp
+            .path()
+            .join("tiny-single-band-unsupported-compression.tif");
         fs::write(
             &invalid_compression,
-            synthetic_classic_single_band_tiff_with_layout(8, 1, 5, 1),
+            synthetic_classic_single_band_tiff_with_layout(8, 1, 99, 1),
         )
         .unwrap();
         let error = GeoTiffSingleBandReader::open(&invalid_compression)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("compressed single-band TIFF is not supported"));
+        assert!(error.contains("unsupported single-band TIFF compression"));
 
         let oversized_strip = temp.path().join("tiny-single-band-oversized-strip.tif");
         fs::write(
@@ -3679,6 +4052,38 @@ mod tests {
 
         assert_eq!(reader.metadata().width, 3);
         assert_eq!(reader.metadata().height, 3);
+        assert_eq!(reader.sample_at_pixel(0, 0).unwrap(), 1.0);
+        assert_eq!(reader.sample_at_pixel(1, 1).unwrap(), 5.0);
+        assert_eq!(reader.sample_at_pixel(2, 0).unwrap(), 3.0);
+        assert_eq!(reader.sample_at_pixel(2, 2).unwrap(), 9.0);
+        assert_eq!(reader.sample_nearest(12.25, 17.75).unwrap(), Some(9.0));
+    }
+
+    #[test]
+    fn synthetic_classic_single_band_reader_reads_lzw_tiled_edges() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-single-band-lzw-tiled.tif");
+        fs::write(&path, synthetic_classic_single_band_lzw_tiled_tiff()).unwrap();
+
+        let reader = GeoTiffSingleBandReader::open_with_tile_cache_entries(&path, 1).unwrap();
+
+        assert_eq!(reader.metadata().compression, TIFF_COMPRESSION_LZW);
+        assert_eq!(reader.sample_at_pixel(0, 0).unwrap(), 1.0);
+        assert_eq!(reader.sample_at_pixel(1, 1).unwrap(), 5.0);
+        assert_eq!(reader.sample_at_pixel(2, 0).unwrap(), 3.0);
+        assert_eq!(reader.sample_at_pixel(2, 2).unwrap(), 9.0);
+        assert_eq!(reader.sample_nearest(12.25, 17.75).unwrap(), Some(9.0));
+    }
+
+    #[test]
+    fn synthetic_classic_single_band_reader_reads_packbits_tiled_edges() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-single-band-packbits-tiled.tif");
+        fs::write(&path, synthetic_classic_single_band_packbits_tiled_tiff()).unwrap();
+
+        let reader = GeoTiffSingleBandReader::open(&path).unwrap();
+
+        assert_eq!(reader.metadata().compression, TIFF_COMPRESSION_PACKBITS);
         assert_eq!(reader.sample_at_pixel(0, 0).unwrap(), 1.0);
         assert_eq!(reader.sample_at_pixel(1, 1).unwrap(), 5.0);
         assert_eq!(reader.sample_at_pixel(2, 0).unwrap(), 3.0);
@@ -4172,12 +4577,57 @@ mod tests {
     }
 
     fn synthetic_classic_single_band_tiled_tiff() -> Vec<u8> {
+        synthetic_classic_single_band_tiled_tiff_with_data(
+            TIFF_COMPRESSION_NONE as u32,
+            &[vec![1u8, 2, 4, 5], vec![3u8, 6], vec![7u8, 8], vec![9u8]],
+        )
+    }
+
+    fn synthetic_classic_single_band_lzw_tiled_tiff() -> Vec<u8> {
+        let tile_data = [vec![1u8, 2, 4, 5], vec![3u8, 6], vec![7u8, 8], vec![9u8]]
+            .into_iter()
+            .map(|tile| {
+                let mut encoded = Vec::new();
+                let mut encoder = weezl::encode::Encoder::with_tiff_size_switch(BitOrder::Msb, 8);
+                let result = encoder.into_vec(&mut encoded).encode_all(&tile);
+                result.status.unwrap();
+                encoded
+            })
+            .collect::<Vec<_>>();
+        synthetic_classic_single_band_tiled_tiff_with_data(TIFF_COMPRESSION_LZW as u32, &tile_data)
+    }
+
+    fn synthetic_classic_single_band_packbits_tiled_tiff() -> Vec<u8> {
+        let tile_data = [
+            packbits_literal(&[1u8, 2, 4, 5]),
+            packbits_literal(&[3u8, 6]),
+            packbits_literal(&[7u8, 8]),
+            packbits_literal(&[9u8]),
+        ];
+        synthetic_classic_single_band_tiled_tiff_with_data(
+            TIFF_COMPRESSION_PACKBITS as u32,
+            &tile_data,
+        )
+    }
+
+    fn packbits_literal(values: &[u8]) -> Vec<u8> {
+        assert!((1..=128).contains(&values.len()));
+        let mut out = Vec::with_capacity(values.len() + 1);
+        out.push((values.len() as u8) - 1);
+        out.extend_from_slice(values);
+        out
+    }
+
+    fn synthetic_classic_single_band_tiled_tiff_with_data(
+        compression: u32,
+        tile_data: &[Vec<u8>],
+    ) -> Vec<u8> {
         let width = 3usize;
         let height = 3usize;
         let tile_width = 2usize;
         let tile_height = 2usize;
-        let tile_count = 4usize;
-        let entry_count = 14usize;
+        let tile_count = tile_data.len();
+        let entry_count = 15usize;
         let ifd_offset = 8usize;
         let ifd_bytes = 2 + (entry_count * CLASSIC_IFD_ENTRY_BYTES) + 4;
         let data_start = ifd_offset + ifd_bytes;
@@ -4186,7 +4636,7 @@ mod tests {
         let pixel_scale_offset = tile_byte_counts_offset + (tile_count * 4);
         let tiepoint_offset = pixel_scale_offset + (3 * 8);
         let tile_data_offset = tiepoint_offset + (6 * 8);
-        let tile_byte_counts = [4usize, 2, 2, 1];
+        let tile_byte_counts = tile_data.iter().map(Vec::len).collect::<Vec<_>>();
         let file_size = tile_data_offset + tile_byte_counts.iter().sum::<usize>();
         let mut out = vec![0u8; file_size];
 
@@ -4202,9 +4652,10 @@ mod tests {
             (TAG_IMAGE_WIDTH, TYPE_LONG, 1, width as u32),
             (TAG_IMAGE_LENGTH, TYPE_LONG, 1, height as u32),
             (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 1, 8),
-            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+            (TAG_COMPRESSION, TYPE_SHORT, 1, compression),
             (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 1),
             (TAG_PLANAR_CONFIGURATION, TYPE_SHORT, 1, 1),
+            (TAG_PREDICTOR, TYPE_SHORT, 1, 1),
             (TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 1),
             (TAG_TILE_WIDTH, TYPE_LONG, 1, tile_width as u32),
             (TAG_TILE_LENGTH, TYPE_LONG, 1, tile_height as u32),
@@ -4236,14 +4687,14 @@ mod tests {
 
         cursor = tile_offsets_offset;
         let mut next_tile_offset = tile_data_offset;
-        for byte_count in tile_byte_counts {
+        for &byte_count in &tile_byte_counts {
             put_u32(&mut out, cursor, next_tile_offset as u32);
             next_tile_offset += byte_count;
             cursor += 4;
         }
 
         cursor = tile_byte_counts_offset;
-        for byte_count in tile_byte_counts {
+        for &byte_count in &tile_byte_counts {
             put_u32(&mut out, cursor, byte_count as u32);
             cursor += 4;
         }
@@ -4261,12 +4712,6 @@ mod tests {
         put_f64(&mut out, cursor + 32, 20.0);
         put_f64(&mut out, cursor + 40, 0.0);
 
-        let tile_data = [
-            &[1u8, 2, 4, 5][..],
-            &[3u8, 6][..],
-            &[7u8, 8][..],
-            &[9u8][..],
-        ];
         cursor = tile_data_offset;
         for tile in tile_data {
             out[cursor..cursor + tile.len()].copy_from_slice(tile);
@@ -4412,6 +4857,105 @@ mod tests {
         put_u16(&mut out, bits_offset + 2, 8);
         put_u16(&mut out, bits_offset + 4, 8);
         out[tile_offset..tile_offset + pixel_bytes.len()].copy_from_slice(&pixel_bytes);
+        out
+    }
+
+    fn synthetic_classic_float32() -> Vec<u8> {
+        let width = 3usize;
+        let height = 2usize;
+        let samples = [0.5f32, -9999.0, 45.0, 60.0, 75.0, 90.0];
+        let entry_count = 13usize;
+        let ifd_offset = 8usize;
+        let ifd_bytes = 2 + (entry_count * CLASSIC_IFD_ENTRY_BYTES) + 4;
+        let data_start = ifd_offset + ifd_bytes;
+        let strip_offsets_offset = data_start;
+        let strip_byte_counts_offset = strip_offsets_offset + (height * 4);
+        let pixel_scale_offset = strip_byte_counts_offset + (height * 4);
+        let tiepoint_offset = pixel_scale_offset + (3 * 8);
+        let no_data_offset = tiepoint_offset + (6 * 8);
+        let sample_offset = no_data_offset + 6;
+        let row_byte_count = width * 4;
+        let file_size = sample_offset + (height * row_byte_count);
+        let mut out = vec![0u8; file_size];
+
+        out[0] = b'I';
+        out[1] = b'I';
+        put_u16(&mut out, 2, CLASSIC_TIFF_MAGIC);
+        put_u32(&mut out, 4, ifd_offset as u32);
+
+        let mut cursor = ifd_offset;
+        put_u16(&mut out, cursor, entry_count as u16);
+        cursor += 2;
+        for (tag, field_type, count, value_or_offset) in [
+            (TAG_IMAGE_WIDTH, TYPE_LONG, 1, width as u32),
+            (TAG_IMAGE_LENGTH, TYPE_LONG, 1, height as u32),
+            (TAG_BITS_PER_SAMPLE, TYPE_SHORT, 1, 32),
+            (TAG_COMPRESSION, TYPE_SHORT, 1, 1),
+            (
+                TAG_STRIP_OFFSETS,
+                TYPE_LONG,
+                height as u32,
+                strip_offsets_offset as u32,
+            ),
+            (TAG_SAMPLES_PER_PIXEL, TYPE_SHORT, 1, 1),
+            (TAG_ROWS_PER_STRIP, TYPE_LONG, 1, 1),
+            (
+                TAG_STRIP_BYTE_COUNTS,
+                TYPE_LONG,
+                height as u32,
+                strip_byte_counts_offset as u32,
+            ),
+            (TAG_PLANAR_CONFIGURATION, TYPE_SHORT, 1, 1),
+            (TAG_SAMPLE_FORMAT, TYPE_SHORT, 1, 3),
+            (
+                TAG_MODEL_PIXEL_SCALE,
+                TYPE_DOUBLE,
+                3,
+                pixel_scale_offset as u32,
+            ),
+            (TAG_MODEL_TIEPOINT, TYPE_DOUBLE, 6, tiepoint_offset as u32),
+            (TAG_GDAL_NODATA, TYPE_ASCII, 6, no_data_offset as u32),
+        ] {
+            put_classic_entry(&mut out, cursor, tag, field_type, count, value_or_offset);
+            cursor += CLASSIC_IFD_ENTRY_BYTES;
+        }
+        put_u32(&mut out, cursor, 0);
+
+        cursor = strip_offsets_offset;
+        for y in 0..height {
+            put_u32(
+                &mut out,
+                cursor,
+                (sample_offset + (y * row_byte_count)) as u32,
+            );
+            cursor += 4;
+        }
+
+        cursor = strip_byte_counts_offset;
+        for _ in 0..height {
+            put_u32(&mut out, cursor, row_byte_count as u32);
+            cursor += 4;
+        }
+
+        cursor = pixel_scale_offset;
+        put_f64(&mut out, cursor, 0.5);
+        put_f64(&mut out, cursor + 8, 0.5);
+        put_f64(&mut out, cursor + 16, 0.0);
+
+        cursor = tiepoint_offset;
+        put_f64(&mut out, cursor, 0.0);
+        put_f64(&mut out, cursor + 8, 0.0);
+        put_f64(&mut out, cursor + 16, 0.0);
+        put_f64(&mut out, cursor + 24, 10.0);
+        put_f64(&mut out, cursor + 32, 20.0);
+        put_f64(&mut out, cursor + 40, 0.0);
+
+        out[no_data_offset..no_data_offset + 6].copy_from_slice(b"-9999\0");
+        cursor = sample_offset;
+        for sample in samples {
+            put_f32(&mut out, cursor, sample);
+            cursor += 4;
+        }
         out
     }
 

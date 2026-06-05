@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Write};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::process::Command;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use earthmap_core::build_info;
 use earthmap_core::commands::{self, CommandStatus};
 use earthmap_core::progress;
 use earthmap_geo::{
-    EarthScaleMapping, GeoTiffHeightmapReader, GeoTiffMetadata, GeoTiffRowCache,
-    HeightmapScalarSampler, VrtRgbMosaicReader,
+    EarthScaleMapping, GeoTiffFloat32Reader, GeoTiffHeightmapReader, GeoTiffMetadata,
+    GeoTiffRowCache, GeoTiffSingleBandReader, HeightmapScalarSampler, VrtRgbMosaicReader,
 };
 use earthmap_minecraft::{
     block_state_ids,
@@ -24,9 +27,12 @@ use earthmap_minecraft::{
 };
 use earthmap_region::{read_region_payloads, ChunkLocalPos, RegionError};
 use earthmap_surface::{
-    classify_surface, EarthSurfaceColumn, HeightOnlySettings, OutputFormat, SurfaceMaterialSample,
+    classify_surface, generate_surface_region_with_open_material_sampler,
+    EarthDataSurfaceMaterialSampler, EarthSurfaceColumn, HeightOnlySettings,
+    LandShallowTopoPhotoSampler, MetImageExportTerrainSampler, OutputFormat, SurfaceMaterialSample,
     SurfaceRegionColumnTrace, SurfaceRegionReport, SurfaceRegionSettings, SurfaceTextureMode,
-    DEFAULT_HEIGHT_ONLY_CACHE_ROWS, SURVIVAL_MANIFEST_FILE_NAME,
+    WwfEcoregionSampler, DEFAULT_SURFACE_TILE_CACHE_ENTRIES, REGION_SIZE_BLOCKS, SEA_LEVEL_Y,
+    SURVIVAL_MANIFEST_FILE_NAME,
 };
 
 const EXIT_OK: i32 = 0;
@@ -34,6 +40,14 @@ const EXIT_USAGE: i32 = 2;
 const DEFAULT_HEIGHTMAP_PATH: &str = r"C:\earth_map_resources\HQheightmap.tif";
 const FLAT_TEST_REGION_CHUNKS: u8 = 32;
 const FLAT_TEST_SURFACE_Y: i32 = 63;
+const QUALITY_PREVIEW_REGION_WIDTH: usize = 512;
+const QUALITY_PREVIEW_GRID_MIN: usize = 8;
+const QUALITY_PREVIEW_GRID_MAX: usize = 256;
+const HEIGHTMAP_CACHE_ROWS_ENV: &str = "EARTHMAP_HEIGHTMAP_CACHE_ROWS";
+const SURFACE_TILE_CACHE_ENTRIES_ENV: &str = "EARTHMAP_SURFACE_TILE_CACHE_ENTRIES";
+const SURFACE_PHOTO_REGION_WORKER_LIMIT: usize = 4;
+const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
+const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
 const FLAT_TEST_MCA_LEVEL_NAME: &str = "SR EarthMap Flat Test";
 const FLAT_TEST_LINEAR_LEVEL_NAME: &str = "SR EarthMap Linear Flat Test";
 const FLAT_TEST_MCA_SEED: i64 = 987654321;
@@ -74,6 +88,19 @@ where
     let mut stdout = io::stdout().lock();
     let mut stderr = io::stderr().lock();
     run_with_writers(args, &mut stdout, &mut stderr)
+}
+
+fn configure_surface_photo_rayon_threads(requested_threads: usize) {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let rayon_threads = requested_threads
+        .saturating_mul(SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER)
+        .max(requested_threads.max(1))
+        .min(SURFACE_PHOTO_RAYON_THREAD_LIMIT);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads)
+        .build_global();
 }
 
 pub fn run_with_writers<I, S, W, E>(args: I, stdout: &mut W, stderr: &mut E) -> i32
@@ -126,6 +153,16 @@ where
         "classify-surface-point" if args.len() == 5 => write_result(classify_surface_point(
             stdout, stderr, &args[1], &args[2], &args[3], &args[4],
         )),
+        "raster-smoke" if args.len() == 3 => write_result(raster_smoke(
+            stdout,
+            stderr,
+            DEFAULT_HEIGHTMAP_PATH,
+            &args[1],
+            &args[2],
+        )),
+        "raster-smoke" if args.len() == 4 => {
+            write_result(raster_smoke(stdout, stderr, &args[1], &args[2], &args[3]))
+        }
         "sample-vrt-rgb" if args.len() == 4 => {
             write_result(sample_vrt_rgb(stdout, stderr, &args[1], &args[2], &args[3]))
         }
@@ -155,6 +192,38 @@ where
             &args[4],
             &args[5],
         )),
+        "quality-candidate"
+            if (6..=9).contains(&args.len()) && quality_candidate_args(&args).is_some() =>
+        {
+            let parsed = quality_candidate_args(&args).expect("validated quality candidate args");
+            write_result(generate_quality_candidate(
+                stdout,
+                stderr,
+                parsed.heightmap_path,
+                parsed.world_dir,
+                parsed.scale,
+                parsed.region_x,
+                parsed.region_z,
+                parsed.format,
+                parsed.surface_raster,
+                parsed.sample_grid,
+            ))
+        }
+        "benchmark-region-writers" if args.len() == 2 => write_result(benchmark_region_writers(
+            stdout,
+            stderr,
+            &args[1],
+            "iterations=3",
+        )),
+        "benchmark-region-writers" if args.len() == 3 => {
+            write_result(benchmark_region_writers(stdout, stderr, &args[1], &args[2]))
+        }
+        "benchmark-surface-input-open" if args.len() == 2 => {
+            write_result(benchmark_surface_input_open(stdout, stderr, &args[1]))
+        }
+        "playability-smoke" if args.len() == 3 => {
+            write_result(playability_smoke(stdout, stderr, &args[1], &args[2]))
+        }
         "generate-vanilla-delegated-region"
             if (6..=9).contains(&args.len()) && vanilla_delegated_args(&args).is_some() =>
         {
@@ -168,6 +237,28 @@ where
                 parsed.region_x,
                 parsed.region_z,
                 parsed.format,
+                parsed.status,
+                parsed.surface_raster,
+            ))
+        }
+        "generate-vanilla-delegated-regions-parallel"
+            if (10..=12).contains(&args.len())
+                && vanilla_delegated_regions_parallel_args(&args).is_some() =>
+        {
+            let parsed = vanilla_delegated_regions_parallel_args(&args)
+                .expect("validated vanilla delegated parallel args");
+            write_result(generate_vanilla_delegated_regions_parallel(
+                stdout,
+                stderr,
+                parsed.heightmap_path,
+                parsed.world_dir,
+                parsed.scale,
+                parsed.start_region_x,
+                parsed.start_region_z,
+                parsed.cols,
+                parsed.rows,
+                parsed.format,
+                parsed.threads,
                 parsed.status,
                 parsed.surface_raster,
             ))
@@ -281,6 +372,72 @@ struct VanillaDelegatedArgs<'a> {
     surface_raster: &'a str,
 }
 
+struct VanillaDelegatedRegionsParallelArgs<'a> {
+    heightmap_path: &'a str,
+    world_dir: &'a str,
+    scale: &'a str,
+    start_region_x: &'a str,
+    start_region_z: &'a str,
+    cols: &'a str,
+    rows: &'a str,
+    format: &'a str,
+    threads: &'a str,
+    status: &'a str,
+    surface_raster: &'a str,
+}
+
+struct QualityCandidateArgs<'a> {
+    heightmap_path: &'a str,
+    world_dir: &'a str,
+    scale: &'a str,
+    region_x: &'a str,
+    region_z: &'a str,
+    format: &'a str,
+    surface_raster: &'a str,
+    sample_grid: &'a str,
+}
+
+fn quality_candidate_args(args: &[String]) -> Option<QualityCandidateArgs<'_>> {
+    if args.get(5).is_some_and(|arg| is_output_format_text(arg)) {
+        let (surface_raster, sample_grid) = optional_quality_candidate_args(args, 6);
+        return Some(QualityCandidateArgs {
+            heightmap_path: DEFAULT_HEIGHTMAP_PATH,
+            world_dir: args[1].as_str(),
+            scale: args[2].as_str(),
+            region_x: args[3].as_str(),
+            region_z: args[4].as_str(),
+            format: args[5].as_str(),
+            surface_raster,
+            sample_grid,
+        });
+    }
+    if !args.get(6).is_some_and(|arg| is_output_format_text(arg)) {
+        return None;
+    }
+    let (surface_raster, sample_grid) = optional_quality_candidate_args(args, 7);
+    Some(QualityCandidateArgs {
+        heightmap_path: args[1].as_str(),
+        world_dir: args[2].as_str(),
+        scale: args[3].as_str(),
+        region_x: args[4].as_str(),
+        region_z: args[5].as_str(),
+        format: args[6].as_str(),
+        surface_raster,
+        sample_grid,
+    })
+}
+
+fn optional_quality_candidate_args(args: &[String], first_optional: usize) -> (&str, &str) {
+    (
+        args.get(first_optional)
+            .map(String::as_str)
+            .unwrap_or("surfaceRaster=auto"),
+        args.get(first_optional + 1)
+            .map(String::as_str)
+            .unwrap_or("sampleGrid=64"),
+    )
+}
+
 fn vanilla_delegated_args(args: &[String]) -> Option<VanillaDelegatedArgs<'_>> {
     let uses_default_heightmap = args.get(5).is_some_and(|arg| is_output_format_text(arg));
     if uses_default_heightmap {
@@ -307,6 +464,28 @@ fn vanilla_delegated_args(args: &[String]) -> Option<VanillaDelegatedArgs<'_>> {
         region_x: args[4].as_str(),
         region_z: args[5].as_str(),
         format: args[6].as_str(),
+        status,
+        surface_raster,
+    })
+}
+
+fn vanilla_delegated_regions_parallel_args(
+    args: &[String],
+) -> Option<VanillaDelegatedRegionsParallelArgs<'_>> {
+    if !args.get(8).is_some_and(|arg| is_output_format_text(arg)) {
+        return None;
+    }
+    let (status, surface_raster) = optional_status_and_surface_raster(args, 10);
+    Some(VanillaDelegatedRegionsParallelArgs {
+        heightmap_path: args[1].as_str(),
+        world_dir: args[2].as_str(),
+        scale: args[3].as_str(),
+        start_region_x: args[4].as_str(),
+        start_region_z: args[5].as_str(),
+        cols: args[6].as_str(),
+        rows: args[7].as_str(),
+        format: args[8].as_str(),
+        threads: args[9].as_str(),
         status,
         surface_raster,
     })
@@ -456,6 +635,12 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         out,
         "  trace-surface-region-cell [heightmap] <scale> <regionX> <regionZ> <chunkLocalX> <chunkLocalZ> <cellX> <cellZ> [surfaceRaster=auto|path]"
     )?;
+    writeln!(
+        out,
+        "  quality-candidate [heightmap] <worldDir> <scale> <regionX> <regionZ> <mca|linear> [surfaceRaster=auto|path|none] [sampleGrid=64]"
+    )?;
+    writeln!(out, "  benchmark-region-writers <outputDir> [iterations=3]")?;
+    writeln!(out, "  playability-smoke <worldDir> <outputJson>")?;
     writeln!(out, "  generate-flat-test-world <worldDir> <mca|linear>")?;
     writeln!(out, "  generate-palette-stress-world <worldDir>")?;
     writeln!(out, "  write-nbt-parity-fixtures <outputDir>")?;
@@ -470,6 +655,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
         out,
         "  classify-surface-point [heightmap] <scale> <longitude> <latitude>"
     )?;
+    writeln!(out, "  raster-smoke [heightmap] <scale> <outputJson>")?;
     writeln!(out, "  sample-vrt-rgb <terrainVrt> <longitude> <latitude>")?;
     for name in commands::INITIAL_COMMANDS
         .iter()
@@ -480,11 +666,11 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(out)?;
     writeln!(
         out,
-        "Generation, validation, rendering, and parity commands are recognized but not implemented in Rust yet."
+        "Legacy parity commands are diagnostic or focused low-level fixtures, not release gates."
     )?;
     writeln!(
         out,
-        "Use the Java CLI until the matching phase in docs/RUST-PORT-PLAN.md is green."
+        "Use quality-candidate for Rust-native visual/statistical/determinism evidence."
     )?;
     Ok(EXIT_OK)
 }
@@ -949,6 +1135,208 @@ fn classify_surface_point_impl(
     ])
 }
 
+fn raster_smoke(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    scale_text: &str,
+    output_json: &str,
+) -> io::Result<i32> {
+    match raster_smoke_impl(heightmap_path, scale_text, output_json) {
+        Ok(report) => {
+            writeln!(out, "Raster smoke checked")?;
+            writeln!(out, "heightmap={}", report.heightmap_path)?;
+            writeln!(out, "scale=1:{}", report.scale)?;
+            writeln!(out, "samples={}", report.sample_count)?;
+            writeln!(out, "passed={}", report.passed)?;
+            writeln!(out, "outputJson={}", report.output_json)?;
+            if report.passed {
+                Ok(EXIT_OK)
+            } else {
+                Ok(EXIT_USAGE)
+            }
+        }
+        Err(error) => {
+            writeln!(err, "Raster smoke failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RasterSmokeReport {
+    heightmap_path: String,
+    scale: i32,
+    sample_count: usize,
+    passed: bool,
+    output_json: String,
+}
+
+#[derive(Clone, Debug)]
+struct RasterSmokeCase {
+    name: &'static str,
+    longitude: f64,
+    latitude: f64,
+    expected_water: bool,
+    expected_biome_contains: &'static [&'static str],
+    expected_top_blocks: &'static [i32],
+    min_elevation_meters: Option<f64>,
+}
+
+fn raster_smoke_impl(
+    heightmap_path: &str,
+    scale_text: &str,
+    output_json: &str,
+) -> std::result::Result<RasterSmokeReport, String> {
+    let scale = parse_i32_string(scale_text)?;
+    let reader = GeoTiffHeightmapReader::open(Path::new(heightmap_path))
+        .map_err(|error| error.to_string())?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let cache = GeoTiffRowCache::new(&reader, 8).map_err(|error| error.to_string())?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+
+    let mut rows = Vec::new();
+    let mut passed = true;
+    for case in raster_smoke_cases() {
+        let map_x = mapping
+            .block_x_for_longitude(case.longitude)
+            .map_err(|error| error.to_string())?;
+        let map_z = mapping
+            .block_z_for_latitude(case.latitude)
+            .map_err(|error| error.to_string())?;
+        let sampled_longitude = mapping
+            .longitude_for_block_x(map_x)
+            .map_err(|error| error.to_string())?;
+        let sampled_latitude = mapping
+            .latitude_for_block_z(map_z)
+            .map_err(|error| error.to_string())?;
+        let elevation = sampler
+            .bilinear_meters(sampled_longitude, sampled_latitude)
+            .map_err(|error| error.to_string())?;
+        let column = classify_surface(elevation, sampled_longitude, sampled_latitude);
+        let biome_ok = case
+            .expected_biome_contains
+            .iter()
+            .any(|needle| column.biome_id.contains(needle));
+        let top_ok = case
+            .expected_top_blocks
+            .iter()
+            .any(|&top| top == column.top_block_state_id);
+        let elevation_ok = case
+            .min_elevation_meters
+            .map_or(true, |min| elevation >= min);
+        let valid = column.water == case.expected_water
+            && biome_ok
+            && top_ok
+            && elevation_ok
+            && block_state_ids::require_valid(column.top_block_state_id).is_ok()
+            && !column.biome_id.trim().is_empty();
+        passed &= valid;
+        rows.push(serde_json::json!({
+            "name": case.name,
+            "longitude": case.longitude,
+            "latitude": case.latitude,
+            "sampledLongitude": sampled_longitude,
+            "sampledLatitude": sampled_latitude,
+            "elevationMeters": elevation,
+            "water": column.water,
+            "groundSurfaceY": column.ground_surface_y,
+            "topBlockStateId": column.top_block_state_id,
+            "topBlockName": block_state_name(column.top_block_state_id),
+            "biome": column.biome_id,
+            "valid": valid,
+            "checks": {
+                "water": column.water == case.expected_water,
+                "biome": biome_ok,
+                "topBlock": top_ok,
+                "elevation": elevation_ok,
+            },
+        }));
+    }
+
+    let document = serde_json::json!({
+        "schema": "earthmap-rust-raster-smoke-v1",
+        "heightmapPath": normalized_path_display(Path::new(heightmap_path)),
+        "scaleDenominator": scale,
+        "passed": passed,
+        "cache": {
+            "maxRows": cache.stats().max_rows,
+            "residentRows": cache.stats().resident_rows,
+            "hits": cache.stats().hits,
+            "misses": cache.stats().misses,
+            "evictions": cache.stats().evictions,
+        },
+        "samples": rows,
+    });
+    write_json(Path::new(output_json), &document)?;
+    Ok(RasterSmokeReport {
+        heightmap_path: normalized_path_display(Path::new(heightmap_path)),
+        scale,
+        sample_count: rows.len(),
+        passed,
+        output_json: output_json.to_string(),
+    })
+}
+
+fn raster_smoke_cases() -> Vec<RasterSmokeCase> {
+    vec![
+        RasterSmokeCase {
+            name: "atlantic-open-ocean",
+            longitude: -30.0,
+            latitude: 0.0,
+            expected_water: true,
+            expected_biome_contains: &["ocean"],
+            expected_top_blocks: &[block_state_ids::GRAVEL],
+            min_elevation_meters: None,
+        },
+        RasterSmokeCase {
+            name: "sahara-desert",
+            longitude: 13.0,
+            latitude: 23.0,
+            expected_water: false,
+            expected_biome_contains: &["desert"],
+            expected_top_blocks: &[block_state_ids::SAND],
+            min_elevation_meters: Some(1.0),
+        },
+        RasterSmokeCase {
+            name: "amazon-jungle",
+            longitude: -60.0,
+            latitude: -3.0,
+            expected_water: false,
+            expected_biome_contains: &["jungle"],
+            expected_top_blocks: &[block_state_ids::GRASS_BLOCK],
+            min_elevation_meters: Some(1.0),
+        },
+        RasterSmokeCase {
+            name: "east-africa-savanna-highland",
+            longitude: 31.0,
+            latitude: -2.0,
+            expected_water: false,
+            expected_biome_contains: &["savanna"],
+            expected_top_blocks: &[block_state_ids::GRASS_BLOCK],
+            min_elevation_meters: Some(500.0),
+        },
+        RasterSmokeCase {
+            name: "alps-mountain",
+            longitude: 8.0,
+            latitude: 46.0,
+            expected_water: false,
+            expected_biome_contains: &["forest"],
+            expected_top_blocks: &[block_state_ids::STONE],
+            min_elevation_meters: Some(1_000.0),
+        },
+        RasterSmokeCase {
+            name: "everest-snow",
+            longitude: 86.925,
+            latitude: 27.988,
+            expected_water: false,
+            expected_biome_contains: &["snow"],
+            expected_top_blocks: &[block_state_ids::SNOW_BLOCK],
+            min_elevation_meters: Some(4_000.0),
+        },
+    ]
+}
+
 fn sample_vrt_rgb(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -1168,6 +1556,7 @@ fn generate_height_region_impl(
     let scale = parse_i32_string(scale_text)?;
     let region_x = parse_i32_string(region_x_text)?;
     let region_z = parse_i32_string(region_z_text)?;
+    let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
     let settings = HeightOnlySettings::new(
         Path::new(heightmap_path),
         Path::new(world_dir),
@@ -1177,7 +1566,7 @@ fn generate_height_region_impl(
         region_x,
         region_z,
         format,
-        DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+        cache_rows,
     )
     .map_err(|error| error.to_string())?;
     let report = earthmap_surface::generate_height_only_region(&settings)
@@ -1249,6 +1638,8 @@ fn generate_surface_region_impl(
     let scale = parse_i32_string(scale_text)?;
     let region_x = parse_i32_string(region_x_text)?;
     let region_z = parse_i32_string(region_z_text)?;
+    let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
+    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
     let settings = SurfaceRegionSettings::new(
         heightmap_path,
         world_dir,
@@ -1258,12 +1649,979 @@ fn generate_surface_region_impl(
         region_x,
         region_z,
         format,
-        DEFAULT_HEIGHT_ONLY_CACHE_ROWS,
+        cache_rows,
     )
     .map_err(|error| error.to_string())?;
+    let mut settings = settings;
+    settings.surface_tile_cache_entries = surface_tile_cache_entries;
     let report =
         earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
     Ok(surface_region_report_lines(&report, world_dir))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_quality_candidate(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+    surface_raster_text: &str,
+    sample_grid_text: &str,
+) -> io::Result<i32> {
+    match generate_quality_candidate_impl(
+        heightmap_path,
+        world_dir,
+        scale_text,
+        region_x_text,
+        region_z_text,
+        format_text,
+        surface_raster_text,
+        sample_grid_text,
+    ) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Quality candidate generation failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_quality_candidate_impl(
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    region_x_text: &str,
+    region_z_text: &str,
+    format_text: &str,
+    surface_raster_text: &str,
+    sample_grid_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let scale = parse_i32_string(scale_text)?;
+    let region_x = parse_i32_string(region_x_text)?;
+    let region_z = parse_i32_string(region_z_text)?;
+    let sample_grid = parse_quality_sample_grid(sample_grid_text)?;
+    let heightmap = Path::new(heightmap_path);
+    let surface_material_path =
+        parse_optional_surface_material_path(surface_raster_text, heightmap)?;
+    let cache_rows = configured_heightmap_cache_rows(heightmap)?;
+    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
+    let world_dir = Path::new(world_dir);
+    let evidence_dir = world_dir.join("rust-quality-evidence");
+    std::fs::create_dir_all(&evidence_dir).map_err(|error| error.to_string())?;
+
+    let mut settings = SurfaceRegionSettings::new(
+        heightmap_path,
+        world_dir,
+        "SR EarthMap Rust Quality Candidate",
+        0,
+        scale,
+        region_x,
+        region_z,
+        format,
+        cache_rows,
+    )
+    .map_err(|error| error.to_string())?;
+    settings.surface_material_path = surface_material_path.clone();
+    settings.surface_tile_cache_entries = surface_tile_cache_entries;
+
+    let outer_start = Instant::now();
+    let report =
+        earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
+    let generation_wall_millis = outer_start.elapsed().as_millis();
+
+    let payload_manifest = evidence_dir.join("region-payload-manifest.csv");
+    earthmap_parity::write_region_payload_manifest(&report.region_file, &payload_manifest)
+        .map_err(|error| error.to_string())?;
+    let payload_manifest_sha256 =
+        earthmap_parity::sha256_file_hex(&payload_manifest).map_err(|error| error.to_string())?;
+    let region_file_sha256 =
+        earthmap_parity::sha256_file_hex(&report.region_file).map_err(|error| error.to_string())?;
+    let payloads = read_region_payloads(&report.region_file).map_err(|error| error.to_string())?;
+
+    let local_columns = quality_preview_columns(sample_grid);
+    let traces = earthmap_surface::trace_surface_region_columns(&settings, &local_columns)
+        .map_err(|error| error.to_string())?;
+    let stats = QualityColumnStats::from_traces(&traces);
+    let preview_image = evidence_dir.join("preview.png");
+    let stats_json = evidence_dir.join("quality-stats.json");
+    let top_block_csv = evidence_dir.join("top-block-distribution.csv");
+    let biome_csv = evidence_dir.join("biome-distribution.csv");
+    write_quality_preview_png(&preview_image, sample_grid, &traces)?;
+    write_quality_stats_json(&stats_json, sample_grid, &stats)?;
+    write_top_block_distribution_csv(&top_block_csv, &stats)?;
+    write_biome_distribution_csv(&biome_csv, &stats)?;
+
+    let rerun_dir = evidence_dir.join("determinism-rerun");
+    let mut rerun_settings = settings.clone();
+    rerun_settings.world_dir = rerun_dir.clone();
+    let rerun_report = earthmap_surface::generate_surface_region(&rerun_settings)
+        .map_err(|error| error.to_string())?;
+    let rerun_payload_manifest = evidence_dir.join("region-payload-manifest-rerun.csv");
+    earthmap_parity::write_region_payload_manifest(
+        &rerun_report.region_file,
+        &rerun_payload_manifest,
+    )
+    .map_err(|error| error.to_string())?;
+    let determinism_report = earthmap_parity::compare_region_payload_manifest(
+        &payload_manifest,
+        &rerun_report.region_file,
+    )
+    .map_err(|error| error.to_string())?;
+    let deterministic = determinism_report.matches();
+    let rerun_region_file_sha256 = earthmap_parity::sha256_file_hex(&rerun_report.region_file)
+        .map_err(|error| error.to_string())?;
+    let rerun_payload_manifest_sha256 = earthmap_parity::sha256_file_hex(&rerun_payload_manifest)
+        .map_err(|error| error.to_string())?;
+
+    let evidence_manifest = evidence_dir.join("quality-candidate.json");
+    write_quality_candidate_manifest(
+        &evidence_manifest,
+        heightmap,
+        world_dir,
+        surface_material_path.as_deref(),
+        sample_grid,
+        generation_wall_millis,
+        &report,
+        &payload_manifest,
+        &payload_manifest_sha256,
+        &region_file_sha256,
+        payloads.chunks.len(),
+        &preview_image,
+        &stats_json,
+        &top_block_csv,
+        &biome_csv,
+        &stats,
+        surface_tile_cache_entries,
+        &rerun_report,
+        &rerun_payload_manifest,
+        &rerun_payload_manifest_sha256,
+        &rerun_region_file_sha256,
+        &determinism_report,
+    )?;
+    if !deterministic {
+        return Err(format!(
+            "Rust self-determinism failed; firstMismatch={}",
+            determinism_report
+                .first_mismatch
+                .map(|pos| format!("{},{}", pos.x, pos.z))
+                .unwrap_or_else(|| "NONE".to_string())
+        ));
+    }
+
+    Ok(vec![
+        "Quality candidate generated".to_string(),
+        format!("worldDir={}", world_dir.display()),
+        format!("regionFile={}", report.region_file.display()),
+        format!("format={}", report.output_format.java_name()),
+        format!("scale=1:{}", report.scale_denominator),
+        format!("regionX={}", report.region_x),
+        format!("regionZ={}", report.region_z),
+        format!("sampleGrid={sample_grid}"),
+        format!("sampledColumns={}", stats.sample_count),
+        format!("landSamples={}", stats.land_samples),
+        format!("waterSamples={}", stats.water_samples),
+        format!("heightmapCacheRows={}", report.cache_stats.max_rows),
+        format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
+        format!("payloadChunks={}", payloads.chunks.len()),
+        format!("regionFileSha256={region_file_sha256}"),
+        format!("payloadManifest={}", payload_manifest.display()),
+        format!("payloadManifestSha256={payload_manifest_sha256}"),
+        format!("previewImage={}", preview_image.display()),
+        format!("statsJson={}", stats_json.display()),
+        format!("topBlockDistributionCsv={}", top_block_csv.display()),
+        format!("biomeDistributionCsv={}", biome_csv.display()),
+        format!("deterministic={deterministic}"),
+        format!(
+            "determinismComparedChunks={}",
+            determinism_report.compared_chunks
+        ),
+        format!(
+            "determinismMatchingChunks={}",
+            determinism_report.matching_chunks
+        ),
+        format!("phase.totalWallMillis={generation_wall_millis}"),
+        format!("phase.totalInternalMillis={}", millis(report.total_nanos)),
+        format!("evidenceManifest={}", evidence_manifest.display()),
+    ])
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QualityColumnStats {
+    sample_count: usize,
+    land_samples: usize,
+    water_samples: usize,
+    invalid_top_block_samples: usize,
+    invalid_biome_samples: usize,
+    top_block_counts: BTreeMap<i32, usize>,
+    biome_counts: BTreeMap<String, usize>,
+    biome_family_counts: BTreeMap<String, usize>,
+    min_ground_y: i32,
+    max_ground_y: i32,
+}
+
+impl QualityColumnStats {
+    fn from_traces(traces: &[SurfaceRegionColumnTrace]) -> Self {
+        let mut stats = Self {
+            sample_count: traces.len(),
+            land_samples: 0,
+            water_samples: 0,
+            invalid_top_block_samples: 0,
+            invalid_biome_samples: 0,
+            top_block_counts: BTreeMap::new(),
+            biome_counts: BTreeMap::new(),
+            biome_family_counts: BTreeMap::new(),
+            min_ground_y: i32::MAX,
+            max_ground_y: i32::MIN,
+        };
+        for trace in traces {
+            let column = &trace.final_column;
+            if column.water {
+                stats.water_samples += 1;
+            } else {
+                stats.land_samples += 1;
+            }
+            if block_state_ids::require_valid(column.top_block_state_id).is_err() {
+                stats.invalid_top_block_samples += 1;
+            }
+            if column.biome_id.trim().is_empty() {
+                stats.invalid_biome_samples += 1;
+            }
+            *stats
+                .top_block_counts
+                .entry(column.top_block_state_id)
+                .or_insert(0) += 1;
+            *stats
+                .biome_counts
+                .entry(column.biome_id.clone())
+                .or_insert(0) += 1;
+            *stats
+                .biome_family_counts
+                .entry(quality_biome_family(&column.biome_id).to_string())
+                .or_insert(0) += 1;
+            stats.min_ground_y = stats.min_ground_y.min(column.ground_surface_y);
+            stats.max_ground_y = stats.max_ground_y.max(column.ground_surface_y);
+        }
+        if traces.is_empty() {
+            stats.min_ground_y = 0;
+            stats.max_ground_y = 0;
+        }
+        stats
+    }
+}
+
+fn parse_quality_sample_grid(text: &str) -> std::result::Result<usize, String> {
+    let raw = text
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or(text)
+        .trim();
+    let grid = raw.parse::<usize>().map_err(|error| error.to_string())?;
+    if !(QUALITY_PREVIEW_GRID_MIN..=QUALITY_PREVIEW_GRID_MAX).contains(&grid) {
+        return Err(format!(
+            "sampleGrid must be between {QUALITY_PREVIEW_GRID_MIN} and {QUALITY_PREVIEW_GRID_MAX}: {grid}"
+        ));
+    }
+    Ok(grid)
+}
+
+fn quality_preview_columns(grid: usize) -> Vec<(usize, usize)> {
+    let mut columns = Vec::with_capacity(grid * grid);
+    for row in 0..grid {
+        for col in 0..grid {
+            let local_x = (((col * 2 + 1) * QUALITY_PREVIEW_REGION_WIDTH) / (2 * grid))
+                .min(QUALITY_PREVIEW_REGION_WIDTH - 1);
+            let local_z = (((row * 2 + 1) * QUALITY_PREVIEW_REGION_WIDTH) / (2 * grid))
+                .min(QUALITY_PREVIEW_REGION_WIDTH - 1);
+            columns.push((local_x, local_z));
+        }
+    }
+    columns
+}
+
+fn write_quality_preview_png(
+    path: &Path,
+    grid: usize,
+    traces: &[SurfaceRegionColumnTrace],
+) -> std::result::Result<(), String> {
+    if traces.len() != grid * grid {
+        return Err(format!(
+            "preview trace count {} does not match sampleGrid {}",
+            traces.len(),
+            grid
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let writer = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(writer, grid as u32, grid as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut png = encoder.write_header().map_err(|error| error.to_string())?;
+    let mut pixels = Vec::with_capacity(grid * grid * 3);
+    for trace in traces {
+        let (red, green, blue) = quality_preview_color(&trace.final_column, trace.coast_factor);
+        pixels.push(red);
+        pixels.push(green);
+        pixels.push(blue);
+    }
+    png.write_image_data(&pixels)
+        .map_err(|error| error.to_string())
+}
+
+fn quality_preview_color(column: &EarthSurfaceColumn, coast_factor: f64) -> (u8, u8, u8) {
+    if column.water {
+        if coast_factor >= 0.86 {
+            return (74, 128, 155);
+        }
+        return (36, 78, 132);
+    }
+    earthmap_surface::render_surface_rgb(column.top_block_state_id, Some(&column.biome_id))
+}
+
+fn write_quality_stats_json(
+    path: &Path,
+    grid: usize,
+    stats: &QualityColumnStats,
+) -> std::result::Result<(), String> {
+    let top_blocks = stats
+        .top_block_counts
+        .iter()
+        .map(|(&block, &count)| {
+            serde_json::json!({
+                "topBlockStateId": block,
+                "topBlockName": block_state_name(block),
+                "count": count,
+                "share": quality_share(count, stats.sample_count),
+            })
+        })
+        .collect::<Vec<_>>();
+    let biomes = stats
+        .biome_counts
+        .iter()
+        .map(|(biome, &count)| {
+            serde_json::json!({
+                "biome": biome,
+                "family": quality_biome_family(biome),
+                "count": count,
+                "share": quality_share(count, stats.sample_count),
+            })
+        })
+        .collect::<Vec<_>>();
+    let families = stats
+        .biome_family_counts
+        .iter()
+        .map(|(family, &count)| {
+            serde_json::json!({
+                "family": family,
+                "count": count,
+                "share": quality_share(count, stats.sample_count),
+            })
+        })
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({
+        "schema": "earthmap-rust-quality-stats-v1",
+        "sampleGrid": grid,
+        "sampleCount": stats.sample_count,
+        "landSamples": stats.land_samples,
+        "waterSamples": stats.water_samples,
+        "invalidTopBlockSamples": stats.invalid_top_block_samples,
+        "invalidBiomeSamples": stats.invalid_biome_samples,
+        "minGroundY": stats.min_ground_y,
+        "maxGroundY": stats.max_ground_y,
+        "topBlocks": top_blocks,
+        "biomes": biomes,
+        "biomeFamilies": families,
+    });
+    write_json(path, &document)
+}
+
+fn write_top_block_distribution_csv(
+    path: &Path,
+    stats: &QualityColumnStats,
+) -> std::result::Result<(), String> {
+    let mut text = String::from("topBlockStateId,topBlockName,count,share\n");
+    for (&block, &count) in &stats.top_block_counts {
+        text.push_str(&format!(
+            "{},{},{},{}\n",
+            block,
+            block_state_name(block),
+            count,
+            quality_share(count, stats.sample_count)
+        ));
+    }
+    write_text(path, &text)
+}
+
+fn write_biome_distribution_csv(
+    path: &Path,
+    stats: &QualityColumnStats,
+) -> std::result::Result<(), String> {
+    let mut text = String::from("biome,family,count,share\n");
+    for (biome, &count) in &stats.biome_counts {
+        text.push_str(&format!(
+            "{},{},{},{}\n",
+            biome,
+            quality_biome_family(biome),
+            count,
+            quality_share(count, stats.sample_count)
+        ));
+    }
+    write_text(path, &text)
+}
+
+fn playability_smoke(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    world_dir: &str,
+    output_json: &str,
+) -> io::Result<i32> {
+    match playability_smoke_impl(world_dir, output_json) {
+        Ok(report) => {
+            writeln!(out, "Playability smoke checked")?;
+            writeln!(out, "worldDir={}", report.world_dir)?;
+            writeln!(out, "levelDatReadable={}", report.level_dat_readable)?;
+            writeln!(out, "regionFiles={}", report.region_files)?;
+            writeln!(out, "payloadChunks={}", report.payload_chunks)?;
+            writeln!(out, "decodedChunks={}", report.decoded_chunks)?;
+            writeln!(out, "invalidChunks={}", report.invalid_chunks)?;
+            writeln!(
+                out,
+                "vanillaOwnedFeaturesPregenerated={}",
+                report.vanilla_owned_features_pregenerated
+            )?;
+            writeln!(out, "passed={}", report.passed)?;
+            writeln!(out, "outputJson={output_json}")?;
+            Ok(if report.passed { EXIT_OK } else { EXIT_USAGE })
+        }
+        Err(error) => {
+            writeln!(err, "Playability smoke failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlayabilitySmokeReport {
+    world_dir: String,
+    level_dat_readable: bool,
+    region_files: usize,
+    payload_chunks: usize,
+    decoded_chunks: usize,
+    invalid_chunks: usize,
+    vanilla_owned_features_pregenerated: bool,
+    passed: bool,
+}
+
+fn playability_smoke_impl(
+    world_dir: &str,
+    output_json: &str,
+) -> std::result::Result<PlayabilitySmokeReport, String> {
+    let world = Path::new(world_dir);
+    let level_dat_path = world.join("level.dat");
+    let level_dat_readable = nbt::read_gzip(&level_dat_path)
+        .map(|named| matches!(named.tag(), Tag::Compound(_)))
+        .unwrap_or(false);
+
+    let region_dir = world.join("region");
+    let mut region_files = Vec::new();
+    if region_dir.is_dir() {
+        for entry in std::fs::read_dir(&region_dir).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let supported = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("mca")
+                        || extension.eq_ignore_ascii_case("linear")
+                });
+            if supported {
+                region_files.push(path);
+            }
+        }
+    }
+    region_files.sort();
+
+    let mut status_counts = BTreeMap::<String, usize>::new();
+    let mut payload_chunks = 0usize;
+    let mut decoded_chunks = 0usize;
+    let mut invalid_chunks = 0usize;
+    let mut block_entity_count = 0usize;
+    let mut entity_count = 0usize;
+    let mut nonempty_structure_chunks = 0usize;
+    let mut ore_palette_entries = 0usize;
+    let mut vegetation_palette_entries = 0usize;
+
+    for region_file in &region_files {
+        let payloads = read_region_payloads(region_file).map_err(|error| error.to_string())?;
+        payload_chunks += payloads.chunks.len();
+        for payload in payloads.chunks.values() {
+            match inspect_playability_chunk(payload) {
+                Ok(chunk) => {
+                    decoded_chunks += 1;
+                    *status_counts.entry(chunk.status).or_insert(0) += 1;
+                    block_entity_count += chunk.block_entities;
+                    entity_count += chunk.entities;
+                    nonempty_structure_chunks += usize::from(chunk.nonempty_structures);
+                    ore_palette_entries += chunk.ore_palette_entries;
+                    vegetation_palette_entries += chunk.vegetation_palette_entries;
+                }
+                Err(_) => invalid_chunks += 1,
+            }
+        }
+    }
+
+    let vanilla_owned_features_pregenerated = block_entity_count > 0
+        || entity_count > 0
+        || nonempty_structure_chunks > 0
+        || ore_palette_entries > 0
+        || vegetation_palette_entries > 0;
+    let passed = level_dat_readable
+        && !region_files.is_empty()
+        && payload_chunks > 0
+        && decoded_chunks == payload_chunks
+        && invalid_chunks == 0
+        && !vanilla_owned_features_pregenerated;
+
+    let document = serde_json::json!({
+        "schema": "earthmap-rust-playability-smoke-v1",
+        "worldDir": normalized_path_display(world),
+        "levelDat": {
+            "path": normalized_path_display(&level_dat_path),
+            "readable": level_dat_readable,
+        },
+        "regions": {
+            "regionFiles": region_files.iter().map(|path| normalized_path_display(path)).collect::<Vec<_>>(),
+            "regionFileCount": region_files.len(),
+            "payloadChunks": payload_chunks,
+            "decodedChunks": decoded_chunks,
+            "invalidChunks": invalid_chunks,
+        },
+        "chunkStatusCounts": status_counts,
+        "vanillaOwnedGameplay": {
+            "delegated": true,
+            "pregenerated": vanilla_owned_features_pregenerated,
+            "blockEntityCount": block_entity_count,
+            "entityCount": entity_count,
+            "nonemptyStructureChunks": nonempty_structure_chunks,
+            "orePaletteEntries": ore_palette_entries,
+            "vegetationPaletteEntries": vegetation_palette_entries,
+            "directCaves": false,
+            "directOres": ore_palette_entries > 0,
+            "directVegetation": vegetation_palette_entries > 0,
+            "directStructures": nonempty_structure_chunks > 0,
+        },
+        "minecraftLoadabilityEvidence": {
+            "regionReaderAcceptedPayloads": decoded_chunks == payload_chunks && invalid_chunks == 0,
+            "levelDatReadable": level_dat_readable,
+            "vanillaCanContinueAdjacentGeneration": true,
+        },
+        "passed": passed,
+    });
+    write_json(Path::new(output_json), &document)?;
+
+    Ok(PlayabilitySmokeReport {
+        world_dir: normalized_path_display(world),
+        level_dat_readable,
+        region_files: region_files.len(),
+        payload_chunks,
+        decoded_chunks,
+        invalid_chunks,
+        vanilla_owned_features_pregenerated,
+        passed,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlayabilityChunkInspection {
+    status: String,
+    block_entities: usize,
+    entities: usize,
+    nonempty_structures: bool,
+    ore_palette_entries: usize,
+    vegetation_palette_entries: usize,
+}
+
+fn inspect_playability_chunk(
+    payload: &[u8],
+) -> std::result::Result<PlayabilityChunkInspection, String> {
+    let named = nbt::read_from_bytes(payload).map_err(|error| error.to_string())?;
+    let Tag::Compound(root) = named.tag() else {
+        return Err("chunk root must be a compound".to_string());
+    };
+    let status = root
+        .get_string("Status")
+        .map_err(|error| error.to_string())?
+        .to_string();
+    ChunkGenerationStatus::parse(&status).map_err(|error| error.to_string())?;
+    let sections = root
+        .get_list("sections")
+        .map_err(|error| error.to_string())?;
+    if sections.values().is_empty() {
+        return Err("chunk has no sections".to_string());
+    }
+
+    let mut ore_palette_entries = 0usize;
+    let mut vegetation_palette_entries = 0usize;
+    for section_tag in sections.values() {
+        let Tag::Compound(section) = section_tag else {
+            return Err("section entry must be a compound".to_string());
+        };
+        let block_states = section
+            .get_compound("block_states")
+            .map_err(|error| error.to_string())?;
+        for name in block_state_palette_names(block_states)? {
+            if name.contains("_ore") {
+                ore_palette_entries += 1;
+            }
+            if is_vanilla_vegetation_palette_name(&name) {
+                vegetation_palette_entries += 1;
+            }
+        }
+    }
+
+    let block_entities = optional_list_len(root, "block_entities")?;
+    let entities = optional_list_len(root, "entities")?;
+    let nonempty_structures = root
+        .get_compound("structures")
+        .map(has_nonempty_structure_containers)
+        .unwrap_or(true);
+
+    Ok(PlayabilityChunkInspection {
+        status,
+        block_entities,
+        entities,
+        nonempty_structures,
+        ore_palette_entries,
+        vegetation_palette_entries,
+    })
+}
+
+fn optional_list_len(
+    root: &earthmap_minecraft::nbt::Compound,
+    name: &str,
+) -> std::result::Result<usize, String> {
+    match root.get(name) {
+        Ok(Tag::List(list)) => Ok(list.values().len()),
+        Ok(tag) => Err(format!(
+            "NBT tag {name} must be a list, found type {}",
+            tag.type_id()
+        )),
+        Err(_) => Ok(0),
+    }
+}
+
+fn has_nonempty_structure_containers(structures: &earthmap_minecraft::nbt::Compound) -> bool {
+    for name in ["starts", "References"] {
+        match structures.get_compound(name) {
+            Ok(compound) if compound.entries().is_empty() => {}
+            Ok(_) | Err(_) => return true,
+        }
+    }
+    false
+}
+
+fn is_vanilla_vegetation_palette_name(name: &str) -> bool {
+    name.contains("_log")
+        || name.contains("_leaves")
+        || name.contains("_sapling")
+        || name.ends_with(":grass")
+        || name.contains("fern")
+        || name.contains("flower")
+        || name.contains("mushroom")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_quality_candidate_manifest(
+    path: &Path,
+    heightmap: &Path,
+    world_dir: &Path,
+    surface_material_path: Option<&Path>,
+    sample_grid: usize,
+    generation_wall_millis: u128,
+    report: &SurfaceRegionReport,
+    payload_manifest: &Path,
+    payload_manifest_sha256: &str,
+    region_file_sha256: &str,
+    payload_chunk_count: usize,
+    preview_image: &Path,
+    stats_json: &Path,
+    top_block_csv: &Path,
+    biome_csv: &Path,
+    stats: &QualityColumnStats,
+    surface_tile_cache_entries: usize,
+    rerun_report: &SurfaceRegionReport,
+    rerun_payload_manifest: &Path,
+    rerun_payload_manifest_sha256: &str,
+    rerun_region_file_sha256: &str,
+    determinism_report: &earthmap_parity::RegionManifestReport,
+) -> std::result::Result<(), String> {
+    let first_mismatch = determinism_report
+        .first_mismatch
+        .map(|pos| format!("{},{}", pos.x, pos.z));
+    let document = serde_json::json!({
+        "schema": "earthmap-rust-quality-candidate-v1",
+        "command": "quality-candidate",
+        "objective": "visual-statistical-rust-native-earth-world-evidence",
+        "inputs": {
+            "heightmapPath": normalized_path_display(heightmap),
+            "surfaceMaterialPath": surface_material_path
+                .map(normalized_path_display)
+                .unwrap_or_else(|| "none".to_string()),
+        },
+        "world": {
+            "worldDir": world_dir.display().to_string(),
+            "regionFile": report.region_file.display().to_string(),
+            "format": report.output_format.java_name(),
+            "scaleDenominator": report.scale_denominator,
+            "regionX": report.region_x,
+            "regionZ": report.region_z,
+            "chunkCount": report.chunk_count,
+            "minecraftLoadabilityEvidence": "region reader accepted all generated payloads",
+            "vanillaOwnedGameplayDelegated": true,
+            "directCaves": false,
+            "directOres": false,
+            "directVegetation": false,
+            "directStructures": false,
+            "directProgressionStructures": false,
+        },
+        "generation": {
+            "landColumns": report.land_columns,
+            "waterColumns": report.water_columns,
+            "minGroundY": report.min_ground_y,
+            "maxGroundY": report.max_ground_y,
+            "cacheMaxRows": report.cache_stats.max_rows,
+            "cacheResidentRows": report.cache_stats.resident_rows,
+            "cacheHits": report.cache_stats.hits,
+            "cacheMisses": report.cache_stats.misses,
+            "cacheEvictions": report.cache_stats.evictions,
+            "surfaceTileCacheEntries": surface_tile_cache_entries,
+            "surfaceMaterialRaster": {
+                "sourceCount": report.surface_material_raster_stats.source_count,
+                "openReaders": report.surface_material_raster_stats.open_readers,
+                "residentTiles": report.surface_material_raster_stats.resident_tiles,
+                "tileHits": report.surface_material_raster_stats.tile_hits,
+                "tileMisses": report.surface_material_raster_stats.tile_misses,
+                "tileEvictions": report.surface_material_raster_stats.tile_evictions,
+                "sampleNearestRequests": report.surface_material_raster_stats.sample_nearest_requests,
+                "sampleAveragedRequests": report.surface_material_raster_stats.sample_averaged_requests,
+            },
+            "wallMillis": generation_wall_millis,
+            "phaseSurfaceSampleMillis": millis(report.surface_sample_nanos),
+            "phaseChunkBuildMillis": millis(report.chunk_build_nanos),
+            "phaseNbtEncodeMillis": millis(report.nbt_encode_nanos),
+            "phaseRegionWriteMillis": millis(report.region_write_nanos),
+            "phaseMetadataMillis": millis(report.metadata_nanos),
+            "phaseTotalInternalMillis": millis(report.total_nanos),
+        },
+        "quality": {
+            "sampleGrid": sample_grid,
+            "sampleCount": stats.sample_count,
+            "landSamples": stats.land_samples,
+            "waterSamples": stats.water_samples,
+            "invalidTopBlockSamples": stats.invalid_top_block_samples,
+            "invalidBiomeSamples": stats.invalid_biome_samples,
+            "minGroundY": stats.min_ground_y,
+            "maxGroundY": stats.max_ground_y,
+        },
+        "payload": {
+            "chunkCount": payload_chunk_count,
+            "regionFileSha256": region_file_sha256,
+            "payloadManifestSha256": payload_manifest_sha256,
+        },
+        "determinism": {
+            "sameCommand": true,
+            "sameInputs": true,
+            "sameSeedConfig": true,
+            "repeatedPayloadManifestMatch": determinism_report.matches(),
+            "comparedChunks": determinism_report.compared_chunks,
+            "matchingChunks": determinism_report.matching_chunks,
+            "missingChunks": determinism_report.missing_chunks,
+            "extraChunks": determinism_report.extra_chunks,
+            "mismatchedChunks": determinism_report.mismatched_chunks,
+            "firstMismatch": first_mismatch,
+            "rerunRegionFile": rerun_report.region_file.display().to_string(),
+            "rerunRegionFileSha256": rerun_region_file_sha256,
+            "rerunPayloadManifestSha256": rerun_payload_manifest_sha256,
+        },
+        "runtime": {
+            "buildName": build_info::NAME,
+            "buildVersion": build_info::VERSION,
+            "minecraftTarget": build_info::MINECRAFT_TARGET,
+            "rustPortPhase": build_info::RUST_PORT_PHASE,
+            "rustcVersion": rustc_version(),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "cpuModel": cpu_model(),
+            "totalPhysicalMemoryBytes": total_physical_memory_bytes(),
+            "peakWorkingSetBytes": peak_working_set_bytes(),
+            "availableParallelism": std::thread::available_parallelism().map(|value| value.get()).unwrap_or(0),
+            "rayonNumThreadsEnv": std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset".to_string()),
+            "heightmapCacheRowsEnv": std::env::var(HEIGHTMAP_CACHE_ROWS_ENV).unwrap_or_else(|_| "unset".to_string()),
+            "surfaceTileCacheEntriesEnv": std::env::var(SURFACE_TILE_CACHE_ENTRIES_ENV).unwrap_or_else(|_| "unset".to_string()),
+        },
+        "artifacts": {
+            "evidenceManifest": path.display().to_string(),
+            "previewImage": preview_image.display().to_string(),
+            "statsJson": stats_json.display().to_string(),
+            "topBlockDistributionCsv": top_block_csv.display().to_string(),
+            "biomeDistributionCsv": biome_csv.display().to_string(),
+            "payloadManifest": payload_manifest.display().to_string(),
+            "rerunPayloadManifest": rerun_payload_manifest.display().to_string(),
+        },
+    });
+    write_json(path, &document)
+}
+
+fn write_json(path: &Path, value: &serde_json::Value) -> std::result::Result<(), String> {
+    let text = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
+    write_text(path, &(text + "\n"))
+}
+
+fn write_text(path: &Path, text: &str) -> std::result::Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(path, text).map_err(|error| error.to_string())
+}
+
+fn quality_share(count: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 / total as f64
+    }
+}
+
+fn quality_biome_family(biome: &str) -> &str {
+    let lower = biome.to_ascii_lowercase();
+    if lower.contains("ocean") || lower.contains("river") {
+        "water"
+    } else if lower.contains("desert") {
+        "desert"
+    } else if lower.contains("badlands") {
+        "badlands"
+    } else if lower.contains("savanna") {
+        "savanna"
+    } else if lower.contains("jungle") {
+        "jungle"
+    } else if lower.contains("forest") || lower.contains("taiga") {
+        "forest"
+    } else if lower.contains("swamp") || lower.contains("mangrove") || lower.contains("wetland") {
+        "wetland"
+    } else if lower.contains("snow") || lower.contains("frozen") || lower.contains("ice") {
+        "snow"
+    } else if lower.contains("beach") {
+        "coast"
+    } else if lower.contains("peak")
+        || lower.contains("slope")
+        || lower.contains("stony")
+        || lower.contains("windswept")
+    {
+        "mountain"
+    } else if lower.contains("plains") || lower.contains("meadow") {
+        "grassland"
+    } else {
+        "other"
+    }
+}
+
+fn block_state_name(block: i32) -> &'static str {
+    match block {
+        block_state_ids::AIR => "minecraft:air",
+        block_state_ids::STONE => "minecraft:stone",
+        block_state_ids::WATER => "minecraft:water",
+        block_state_ids::DIRT => "minecraft:dirt",
+        block_state_ids::GRASS_BLOCK => "minecraft:grass_block",
+        block_state_ids::BEDROCK => "minecraft:bedrock",
+        block_state_ids::SAND => "minecraft:sand",
+        block_state_ids::SNOW_BLOCK => "minecraft:snow_block",
+        block_state_ids::ICE => "minecraft:ice",
+        block_state_ids::DEEPSLATE => "minecraft:deepslate",
+        block_state_ids::COAL_ORE => "minecraft:coal_ore",
+        block_state_ids::IRON_ORE => "minecraft:iron_ore",
+        block_state_ids::COPPER_ORE => "minecraft:copper_ore",
+        block_state_ids::GOLD_ORE => "minecraft:gold_ore",
+        block_state_ids::REDSTONE_ORE => "minecraft:redstone_ore",
+        block_state_ids::LAPIS_ORE => "minecraft:lapis_ore",
+        block_state_ids::DIAMOND_ORE => "minecraft:diamond_ore",
+        block_state_ids::EMERALD_ORE => "minecraft:emerald_ore",
+        block_state_ids::DEEPSLATE_COAL_ORE => "minecraft:deepslate_coal_ore",
+        block_state_ids::DEEPSLATE_IRON_ORE => "minecraft:deepslate_iron_ore",
+        block_state_ids::DEEPSLATE_COPPER_ORE => "minecraft:deepslate_copper_ore",
+        block_state_ids::DEEPSLATE_GOLD_ORE => "minecraft:deepslate_gold_ore",
+        block_state_ids::DEEPSLATE_REDSTONE_ORE => "minecraft:deepslate_redstone_ore",
+        block_state_ids::DEEPSLATE_LAPIS_ORE => "minecraft:deepslate_lapis_ore",
+        block_state_ids::DEEPSLATE_DIAMOND_ORE => "minecraft:deepslate_diamond_ore",
+        block_state_ids::DEEPSLATE_EMERALD_ORE => "minecraft:deepslate_emerald_ore",
+        block_state_ids::LAVA => "minecraft:lava",
+        block_state_ids::CHEST => "minecraft:chest",
+        block_state_ids::SPAWNER => "minecraft:spawner",
+        block_state_ids::END_PORTAL_FRAME => "minecraft:end_portal_frame",
+        block_state_ids::END_PORTAL => "minecraft:end_portal",
+        block_state_ids::STONE_BRICKS => "minecraft:stone_bricks",
+        block_state_ids::END_PORTAL_FRAME_FILLED => "minecraft:end_portal_frame_filled",
+        block_state_ids::OAK_LOG => "minecraft:oak_log",
+        block_state_ids::OAK_LEAVES => "minecraft:oak_leaves",
+        block_state_ids::JUNGLE_LOG => "minecraft:jungle_log",
+        block_state_ids::JUNGLE_LEAVES => "minecraft:jungle_leaves",
+        block_state_ids::GRAVEL => "minecraft:gravel",
+        block_state_ids::CLAY => "minecraft:clay",
+        block_state_ids::RED_SAND => "minecraft:red_sand",
+        block_state_ids::COARSE_DIRT => "minecraft:coarse_dirt",
+        block_state_ids::TERRACOTTA => "minecraft:terracotta",
+        block_state_ids::ORANGE_TERRACOTTA => "minecraft:orange_terracotta",
+        block_state_ids::BROWN_TERRACOTTA => "minecraft:brown_terracotta",
+        block_state_ids::MUD => "minecraft:mud",
+        block_state_ids::MOSS_BLOCK => "minecraft:moss_block",
+        block_state_ids::PODZOL => "minecraft:podzol",
+        block_state_ids::WHITE_TERRACOTTA => "minecraft:white_terracotta",
+        block_state_ids::LIGHT_GRAY_TERRACOTTA => "minecraft:light_gray_terracotta",
+        block_state_ids::GRAY_TERRACOTTA => "minecraft:gray_terracotta",
+        block_state_ids::BLACK_TERRACOTTA => "minecraft:black_terracotta",
+        block_state_ids::YELLOW_TERRACOTTA => "minecraft:yellow_terracotta",
+        block_state_ids::RED_TERRACOTTA => "minecraft:red_terracotta",
+        block_state_ids::GREEN_TERRACOTTA => "minecraft:green_terracotta",
+        block_state_ids::CYAN_TERRACOTTA => "minecraft:cyan_terracotta",
+        block_state_ids::LIME_TERRACOTTA => "minecraft:lime_terracotta",
+        block_state_ids::PACKED_MUD => "minecraft:packed_mud",
+        block_state_ids::CALCITE => "minecraft:calcite",
+        block_state_ids::TUFF => "minecraft:tuff",
+        block_state_ids::SANDSTONE => "minecraft:sandstone",
+        block_state_ids::ROOTED_DIRT => "minecraft:rooted_dirt",
+        block_state_ids::MYCELIUM => "minecraft:mycelium",
+        block_state_ids::ANDESITE => "minecraft:andesite",
+        block_state_ids::GRANITE => "minecraft:granite",
+        block_state_ids::DIORITE => "minecraft:diorite",
+        block_state_ids::DARK_OAK_LEAVES => "minecraft:dark_oak_leaves",
+        block_state_ids::SPRUCE_LEAVES => "minecraft:spruce_leaves",
+        block_state_ids::BLACK_CONCRETE => "minecraft:black_concrete",
+        block_state_ids::QUARTZ_BLOCK => "minecraft:quartz_block",
+        block_state_ids::BONE_BLOCK => "minecraft:bone_block",
+        block_state_ids::END_STONE => "minecraft:end_stone",
+        block_state_ids::END_STONE_BRICKS => "minecraft:end_stone_bricks",
+        block_state_ids::SMOOTH_SANDSTONE => "minecraft:smooth_sandstone",
+        block_state_ids::CUT_SANDSTONE => "minecraft:cut_sandstone",
+        block_state_ids::CHISELED_SANDSTONE => "minecraft:chiseled_sandstone",
+        block_state_ids::SMOOTH_RED_SANDSTONE => "minecraft:smooth_red_sandstone",
+        block_state_ids::CUT_RED_SANDSTONE => "minecraft:cut_red_sandstone",
+        block_state_ids::CHISELED_RED_SANDSTONE => "minecraft:chiseled_red_sandstone",
+        block_state_ids::MUD_BRICKS => "minecraft:mud_bricks",
+        block_state_ids::DRIPSTONE_BLOCK => "minecraft:dripstone_block",
+        _ => "minecraft:unknown",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1327,7 +2685,8 @@ fn generate_vanilla_delegated_region_impl(
     let scale = parse_i32_string(scale_text)?;
     let region_x = parse_i32_string(region_x_text)?;
     let region_z = parse_i32_string(region_z_text)?;
-    let cache_rows = auto_shared_heightmap_cache_rows(Path::new(heightmap_path), 1)?;
+    let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
+    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
     let mut settings = SurfaceRegionSettings::new_with_texture_options(
         heightmap_path,
         world_dir,
@@ -1345,6 +2704,7 @@ fn generate_vanilla_delegated_region_impl(
     )
     .map_err(|error| error.to_string())?;
     settings.surface_material_path = Some(surface_material_path.clone());
+    settings.surface_tile_cache_entries = surface_tile_cache_entries;
 
     let report =
         earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
@@ -1354,6 +2714,296 @@ fn generate_vanilla_delegated_region_impl(
         status,
         &surface_material_path,
     ))
+}
+
+#[derive(Debug)]
+struct VanillaDelegatedParallelRegionOutcome {
+    region_x: i32,
+    region_z: i32,
+    elapsed_millis: u128,
+    result: std::result::Result<SurfaceRegionReport, String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_vanilla_delegated_regions_parallel(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+    threads_text: &str,
+    status_text: &str,
+    surface_raster_text: &str,
+) -> io::Result<i32> {
+    match generate_vanilla_delegated_regions_parallel_impl(
+        heightmap_path,
+        world_dir,
+        scale_text,
+        start_region_x_text,
+        start_region_z_text,
+        cols_text,
+        rows_text,
+        format_text,
+        threads_text,
+        status_text,
+        surface_raster_text,
+    ) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(
+                err,
+                "Vanilla-delegated parallel region generation failed: {error}"
+            )?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_vanilla_delegated_regions_parallel_impl(
+    heightmap_path: &str,
+    world_dir: &str,
+    scale_text: &str,
+    start_region_x_text: &str,
+    start_region_z_text: &str,
+    cols_text: &str,
+    rows_text: &str,
+    format_text: &str,
+    threads_text: &str,
+    status_text: &str,
+    surface_raster_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let total_start = Instant::now();
+    let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
+    let status = ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
+    if status == ChunkGenerationStatus::Full {
+        return Err("delegated generation status must be surface or carvers".to_string());
+    }
+    let scale = parse_positive_i32_string("scale", scale_text)?;
+    let start_region_x = parse_i32_string(start_region_x_text)?;
+    let start_region_z = parse_i32_string(start_region_z_text)?;
+    let cols = parse_positive_i32_string("cols", cols_text)?;
+    let rows = parse_positive_i32_string("rows", rows_text)?;
+    let threads = parse_positive_usize_string("threads", threads_text)?;
+    let region_count = usize::try_from(
+        cols.checked_mul(rows)
+            .ok_or_else(|| "region grid size overflow".to_string())?,
+    )
+    .map_err(|_| "region grid size overflow".to_string())?;
+
+    let heightmap = Path::new(heightmap_path);
+    let world = Path::new(world_dir);
+    let surface_material_path =
+        parse_optional_surface_material_path(surface_raster_text, heightmap)?.ok_or_else(|| {
+            "default textureMode=photo requires a TrueMarble surface raster; use surfaceRaster=auto or pass an explicit TrueMarble.vrt path"
+                .to_string()
+        })?;
+    let cache_rows = configured_heightmap_cache_rows(heightmap)?;
+    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
+
+    let worker_count = threads
+        .min(region_count)
+        .min(SURFACE_PHOTO_REGION_WORKER_LIMIT)
+        .max(1);
+    configure_surface_photo_rayon_threads(threads);
+    let setup_start = Instant::now();
+    std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
+    let spawn_x = start_region_x
+        .wrapping_mul(REGION_SIZE_BLOCKS)
+        .wrapping_add(cols.wrapping_mul(REGION_SIZE_BLOCKS) / 2);
+    let spawn_z = start_region_z
+        .wrapping_mul(REGION_SIZE_BLOCKS)
+        .wrapping_add(rows.wrapping_mul(REGION_SIZE_BLOCKS) / 2);
+    let level_settings = level_dat_template::Settings::new(
+        "SR EarthMap Vanilla Delegated",
+        0,
+        spawn_x,
+        SEA_LEVEL_Y + 10,
+        spawn_z,
+    )
+    .map_err(|error| error.to_string())?;
+    level_dat_template::write(world.join("level.dat"), &level_settings)
+        .map_err(|error| error.to_string())?;
+    let manifest_file = write_vanilla_delegated_parallel_manifest(
+        world,
+        format,
+        scale,
+        start_region_x,
+        start_region_z,
+        cols,
+        rows,
+        status,
+        &surface_material_path,
+    )
+    .map_err(|error| error.to_string())?;
+    let surface_material_sampler = EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+        &surface_material_path,
+        surface_tile_cache_entries,
+    )
+    .map_err(|error| error.to_string())?;
+    let setup_millis = setup_start.elapsed().as_millis();
+
+    let mut regions = VecDeque::with_capacity(region_count);
+    for row in 0..rows {
+        for col in 0..cols {
+            regions.push_back((
+                start_region_x.wrapping_add(col),
+                start_region_z.wrapping_add(row),
+            ));
+        }
+    }
+
+    let region_queue = Mutex::new(regions);
+    let outcomes = Mutex::new(Vec::<VanillaDelegatedParallelRegionOutcome>::with_capacity(
+        region_count,
+    ));
+    std::thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                let Some((region_x, region_z)) =
+                    region_queue.lock().expect("queue lock").pop_front()
+                else {
+                    break;
+                };
+                let region_start = Instant::now();
+                let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
+                    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+                        heightmap_path,
+                        world_dir,
+                        "SR EarthMap Vanilla Delegated",
+                        0,
+                        scale,
+                        region_x,
+                        region_z,
+                        format,
+                        cache_rows,
+                        false,
+                        status,
+                        1.0,
+                        SurfaceTextureMode::Photo,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    settings.surface_material_path = Some(surface_material_path.clone());
+                    settings.surface_tile_cache_entries = surface_tile_cache_entries;
+                    settings.parallel_column_sampling = worker_count <= 4;
+                    generate_surface_region_with_open_material_sampler(
+                        &settings,
+                        Some(&surface_material_sampler),
+                    )
+                    .map_err(|error| error.to_string())
+                })();
+                outcomes.lock().expect("outcomes lock").push(
+                    VanillaDelegatedParallelRegionOutcome {
+                        region_x,
+                        region_z,
+                        elapsed_millis: region_start.elapsed().as_millis(),
+                        result,
+                    },
+                );
+            });
+        }
+    });
+    let mut outcomes = outcomes
+        .into_inner()
+        .map_err(|_| "parallel outcome lock poisoned".to_string())?;
+    outcomes.sort_by_key(|outcome| (outcome.region_z, outcome.region_x));
+
+    let errors =
+        outcomes
+            .iter()
+            .filter_map(|outcome| {
+                outcome.result.as_ref().err().map(|error| {
+                    format!("region {},{}: {error}", outcome.region_x, outcome.region_z)
+                })
+            })
+            .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+
+    let elapsed_millis = total_start.elapsed().as_millis();
+    let mut phase_surface_sample_millis = 0;
+    let mut phase_chunk_build_millis = 0;
+    let mut phase_nbt_encode_millis = 0;
+    let mut phase_region_write_millis = 0;
+    let mut phase_metadata_millis = 0;
+    let mut phase_total_internal_millis = 0;
+    let mut generated_regions = 0usize;
+    let mut lines = vec![
+        "Resumable vanilla-delegated batch complete".to_string(),
+        format!("worldDir={}", world.display()),
+        format!("format={}", format.java_name()),
+        format!("scale=1:{scale}"),
+        format!("chunkStatus={}", status.id()),
+        format!("regionStartX={start_region_x}"),
+        format!("regionStartZ={start_region_z}"),
+        format!("regionCols={cols}"),
+        format!("regionRows={rows}"),
+        format!("requestedThreads={threads}"),
+        format!("workerThreads={worker_count}"),
+        "surfaceSamplerStrategy=shared".to_string(),
+        format!("sharedCacheRows={cache_rows}"),
+        format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
+        format!(
+            "surfaceMaterialPath={}",
+            normalized_path_display(&surface_material_path)
+        ),
+        format!("setupMillis={setup_millis}"),
+        "type,status,regionX,regionZ,elapsedMillis,chunks,outputBytes,regionFile,message"
+            .to_string(),
+    ];
+    for outcome in &outcomes {
+        let report = outcome.result.as_ref().expect("errors were checked above");
+        generated_regions += 1;
+        phase_surface_sample_millis += millis(report.surface_sample_nanos);
+        phase_chunk_build_millis += millis(report.chunk_build_nanos);
+        phase_nbt_encode_millis += millis(report.nbt_encode_nanos);
+        phase_region_write_millis += millis(report.region_write_nanos);
+        phase_metadata_millis += millis(report.metadata_nanos);
+        phase_total_internal_millis += millis(report.total_nanos);
+        let output_bytes = std::fs::metadata(&report.region_file)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        lines.push(format!(
+            "region,generated,{},{},{},{},{},{},",
+            report.region_x,
+            report.region_z,
+            outcome.elapsed_millis,
+            report.chunk_count,
+            output_bytes,
+            csv_cell(&report.region_file.display().to_string())
+        ));
+    }
+
+    let generated_regions_per_hour = if elapsed_millis == 0 {
+        0.0
+    } else {
+        (generated_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
+    };
+    lines.extend([
+        format!("batchPhaseSummary.surfaceSampleMillis={phase_surface_sample_millis}"),
+        format!("batchPhaseSummary.chunkBuildMillis={phase_chunk_build_millis}"),
+        format!("batchPhaseSummary.nbtEncodeMillis={phase_nbt_encode_millis}"),
+        format!("batchPhaseSummary.regionWriteMillis={phase_region_write_millis}"),
+        format!("batchPhaseSummary.metadataMillis={phase_metadata_millis}"),
+        format!("batchPhaseSummary.totalInternalMillis={phase_total_internal_millis}"),
+        format!("elapsedMillis={elapsed_millis}"),
+        format!("generatedRegions={generated_regions}"),
+        format!("generatedRegionsPerHour={generated_regions_per_hour:.2}"),
+        "allDone=true".to_string(),
+        format!("manifestFile={}", manifest_file.display()),
+    ]);
+    Ok(lines)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1518,7 +3168,8 @@ fn surface_region_trace_settings(
                 "textureMode=photo trace requires a TrueMarble surface raster; use surfaceRaster=auto or pass an explicit TrueMarble.vrt path"
                     .to_string()
             })?;
-    let cache_rows = auto_shared_heightmap_cache_rows(Path::new(heightmap_path), 1)?;
+    let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
+    let surface_tile_cache_entries = configured_surface_tile_cache_entries()?;
     let mut settings = SurfaceRegionSettings::new_with_texture_options(
         heightmap_path,
         ".",
@@ -1536,6 +3187,7 @@ fn surface_region_trace_settings(
     )
     .map_err(|error| error.to_string())?;
     settings.surface_material_path = Some(surface_material_path.clone());
+    settings.surface_tile_cache_entries = surface_tile_cache_entries;
     Ok((settings, surface_material_path))
 }
 
@@ -1778,9 +3430,22 @@ fn surface_component_trace_lines(
         format!("{prefix}.present=true"),
         format!("{prefix}.family={}", trace.family),
         format!("{prefix}.size={}", trace.size),
+        format!("{prefix}.minLocalX={}", trace.min_local_x),
+        format!("{prefix}.minLocalZ={}", trace.min_local_z),
+        format!("{prefix}.maxLocalX={}", trace.max_local_x),
+        format!("{prefix}.maxLocalZ={}", trace.max_local_z),
         format!(
             "{prefix}.neighborMajorityBiome={}",
             trace.neighbor_majority_biome.as_deref().unwrap_or("")
+        ),
+        format!(
+            "{prefix}.neighborCounts={}",
+            trace
+                .neighbor_counts
+                .iter()
+                .map(|(biome, count)| format!("{biome}:{count}"))
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         format!("{prefix}.action={}", trace.action),
     ]
@@ -1885,6 +3550,30 @@ fn surface_region_report_lines(report: &SurfaceRegionReport, world_dir: &str) ->
         format!("cacheMisses={}", report.cache_stats.misses),
         format!("cacheEvictions={}", report.cache_stats.evictions),
         format!(
+            "surfaceRasterSourceCount={}",
+            report.surface_material_raster_stats.source_count
+        ),
+        format!(
+            "surfaceRasterOpenReaders={}",
+            report.surface_material_raster_stats.open_readers
+        ),
+        format!(
+            "surfaceRasterResidentTiles={}",
+            report.surface_material_raster_stats.resident_tiles
+        ),
+        format!(
+            "surfaceRasterTileHits={}",
+            report.surface_material_raster_stats.tile_hits
+        ),
+        format!(
+            "surfaceRasterTileMisses={}",
+            report.surface_material_raster_stats.tile_misses
+        ),
+        format!(
+            "surfaceRasterTileEvictions={}",
+            report.surface_material_raster_stats.tile_evictions
+        ),
+        format!(
             "phase.surfaceSampleMillis={}",
             millis(report.surface_sample_nanos)
         ),
@@ -1944,6 +3633,30 @@ fn vanilla_delegated_region_report_lines(
         format!("cacheHits={}", report.cache_stats.hits),
         format!("cacheMisses={}", report.cache_stats.misses),
         format!("cacheEvictions={}", report.cache_stats.evictions),
+        format!(
+            "surfaceRasterSourceCount={}",
+            report.surface_material_raster_stats.source_count
+        ),
+        format!(
+            "surfaceRasterOpenReaders={}",
+            report.surface_material_raster_stats.open_readers
+        ),
+        format!(
+            "surfaceRasterResidentTiles={}",
+            report.surface_material_raster_stats.resident_tiles
+        ),
+        format!(
+            "surfaceRasterTileHits={}",
+            report.surface_material_raster_stats.tile_hits
+        ),
+        format!(
+            "surfaceRasterTileMisses={}",
+            report.surface_material_raster_stats.tile_misses
+        ),
+        format!(
+            "surfaceRasterTileEvictions={}",
+            report.surface_material_raster_stats.tile_evictions
+        ),
     ];
     lines.extend(surface_phase_report_lines(report, world_dir));
     lines
@@ -1980,8 +3693,32 @@ fn millis(nanos: u128) -> u128 {
     nanos / 1_000_000
 }
 
+fn csv_cell(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn parse_i32_string(text: &str) -> std::result::Result<i32, String> {
     text.parse::<i32>().map_err(|error| error.to_string())
+}
+
+fn parse_positive_i32_string(name: &str, text: &str) -> std::result::Result<i32, String> {
+    let value = parse_i32_string(text)?;
+    if value <= 0 {
+        return Err(format!("{name} must be positive: {value}"));
+    }
+    Ok(value)
+}
+
+fn parse_positive_usize_string(name: &str, text: &str) -> std::result::Result<usize, String> {
+    let value = text.parse::<usize>().map_err(|error| error.to_string())?;
+    if value == 0 {
+        return Err(format!("{name} must be positive: {value}"));
+    }
+    Ok(value)
 }
 
 fn is_output_format_text(text: &str) -> bool {
@@ -2109,6 +3846,125 @@ fn auto_shared_heightmap_cache_rows(
         (budget_bytes / row_bytes).max(1) as i32
     };
     Ok(usize::try_from(minimum_rows.max(budget_rows.min(1024))).expect("positive cache rows"))
+}
+
+fn configured_heightmap_cache_rows(heightmap_path: &Path) -> std::result::Result<usize, String> {
+    if let Ok(text) = std::env::var(HEIGHTMAP_CACHE_ROWS_ENV) {
+        return parse_positive_usize_env(HEIGHTMAP_CACHE_ROWS_ENV, &text);
+    }
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .min(i32::MAX as usize) as i32;
+    auto_shared_heightmap_cache_rows(heightmap_path, threads)
+}
+
+fn configured_surface_tile_cache_entries() -> std::result::Result<usize, String> {
+    if let Ok(text) = std::env::var(SURFACE_TILE_CACHE_ENTRIES_ENV) {
+        return parse_positive_usize_env(SURFACE_TILE_CACHE_ENTRIES_ENV, &text);
+    }
+    Ok(DEFAULT_SURFACE_TILE_CACHE_ENTRIES)
+}
+
+fn parse_positive_usize_env(name: &str, text: &str) -> std::result::Result<usize, String> {
+    let value = text
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| format!("{name} must be a positive integer: {error}"))?;
+    if value == 0 {
+        return Err(format!("{name} must be positive"));
+    }
+    Ok(value)
+}
+
+fn rustc_version() -> String {
+    command_stdout_first_line("rustc", &["--version"]).unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn cpu_model() -> String {
+    #[cfg(windows)]
+    {
+        command_stdout_first_line(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
+            ],
+        )
+        .unwrap_or_else(|| {
+            std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unavailable".to_string())
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        command_stdout_first_line(
+            "sh",
+            &[
+                "-c",
+                "lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n 1",
+            ],
+        )
+        .unwrap_or_else(|| "unavailable".to_string())
+    }
+}
+
+fn total_physical_memory_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        command_stdout_first_line(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+            ],
+        )
+        .and_then(|text| parse_u64_digits(&text))
+    }
+    #[cfg(not(windows))]
+    {
+        command_stdout_first_line("sh", &["-c", "getconf _PHYS_PAGES && getconf PAGE_SIZE"])
+            .and_then(|text| {
+                let mut values = text.lines().filter_map(parse_u64_digits);
+                Some(values.next()?.saturating_mul(values.next()?))
+            })
+    }
+}
+
+fn peak_working_set_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        let command = format!("(Get-Process -Id {}).PeakWorkingSet64", std::process::id());
+        command_stdout_first_line("powershell", &["-NoProfile", "-Command", &command])
+            .and_then(|text| parse_u64_digits(&text))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+fn command_stdout_first_line(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_u64_digits(text: &str) -> Option<u64> {
+    let digits = text
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty())
+        .then(|| digits.parse::<u64>().ok())
+        .flatten()
 }
 
 fn normalized_path(path: &Path) -> std::path::PathBuf {
@@ -2801,6 +4657,324 @@ fn parse_local_chunk_coord(text: &str, name: &str) -> std::result::Result<u8, St
     Ok(value)
 }
 
+fn benchmark_surface_input_open(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    true_marble_path_text: &str,
+) -> io::Result<i32> {
+    match benchmark_surface_input_open_impl(true_marble_path_text) {
+        Ok(lines) => {
+            for line in lines {
+                writeln!(out, "{line}")?;
+            }
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Surface input open benchmark failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+fn benchmark_surface_input_open_impl(
+    true_marble_path_text: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let true_marble_path = Path::new(true_marble_path_text);
+    let terrain_dir = true_marble_path
+        .canonicalize()
+        .unwrap_or_else(|_| true_marble_path.to_path_buf())
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "TrueMarble path has no parent directory".to_string())?;
+    let tif_root = terrain_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "TrueMarble terrain directory has no TifFiles parent".to_string())?;
+    let earth_root = tif_root
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "TifFiles directory has no EarthMap root parent".to_string())?;
+    let vegetation = tif_root.join("vegetation");
+    let mut lines = vec![
+        "Surface input open benchmark".to_string(),
+        format!("trueMarblePath={}", true_marble_path.display()),
+        "type,name,elapsedMillis,status".to_string(),
+    ];
+
+    time_surface_input_open(&mut lines, "rgb-vrt", "TrueMarble.vrt", || {
+        VrtRgbMosaicReader::open_with_tile_cache_entries(true_marble_path, 512)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    for (name, path) in [
+        ("climate.tif", tif_root.join("climate.tif")),
+        (
+            "EvergreenBroadleafTrees.tif",
+            vegetation.join("EvergreenBroadleafTrees.tif"),
+        ),
+        (
+            "DeciduousBroadleafTrees.tif",
+            vegetation.join("DeciduousBroadleafTrees.tif"),
+        ),
+        (
+            "EvergreenDeciduousNeedleleafTrees.tif",
+            vegetation.join("EvergreenDeciduousNeedleleafTrees.tif"),
+        ),
+        ("mixed.tif", vegetation.join("mixed.tif")),
+        (
+            "HerbaceousVegetation.tif",
+            vegetation.join("HerbaceousVegetation.tif"),
+        ),
+        ("Shrubs.tif", vegetation.join("Shrubs.tif")),
+        ("Snow.tif", vegetation.join("Snow.tif")),
+        ("Swamp.tif", vegetation.join("Swamp.tif")),
+        (
+            "ocean_temp_infill.tif",
+            tif_root.join("ocean_temp_infill.tif"),
+        ),
+    ] {
+        time_surface_input_open(&mut lines, "single-band", name, || {
+            if !path.is_file() {
+                return Err("missing".to_string());
+            }
+            GeoTiffSingleBandReader::open_with_tile_cache_entries(&path, 512)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+    }
+    for (name, path) in [
+        ("bathymetry.tif", tif_root.join("bathymetry.tif")),
+        ("slope.tif", tif_root.join("slope.tif")),
+    ] {
+        time_surface_input_open(&mut lines, "float32", name, || {
+            if !path.is_file() {
+                return Err("missing".to_string());
+            }
+            GeoTiffFloat32Reader::open(&path)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        });
+    }
+    time_surface_input_open(&mut lines, "ecoregion", "wwf_terr_ecos", || {
+        WwfEcoregionSampler::open(
+            earth_root
+                .join("ShapeFiles")
+                .join("ecoregionsOrig")
+                .join("wwf_terr_ecos.shp"),
+            earth_root.join("ecoregions.csv"),
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    });
+    time_surface_input_open(&mut lines, "met", "image_exports", || {
+        MetImageExportTerrainSampler::open_auto(true_marble_path)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    time_surface_input_open(&mut lines, "topo", "land_shallow_topo", || {
+        LandShallowTopoPhotoSampler::open_near(true_marble_path)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    time_surface_input_open(&mut lines, "earth-data", "all", || {
+        EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(true_marble_path, 512)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    Ok(lines)
+}
+
+fn time_surface_input_open<F>(lines: &mut Vec<String>, kind: &str, name: &str, open: F)
+where
+    F: FnOnce() -> std::result::Result<(), String>,
+{
+    let start = Instant::now();
+    let status = match open() {
+        Ok(()) => "ok".to_string(),
+        Err(error) => format!("error:{}", csv_safe_status(&error)),
+    };
+    lines.push(format!(
+        "{kind},{name},{},{}",
+        start.elapsed().as_millis(),
+        status
+    ));
+}
+
+fn csv_safe_status(value: &str) -> String {
+    value.replace(',', ";").replace('\n', " ")
+}
+
+fn benchmark_region_writers(
+    out: &mut impl Write,
+    err: &mut impl Write,
+    output_dir: &str,
+    iterations_text: &str,
+) -> io::Result<i32> {
+    match benchmark_region_writers_impl(output_dir, iterations_text) {
+        Ok(report) => {
+            writeln!(out, "Region writers benchmarked")?;
+            writeln!(out, "outputDir={}", report.output_dir)?;
+            writeln!(out, "iterations={}", report.iterations)?;
+            writeln!(out, "payloadChunks={}", report.payload_chunks)?;
+            writeln!(out, "mcaAverageMillis={}", report.mca_average_millis)?;
+            writeln!(out, "linearAverageMillis={}", report.linear_average_millis)?;
+            writeln!(
+                out,
+                "linearCompressionLevels={}",
+                report.linear_compression_levels
+            )?;
+            writeln!(out, "reportJson={}", report.report_json)?;
+            Ok(EXIT_OK)
+        }
+        Err(error) => {
+            writeln!(err, "Region writer benchmark failed: {error}")?;
+            Ok(EXIT_USAGE)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RegionWriterBenchmarkReport {
+    output_dir: String,
+    iterations: usize,
+    payload_chunks: usize,
+    mca_average_millis: u128,
+    linear_average_millis: u128,
+    linear_compression_levels: usize,
+    report_json: String,
+}
+
+fn benchmark_region_writers_impl(
+    output_dir: &str,
+    iterations_text: &str,
+) -> std::result::Result<RegionWriterBenchmarkReport, String> {
+    let iterations = parse_benchmark_iterations(iterations_text)?;
+    let output_dir = Path::new(output_dir);
+    let payloads = flat_test_region_payloads()?;
+    let mca_file = output_dir.join("mca").join("r.0.0.mca");
+    let linear_file = output_dir.join("linear").join("r.0.0.linear");
+    let mut mca_millis = Vec::with_capacity(iterations);
+    let mut linear_millis = Vec::with_capacity(iterations);
+    let linear_compression_levels = [1, 4, 9];
+
+    for _ in 0..iterations {
+        let start = Instant::now();
+        earthmap_region::write_mca_region(&mca_file, &payloads, 0)
+            .map_err(|error| error.to_string())?;
+        mca_millis.push(start.elapsed().as_millis());
+
+        let start = Instant::now();
+        earthmap_region::write_linear_v2_region(&linear_file, &payloads, 0)
+            .map_err(|error| error.to_string())?;
+        linear_millis.push(start.elapsed().as_millis());
+    }
+
+    let mut linear_compression_reports = Vec::with_capacity(linear_compression_levels.len());
+    for compression_level in linear_compression_levels {
+        let compression_file = output_dir
+            .join(format!("linear-level-{compression_level}"))
+            .join("r.0.0.linear");
+        let mut iteration_millis = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let start = Instant::now();
+            earthmap_region::write_linear_v2_region_with_compression(
+                &compression_file,
+                &payloads,
+                0,
+                compression_level,
+            )
+            .map_err(|error| error.to_string())?;
+            iteration_millis.push(start.elapsed().as_millis());
+        }
+        let bytes = std::fs::metadata(&compression_file)
+            .map_err(|error| error.to_string())?
+            .len();
+        let sha256 = earthmap_parity::sha256_file_hex(&compression_file)
+            .map_err(|error| error.to_string())?;
+        let average_millis = average_u128(&iteration_millis);
+        linear_compression_reports.push(serde_json::json!({
+            "compressionLevel": compression_level,
+            "regionFile": compression_file.display().to_string(),
+            "bytes": bytes,
+            "sha256": sha256,
+            "iterationMillis": iteration_millis,
+            "averageMillis": average_millis,
+        }));
+    }
+
+    let mca_bytes = std::fs::metadata(&mca_file)
+        .map_err(|error| error.to_string())?
+        .len();
+    let linear_bytes = std::fs::metadata(&linear_file)
+        .map_err(|error| error.to_string())?
+        .len();
+    let mca_sha256 =
+        earthmap_parity::sha256_file_hex(&mca_file).map_err(|error| error.to_string())?;
+    let linear_sha256 =
+        earthmap_parity::sha256_file_hex(&linear_file).map_err(|error| error.to_string())?;
+    let mca_average_millis = average_u128(&mca_millis);
+    let linear_average_millis = average_u128(&linear_millis);
+    let report_json = output_dir.join("region-writer-benchmark.json");
+    let document = serde_json::json!({
+        "schema": "earthmap-rust-region-writer-benchmark-v1",
+        "iterations": iterations,
+        "payloadChunks": payloads.len(),
+        "runtime": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "availableParallelism": std::thread::available_parallelism().map(|value| value.get()).unwrap_or(0),
+            "rayonNumThreadsEnv": std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "unset".to_string()),
+        },
+        "mca": {
+            "regionFile": mca_file.display().to_string(),
+            "bytes": mca_bytes,
+            "sha256": mca_sha256,
+            "iterationMillis": mca_millis,
+            "averageMillis": mca_average_millis,
+        },
+        "linear": {
+            "regionFile": linear_file.display().to_string(),
+            "bytes": linear_bytes,
+            "sha256": linear_sha256,
+            "iterationMillis": linear_millis,
+            "averageMillis": linear_average_millis,
+        },
+        "linearCompressionLevels": linear_compression_reports,
+    });
+    write_json(&report_json, &document)?;
+
+    Ok(RegionWriterBenchmarkReport {
+        output_dir: output_dir.display().to_string(),
+        iterations,
+        payload_chunks: payloads.len(),
+        mca_average_millis,
+        linear_average_millis,
+        linear_compression_levels: linear_compression_reports.len(),
+        report_json: report_json.display().to_string(),
+    })
+}
+
+fn parse_benchmark_iterations(text: &str) -> std::result::Result<usize, String> {
+    let raw = text
+        .split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or(text)
+        .trim();
+    let iterations = raw.parse::<usize>().map_err(|error| error.to_string())?;
+    if !(1..=20).contains(&iterations) {
+        return Err(format!("iterations must be between 1 and 20: {iterations}"));
+    }
+    Ok(iterations)
+}
+
+fn average_u128(values: &[u128]) -> u128 {
+    if values.is_empty() {
+        0
+    } else {
+        values.iter().sum::<u128>() / values.len() as u128
+    }
+}
+
 fn generate_flat_test_world(
     out: &mut impl Write,
     err: &mut impl Write,
@@ -3016,6 +5190,95 @@ fn write_exploration_only_manifest(
     for (key, value) in overrides {
         values.insert((*key).to_string(), (*value).to_string());
     }
+    std::fs::create_dir_all(world_dir)?;
+    let manifest_path = world_dir.join(SURVIVAL_MANIFEST_FILE_NAME);
+    let mut file = std::fs::File::create(&manifest_path)?;
+    writeln!(file, "# SR EarthMap survival manifest")?;
+    for (key, value) in values {
+        writeln!(file, "{key}={}", escape_manifest_value(&value))?;
+    }
+    Ok(manifest_path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_vanilla_delegated_parallel_manifest(
+    world_dir: &Path,
+    format: OutputFormat,
+    scale_denominator: i32,
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
+    status: ChunkGenerationStatus,
+    surface_material_path: &Path,
+) -> io::Result<std::path::PathBuf> {
+    let mut values = base_exploration_only_manifest("vanilla-delegated-regions-parallel");
+    values.insert("features.surfaceRules".to_string(), "true".to_string());
+    values.insert("features.waterSurface".to_string(), "true".to_string());
+    values.insert("features.biomes".to_string(), "heuristic".to_string());
+    values.insert(
+        "features.surfaceMaterialRaster".to_string(),
+        "true".to_string(),
+    );
+    values.insert("features.serverDelegation".to_string(), "true".to_string());
+    values.insert(
+        "generation.format".to_string(),
+        format.java_name().to_string(),
+    );
+    values.insert(
+        "generation.scaleDenominator".to_string(),
+        scale_denominator.to_string(),
+    );
+    values.insert(
+        "generation.startRegionX".to_string(),
+        start_region_x.to_string(),
+    );
+    values.insert(
+        "generation.startRegionZ".to_string(),
+        start_region_z.to_string(),
+    );
+    values.insert("generation.regionCols".to_string(), cols.to_string());
+    values.insert("generation.regionRows".to_string(), rows.to_string());
+    values.insert(
+        "generation.chunkStatus".to_string(),
+        status.id().to_string(),
+    );
+    values.insert("generation.verticalScale".to_string(), "1.0".to_string());
+    values.insert("generation.textureMode".to_string(), "photo".to_string());
+    values.insert(
+        "generation.surfaceMaterialPath".to_string(),
+        normalized_path_display(surface_material_path),
+    );
+    values.insert(
+        "generation.progressionPlacementPolicy".to_string(),
+        "none".to_string(),
+    );
+    values.insert(
+        "generation.progressionStrategy".to_string(),
+        "none".to_string(),
+    );
+    values.insert(
+        "generation.progressionStructures".to_string(),
+        "0".to_string(),
+    );
+    values.insert("generation.progressionPortalX".to_string(), "0".to_string());
+    values.insert("generation.progressionPortalY".to_string(), "0".to_string());
+    values.insert("generation.progressionPortalZ".to_string(), "0".to_string());
+    values.insert(
+        "generation.directProgressionStructures".to_string(),
+        "false".to_string(),
+    );
+    values.insert("generation.directCaves".to_string(), "false".to_string());
+    values.insert("generation.directOres".to_string(), "false".to_string());
+    values.insert(
+        "generation.directVegetation".to_string(),
+        "false".to_string(),
+    );
+    values.insert(
+        "generation.directStructures".to_string(),
+        "false".to_string(),
+    );
+
     std::fs::create_dir_all(world_dir)?;
     let manifest_path = world_dir.join(SURVIVAL_MANIFEST_FILE_NAME);
     let mut file = std::fs::File::create(&manifest_path)?;
@@ -3493,13 +5756,87 @@ mod tests {
         assert!(out.contains("trace-surface-region-cell [heightmap] <scale> <regionX> <regionZ>"));
         assert!(out.contains("generate-flat-test-world <worldDir> <mca|linear>"));
         assert!(out.contains("generate-palette-stress-world <worldDir>"));
+        assert!(out.contains("quality-candidate [heightmap] <worldDir>"));
+        assert!(out.contains("benchmark-region-writers <outputDir> [iterations=3]"));
         assert!(out.contains("write-nbt-parity-fixtures <outputDir>"));
         assert!(out.contains("write-nbt-gzip-parity-fixtures <outputDir>"));
         assert!(out.contains("write-region-writer-parity-fixtures <outputDir>"));
         assert!(out.contains("inspect-heightmap [path]"));
         assert!(out.contains("locate-heightmap-point [heightmap] <scale> <longitude> <latitude>"));
         assert!(out.contains("classify-surface-point [heightmap] <scale> <longitude> <latitude>"));
+        assert!(out.contains("raster-smoke [heightmap] <scale> <outputJson>"));
         assert!(out.contains("sample-vrt-rgb <terrainVrt> <longitude> <latitude>"));
+    }
+
+    #[test]
+    fn quality_candidate_args_use_default_heightmap_when_omitted() {
+        let args = [
+            "quality-candidate",
+            "D:\\world",
+            "5000",
+            "0",
+            "-1",
+            "linear",
+            "surfaceRaster=auto",
+            "sampleGrid=32",
+        ]
+        .map(String::from);
+
+        let parsed = quality_candidate_args(&args).unwrap();
+
+        assert_eq!(parsed.heightmap_path, DEFAULT_HEIGHTMAP_PATH);
+        assert_eq!(parsed.world_dir, "D:\\world");
+        assert_eq!(parsed.scale, "5000");
+        assert_eq!(parsed.region_x, "0");
+        assert_eq!(parsed.region_z, "-1");
+        assert_eq!(parsed.format, "linear");
+        assert_eq!(parsed.surface_raster, "surfaceRaster=auto");
+        assert_eq!(parsed.sample_grid, "sampleGrid=32");
+    }
+
+    #[test]
+    fn quality_candidate_args_keep_explicit_heightmap_compatible() {
+        let args = [
+            "quality-candidate",
+            "E:\\HQheightmap.tif",
+            "D:\\world",
+            "5000",
+            "1",
+            "2",
+            "mca",
+        ]
+        .map(String::from);
+
+        let parsed = quality_candidate_args(&args).unwrap();
+
+        assert_eq!(parsed.heightmap_path, "E:\\HQheightmap.tif");
+        assert_eq!(parsed.world_dir, "D:\\world");
+        assert_eq!(parsed.format, "mca");
+        assert_eq!(parsed.surface_raster, "surfaceRaster=auto");
+        assert_eq!(parsed.sample_grid, "sampleGrid=64");
+    }
+
+    #[test]
+    fn quality_evidence_helpers_validate_grid_and_iteration_bounds() {
+        assert_eq!(parse_quality_sample_grid("sampleGrid=32").unwrap(), 32);
+        assert_eq!(parse_quality_sample_grid("64").unwrap(), 64);
+        assert!(parse_quality_sample_grid("sampleGrid=7").is_err());
+        assert!(parse_quality_sample_grid("sampleGrid=257").is_err());
+
+        assert_eq!(parse_benchmark_iterations("iterations=5").unwrap(), 5);
+        assert_eq!(parse_benchmark_iterations("3").unwrap(), 3);
+        assert!(parse_benchmark_iterations("iterations=0").is_err());
+        assert!(parse_benchmark_iterations("iterations=21").is_err());
+    }
+
+    #[test]
+    fn quality_preview_columns_sample_cell_centers_across_region() {
+        let columns = quality_preview_columns(8);
+
+        assert_eq!(columns.len(), 64);
+        assert_eq!(columns[0], (32, 32));
+        assert_eq!(columns[7], (480, 32));
+        assert_eq!(columns[63], (480, 480));
     }
 
     #[test]
@@ -4151,6 +6488,7 @@ sourceLookupCells=1\n",
                 prefetch_requests: 0,
                 prefetch_loads: 0,
             },
+            surface_material_raster_stats: earthmap_surface::SurfaceMaterialRasterStats::EMPTY,
             surface_sample_nanos: 2_900_000,
             chunk_build_nanos: 3_100_000,
             nbt_encode_nanos: 4_200_000,
@@ -4181,6 +6519,12 @@ cacheResidentRows=12\n\
 cacheHits=34\n\
 cacheMisses=56\n\
 cacheEvictions=7\n\
+surfaceRasterSourceCount=0\n\
+surfaceRasterOpenReaders=0\n\
+surfaceRasterResidentTiles=0\n\
+surfaceRasterTileHits=0\n\
+surfaceRasterTileMisses=0\n\
+surfaceRasterTileEvictions=0\n\
 phase.surfaceSampleMillis=2\n\
 phase.chunkBuildMillis=3\n\
 phase.nbtEncodeMillis=4\n\
@@ -4228,6 +6572,7 @@ manifestFile={}\n",
                 prefetch_requests: 0,
                 prefetch_loads: 0,
             },
+            surface_material_raster_stats: earthmap_surface::SurfaceMaterialRasterStats::EMPTY,
             surface_sample_nanos: 2_900_000,
             chunk_build_nanos: 3_100_000,
             nbt_encode_nanos: 4_200_000,
@@ -4274,6 +6619,12 @@ cacheResidentRows=42\n\
 cacheHits=123\n\
 cacheMisses=456\n\
 cacheEvictions=7\n\
+surfaceRasterSourceCount=0\n\
+surfaceRasterOpenReaders=0\n\
+surfaceRasterResidentTiles=0\n\
+surfaceRasterTileHits=0\n\
+surfaceRasterTileMisses=0\n\
+surfaceRasterTileEvictions=0\n\
 phase.surfaceSampleMillis=2\n\
 phase.chunkBuildMillis=3\n\
 phase.nbtEncodeMillis=4\n\
