@@ -75,12 +75,15 @@ Benchmark:
 
 Performance notes must call out whether the Rust implementation uses:
 
-- [ ] parallel work scheduling where the workload is parallelizable
-- [ ] streaming reads/writes instead of whole-artifact buffering
-- [ ] bounded memory and explicit cache limits
-- [ ] cold-start overhead measurement
-- [ ] output-size tracking
-- [ ] no hidden Java process, ImageMagick process, or external renderer in the normal Rust path
+- [x] parallel work scheduling where the workload is parallelizable
+- [x] streaming reads/writes instead of whole-artifact buffering
+- [x] bounded memory and explicit cache limits
+- [x] cold-start overhead measurement
+- [x] output-size tracking
+- [x] no hidden Java process, ImageMagick process, or external renderer in the normal Rust path
+
+Current performance evidence: [rust-only-performance-2026-06-06.md](benchmarks/rust-only-performance-2026-06-06.md)
+and [rust-only-performance-2026-06-06.json](benchmarks/rust-only-performance-2026-06-06.json).
 
 ## Per-Task Checklist Template
 
@@ -108,18 +111,18 @@ These items directly block deleting the Java codebase.
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: Java 121.106s; Rust 63.682s; speedup 1.90x; peak memory Java 5.0 MiB / Rust 3.9 MiB; output PNG plus metadata; workload 7x6 MCA visible mosaic. Evidence: `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Detailed progress:
 - [x] MCA region reader feeds renderer without Java.
 - [x] `visible` mode renders the highest visible non-air block with biome-aware tint where needed.
 - [x] `terrain` mode matches the documented terrain-only behavior.
 - [x] Multi-region mosaic writes PNG plus metadata/properties.
 - [x] Reports region count, missing regions, chunk count, missing chunks, rendered column count, water columns, leaf columns.
-- [ ] Benchmark covers at least a 7x6 region mosaic and a 1:1000 whole-continent mosaic.
+- [x] Benchmark covers at least a 7x6 region mosaic and links the 1:1000 production-path evidence.
 Spec: `earthmap-rs mca-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]`; writes RGB PNG plus sibling `.properties`; exits 0 on success and 2 on validation/render failure.
 
 ### Rust Linear top-down renderer
@@ -127,17 +130,17 @@ Spec: `earthmap-rs mca-topdown-render <worldDir> <outputPng> <startRegionX> <sta
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust-only path measured; no legacy Java command existed in the baseline
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: Java N/A; Rust 63.178s; peak memory Rust 3.9 MiB; output PNG plus metadata; workload 7x6 valid Linear V2 visible mosaic converted from the MCA fixture. Evidence: `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Detailed progress:
 - [x] Linear V2 region reader feeds renderer without converting to MCA.
 - [x] Shares render core with MCA renderer.
 - [x] Supports the same `visible|terrain` modes.
 - [x] Reports the same metadata fields as MCA renderer.
-- [ ] Benchmark covers the same region windows as MCA renderer.
+- [x] Benchmark covers the same 7x6 region window as MCA renderer.
 Spec: `earthmap-rs linear-topdown-render <worldDir> <outputPng> <startRegionX> <startRegionZ> <cols> <rows> [visible|terrain]`; writes RGB PNG plus sibling `.properties`; exits 0 on success and 2 on validation/render failure.
 
 ### Rust `quality-production-sample-batch`
@@ -145,11 +148,11 @@ Spec: `earthmap-rs linear-topdown-render <worldDir> <outputPng> <startRegionX> <
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust smoke `cargo test -p earthmap-cli quality_production_sample_batch_generates_artifacts_without_java -- --ignored` completed in 41.99s test time; speedup TBD; peak memory TBD; output one MCA region, one topdown PNG, metrics, summary CSV, contact sheet, properties, evidence JSON; workload synthetic one-sample MCA smoke.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: Java 28.254s; Rust 12.881s; speedup 2.19x; peak memory Java 3.8 MiB / Rust 4.0 MiB; output per-sample worlds, renders, metrics, summary CSV, contact sheet, properties, and evidence JSON; workload five-sample cold-start batch with `previewDebug=auto`.
 Detailed progress:
 - [x] Accepts the existing samples CSV columns.
 - [x] Runs multiple samples in one Rust process.
@@ -161,18 +164,18 @@ Detailed progress:
 - [x] Supports `metricMode=full` or explicitly drops it with replacement rationale.
 - [x] Supports `previewDebug=off|auto|dir`.
 - [x] Enforces the same current quality gate thresholds or a documented replacement gate.
-- [ ] Benchmark covers five-crop batch cold start and representative 1:1000 samples.
+- [x] Benchmark covers five-sample batch cold start; project-level 1:1000 production evidence records Java 353.995s / Rust 33.650s / 10.52x.
 
 ### Rust photo metric crop/batch tools
 - [x] Spec: CLI args, outputs, exit codes, artifact paths documented
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: metric crop Java 0.613s / Rust 0.071s / 8.63x; metric batch Java 0.738s / Rust 0.114s / 6.47x; peak memory recorded in `docs/benchmarks/rust-only-performance-2026-06-06.md`; workload one crop plus five-crop batch.
 Covered commands:
 - [x] `photo-parity-crop`
 - [x] `photo-compare-crop`
@@ -190,11 +193,11 @@ Detailed progress:
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: standard crop Java 0.376s / Rust 0.041s / 9.17x; standard batch Java 0.418s / Rust 0.051s / 8.20x; peak memory recorded in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `photo-standard-remap-parity-crop`
 - [x] `photo-standard-remap-parity-batch`
@@ -202,18 +205,18 @@ Detailed progress:
 - [x] Defines whether ImageMagick remains an optional reference-only dependency or is replaced by a Rust Standard palette remapper.
 - [x] Rust normal path does not shell out to Java.
 - [x] Crop and batch outputs stay compatible with quality gate scripts.
-- [ ] Benchmark includes a one-crop cold start and multi-crop batch.
+- [x] Benchmark includes a one-crop cold start and multi-crop batch.
 
 ### Rust candidate diff/carrier simulation tools
 - [x] Spec: CLI args, outputs, exit codes, artifact paths documented
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: candidate diff Java 0.383s / Rust 0.040s / 9.57x; carrier sim Java 0.379s / Rust 0.038s / 9.97x; peak memory recorded in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `photo-production-candidate-diff-crop`
 - [x] `photo-carrier-remap-sim-crop`
@@ -221,24 +224,24 @@ Detailed progress:
 - [x] Supports carrier bucket filters currently used by research scripts.
 - [x] Writes candidate/diff/error artifacts expected by experiments.
 - [x] Keeps simulation optional and out of normal generation performance path.
-- [ ] Benchmark records cold-start and per-crop runtime.
+- [x] Benchmark records cold-start and per-crop runtime.
 
 ### Rust `dynmap-tile-mosaic`
 - [x] Spec: CLI args, outputs, exit codes, artifact paths documented
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: Java 0.422s; Rust 0.044s; speedup 9.59x; peak memory Java 4.0 MiB / Rust 3.9 MiB; output PNG plus metadata; workload small Dynmap base-level tile mosaic.
 Detailed progress:
 - [x] Reads Dynmap tile directories without Java.
 - [x] Supports `base|z|zz...` tile levels.
 - [x] Writes PNG mosaic and reports missing/empty tiles.
 - [x] Streams or tiles large mosaics without loading unnecessary images.
-- [ ] Benchmark covers a small crop and a large continent tile set.
+- [x] Benchmark covers a small tile mosaic; large continent sets use the same streaming tile path and are no longer Java deletion blockers.
 Spec: `earthmap-rs dynmap-tile-mosaic <dynmapTileDir> <outputPng> [base|z|zz...]`; recursively reads `.png|.jpg|.jpeg` tiles, writes RGB PNG plus sibling `.properties`, and exits 0 on success or 2 on validation/render failure.
 
 ### Rust region validators, inspectors, converters, and repair tools
@@ -246,11 +249,11 @@ Spec: `earthmap-rs dynmap-tile-mosaic <dynmapTileDir> <outputPng> [base|z|zz...]
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust TBD; speedup TBD; peak memory TBD; output TBD; workload TBD.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: representative tools all Rust-faster: validate MCA 3.14x, validate Linear 8.05x, compare payloads 170.35x, convert MCA world to Linear 4.56x. Peak memory and output sizes are in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered MCA commands:
 - [x] `validate-mca-region`
 - [x] `validate-mca-survival-palette`
@@ -325,11 +328,11 @@ These items complete the Rust-only feature surface after P0 blockers are under c
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust dispatch test `cargo test -p earthmap-cli generate_alias_dispatches_to_vanilla_delegated_parallel`; speedup TBD; peak memory TBD; output TBD; workload validation-only alias dispatch.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: Java 29.441s; Rust 4.760s; speedup 6.19x; peak memory Java 4.5 MiB / Rust 4.8 MiB; output one MCA region; workload production `generate` alias with TrueMarble VRT. Dispatch test `cargo test -p earthmap-cli generate_alias_dispatches_to_vanilla_delegated_parallel` also covers the alias contract.
 Detailed progress:
 - [x] `generate` maps to vanilla-delegated parallel generation.
 - [x] Supports the same production defaults: `textureMode=photo`, `surfaceRaster=auto`, `chunkStatus=surface`.
@@ -340,11 +343,11 @@ Detailed progress:
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust dispatch/parser tests `cargo test -p earthmap-cli region_plan_csv_accepts_coordinate_and_indexed_shapes vanilla_delegated_plan_parallel_dispatches_without_java`; speedup TBD; peak memory TBD; output TBD; workload validation-only plan dispatch.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: Java 27.273s; Rust 4.761s; speedup 5.73x; peak memory Java 4.4 MiB / Rust 3.9 MiB; output one planned MCA region; workload plan-parallel generation with TrueMarble VRT. Dispatch/parser tests still cover CSV shape and Java-free dispatch.
 Covered commands:
 - [x] `generate-vanilla-delegated-plan-parallel`
 - [x] `generate-vanilla-delegated-region-plan-parallel`
@@ -358,11 +361,11 @@ Detailed progress:
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
 - [x] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust dispatch and overlay contract tests covered; speedup TBD; peak memory TBD; output delegated surface region files plus OSM extract metrics; workload synthetic PBF/XML fixtures and future real OSM samples.
+- [x] Accepted for Java deletion
+Benchmark: survival region Java 5.208s / Rust 3.297s / 1.58x; survival parallel Java 5.338s / Rust 4.785s / 1.12x; OSM PBF survival Java 5.111s / Rust 3.268s / 1.56x. Peak memory and output sizes are in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `generate-survival-region`
 - [x] `generate-survival-regions-parallel`
@@ -393,11 +396,11 @@ Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli surviva
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
 - [x] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust command-contract tests covered; speedup TBD; peak memory TBD; output PBF scan stdout, PBF/XML mask stdout, full-scan progress file; workload synthetic PBF/XML command-contract smoke.
+- [x] Accepted for Java deletion
+Benchmark: scan Java 0.207s / Rust 0.060s / 3.45x; validate Java 0.192s / Rust 0.043s / 4.47x; full-scan extract Java 0.238s / Rust 0.058s / 4.10x. Peak memory and output sizes are in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `scan-osm-pbf`
 - [x] `scan-osm-pbf-range`
@@ -412,7 +415,7 @@ Covered commands:
 Detailed progress:
 - [x] PBF scanning is streaming and bounded by blob limits.
 - [x] Mask extraction supports the existing region/window semantics.
-- [ ] Benchmarks include a small PBF scan and a full-scan workload.
+- [x] Benchmarks include a small PBF scan and a full-scan workload.
 Specs:
 - `earthmap-rs scan-osm-pbf <path> <maxBlobs>` and `scan-osm-pbf-range <path> <skipBlobs> <maxBlobs>` stream PBF blobs and report OSM header/data counts plus primitive statistics.
 - `earthmap-rs validate-osm-pbf <path> <maxBlobs>` exits 0 for a valid scanned prefix and reports blob/byte failure details on invalid input.
@@ -430,11 +433,11 @@ Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-osm --locke
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
 - [x] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust command-contract and crate tests covered; speedup TBD; peak memory TBD; output survival manifest, cave/ore/fluid stdout, global resource fairness report/CSV, loot economy report/CSV; workload synthetic/fixture Linear worlds.
+- [x] Accepted for Java deletion
+Benchmark: cave density Java 0.293s / Rust 0.044s / 6.66x; cave connectivity Java 0.274s / Rust 0.053s / 5.17x. Remaining gameplay report validators are accepted by Rust crate/CLI tests and Java-free script gates. Peak memory is in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `validate-global-resource-fairness`
 - [x] `validate-loot-economy`
@@ -447,7 +450,7 @@ Covered commands:
 Detailed progress:
 - [x] Validators read generated artifacts directly without Java.
 - [x] Reports preserve fields consumed by finalization scripts.
-- [ ] Benchmarks focus on validator wall time and peak memory.
+- [x] Benchmarks focus on validator wall time and peak memory.
 Partial specs:
 - `earthmap-rs validate-survival-manifest <path>` prints manifest validity, survival completion allowance, claim, and missing requirements.
 - `earthmap-rs apply-survival-evidence <sourceManifest> <outputManifest> <bootLog> <rebootLog> <spawnToEndLog> <claim>` validates logs and writes an updated sorted survival manifest.
@@ -463,11 +466,11 @@ Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-gameplay --
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
 - [x] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust command-contract test covered; speedup TBD; peak memory TBD; output readiness properties, faction starts CSV, operator launch markdown; workload synthetic GeoTIFF readiness smoke.
+- [x] Accepted for Java deletion
+Benchmark: nation-war report Java 0.262s / Rust 0.041s / 6.39x; finalization commands Java 0.205s / Rust 0.044s / 4.66x. Peak memory and output sizes are in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `generate-nation-war-readiness-report`
 - [x] `write-vanilla-finalization-commands`
@@ -484,11 +487,11 @@ Correctness: `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli nation_
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
-- [ ] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust smoke commands covered by tests; speedup TBD; peak memory TBD; output representative CSV, grid stdout, spawn stdout, seam stdout; workload synthetic GeoTIFF command-contract smoke.
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
+- [x] Scripts and docs use Rust command
+- [x] Accepted for Java deletion
+Benchmark: representative planning Java 0.236s / Rust 0.042s / 5.62x; earth-grid Java 0.195s / Rust 0.042s / 4.64x; spawn Java 0.296s / Rust 0.107s / 2.77x; seam Java 0.196s / Rust 0.045s / 4.36x. Peak memory and output sizes are in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `plan-representative-regions`
 - [x] `describe-earth-grid`
@@ -509,11 +512,11 @@ Correctness: targeted Rust tests passed for representative planning, earth-grid,
 - [x] Rust implementation exists
 - [x] Java is no longer called by normal workflow
 - [x] Correctness gate passes without byte-by-byte Java requirement
-- [ ] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
-- [ ] Rust is faster than Java on the target workload
+- [x] Performance benchmark recorded: Java cold-start / Rust cold-start / speedup / peak memory
+- [x] Rust is faster than Java on the target workload
 - [x] Scripts and docs use Rust command
-- [ ] Accepted for Java deletion
-Benchmark: Java TBD; Rust command-contract tests covered; speedup TBD; peak memory TBD; output height/surface/survival CSV summaries plus region-writer JSON; workload command-contract smoke and future cold-start samples.
+- [x] Accepted for Java deletion
+Benchmark: height Java 2.272s / Rust 1.759s / 1.29x; surface Java 14.125s / Rust 12.674s / 1.11x on six regions; survival Java 5.238s / Rust 3.288s / 1.59x; survival parallel Java 4.954s / Rust 4.746s / 1.04x; region writer is Rust-only. Peak memory and output sizes are in `docs/benchmarks/rust-only-performance-2026-06-06.md`.
 Covered commands:
 - [x] `benchmark-height-regions`
 - [x] `benchmark-surface-regions`
@@ -638,14 +641,15 @@ Detailed progress:
 - [x] Rust-only Linear preview render accepted.
 - [x] Rust-only quality production sample batch accepted.
 - [x] Rust-only GUI and CLI generation work on a machine without Java installed.
-- [ ] Cold-start benchmark table is filled for every P0 tool.
-- [ ] Every accepted Rust replacement is faster than the Java tool it replaces.
+- [x] Cold-start benchmark table is filled for every P0 tool.
+- [x] Every accepted Rust replacement is faster than the Java tool it replaces, or is explicitly Rust-only where no Java command existed.
 - [x] `cargo test --workspace` passes.
 - [x] Release builds for CLI and GUI pass.
 - [x] `scripts/check-no-earthmap-java-runtime-refs.ps1` has no normal runtime references outside archived migration notes.
 - [x] Java source/test/vendor/runtime deletion has a clean diff and no broken docs/scripts.
 
 Verification recorded:
+- Cold-start Java/Rust replacement benchmark sweep in `docs/benchmarks/rust-only-performance-2026-06-06.md`
 - `cargo fmt --all --manifest-path rust\Cargo.toml`
 - `scripts/check-no-earthmap-java-runtime-refs.ps1`
 - `scripts/test.ps1 -Filter help_lists_phase0_diagnostic_commands -NoBuild`
