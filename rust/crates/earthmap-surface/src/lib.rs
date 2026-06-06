@@ -376,6 +376,7 @@ pub struct SurfaceRegionReport {
     pub region_z: i32,
     pub output_format: OutputFormat,
     pub scale_denominator: i32,
+    pub vertical_scale: f64,
     pub chunk_count: usize,
     pub land_columns: i32,
     pub water_columns: i32,
@@ -10810,6 +10811,7 @@ pub fn generate_surface_region_with_open_material_sampler(
         region_z: settings.region_z,
         output_format: settings.output_format,
         scale_denominator: settings.scale_denominator,
+        vertical_scale: settings.vertical_scale,
         chunk_count: chunks.len(),
         land_columns,
         water_columns,
@@ -11191,6 +11193,9 @@ pub fn surface_y_for_elevation_meters(elevation_meters: f64) -> i32 {
 }
 
 pub const DEFAULT_VERTICAL_SCALE: f64 = 1.0;
+pub const AUTO_VERTICAL_SCALE_REFERENCE_DENOMINATOR: f64 = 1000.0;
+pub const AUTO_VERTICAL_SCALE_MIN: f64 = DEFAULT_VERTICAL_SCALE;
+pub const AUTO_VERTICAL_SCALE_MAX: f64 = 4.0;
 
 const BEACH_COAST_FACTOR: f64 = 0.985;
 const SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR: f64 = 0.985;
@@ -13280,6 +13285,19 @@ pub fn require_valid_vertical_scale(vertical_scale: f64) -> Result<f64> {
         )));
     }
     Ok(vertical_scale)
+}
+
+pub fn auto_vertical_scale_for_denominator(scale_denominator: i32) -> f64 {
+    if scale_denominator <= 0 {
+        return DEFAULT_VERTICAL_SCALE;
+    }
+    let scale = AUTO_VERTICAL_SCALE_REFERENCE_DENOMINATOR / f64::from(scale_denominator);
+    scale.clamp(AUTO_VERTICAL_SCALE_MIN, AUTO_VERTICAL_SCALE_MAX)
+}
+
+pub fn effective_surface_meters_per_block(vertical_scale: f64) -> Result<f64> {
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    Ok(SHAPED_ELEVATION_METERS_PER_BLOCK / vertical_scale)
 }
 
 pub fn ground_surface_y(elevation_meters: f64, water: bool) -> i32 {
@@ -18266,6 +18284,68 @@ mod tests {
             applied.ground_surface_y
         );
         assert_eq!(applied.decision_source, "water");
+    }
+
+    #[test]
+    fn auto_vertical_scale_preserves_world_scale_and_boosts_regional_scale() {
+        assert_eq!(auto_vertical_scale_for_denominator(5000), 1.0);
+        assert_eq!(auto_vertical_scale_for_denominator(1000), 1.0);
+        assert_eq!(auto_vertical_scale_for_denominator(500), 2.0);
+        assert_eq!(auto_vertical_scale_for_denominator(200), 4.0);
+        assert_eq!(auto_vertical_scale_for_denominator(100), 4.0);
+        assert_eq!(
+            auto_vertical_scale_for_denominator(0),
+            DEFAULT_VERTICAL_SCALE
+        );
+        assert_eq!(effective_surface_meters_per_block(4.0).unwrap(), 11.25);
+    }
+
+    #[test]
+    fn scale_aware_bathymetry_uses_more_vertical_resolution_for_detailed_maps() {
+        let water = surface_column(
+            true,
+            SEA_LEVEL_Y - 2,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            "minecraft:ocean",
+        );
+        let sample = SurfaceMaterialSample::new(
+            RgbColor::of(0, 0, 24),
+            RgbColor::unavailable(),
+            TerrainTokenSource::None,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            18_000,
+            -90,
+            0,
+            "",
+            "",
+            0.0,
+        );
+
+        let legacy_y = surface_material_bathymetry_ground_surface_y(
+            &water,
+            &sample,
+            0.0,
+            DEFAULT_VERTICAL_SCALE,
+        );
+        let regional_y = surface_material_bathymetry_ground_surface_y(
+            &water,
+            &sample,
+            0.0,
+            auto_vertical_scale_for_denominator(200),
+        );
+
+        assert_eq!(SEA_LEVEL_Y - legacy_y, 2);
+        assert_eq!(SEA_LEVEL_Y - regional_y, 8);
     }
 
     #[test]

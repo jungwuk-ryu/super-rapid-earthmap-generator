@@ -25,6 +25,7 @@ const OUTPUT_ROOT_ENV: &str = "EARTHMAP_OUTPUT_ROOT";
 const DEFAULT_WORLD_DIR_NAME: &str = "earthmap-gui-world";
 const DEFAULT_CACHE_ROWS: &str = "auto";
 const DEFAULT_SURFACE_TILE_CACHE_ENTRIES: &str = "auto";
+const DEFAULT_VERTICAL_SCALE: &str = "auto";
 const REGION_SIZE_BLOCKS: i32 = 512;
 const FULL_EARTH_MIN_LATITUDE: f64 = -90.0;
 const FULL_EARTH_MAX_LATITUDE: f64 = 90.0;
@@ -229,6 +230,7 @@ struct GenerationOptions {
     mca_compression_level: u32,
     threads: usize,
     status: ChunkStatusChoice,
+    vertical_scale: String,
     cache_rows: String,
     surface_tile_cache_entries: String,
     rayon_threads: String,
@@ -258,6 +260,7 @@ impl Default for GenerationOptions {
             mca_compression_level: 6,
             threads: 8,
             status: ChunkStatusChoice::Surface,
+            vertical_scale: DEFAULT_VERTICAL_SCALE.to_string(),
             cache_rows: DEFAULT_CACHE_ROWS.to_string(),
             surface_tile_cache_entries: DEFAULT_SURFACE_TILE_CACHE_ENTRIES.to_string(),
             rayon_threads: String::new(),
@@ -295,6 +298,15 @@ impl GenerationOptions {
             OutputFormatChoice::Mca => {
                 format!("mcaCompression={}", self.mca_compression_level.min(9))
             }
+        }
+    }
+
+    fn vertical_scale_option(&self) -> String {
+        let trimmed = self.vertical_scale.trim();
+        if trimmed.is_empty() {
+            "verticalScale=auto".to_string()
+        } else {
+            format!("verticalScale={trimmed}")
         }
     }
 
@@ -350,6 +362,7 @@ fn build_generation_args(options: &GenerationOptions) -> Vec<String> {
         options.threads.max(1).to_string(),
         options.status.as_cli_arg().to_string(),
         options.normalized_surface_raster(),
+        options.vertical_scale_option(),
         options.compression_option(),
     ]
 }
@@ -1339,6 +1352,11 @@ impl eframe::App for EarthMapGuiApp {
                     ui.add(egui::DragValue::new(&mut self.options.scale).range(1..=100_000));
                 });
                 ui.small("1000 means about one Minecraft block per kilometer at the equator. Smaller numbers create larger worlds.");
+                ui.horizontal(|ui| {
+                    ui.label("Vertical scale");
+                    ui.text_edit_singleline(&mut self.options.vertical_scale);
+                });
+                ui.small("auto follows map scale for detailed regional worlds while capping height within Minecraft limits.");
 
                 ui.separator();
                 ui.heading("Area");
@@ -1879,7 +1897,8 @@ mod tests {
             args[11],
             format!("surfaceRaster={}", true_marble_from_tif_root("TifFiles"))
         );
-        assert_eq!(args[12], "linearCompression=4");
+        assert_eq!(args[12], "verticalScale=auto");
+        assert_eq!(args[13], "linearCompression=4");
     }
 
     #[test]
@@ -1890,6 +1909,7 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[11], "surfaceRaster=fixtures/TrueMarble.vrt");
+        assert_eq!(args[12], "verticalScale=auto");
     }
 
     #[test]
@@ -1901,7 +1921,7 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[8], "mca");
-        assert_eq!(args[12], "mcaCompression=9");
+        assert_eq!(args[13], "mcaCompression=9");
     }
 
     #[test]
@@ -1912,6 +1932,17 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[11], "surfaceRaster=auto");
+        assert_eq!(args[12], "verticalScale=auto");
+    }
+
+    #[test]
+    fn generation_args_include_explicit_vertical_scale_when_selected() {
+        let options = GenerationOptions {
+            vertical_scale: "legacy".to_string(),
+            ..GenerationOptions::default()
+        };
+        let args = build_generation_args(&options);
+        assert_eq!(args[12], "verticalScale=legacy");
     }
 
     #[test]

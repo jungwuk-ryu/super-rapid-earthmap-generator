@@ -38,13 +38,14 @@ use earthmap_region::{
     RegionFormat, REGION_CHUNKS_PER_REGION,
 };
 use earthmap_surface::{
-    classify_surface, generate_surface_region_with_open_material_sampler,
-    surface_y_for_elevation_meters, EarthDataSurfaceMaterialSampler, EarthSurfaceColumn,
-    HeightOnlySettings, LandShallowTopoPhotoSampler, MetImageExportTerrainSampler,
+    auto_vertical_scale_for_denominator, classify_surface,
+    generate_surface_region_with_open_material_sampler, surface_y_for_elevation_meters,
+    EarthDataSurfaceMaterialSampler, EarthSurfaceColumn, HeightOnlySettings,
+    LandShallowTopoPhotoSampler, MetImageExportTerrainSampler,
     OsmFeatureKind as SurfaceOsmFeatureKind, OsmRegionFeatureMask as SurfaceOsmRegionFeatureMask,
     OutputFormat, SurfaceMaterialSample, SurfaceRegionColumnTrace, SurfaceRegionReport,
     SurfaceRegionSettings, SurfaceTextureMode, WwfEcoregionSampler,
-    DEFAULT_SURFACE_TILE_CACHE_ENTRIES, REGION_SIZE_BLOCKS, SEA_LEVEL_Y,
+    DEFAULT_SURFACE_TILE_CACHE_ENTRIES, DEFAULT_VERTICAL_SCALE, REGION_SIZE_BLOCKS, SEA_LEVEL_Y,
     SURVIVAL_MANIFEST_FILE_NAME,
 };
 use serde_json::{json, Value};
@@ -2563,6 +2564,43 @@ struct RegionCompressionOptions {
     linear_compression_level: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VerticalScaleOption {
+    Auto,
+    Legacy,
+    Explicit(f64),
+}
+
+impl Default for VerticalScaleOption {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl VerticalScaleOption {
+    fn effective(self, scale_denominator: i32) -> f64 {
+        match self {
+            Self::Auto => auto_vertical_scale_for_denominator(scale_denominator),
+            Self::Legacy => DEFAULT_VERTICAL_SCALE,
+            Self::Explicit(value) => value,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Legacy => "legacy",
+            Self::Explicit(_) => "explicit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GenerationRuntimeOptions {
+    compression: RegionCompressionOptions,
+    vertical_scale: VerticalScaleOption,
+}
+
 fn optional_generation_args(args: &[String], first_optional: usize) -> GenerationOptionalArgs<'_> {
     let rest = args.get(first_optional..).unwrap_or(&[]);
     optional_generation_args_from_rest(rest)
@@ -2612,11 +2650,19 @@ fn is_surface_raster_option(value: &str) -> bool {
         .is_some_and(|(key, _)| key.eq_ignore_ascii_case("surfaceRaster"))
 }
 
+#[cfg(test)]
 fn parse_region_compression_options(
     format: OutputFormat,
     options: &[String],
 ) -> std::result::Result<RegionCompressionOptions, String> {
-    let mut parsed = RegionCompressionOptions::default();
+    Ok(parse_generation_runtime_options(format, options)?.compression)
+}
+
+fn parse_generation_runtime_options(
+    format: OutputFormat,
+    options: &[String],
+) -> std::result::Result<GenerationRuntimeOptions, String> {
+    let mut parsed = GenerationRuntimeOptions::default();
     for option in options {
         let (key, value) = option
             .split_once('=')
@@ -2624,10 +2670,12 @@ fn parse_region_compression_options(
         if key.eq_ignore_ascii_case("compression") || key.eq_ignore_ascii_case("compressionLevel") {
             match format {
                 OutputFormat::Mca => {
-                    parsed.mca_compression_level = Some(parse_mca_compression_level(value)?);
+                    parsed.compression.mca_compression_level =
+                        Some(parse_mca_compression_level(value)?);
                 }
                 OutputFormat::LinearV2 => {
-                    parsed.linear_compression_level = Some(parse_linear_compression_level(value)?);
+                    parsed.compression.linear_compression_level =
+                        Some(parse_linear_compression_level(value)?);
                 }
             }
             continue;
@@ -2635,18 +2683,44 @@ fn parse_region_compression_options(
         if key.eq_ignore_ascii_case("mcaCompression")
             || key.eq_ignore_ascii_case("mcaCompressionLevel")
         {
-            parsed.mca_compression_level = Some(parse_mca_compression_level(value)?);
+            parsed.compression.mca_compression_level = Some(parse_mca_compression_level(value)?);
             continue;
         }
         if key.eq_ignore_ascii_case("linearCompression")
             || key.eq_ignore_ascii_case("linearCompressionLevel")
         {
-            parsed.linear_compression_level = Some(parse_linear_compression_level(value)?);
+            parsed.compression.linear_compression_level =
+                Some(parse_linear_compression_level(value)?);
+            continue;
+        }
+        if key.eq_ignore_ascii_case("verticalScale")
+            || key.eq_ignore_ascii_case("heightScale")
+            || key.eq_ignore_ascii_case("yScale")
+            || key.eq_ignore_ascii_case("reliefScale")
+            || key.eq_ignore_ascii_case("verticalProfile")
+        {
+            parsed.vertical_scale = parse_generation_vertical_scale_option(value)?;
             continue;
         }
         return Err(format!("unknown generation option: {key}"));
     }
     Ok(parsed)
+}
+
+fn parse_generation_vertical_scale_option(
+    value: &str,
+) -> std::result::Result<VerticalScaleOption, String> {
+    let value = value.trim();
+    if matches_ignore_ascii_case(value, &["auto", "realistic", "scale-aware", "scaleAware"]) {
+        return Ok(VerticalScaleOption::Auto);
+    }
+    if matches_ignore_ascii_case(value, &["legacy", "fixed", "default"]) {
+        return Ok(VerticalScaleOption::Legacy);
+    }
+    let parsed = value.parse::<f64>().map_err(|error| error.to_string())?;
+    earthmap_surface::require_valid_vertical_scale(parsed)
+        .map_err(|error| error.to_string())
+        .map(VerticalScaleOption::Explicit)
 }
 
 fn parse_mca_compression_level(value: &str) -> std::result::Result<u32, String> {
@@ -2899,7 +2973,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(
         out,
@@ -2931,19 +3005,19 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-region [heightmap] <worldDir> <scale> <regionX> <regionZ> <mca|linear> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate-vanilla-delegated-region [heightmap] <worldDir> <scale> <regionX> <regionZ> <mca|linear> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate-vanilla-delegated-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
     )?;
     writeln!(
         out,
@@ -8297,7 +8371,7 @@ fn generate_vanilla_delegated_region_impl_with_osm_mask(
     osm_region_feature_mask: Option<SurfaceOsmRegionFeatureMask>,
 ) -> std::result::Result<Vec<String>, String> {
     let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
-    let compression_options = parse_region_compression_options(format, extra_options)?;
+    let runtime_options = parse_generation_runtime_options(format, extra_options)?;
     let status = ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
     if status == ChunkGenerationStatus::Full {
         return Err("delegated generation status must be surface or carvers".to_string());
@@ -8309,6 +8383,7 @@ fn generate_vanilla_delegated_region_impl_with_osm_mask(
                     .to_string()
             })?;
     let scale = parse_i32_string(scale_text)?;
+    let vertical_scale = runtime_options.vertical_scale.effective(scale);
     let region_x = parse_i32_string(region_x_text)?;
     let region_z = parse_i32_string(region_z_text)?;
     let cache_rows = configured_heightmap_cache_rows(Path::new(heightmap_path))?;
@@ -8326,14 +8401,14 @@ fn generate_vanilla_delegated_region_impl_with_osm_mask(
         cache_rows,
         true,
         status,
-        1.0,
+        vertical_scale,
         SurfaceTextureMode::Photo,
     )
     .map_err(|error| error.to_string())?;
     settings.surface_material_path = Some(surface_material_path.clone());
     settings.surface_tile_cache_entries = surface_tile_cache_entries;
     settings.osm_region_feature_mask = osm_region_feature_mask;
-    apply_region_compression_options(&mut settings, compression_options);
+    apply_region_compression_options(&mut settings, runtime_options.compression);
 
     let report =
         earthmap_surface::generate_surface_region(&settings).map_err(|error| error.to_string())?;
@@ -8342,7 +8417,8 @@ fn generate_vanilla_delegated_region_impl_with_osm_mask(
         world_dir,
         status,
         &surface_material_path,
-        compression_options,
+        runtime_options.compression,
+        runtime_options.vertical_scale.label(),
     ))
 }
 
@@ -8407,12 +8483,13 @@ fn generate_vanilla_delegated_regions_parallel_impl(
 ) -> std::result::Result<(), String> {
     let total_start = Instant::now();
     let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
-    let compression_options = parse_region_compression_options(format, extra_options)?;
+    let runtime_options = parse_generation_runtime_options(format, extra_options)?;
     let status = ChunkGenerationStatus::parse(status_text).map_err(|error| error.to_string())?;
     if status == ChunkGenerationStatus::Full {
         return Err("delegated generation status must be surface or carvers".to_string());
     }
     let scale = parse_positive_i32_string("scale", scale_text)?;
+    let vertical_scale = runtime_options.vertical_scale.effective(scale);
     let start_region_x = parse_i32_string(start_region_x_text)?;
     let start_region_z = parse_i32_string(start_region_z_text)?;
     let cols = parse_positive_i32_string("cols", cols_text)?;
@@ -8444,7 +8521,9 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         rows,
         status,
         &surface_material_path,
-        compression_options,
+        runtime_options.compression,
+        vertical_scale,
+        runtime_options.vertical_scale.label(),
     );
 
     let worker_count = threads
@@ -8480,6 +8559,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         rows,
         status,
         &surface_material_path,
+        vertical_scale,
+        runtime_options.vertical_scale.label(),
     )
     .map_err(|error| error.to_string())?;
     let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
@@ -8499,6 +8580,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "worldDir": normalized_path_display(world),
             "format": format.java_name(),
             "scale": scale,
+            "verticalScale": vertical_scale,
+            "verticalScaleMode": runtime_options.vertical_scale.label(),
             "chunkStatus": status.id(),
             "regionStartX": start_region_x,
             "regionStartZ": start_region_z,
@@ -8614,14 +8697,14 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                         cache_rows,
                         false,
                         status,
-                        1.0,
+                        vertical_scale,
                         SurfaceTextureMode::Photo,
                     )
                     .map_err(|error| error.to_string())?;
                     settings.surface_material_path = Some((*surface_material_path).clone());
                     settings.surface_tile_cache_entries = surface_tile_cache_entries;
                     settings.parallel_column_sampling = worker_count <= 4;
-                    apply_region_compression_options(&mut settings, compression_options);
+                    apply_region_compression_options(&mut settings, runtime_options.compression);
                     let report = generate_surface_region_with_open_material_sampler(
                         &settings,
                         Some(surface_material_sampler),
@@ -8723,7 +8806,12 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         "surfaceSamplerStrategy=shared".to_string(),
         format!("sharedCacheRows={cache_rows}"),
         format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
-        compression_options_report_line(format, compression_options),
+        format!("verticalScale={vertical_scale}"),
+        format!(
+            "verticalScaleMode={}",
+            runtime_options.vertical_scale.label()
+        ),
+        compression_options_report_line(format, runtime_options.compression),
         format!(
             "surfaceMaterialPath={}",
             normalized_path_display(&surface_material_path)
@@ -8831,8 +8919,8 @@ fn generate_vanilla_delegated_plan_parallel_impl(
     let generation_options = optional_generation_args_from_rest(
         optional_args.get(generation_option_offset..).unwrap_or(&[]),
     );
-    let compression_options =
-        parse_region_compression_options(format, generation_options.extra_options)?;
+    let runtime_options =
+        parse_generation_runtime_options(format, generation_options.extra_options)?;
     let status = ChunkGenerationStatus::parse(generation_options.status)
         .map_err(|error| error.to_string())?;
     if status == ChunkGenerationStatus::Full {
@@ -8845,6 +8933,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
     }
     let heightmap = Path::new(heightmap_path);
     let world = Path::new(world_dir);
+    let vertical_scale = runtime_options.vertical_scale.effective(scale);
     let surface_material_path =
         parse_optional_surface_material_path(generation_options.surface_raster, heightmap)?
             .ok_or_else(|| {
@@ -8862,7 +8951,9 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         scale,
         status,
         &surface_material_path,
-        compression_options,
+        runtime_options.compression,
+        vertical_scale,
+        runtime_options.vertical_scale.label(),
     );
     let worker_count = threads
         .min(submitted_regions)
@@ -8898,6 +8989,8 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         submitted_regions,
         status,
         &surface_material_path,
+        vertical_scale,
+        runtime_options.vertical_scale.label(),
     )
     .map_err(|error| error.to_string())?;
     let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
@@ -8919,6 +9012,8 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "planCsv": normalized_path_display(plan_path),
             "format": format.java_name(),
             "scale": scale,
+            "verticalScale": vertical_scale,
+            "verticalScaleMode": runtime_options.vertical_scale.label(),
             "chunkStatus": status.id(),
             "plannedRegions": plan_regions.len(),
             "submittedRegions": submitted_regions,
@@ -9026,14 +9121,14 @@ fn generate_vanilla_delegated_plan_parallel_impl(
                         cache_rows,
                         false,
                         status,
-                        1.0,
+                        vertical_scale,
                         SurfaceTextureMode::Photo,
                     )
                     .map_err(|error| error.to_string())?;
                     settings.surface_material_path = Some((*surface_material_path).clone());
                     settings.surface_tile_cache_entries = surface_tile_cache_entries;
                     settings.parallel_column_sampling = worker_count <= 4;
-                    apply_region_compression_options(&mut settings, compression_options);
+                    apply_region_compression_options(&mut settings, runtime_options.compression);
                     let report = generate_surface_region_with_open_material_sampler(
                         &settings,
                         Some(surface_material_sampler),
@@ -9139,7 +9234,12 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         format!("surfaceSamplerStrategy=shared"),
         format!("sharedCacheRows={cache_rows}"),
         format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
-        compression_options_report_line(format, compression_options),
+        format!("verticalScale={vertical_scale}"),
+        format!(
+            "verticalScaleMode={}",
+            runtime_options.vertical_scale.label()
+        ),
+        compression_options_report_line(format, runtime_options.compression),
         format!(
             "surfaceMaterialPath={}",
             normalized_path_display(&surface_material_path)
@@ -9275,6 +9375,8 @@ fn vanilla_delegated_plan_resume_fingerprint(
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
     compression_options: RegionCompressionOptions,
+    vertical_scale: f64,
+    vertical_scale_mode: &str,
 ) -> Value {
     json!({
         "schemaVersion": RESUME_FINGERPRINT_SCHEMA_VERSION,
@@ -9291,7 +9393,8 @@ fn vanilla_delegated_plan_resume_fingerprint(
         "planRegions": regions.iter().map(|(x, z)| json!({"regionX": x, "regionZ": z})).collect::<Vec<_>>(),
         "chunkStatus": status.id(),
         "textureMode": "photo",
-        "verticalScale": "1.0",
+        "verticalScale": vertical_scale,
+        "verticalScaleMode": vertical_scale_mode,
         "serverDelegation": true,
         "directCaves": false,
         "directOres": false,
@@ -9634,6 +9737,8 @@ fn vanilla_delegated_parallel_resume_fingerprint(
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
     compression_options: RegionCompressionOptions,
+    vertical_scale: f64,
+    vertical_scale_mode: &str,
 ) -> Value {
     json!({
         "schemaVersion": RESUME_FINGERPRINT_SCHEMA_VERSION,
@@ -9652,7 +9757,8 @@ fn vanilla_delegated_parallel_resume_fingerprint(
         "regionRows": rows,
         "chunkStatus": status.id(),
         "textureMode": "photo",
-        "verticalScale": "1.0",
+        "verticalScale": vertical_scale,
+        "verticalScaleMode": vertical_scale_mode,
         "serverDelegation": true,
         "directCaves": false,
         "directOres": false,
@@ -10495,6 +10601,7 @@ fn vanilla_delegated_region_report_lines(
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
     compression_options: RegionCompressionOptions,
+    vertical_scale_mode: &str,
 ) -> Vec<String> {
     let mut lines = vec![
         "Vanilla-delegated surface region generated".to_string(),
@@ -10502,6 +10609,8 @@ fn vanilla_delegated_region_report_lines(
         format!("regionZ={}", report.region_z),
         format!("format={}", report.output_format.java_name()),
         format!("scale=1:{}", report.scale_denominator),
+        format!("verticalScale={}", report.vertical_scale),
+        format!("verticalScaleMode={vertical_scale_mode}"),
         format!("chunkStatus={}", status.id()),
         compression_options_report_line(report.output_format, compression_options),
         format!(
@@ -16148,6 +16257,8 @@ fn write_vanilla_delegated_parallel_manifest(
     rows: i32,
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
+    vertical_scale: f64,
+    vertical_scale_mode: &str,
 ) -> io::Result<std::path::PathBuf> {
     let mut values = base_exploration_only_manifest("vanilla-delegated-regions-parallel");
     values.insert("features.surfaceRules".to_string(), "true".to_string());
@@ -16180,7 +16291,14 @@ fn write_vanilla_delegated_parallel_manifest(
         "generation.chunkStatus".to_string(),
         status.id().to_string(),
     );
-    values.insert("generation.verticalScale".to_string(), "1.0".to_string());
+    values.insert(
+        "generation.verticalScale".to_string(),
+        vertical_scale.to_string(),
+    );
+    values.insert(
+        "generation.verticalScaleMode".to_string(),
+        vertical_scale_mode.to_string(),
+    );
     values.insert("generation.textureMode".to_string(), "photo".to_string());
     values.insert(
         "generation.surfaceMaterialPath".to_string(),
@@ -16236,6 +16354,8 @@ fn write_vanilla_delegated_plan_manifest(
     submitted_regions: usize,
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
+    vertical_scale: f64,
+    vertical_scale_mode: &str,
 ) -> io::Result<std::path::PathBuf> {
     let mut values = base_exploration_only_manifest("vanilla-delegated-plan-parallel");
     values.insert("features.surfaceRules".to_string(), "true".to_string());
@@ -16270,7 +16390,14 @@ fn write_vanilla_delegated_plan_manifest(
         "generation.chunkStatus".to_string(),
         status.id().to_string(),
     );
-    values.insert("generation.verticalScale".to_string(), "1.0".to_string());
+    values.insert(
+        "generation.verticalScale".to_string(),
+        vertical_scale.to_string(),
+    );
+    values.insert(
+        "generation.verticalScaleMode".to_string(),
+        vertical_scale_mode.to_string(),
+    );
     values.insert("generation.textureMode".to_string(), "photo".to_string());
     values.insert(
         "generation.surfaceMaterialPath".to_string(),
@@ -16717,6 +16844,8 @@ mod tests {
                 linear_compression_level: Some(4),
                 ..RegionCompressionOptions::default()
             },
+            DEFAULT_VERTICAL_SCALE,
+            "auto",
         );
         fs::write(&climate, b"climate-v2-with-different-length").unwrap();
         let second = vanilla_delegated_parallel_resume_fingerprint(
@@ -16733,6 +16862,8 @@ mod tests {
                 linear_compression_level: Some(4),
                 ..RegionCompressionOptions::default()
             },
+            DEFAULT_VERTICAL_SCALE,
+            "auto",
         );
 
         assert_ne!(first, second);
@@ -16768,6 +16899,8 @@ mod tests {
             ChunkGenerationStatus::Surface,
             &true_marble,
             RegionCompressionOptions::default(),
+            DEFAULT_VERTICAL_SCALE,
+            "auto",
         );
         fs::write(cache_dir.join("wwf-ecoregions-v2.bin"), b"derived-cache").unwrap();
         let second = vanilla_delegated_parallel_resume_fingerprint(
@@ -16781,6 +16914,8 @@ mod tests {
             ChunkGenerationStatus::Surface,
             &true_marble,
             RegionCompressionOptions::default(),
+            DEFAULT_VERTICAL_SCALE,
+            "auto",
         );
 
         assert_eq!(first, second);
@@ -18306,6 +18441,36 @@ mod tests {
                 mca_compression_level: Some(3)
             }
         );
+    }
+
+    #[test]
+    fn generation_runtime_options_parse_scale_aware_vertical_profile() {
+        let auto = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &[
+                "verticalScale=auto".to_string(),
+                "linearCompression=4".to_string(),
+            ],
+        )
+        .unwrap();
+        let legacy = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &["verticalScale=legacy".to_string()],
+        )
+        .unwrap();
+        let explicit = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &["verticalProfile=2.5".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(auto.vertical_scale.effective(200), 4.0);
+        assert_eq!(auto.vertical_scale.label(), "auto");
+        assert_eq!(auto.compression.linear_compression_level, Some(4));
+        assert_eq!(legacy.vertical_scale.effective(200), DEFAULT_VERTICAL_SCALE);
+        assert_eq!(legacy.vertical_scale.label(), "legacy");
+        assert_eq!(explicit.vertical_scale.effective(200), 2.5);
+        assert_eq!(explicit.vertical_scale.label(), "explicit");
     }
 
     #[test]
@@ -19900,6 +20065,7 @@ sourceLookupCells=1\n",
             region_z: -1,
             output_format: OutputFormat::LinearV2,
             scale_denominator: 5000,
+            vertical_scale: DEFAULT_VERTICAL_SCALE,
             chunk_count: 1024,
             land_columns: 200_000,
             water_columns: 62_144,
@@ -19984,6 +20150,7 @@ manifestFile={}\n",
             region_z: -1,
             output_format: OutputFormat::LinearV2,
             scale_denominator: 5000,
+            vertical_scale: DEFAULT_VERTICAL_SCALE,
             chunk_count: 1024,
             land_columns: 200_000,
             water_columns: 62_144,
@@ -20017,6 +20184,7 @@ manifestFile={}\n",
             ChunkGenerationStatus::Surface,
             &material,
             RegionCompressionOptions::default(),
+            "auto",
         )
         .join("\n")
             + "\n";
@@ -20029,6 +20197,8 @@ regionX=0\n\
 regionZ=-1\n\
 format=LINEAR_V2\n\
 scale=1:5000\n\
+verticalScale=1\n\
+verticalScaleMode=auto\n\
 chunkStatus=minecraft:surface\n\
 linearCompression=default\n\
 surfaceMaterialPath={}\n\

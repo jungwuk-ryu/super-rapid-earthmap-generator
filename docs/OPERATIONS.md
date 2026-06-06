@@ -57,6 +57,10 @@ GUI area setup:
 - Choose **Advanced region grid** only when you already know the Minecraft region coordinates.
 - Scale denominator `1000` means roughly one Minecraft block per kilometer at the equator. Smaller values generate
   larger worlds; larger values generate smaller worlds.
+- Vertical scale defaults to `auto`. It keeps `1:1000` worlds at the legacy `1.0` profile, boosts more detailed
+  regional worlds with `1000 / scale`, and caps the boost at `4.0` so terrain and bathymetry use more of Minecraft's
+  height range without exceeding normal world limits. Use `verticalScale=legacy` to force the old fixed `1.0` profile
+  or `verticalScale=N` for an explicit profile.
 
 GUI generation setup:
 
@@ -73,11 +77,11 @@ The same options are available from the CLI:
 ```powershell
 cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
   generate-vanilla-delegated-regions-parallel $env:EARTHMAP_HEIGHTMAP $env:EARTHMAP_OUTPUT_ROOT 1000 `
-  26 -10 3 3 linear 8 surface surfaceRaster=auto linearCompression=4
+  26 -10 3 3 linear 8 surface surfaceRaster=auto verticalScale=auto linearCompression=4
 
 cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
   generate-vanilla-delegated-regions-parallel $env:EARTHMAP_HEIGHTMAP $env:EARTHMAP_OUTPUT_ROOT 1000 `
-  26 -10 3 3 mca 8 surface surfaceRaster=auto mcaCompression=6
+  26 -10 3 3 mca 8 surface surfaceRaster=auto verticalScale=auto mcaCompression=6
 ```
 
 `compression=N` can be used instead of the format-specific key; it applies to the selected output format.
