@@ -472,6 +472,46 @@ impl GeoTiffFloat32Reader {
         Ok(Some(value))
     }
 
+    pub fn sample_bilinear(&self, longitude: f64, latitude: f64) -> Result<Option<f64>> {
+        let pixel_x = ((longitude - self.metadata.top_left_longitude)
+            / self.metadata.pixel_width_degrees)
+            - 0.5;
+        let pixel_y = ((self.metadata.top_left_latitude - latitude)
+            / self.metadata.pixel_height_degrees)
+            - 0.5;
+        let floor_x = pixel_x.floor();
+        let floor_y = pixel_y.floor();
+        let x0 = clamp(floor_x as i32, self.metadata.width);
+        let y0 = clamp(floor_y as i32, self.metadata.height);
+        let x1 = clamp(x0 + 1, self.metadata.width);
+        let y1 = clamp(y0 + 1, self.metadata.height);
+        let tx = clamp_unit(pixel_x - floor_x);
+        let ty = clamp_unit(pixel_y - floor_y);
+
+        let samples = [
+            (
+                self.sample_optional_at_pixel(x0, y0)?,
+                (1.0 - tx) * (1.0 - ty),
+            ),
+            (self.sample_optional_at_pixel(x1, y0)?, tx * (1.0 - ty)),
+            (self.sample_optional_at_pixel(x0, y1)?, (1.0 - tx) * ty),
+            (self.sample_optional_at_pixel(x1, y1)?, tx * ty),
+        ];
+        let mut weighted = 0.0;
+        let mut weight_sum = 0.0;
+        for (sample, weight) in samples {
+            if let Some(value) = sample {
+                weighted += value * weight;
+                weight_sum += weight;
+            }
+        }
+        if weight_sum == 0.0 {
+            Ok(None)
+        } else {
+            Ok(Some(weighted / weight_sum))
+        }
+    }
+
     pub fn sample_at_pixel(&self, x: i32, y: i32) -> Result<f32> {
         self.require_pixel(x, y)?;
         let expected_bytes = usize::try_from(self.metadata.width)
@@ -515,6 +555,19 @@ impl GeoTiffFloat32Reader {
             return Err(GeoError::invalid(format!("y outside raster: {y}")));
         }
         Ok(())
+    }
+
+    fn sample_optional_at_pixel(&self, x: i32, y: i32) -> Result<Option<f64>> {
+        let value = f64::from(self.sample_at_pixel(x, y)?);
+        if !value.is_finite()
+            || self
+                .metadata
+                .no_data_value
+                .is_some_and(|no_data| java_double_compare_equal(value, no_data))
+        {
+            return Ok(None);
+        }
+        Ok(Some(value))
     }
 }
 
@@ -3846,6 +3899,10 @@ mod tests {
         assert_eq!(reader.sample_nearest(10.75, 19.75).unwrap(), None);
         assert_eq!(reader.sample_nearest(9.99, 19.75).unwrap(), None);
         assert_eq!(reader.sample_nearest(10.25, 18.9).unwrap(), None);
+        assert_eq!(reader.sample_bilinear(10.25, 19.75).unwrap(), Some(1.25));
+        let interpolated = reader.sample_bilinear(10.5, 19.5).unwrap().unwrap();
+        assert!((interpolated - (11.0 / 3.0)).abs() < 0.000_001);
+        assert_eq!(reader.sample_bilinear(9.99, 19.75).unwrap(), Some(1.25));
 
         let u16_path = temp.path().join("tiny-single-band-u16.tif");
         fs::write(

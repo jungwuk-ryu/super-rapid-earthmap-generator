@@ -9607,7 +9607,7 @@ pub fn normalize_longitude(longitude: f64) -> f64 {
 
 pub fn material_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f64) -> f64 {
     java_max(
-        0.012,
+        0.003,
         java_min(
             0.060,
             java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) * 2.0,
@@ -9653,7 +9653,7 @@ fn usable_photo_color(color: RgbColor) -> bool {
 
 pub fn photo_evidence_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees: f64) -> f64 {
     java_max(
-        0.030,
+        0.006,
         java_min(
             0.090,
             java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) * 5.0,
@@ -10563,7 +10563,7 @@ fn sample_bathymetry_meters(
     let Some(reader) = reader else {
         return SurfaceMaterialSample::UNKNOWN;
     };
-    match reader.sample_nearest(longitude, latitude) {
+    match reader.sample_bilinear(longitude, latitude) {
         Ok(Some(value)) if value.is_finite() => SurfaceMaterialSample::rounded(Some(value)),
         Ok(Some(_)) | Ok(None) | Err(_) => SurfaceMaterialSample::UNKNOWN,
     }
@@ -10898,7 +10898,24 @@ pub fn trace_surface_region_columns(
         }
     }
 
-    let water_mask = surface_region_water_decision_mask(&elevations, &valid);
+    let longitude_span_degrees = 360.0 / f64::from(mapping.width_blocks);
+    let latitude_span_degrees =
+        (mapping.max_latitude - mapping.min_latitude) / f64::from(mapping.height_blocks);
+    let mut trace_elevation_fn = |longitude, latitude| {
+        sampler
+            .bilinear_meters(longitude, latitude)
+            .map_err(Into::into)
+    };
+    let water_mask = surface_region_water_decision_mask_with_coverage(
+        &elevations,
+        &valid,
+        &mapping,
+        region_block_x,
+        region_block_z,
+        longitude_span_degrees,
+        latitude_span_degrees,
+        &mut trace_elevation_fn,
+    )?;
     let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
     let mut columns = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
     let mut coast_factors = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
@@ -10991,17 +11008,14 @@ pub fn trace_surface_region_columns(
                     water,
                     coast_factor,
                 ) {
-                    let longitude_span = 360.0 / f64::from(mapping.width_blocks);
-                    let latitude_span = (mapping.max_latitude - mapping.min_latitude)
-                        / f64::from(mapping.height_blocks);
                     let material = sample_surface_region_material(
                         material_sampler,
                         settings.texture_mode,
                         water,
                         longitude,
                         latitude,
-                        longitude_span,
-                        latitude_span,
+                        longitude_span_degrees,
+                        latitude_span_degrees,
                     )?;
                     column = apply_surface_region_semantic_material_sample(
                         column,
@@ -11603,7 +11617,19 @@ where
         }
     }
 
-    let water_mask = surface_region_water_decision_mask(&elevations, &valid);
+    let longitude_span_degrees = 360.0 / f64::from(mapping.width_blocks);
+    let latitude_span_degrees =
+        (mapping.max_latitude - mapping.min_latitude) / f64::from(mapping.height_blocks);
+    let water_mask = surface_region_water_decision_mask_with_coverage(
+        &elevations,
+        &valid,
+        mapping,
+        region_block_x,
+        region_block_z,
+        longitude_span_degrees,
+        latitude_span_degrees,
+        &mut elevation_fn,
+    )?;
     let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
     let collect_photo_materials =
         texture_mode == SurfaceTextureMode::Photo && material_sampler.is_some();
@@ -11661,17 +11687,14 @@ where
                 water,
                 coast_factor,
             ) {
-                let longitude_span = 360.0 / f64::from(mapping.width_blocks);
-                let latitude_span = (mapping.max_latitude - mapping.min_latitude)
-                    / f64::from(mapping.height_blocks);
                 let sampled_material = sample_surface_region_material(
                     material_sampler,
                     texture_mode,
                     water,
                     longitude,
                     latitude,
-                    longitude_span,
-                    latitude_span,
+                    longitude_span_degrees,
+                    latitude_span_degrees,
                 )?;
                 local_relief_meters =
                     surface_region_local_relief_meters(&elevations, &valid, center_x, center_z);
@@ -13872,6 +13895,139 @@ fn surface_region_water_decision_mask(elevations: &[f64], valid: &[bool]) -> Vec
         }
     }
     water_mask
+}
+
+#[allow(clippy::too_many_arguments)]
+fn surface_region_water_decision_mask_with_coverage<F>(
+    elevations: &[f64],
+    valid: &[bool],
+    mapping: &EarthScaleMapping,
+    region_block_x: i32,
+    region_block_z: i32,
+    longitude_span_degrees: f64,
+    latitude_span_degrees: f64,
+    elevation_fn: &mut F,
+) -> Result<Vec<bool>>
+where
+    F: FnMut(f64, f64) -> Result<f64>,
+{
+    let water_mask = surface_region_water_decision_mask(elevations, valid);
+    if !surface_region_uses_subblock_water_coverage(longitude_span_degrees, latitude_span_degrees) {
+        return Ok(water_mask);
+    }
+    let mut refined = water_mask.clone();
+    for z in 0..SURFACE_REGION_EXTENT {
+        for x in 0..SURFACE_REGION_EXTENT {
+            let index = surface_region_extent_index(x, z);
+            if !valid[index] || !surface_region_water_coverage_candidate(valid, &water_mask, x, z) {
+                continue;
+            }
+            let global_block_x = region_block_x
+                .wrapping_add(x as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+            let global_block_z = region_block_z
+                .wrapping_add(z as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            if !surface_chunk_map_position_valid(mapping, map_x, map_z) {
+                continue;
+            }
+            let longitude = mapping.longitude_for_block_x(map_x)?;
+            let latitude = mapping.latitude_for_block_z(map_z)?;
+            refined[index] = surface_subblock_water_decision(
+                mapping,
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+                water_mask[index],
+                elevation_fn,
+            )?;
+        }
+    }
+    Ok(refined)
+}
+
+fn surface_region_uses_subblock_water_coverage(
+    longitude_span_degrees: f64,
+    latitude_span_degrees: f64,
+) -> bool {
+    java_max(longitude_span_degrees.abs(), latitude_span_degrees.abs()) <= 0.006
+}
+
+fn surface_region_water_coverage_candidate(
+    valid: &[bool],
+    water_mask: &[bool],
+    center_x: usize,
+    center_z: usize,
+) -> bool {
+    let center_index = surface_region_extent_index(center_x, center_z);
+    let center_water = water_mask[center_index];
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dz == 0 {
+                continue;
+            }
+            let x = center_x as i32 + dx;
+            let z = center_z as i32 + dz;
+            if x < 0
+                || x >= SURFACE_REGION_EXTENT as i32
+                || z < 0
+                || z >= SURFACE_REGION_EXTENT as i32
+            {
+                continue;
+            }
+            let index = surface_region_extent_index(x as usize, z as usize);
+            if valid[index] && water_mask[index] != center_water {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn surface_subblock_water_decision<F>(
+    mapping: &EarthScaleMapping,
+    longitude: f64,
+    latitude: f64,
+    longitude_span_degrees: f64,
+    latitude_span_degrees: f64,
+    fallback: bool,
+    elevation_fn: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(f64, f64) -> Result<f64>,
+{
+    let mut samples = 0;
+    let mut water_votes = 0;
+    for (dx, dz) in [(-0.25, -0.25), (0.25, -0.25), (-0.25, 0.25), (0.25, 0.25)] {
+        let sample_longitude = longitude + (dx * longitude_span_degrees);
+        let sample_latitude = latitude - (dz * latitude_span_degrees);
+        if !surface_subblock_sample_valid(mapping, sample_longitude, sample_latitude) {
+            continue;
+        }
+        let elevation = elevation_fn(sample_longitude, sample_latitude)?;
+        samples += 1;
+        if surface_chunk_water_decision(elevation, elevation) {
+            water_votes += 1;
+        }
+    }
+    if samples == 0 || water_votes * 2 == samples {
+        return Ok(fallback);
+    }
+    Ok(water_votes * 2 > samples)
+}
+
+fn surface_subblock_sample_valid(
+    mapping: &EarthScaleMapping,
+    longitude: f64,
+    latitude: f64,
+) -> bool {
+    longitude >= -180.0
+        && longitude < 180.0
+        && latitude >= mapping.min_latitude
+        && latitude <= mapping.max_latitude
 }
 
 const SURFACE_REGION_DISTANCE_INFINITY: i32 = 1_000_000_000;
@@ -19776,6 +19932,51 @@ mod tests {
     }
 
     #[test]
+    fn surface_region_subblock_water_coverage_refines_high_detail_coastlines() {
+        let mapping = EarthScaleMapping::for_denominator(200, -84.0, 84.0).unwrap();
+        let longitude_span = 360.0 / f64::from(mapping.width_blocks);
+        let latitude_span =
+            (mapping.max_latitude - mapping.min_latitude) / f64::from(mapping.height_blocks);
+        assert!(surface_region_uses_subblock_water_coverage(
+            longitude_span,
+            latitude_span
+        ));
+
+        let center_longitude = 126.0;
+        let center_latitude = 36.0;
+        let mut calls = 0;
+        let refined = surface_subblock_water_decision(
+            &mapping,
+            center_longitude,
+            center_latitude,
+            longitude_span,
+            latitude_span,
+            false,
+            &mut |longitude, latitude| {
+                calls += 1;
+                Ok(
+                    if longitude > center_longitude && latitude < center_latitude {
+                        100.0
+                    } else {
+                        -20.0
+                    },
+                )
+            },
+        )
+        .unwrap();
+
+        assert!(refined);
+        assert_eq!(calls, 4);
+
+        let coarse_mapping = EarthScaleMapping::for_denominator(1000, -84.0, 84.0).unwrap();
+        assert!(!surface_region_uses_subblock_water_coverage(
+            360.0 / f64::from(coarse_mapping.width_blocks),
+            (coarse_mapping.max_latitude - coarse_mapping.min_latitude)
+                / f64::from(coarse_mapping.height_blocks)
+        ));
+    }
+
+    #[test]
     fn surface_chunk_sampler_generates_java_shaped_columns_from_heightmap_closure() {
         let mapping = EarthScaleMapping::for_denominator(1_000_000, -90.0, 90.0).unwrap();
         let sample =
@@ -22829,13 +23030,15 @@ mod tests {
         assert_eq!(normalize_longitude(-181.0), 179.0);
         assert!(normalize_longitude(f64::NAN).is_nan());
 
-        assert_eq!(material_cell_degrees(0.0, 0.0), 0.012);
+        assert_eq!(material_cell_degrees(0.0, 0.0), 0.003);
+        assert!((material_cell_degrees(0.0018, 0.0018) - 0.0036).abs() < 0.000_000_001);
         assert_eq!(material_cell_degrees(0.02, 0.01), 0.04);
         assert_eq!(material_cell_degrees(1.0, 0.0), 0.060);
         assert_eq!(photo_cell_degrees(0.001, 0.0), 0.0030);
         assert_eq!(photo_cell_degrees(0.010, 0.0), 0.0275);
         assert_eq!(photo_average_span_degrees(1.0), 0.060);
-        assert_eq!(photo_evidence_cell_degrees(0.001, 0.0), 0.030);
+        assert_eq!(photo_evidence_cell_degrees(0.001, 0.0), 0.006);
+        assert!((photo_evidence_cell_degrees(0.0018, 0.0018) - 0.009).abs() < 0.000_000_001);
         assert_eq!(photo_evidence_cell_degrees(0.010, 0.0), 0.050);
         assert_eq!(photo_evidence_cell_degrees(1.0, 0.0), 0.090);
 

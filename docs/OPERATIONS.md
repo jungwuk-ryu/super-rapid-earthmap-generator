@@ -61,6 +61,9 @@ GUI area setup:
   regional worlds with `1000 / scale`, and caps the boost at `4.0` so terrain and bathymetry use more of Minecraft's
   height range without exceeding normal world limits. Use `verticalScale=legacy` to force the old fixed `1.0` profile
   or `verticalScale=N` for an explicit profile.
+- Detailed regional scales also use finer surface evidence cells and sub-block shoreline coverage near coasts. This
+  reduces rectangular coast/material artifacts at scales such as `1:200` while leaving the normal `1:1000` whole-Earth
+  sampling path on the faster coarse profile.
 
 GUI generation setup:
 

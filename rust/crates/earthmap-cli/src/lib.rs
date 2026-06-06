@@ -78,6 +78,7 @@ const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
 const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+const SURFACE_SAMPLING_PROFILE_VERSION: &str = "bilinear-bathymetry-detail-coast-v1";
 const VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME: &str = "earthmap-vanilla-delegated-resume.ndjson";
 const PARALLEL_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const TOPDOWN_REGION_SIZE_BLOCKS: usize = 512;
@@ -9393,6 +9394,7 @@ fn vanilla_delegated_plan_resume_fingerprint(
         "planRegions": regions.iter().map(|(x, z)| json!({"regionX": x, "regionZ": z})).collect::<Vec<_>>(),
         "chunkStatus": status.id(),
         "textureMode": "photo",
+        "surfaceSamplingProfile": SURFACE_SAMPLING_PROFILE_VERSION,
         "verticalScale": vertical_scale,
         "verticalScaleMode": vertical_scale_mode,
         "serverDelegation": true,
@@ -9757,6 +9759,7 @@ fn vanilla_delegated_parallel_resume_fingerprint(
         "regionRows": rows,
         "chunkStatus": status.id(),
         "textureMode": "photo",
+        "surfaceSamplingProfile": SURFACE_SAMPLING_PROFILE_VERSION,
         "verticalScale": vertical_scale,
         "verticalScaleMode": vertical_scale_mode,
         "serverDelegation": true,
@@ -16301,6 +16304,10 @@ fn write_vanilla_delegated_parallel_manifest(
     );
     values.insert("generation.textureMode".to_string(), "photo".to_string());
     values.insert(
+        "generation.surfaceSamplingProfile".to_string(),
+        SURFACE_SAMPLING_PROFILE_VERSION.to_string(),
+    );
+    values.insert(
         "generation.surfaceMaterialPath".to_string(),
         normalized_path_display(surface_material_path),
     );
@@ -16399,6 +16406,10 @@ fn write_vanilla_delegated_plan_manifest(
         vertical_scale_mode.to_string(),
     );
     values.insert("generation.textureMode".to_string(), "photo".to_string());
+    values.insert(
+        "generation.surfaceSamplingProfile".to_string(),
+        SURFACE_SAMPLING_PROFILE_VERSION.to_string(),
+    );
     values.insert(
         "generation.surfaceMaterialPath".to_string(),
         normalized_path_display(surface_material_path),
@@ -16868,6 +16879,10 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(first.to_string().contains("tifRoot.climate"));
+        assert_eq!(
+            first["surfaceSamplingProfile"].as_str(),
+            Some(SURFACE_SAMPLING_PROFILE_VERSION)
+        );
     }
 
     #[test]
@@ -16920,6 +16935,48 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(!first.to_string().contains("ecoregions.cache"));
+    }
+
+    #[test]
+    fn vanilla_delegated_manifests_record_surface_sampling_profile() {
+        let temp = tempdir().unwrap();
+        let material = temp.path().join("TrueMarble.vrt");
+        fs::write(&material, b"vrt").unwrap();
+
+        let parallel_manifest = write_vanilla_delegated_parallel_manifest(
+            &temp.path().join("parallel"),
+            OutputFormat::LinearV2,
+            200,
+            1,
+            2,
+            3,
+            4,
+            ChunkGenerationStatus::Surface,
+            &material,
+            4.0,
+            "auto",
+        )
+        .unwrap();
+        let plan_manifest = write_vanilla_delegated_plan_manifest(
+            &temp.path().join("plan"),
+            OutputFormat::LinearV2,
+            200,
+            &temp.path().join("plan.csv"),
+            12,
+            10,
+            ChunkGenerationStatus::Surface,
+            &material,
+            4.0,
+            "auto",
+        )
+        .unwrap();
+
+        for manifest in [parallel_manifest, plan_manifest] {
+            let text = fs::read_to_string(manifest).unwrap();
+            assert!(text.contains(&format!(
+                "generation.surfaceSamplingProfile={SURFACE_SAMPLING_PROFILE_VERSION}\n"
+            )));
+        }
     }
 
     #[test]
