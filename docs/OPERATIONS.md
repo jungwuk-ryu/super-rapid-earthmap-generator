@@ -3,10 +3,24 @@
 ## Prerequisites
 
 - Rust toolchain with `cargo` on `PATH`
-- PowerShell 7 or Windows PowerShell capable of running the scripts
-- `C:\earth_map_resources\HQheightmap.tif`
-- `D:\earthmap\TifFiles\terrain\TrueMarble.vrt` or another explicit `surfaceRaster` path
+- PowerShell 7 or Windows PowerShell for the repository scripts; native `cargo` commands also work from
+  Bash-compatible shells
+- A HeightMap GeoTIFF, provided as an explicit CLI argument or `EARTHMAP_HEIGHTMAP`
+- A `TifFiles` dataset root, provided as `EARTHMAP_TIF_ROOT` or as `EARTHMAP_DATA_ROOT/TifFiles`
+- `terrain/TrueMarble.vrt` under that `TifFiles` root, or another explicit `surfaceRaster` path
 - ImageMagick only for optional archived reference-image workflows
+
+Portable setup example:
+
+```powershell
+$env:EARTHMAP_HEIGHTMAP = "<absolute-path-to-heightmap.tif>"
+$env:EARTHMAP_DATA_ROOT = "<absolute-path-to-earthmap-data>"
+$env:EARTHMAP_TIF_ROOT = Join-Path $env:EARTHMAP_DATA_ROOT "TifFiles"
+$env:EARTHMAP_SURFACE_RASTER = Join-Path $env:EARTHMAP_TIF_ROOT "terrain\TrueMarble.vrt"
+$env:EARTHMAP_OUTPUT_ROOT = "<absolute-path-to-output-directory>"
+```
+
+Use the same variable names with POSIX paths on Linux/macOS.
 
 ## Normal Commands
 
@@ -58,12 +72,12 @@ The same options are available from the CLI:
 
 ```powershell
 cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
-  generate-vanilla-delegated-regions-parallel C:\earth_map_resources\HQheightmap.tif D:\worldgen 1000 `
-  26 -10 3 3 linear 8 surface surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt linearCompression=4
+  generate-vanilla-delegated-regions-parallel $env:EARTHMAP_HEIGHTMAP $env:EARTHMAP_OUTPUT_ROOT 1000 `
+  26 -10 3 3 linear 8 surface surfaceRaster=auto linearCompression=4
 
 cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
-  generate-vanilla-delegated-regions-parallel C:\earth_map_resources\HQheightmap.tif D:\worldgen 1000 `
-  26 -10 3 3 mca 8 surface surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt mcaCompression=6
+  generate-vanilla-delegated-regions-parallel $env:EARTHMAP_HEIGHTMAP $env:EARTHMAP_OUTPUT_ROOT 1000 `
+  26 -10 3 3 mca 8 surface surfaceRaster=auto mcaCompression=6
 ```
 
 `compression=N` can be used instead of the format-specific key; it applies to the selected output format.
@@ -101,8 +115,8 @@ Run:
 
 ```powershell
 cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
-  quality-production-sample-batch samples.csv C:\earth_map_resources\HQheightmap.tif `
-  D:\earthmap\quality\photo-parity\vNEXT 5000 mca 1 `
+  quality-production-sample-batch samples.csv $env:EARTHMAP_HEIGHTMAP `
+  (Join-Path $env:EARTHMAP_OUTPUT_ROOT "quality\photo-parity\vNEXT") 5000 mca 1 `
   cacheRows=512 prefetchRows=0 verticalScale=1.25 textureMode=photo surfaceRaster=auto chunkStatus=surface `
   metricMode=current-only previewDebug=off
 ```
@@ -119,7 +133,8 @@ against the reference source and expected Standard crop.
 The PowerShell acceptance wrapper can call the batch command when an explicit job CSV exists:
 
 ```powershell
-.\scripts\run-quality-acceptance-samples.ps1 -ProductionSamplesCsv .\samples.csv -OutputRoot D:\earthmap\quality\photo-parity\vNEXT
+.\scripts\run-quality-acceptance-samples.ps1 -ProductionSamplesCsv .\samples.csv `
+  -OutputRoot (Join-Path $env:EARTHMAP_OUTPUT_ROOT "quality\photo-parity\vNEXT")
 ```
 
 In this batch mode the wrapper passes `metricMode=current-only` automatically, so it stays on the fast production proof
@@ -135,6 +150,6 @@ reported as NO-GO for release evidence.
 ## Recovery
 
 - Generated junk inside the repo should be archived, not deleted first.
-- The current reset archive is `D:\earthmap\archive\super-rapid-reset-20260601`.
+- Keep generated archives under `out/archive` or a path named by `EARTHMAP_OUTPUT_ROOT`.
 - If a generation process is suspected to be stuck, inspect `earthmap-rs` command lines and recent progress logs before
   stopping anything.

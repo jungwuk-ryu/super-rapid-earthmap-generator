@@ -1,5 +1,5 @@
 param(
-    [string]$EvidenceRoot = "D:\earthmap\quality\photo-parity\v103-selective-token-recipe",
+    [string]$EvidenceRoot = $env:EARTHMAP_EVIDENCE_ROOT,
     [string[]]$Samples = @(
         "sahara-core",
         "arabia-coast",
@@ -10,6 +10,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($EvidenceRoot)) {
+    $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $repoRoot = Split-Path -Parent $scriptRoot
+    $EvidenceRoot = Join-Path (Join-Path $repoRoot 'out') 'selective-token-recipe'
+}
 
 function Get-SampleMetricDir {
     param(

@@ -11,9 +11,9 @@ These instructions apply to the Rust workspace rooted at this directory.
 - Keep unsafe code out unless a future task explicitly approves and documents it.
 - Do not revert or overwrite unrelated dirty worktree changes.
 - Stage files explicitly. Never rely on broad staging commands when unrelated changes are present.
-- Use `C:\earth_map_resources\HQheightmap.tif` as the default HeightMap path for Rust CLI smoke runs,
-  parity probes, and documentation examples. The Rust CLI accepts omitted heightmap arguments for supported
-  diagnostic/generation commands and resolves them to this path.
+- Use `EARTHMAP_HEIGHTMAP`, `EARTHMAP_DATA_ROOT`, `EARTHMAP_TIF_ROOT`, and `EARTHMAP_OUTPUT_ROOT`
+  for local data paths in Rust CLI smoke runs, parity probes, and documentation examples. The Rust CLI
+  accepts omitted heightmap arguments only when `EARTHMAP_HEIGHTMAP` is set.
 
 ## Verification
 

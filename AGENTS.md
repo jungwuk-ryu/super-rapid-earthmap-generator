@@ -11,8 +11,9 @@ These instructions apply to the Rust-only EarthMap project rooted at this direct
 - Do not use byte-for-byte Java parity as a default completion condition. File-format invariants still matter.
 - Do not revert or overwrite unrelated dirty worktree changes.
 - Stage files explicitly. Never rely on broad staging commands when unrelated changes are present.
-- Use `C:\earth_map_resources\HQheightmap.tif` as the standard local HeightMap path for CLI examples,
-  parity probes, and verification runs unless a test fixture or user request explicitly names another file.
+- Use `EARTHMAP_HEIGHTMAP`, `EARTHMAP_DATA_ROOT`, `EARTHMAP_TIF_ROOT`, and `EARTHMAP_OUTPUT_ROOT`
+  for local data paths in CLI examples, parity probes, and verification runs unless a test fixture or
+  user request explicitly names another file.
 
 ## Verification
 

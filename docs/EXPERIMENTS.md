@@ -1,6 +1,7 @@
 # Experiments
 
-Newest first. Keep this file short; long logs belong under `D:\earthmap\agent-runs` or `D:\earthmap\archive`.
+Newest first. Keep this file short; long logs belong under `<EARTHMAP_OUTPUT_ROOT>/agent-runs`,
+`<EARTHMAP_OUTPUT_ROOT>/archive`, or the matching `out/` subdirectory.
 
 Historical entries may mention render carriers such as terracotta, black concrete, or leaves. Those entries are metric
 research only for production purposes: the 2026-06-01 Natural Surface Contract in `docs/DECISIONS.md` supersedes them

@@ -1339,13 +1339,12 @@ struct ParsedSimpleSource {
 #[derive(Debug)]
 struct ParsedSourceFilename {
     text: String,
-    relative_to_vrt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VrtTextCapture {
     GeoTransform,
-    SourceFilename { relative_to_vrt: bool },
+    SourceFilename,
 }
 
 fn parse_vrt_rgb_mosaic(vrt_path: &Path) -> Result<ParsedVrtRgbMosaic> {
@@ -1405,11 +1404,7 @@ fn parse_vrt_rgb_mosaic(vrt_path: &Path) -> Result<ParsedVrtRgbMosaic> {
                 if let Some(simple_source) = current_simple_source.as_mut() {
                     match name.as_slice() {
                         b"SourceFilename" => {
-                            capture = Some(VrtTextCapture::SourceFilename {
-                                relative_to_vrt: attr_string(&element, b"relativeToVRT")?
-                                    .as_deref()
-                                    == Some("1"),
-                            });
+                            capture = Some(VrtTextCapture::SourceFilename);
                             capture_text.clear();
                         }
                         b"SrcRect" => simple_source.src = Some(parse_vrt_rect(&element)?),
@@ -1428,9 +1423,6 @@ fn parse_vrt_rgb_mosaic(vrt_path: &Path) -> Result<ParsedVrtRgbMosaic> {
                         b"SourceFilename" => {
                             simple_source.filename = Some(ParsedSourceFilename {
                                 text: String::new(),
-                                relative_to_vrt: attr_string(&element, b"relativeToVRT")?
-                                    .as_deref()
-                                    == Some("1"),
                             });
                         }
                         _ => {}
@@ -1461,11 +1453,10 @@ fn parse_vrt_rgb_mosaic(vrt_path: &Path) -> Result<ParsedVrtRgbMosaic> {
                     capture = None;
                     capture_text.clear();
                 } else if name.as_slice() == b"SourceFilename" {
-                    if let Some(VrtTextCapture::SourceFilename { relative_to_vrt }) = capture {
+                    if capture == Some(VrtTextCapture::SourceFilename) {
                         if let Some(simple_source) = current_simple_source.as_mut() {
                             simple_source.filename = Some(ParsedSourceFilename {
                                 text: capture_text.trim().to_string(),
-                                relative_to_vrt,
                             });
                         }
                         capture = None;
@@ -1544,14 +1535,10 @@ fn finish_vrt_simple_source(
 
 fn vrt_source_path(base_dir: &Path, filename: &ParsedSourceFilename) -> Result<PathBuf> {
     let raw = PathBuf::from(filename.text.trim());
-    let path = if filename.relative_to_vrt && !raw.is_absolute() {
-        base_dir.join(raw)
-    } else if raw.is_absolute() {
+    let path = if raw.is_absolute() {
         raw
     } else {
-        std::env::current_dir()
-            .map_err(|error| GeoError::invalid(error.to_string()))?
-            .join(raw)
+        base_dir.join(raw)
     };
     Ok(path)
 }
@@ -1604,17 +1591,13 @@ fn has_destination(sources: &[VrtSource], dst: VrtRect) -> bool {
 }
 
 fn first_valid_true_marble_tile(base_dir: &Path, tile_name: &str) -> Option<PathBuf> {
-    [
-        base_dir.join(tile_name),
-        PathBuf::from("E:/earthmap/TifFiles/terrain").join(tile_name),
-        PathBuf::from("D:/earthmap/TifFiles/terrain").join(tile_name),
-        PathBuf::from("F:/earthmap/TifFiles/terrain").join(tile_name),
-    ]
-    .into_iter()
-    .filter_map(|candidate| absolute_existing_path(&candidate).ok())
-    .find(|candidate| {
-        candidate.is_file() && GeoTiffRgbReader::open_with_tile_cache_entries(candidate, 1).is_ok()
-    })
+    [base_dir.join(tile_name)]
+        .into_iter()
+        .filter_map(|candidate| absolute_existing_path(&candidate).ok())
+        .find(|candidate| {
+            candidate.is_file()
+                && GeoTiffRgbReader::open_with_tile_cache_entries(candidate, 1).is_ok()
+        })
 }
 
 fn parse_vrt_geo_transform(text: Option<&str>, path: &Path) -> Result<[f64; 6]> {

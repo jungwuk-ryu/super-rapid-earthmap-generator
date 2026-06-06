@@ -1,5 +1,5 @@
 param(
-    [string]$WorldDir = 'D:\worldgen\world',
+    [string]$WorldDir = $env:EARTHMAP_SERVER_WORLD_DIR,
     [int]$RegionX = 0,
     [int]$RegionZ = -1,
     [int]$StartLocalChunkX = 0,
@@ -21,6 +21,11 @@ $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
 $rustRoot = Join-Path $repoRoot 'rust'
 $runScript = Join-Path (Join-Path $rustRoot 'scripts') 'run.ps1'
 $rconScript = Join-Path $repoRoot 'scripts\send-rcon-command.mjs'
+
+if ([string]::IsNullOrWhiteSpace($WorldDir)) {
+    throw "WorldDir is required. Pass -WorldDir or set EARTHMAP_SERVER_WORLD_DIR."
+}
+
 $regionFile = Join-Path $WorldDir ("region\r.{0}.{1}.mca" -f $RegionX, $RegionZ)
 
 if (!(Test-Path $regionFile)) {

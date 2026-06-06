@@ -17,9 +17,12 @@ use serde_json::Value;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const DEFAULT_HEIGHTMAP_PATH: &str = r"C:\earth_map_resources\HQheightmap.tif";
-const DEFAULT_WORLD_DIR: &str = r"D:\earthmap\gui-world";
-const DEFAULT_TIF_ROOT: &str = r"D:\earthmap\TifFiles";
+const HEIGHTMAP_PATH_ENV: &str = "EARTHMAP_HEIGHTMAP";
+const DATA_ROOT_ENV: &str = "EARTHMAP_DATA_ROOT";
+const TIF_ROOT_ENV: &str = "EARTHMAP_TIF_ROOT";
+const SURFACE_RASTER_ENV: &str = "EARTHMAP_SURFACE_RASTER";
+const OUTPUT_ROOT_ENV: &str = "EARTHMAP_OUTPUT_ROOT";
+const DEFAULT_WORLD_DIR_NAME: &str = "earthmap-gui-world";
 const DEFAULT_CACHE_ROWS: &str = "auto";
 const DEFAULT_SURFACE_TILE_CACHE_ENTRIES: &str = "auto";
 const REGION_SIZE_BLOCKS: i32 = 512;
@@ -233,11 +236,15 @@ struct GenerationOptions {
 
 impl Default for GenerationOptions {
     fn default() -> Self {
+        let heightmap_path = default_heightmap_path();
+        let tif_root = default_tif_root();
+        let true_marble_path = default_true_marble_path(&tif_root);
+        let world_dir = default_world_dir();
         Self {
-            heightmap_path: DEFAULT_HEIGHTMAP_PATH.to_string(),
-            tif_root: DEFAULT_TIF_ROOT.to_string(),
-            true_marble_path: true_marble_from_tif_root(DEFAULT_TIF_ROOT),
-            world_dir: DEFAULT_WORLD_DIR.to_string(),
+            heightmap_path,
+            tif_root,
+            true_marble_path,
+            world_dir,
             scale: 1000,
             extent_mode: ExtentMode::Preset,
             preset: AreaPreset::Australia,
@@ -302,14 +309,29 @@ impl GenerationOptions {
         }
     }
 
-    fn apply_local_defaults(&mut self) {
-        self.heightmap_path = DEFAULT_HEIGHTMAP_PATH.to_string();
-        self.tif_root = DEFAULT_TIF_ROOT.to_string();
-        self.true_marble_path = true_marble_from_tif_root(DEFAULT_TIF_ROOT);
+    fn apply_environment_defaults(&mut self) {
+        self.heightmap_path = default_heightmap_path();
+        self.tif_root = default_tif_root();
+        self.true_marble_path = default_true_marble_path(&self.tif_root);
+        self.world_dir = default_world_dir();
     }
 
     fn apply_tif_root(&mut self) {
         self.true_marble_path = true_marble_from_tif_root(&self.tif_root);
+    }
+
+    fn validation_error(&self) -> Option<String> {
+        if self.heightmap_path.trim().is_empty() {
+            return Some(format!(
+                "Select a HeightMap GeoTIFF or set {HEIGHTMAP_PATH_ENV}."
+            ));
+        }
+        if self.world_dir.trim().is_empty() {
+            return Some(format!(
+                "Select an output world directory or set {OUTPUT_ROOT_ENV}."
+            ));
+        }
+        None
     }
 }
 
@@ -415,6 +437,58 @@ fn region_grid_for_bounds(scale: i32, bounds: GeoBounds) -> Option<RegionGrid> {
 
 fn floor_div_i32(value: i32, divisor: i32) -> i32 {
     value.div_euclid(divisor)
+}
+
+fn configured_path_text(name: &str) -> Option<String> {
+    std::env::var_os(name).and_then(|value| {
+        let text = value.to_string_lossy().trim().to_string();
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+fn default_heightmap_path() -> String {
+    configured_path_text(HEIGHTMAP_PATH_ENV).unwrap_or_default()
+}
+
+fn default_tif_root() -> String {
+    if let Some(root) = configured_path_text(TIF_ROOT_ENV) {
+        return root;
+    }
+    configured_path_text(DATA_ROOT_ENV)
+        .map(|root| {
+            let root = Path::new(&root);
+            let tif_root = if root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("TifFiles"))
+            {
+                root.to_path_buf()
+            } else {
+                root.join("TifFiles")
+            };
+            tif_root.display().to_string()
+        })
+        .unwrap_or_default()
+}
+
+fn default_true_marble_path(tif_root: &str) -> String {
+    configured_path_text(SURFACE_RASTER_ENV).unwrap_or_else(|| {
+        if tif_root.trim().is_empty() {
+            String::new()
+        } else {
+            true_marble_from_tif_root(tif_root)
+        }
+    })
+}
+
+fn default_world_dir() -> String {
+    configured_path_text(OUTPUT_ROOT_ENV).unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(DEFAULT_WORLD_DIR_NAME)
+            .display()
+            .to_string()
+    })
 }
 
 fn true_marble_from_tif_root(root: &str) -> String {
@@ -868,6 +942,10 @@ impl EarthMapGuiApp {
         if self.run.is_some() {
             return;
         }
+        if let Some(error) = self.options.validation_error() {
+            self.log_lines.push(format!("Configuration error: {error}"));
+            return;
+        }
         let grid = self.options.resolved_region_grid();
         self.progress.reset(grid);
         let existing_regions = scan_existing_region_files(
@@ -1158,8 +1236,12 @@ impl eframe::App for EarthMapGuiApp {
             ui.horizontal(|ui| {
                 ui.heading("EarthMap Generator");
                 ui.separator();
+                let validation_error = self.options.validation_error();
                 if ui
-                    .add_enabled(self.run.is_none(), egui::Button::new("Start"))
+                    .add_enabled(
+                        self.run.is_none() && validation_error.is_none(),
+                        egui::Button::new("Start"),
+                    )
                     .clicked()
                 {
                     self.start_generation();
@@ -1172,6 +1254,9 @@ impl eframe::App for EarthMapGuiApp {
                 }
                 ui.separator();
                 ui.checkbox(&mut self.map_overlay.enabled, "Map");
+                if let Some(error) = validation_error {
+                    ui.small(error);
+                }
             });
         });
 
@@ -1205,7 +1290,7 @@ impl eframe::App for EarthMapGuiApp {
                         }
                     }
                 });
-                ui.small("Expected: terrain\\TrueMarble.vrt, climate.tif, vegetation\\*.tif, bathymetry.tif, slope.tif.");
+                ui.small("Expected: terrain/TrueMarble.vrt, climate.tif, vegetation/*.tif, bathymetry.tif, slope.tif.");
                 ui.small(path_status("TifFiles root", &self.options.tif_root, false));
                 ui.label("Satellite raster");
                 ui.horizontal(|ui| {
@@ -1230,8 +1315,8 @@ impl eframe::App for EarthMapGuiApp {
                     ));
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Local defaults").clicked() {
-                        self.options.apply_local_defaults();
+                    if ui.button("Environment defaults").clicked() {
+                        self.options.apply_environment_defaults();
                     }
                     if ui.button("Use auto raster").clicked() {
                         self.options.true_marble_path.clear();
@@ -1742,6 +1827,22 @@ fn earthmap_cli_executable() -> PathBuf {
 }
 
 fn apply_generation_env(command: &mut Command, options: &GenerationOptions) {
+    if !options.heightmap_path.trim().is_empty() {
+        command.env(HEIGHTMAP_PATH_ENV, options.heightmap_path.trim());
+    }
+    if !options.world_dir.trim().is_empty() {
+        command.env(OUTPUT_ROOT_ENV, options.world_dir.trim());
+    }
+    if !options.tif_root.trim().is_empty() {
+        command.env(TIF_ROOT_ENV, options.tif_root.trim());
+        let tif_root = Path::new(options.tif_root.trim());
+        if let Some(parent) = tif_root.parent() {
+            command.env(DATA_ROOT_ENV, parent);
+        }
+    }
+    if !options.true_marble_path.trim().is_empty() && !options.true_marble_path.contains('=') {
+        command.env(SURFACE_RASTER_ENV, options.true_marble_path.trim());
+    }
     if !options.cache_rows.trim().is_empty() {
         command.env("EARTHMAP_HEIGHTMAP_CACHE_ROWS", options.cache_rows.trim());
     }
@@ -1762,7 +1863,13 @@ mod tests {
 
     #[test]
     fn build_generation_args_uses_parallel_surface_command() {
-        let options = GenerationOptions::default();
+        let options = GenerationOptions {
+            heightmap_path: "heightmap.tif".to_string(),
+            tif_root: "TifFiles".to_string(),
+            true_marble_path: true_marble_from_tif_root("TifFiles"),
+            world_dir: "world".to_string(),
+            ..GenerationOptions::default()
+        };
         let args = build_generation_args(&options);
         assert_eq!(args[0], "generate-vanilla-delegated-regions-parallel");
         assert_eq!(args[3], "1000");
@@ -1770,7 +1877,7 @@ mod tests {
         assert_eq!(args[10], "surface");
         assert_eq!(
             args[11],
-            r"surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt"
+            format!("surfaceRaster={}", true_marble_from_tif_root("TifFiles"))
         );
         assert_eq!(args[12], "linearCompression=4");
     }
@@ -1778,11 +1885,11 @@ mod tests {
     #[test]
     fn surface_raster_plain_path_is_converted_to_cli_option() {
         let options = GenerationOptions {
-            true_marble_path: r"D:\earthmap\TrueMarble.vrt".to_string(),
+            true_marble_path: "fixtures/TrueMarble.vrt".to_string(),
             ..GenerationOptions::default()
         };
         let args = build_generation_args(&options);
-        assert_eq!(args[11], r"surfaceRaster=D:\earthmap\TrueMarble.vrt");
+        assert_eq!(args[11], "surfaceRaster=fixtures/TrueMarble.vrt");
     }
 
     #[test]
@@ -1974,7 +2081,7 @@ mod tests {
     #[test]
     fn parse_region_progress_line_extracts_region_and_elapsed() {
         let parsed = parse_region_line(
-            r"region,generated,27,-9,10977,1024,571110,D:\world\region\r.27.-9.linear,",
+            "region,generated,27,-9,10977,1024,571110,fixtures/world/region/r.27.-9.linear,",
         );
         assert_eq!(
             parsed,

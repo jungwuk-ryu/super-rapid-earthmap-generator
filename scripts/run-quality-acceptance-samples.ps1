@@ -1,6 +1,6 @@
 param(
-    [string]$Heightmap = "C:\earth_map_resources\HQheightmap.tif",
-    [string]$OutputRoot = "D:\earthmap\quality-acceptance-samples",
+    [string]$Heightmap = $env:EARTHMAP_HEIGHTMAP,
+    [string]$OutputRoot = $env:EARTHMAP_QUALITY_OUTPUT_ROOT,
     [int]$Scale = 5000,
     [int]$Threads = 4,
     [string]$Format = "mca",
@@ -27,6 +27,13 @@ $repoRoot = Split-Path -Parent $scriptRoot
 $run = Join-Path (Join-Path (Join-Path $repoRoot 'rust') 'scripts') 'run.ps1'
 $photoMetricScript = Join-Path $scriptRoot "run-photo-parity-metric-crop.ps1"
 $requiredSummarySchemaVersion = 11
+
+if ([string]::IsNullOrWhiteSpace($Heightmap)) {
+    throw "Heightmap is required. Pass -Heightmap or set EARTHMAP_HEIGHTMAP."
+}
+if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
+    $OutputRoot = Join-Path (Join-Path $repoRoot 'out') 'quality-acceptance-samples'
+}
 
 $sampleDefinitions = @(
     [pscustomobject]@{ Name = "west-africa";     Longitude = 0.0;    Latitude = 5.0;    Cols = 2; Rows = 2; StartRegionX = -1; StartRegionZ = -1; StartRegionScale = 5000 },
@@ -979,9 +986,12 @@ function Get-MagickPath {
 }
 
 function Get-StandardPalettePath {
-    $candidates = @(
+    $candidates = @()
+    if (![string]::IsNullOrWhiteSpace($env:EARTHMAP_DATA_ROOT)) {
+        $candidates += (Join-Path $env:EARTHMAP_DATA_ROOT "wpscript\terrain\Standard.png")
+    }
+    $candidates += @(
         (Join-Path (Split-Path -Parent $repoRoot) "wpscript\terrain\Standard.png"),
-        "D:\earthmap\wpscript\terrain\Standard.png",
         (Join-Path $repoRoot "wpscript\terrain\Standard.png")
     )
     foreach ($candidate in $candidates) {

@@ -5,7 +5,7 @@
 - Full world generation is NO-GO.
 - v123 is evidence-only and must not be treated as a pass.
 - The first priority is faster validation, not more surface heuristics.
-- Generated junk is archived under `D:\earthmap\archive\super-rapid-reset-20260601` before any deletion.
+- Generated junk is archived under `<EARTHMAP_OUTPUT_ROOT>/archive` or `out/archive` before any deletion.
 
 ## 2026-06-01: Test Loop
 

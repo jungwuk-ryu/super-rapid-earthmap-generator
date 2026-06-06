@@ -2,8 +2,8 @@
 param(
     [ValidateSet('plan', 'samples-5000', 'samples-1000', 'parity-existing', 'server-finalization')]
     [string[]]$Stages = @('plan'),
-    [string]$Heightmap = 'C:\earth_map_resources\HQheightmap.tif',
-    [string]$OutputRoot = 'D:\earthmap\nation-war-acceptance',
+    [string]$Heightmap = $env:EARTHMAP_HEIGHTMAP,
+    [string]$OutputRoot = $env:EARTHMAP_NATION_WAR_OUTPUT_ROOT,
     [int]$Threads5000 = 6,
     [int]$Threads1000 = 6,
     [string]$CacheRows = '512',
@@ -27,7 +27,7 @@ param(
     [double]$MaxParityDeltaEOver10Percent = 12.0,
     [double]$MaxParityDeltaEOver20Percent = 0.12,
     [double]$MaxParityDeltaEOver30Percent = 0.0,
-    [string]$ServerWorldDir = 'D:\worldgen\world',
+    [string]$ServerWorldDir = $env:EARTHMAP_SERVER_WORLD_DIR,
     [ValidateSet('auto', 'mca', 'linear')]
     [string]$ServerRegionFormat = 'auto',
     [int]$ServerStartRegionX = -1,
@@ -48,6 +48,16 @@ $repoRoot = Split-Path -Parent $scriptRoot
 $sampleScript = Join-Path $scriptRoot 'run-quality-acceptance-samples.ps1'
 $metricScript = Join-Path $scriptRoot 'run-photo-parity-metric-crop.ps1'
 $finalizationScript = Join-Path $scriptRoot 'run-server-finalization-windows.ps1'
+
+if ([string]::IsNullOrWhiteSpace($Heightmap)) {
+    throw "Heightmap is required. Pass -Heightmap or set EARTHMAP_HEIGHTMAP."
+}
+if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
+    $OutputRoot = Join-Path (Join-Path $repoRoot 'out') 'nation-war-acceptance'
+}
+if (($Stages -contains 'server-finalization') -and [string]::IsNullOrWhiteSpace($ServerWorldDir)) {
+    throw "Server world directory is required for server-finalization. Pass -ServerWorldDir or set EARTHMAP_SERVER_WORLD_DIR."
+}
 
 $samples5000 = @(
     'west-africa',

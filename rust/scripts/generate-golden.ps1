@@ -4,18 +4,25 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputRoot,
     [switch]$IncludeHeightOnly,
-    [string]$HeightmapPath = 'C:\earth_map_resources\HQheightmap.tif',
+    [string]$HeightmapPath = $env:EARTHMAP_HEIGHTMAP,
     [int]$HeightOnlyScale = 5000,
     [int]$HeightOnlyRegionX = 0,
     [int]$HeightOnlyRegionZ = 0,
     [switch]$IncludeSurface,
-    [string]$SurfaceHeightmapPath = 'C:\earth_map_resources\HQheightmap.tif',
+    [string]$SurfaceHeightmapPath = $env:EARTHMAP_HEIGHTMAP,
     [int]$SurfaceScale = 5000,
     [int]$SurfaceRegionX = 0,
     [int]$SurfaceRegionZ = 0
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($IncludeHeightOnly -and [string]::IsNullOrWhiteSpace($HeightmapPath)) {
+    throw "HeightmapPath is required for -IncludeHeightOnly. Pass -HeightmapPath or set EARTHMAP_HEIGHTMAP."
+}
+if ($IncludeSurface -and [string]::IsNullOrWhiteSpace($SurfaceHeightmapPath)) {
+    throw "SurfaceHeightmapPath is required for -IncludeSurface. Pass -SurfaceHeightmapPath or set EARTHMAP_HEIGHTMAP."
+}
 
 function Get-RustCli {
     param([string]$Root)

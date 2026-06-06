@@ -35,6 +35,9 @@ pub const DEFAULT_HEIGHT_ONLY_CACHE_ROWS: usize = 64;
 pub const DEFAULT_SURFACE_TILE_CACHE_ENTRIES: usize = DEFAULT_RGB_TILE_CACHE_ENTRIES;
 pub const SURVIVAL_MANIFEST_FILE_NAME: &str = "earthmap-survival.properties";
 
+const DATA_ROOT_ENV: &str = "EARTHMAP_DATA_ROOT";
+const TIF_ROOT_ENV: &str = "EARTHMAP_TIF_ROOT";
+
 static PHOTO_SURFACE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
 fn photo_surface_trace_enabled() -> bool {
@@ -8664,6 +8667,9 @@ fn parse_met_tile_name(tile_name: &str) -> Option<MetTileOrigin> {
 
 fn met_candidate_roots(true_marble_path: &Path) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
+    for root in configured_earth_roots() {
+        push_distinct_path(&mut roots, absolute_normalized_path(&root)?);
+    }
     let normalized = absolute_normalized_path(true_marble_path)?;
     if let Some(earth_root) = normalized
         .parent()
@@ -8671,9 +8677,6 @@ fn met_candidate_roots(true_marble_path: &Path) -> Result<Vec<PathBuf>> {
         .and_then(Path::parent)
     {
         push_distinct_path(&mut roots, earth_root.to_path_buf());
-    }
-    for root in ["E:/earthmap", "D:/earthmap", "F:/earthmap"] {
-        push_distinct_path(&mut roots, absolute_normalized_path(Path::new(root))?);
     }
     Ok(roots)
 }
@@ -10203,6 +10206,9 @@ fn biome_family(biome: &str) -> &str {
 
 fn wwf_candidate_roots(true_marble_path: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::with_capacity(4);
+    for root in configured_earth_roots() {
+        push_distinct_path(&mut roots, normalized_configured_path(&root));
+    }
     let terrain = true_marble_path
         .canonicalize()
         .unwrap_or_else(|_| true_marble_path.to_path_buf())
@@ -10212,9 +10218,6 @@ fn wwf_candidate_roots(true_marble_path: &Path) -> Vec<PathBuf> {
     if let Some(root) = tif_root.and_then(|path| path.parent()) {
         push_distinct_path(&mut roots, root.to_path_buf());
     }
-    push_distinct_path(&mut roots, PathBuf::from("E:/earthmap"));
-    push_distinct_path(&mut roots, PathBuf::from("D:/earthmap"));
-    push_distinct_path(&mut roots, PathBuf::from("F:/earthmap"));
     roots
 }
 
@@ -10222,6 +10225,58 @@ fn push_distinct_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
     }
+}
+
+fn configured_path_from_env(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).and_then(|value| {
+        let text = value.to_string_lossy().trim().to_string();
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    })
+}
+
+fn configured_earth_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = configured_path_from_env(DATA_ROOT_ENV) {
+        push_distinct_path(&mut roots, root);
+    }
+    if let Some(tif_root) = configured_path_from_env(TIF_ROOT_ENV) {
+        let normalized = normalized_configured_path(&tif_root);
+        if let Some(parent) = normalized.parent() {
+            push_distinct_path(&mut roots, parent.to_path_buf());
+        }
+    }
+    roots
+}
+
+fn configured_tif_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = configured_path_from_env(TIF_ROOT_ENV) {
+        push_distinct_path(&mut roots, root);
+    }
+    if let Some(root) = configured_path_from_env(DATA_ROOT_ENV) {
+        let tif_root = if root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("TifFiles"))
+        {
+            root
+        } else {
+            root.join("TifFiles")
+        };
+        push_distinct_path(&mut roots, tif_root);
+    }
+    roots
+}
+
+fn normalized_configured_path(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    normalize_path_components(&absolute)
 }
 
 fn is_fresh_wwf_cache(cache: &Path, sources: &[PathBuf]) -> bool {
@@ -10459,11 +10514,19 @@ fn surface_candidate_directories(directory: Option<&Path>) -> Vec<PathBuf> {
     };
     let mut candidates = Vec::with_capacity(4);
     if let Some(directory) = directory {
-        candidates.push(directory.to_path_buf());
+        push_distinct_path(&mut candidates, directory.to_path_buf());
     }
-    candidates.push(PathBuf::from("E:/earthmap").join(&relative));
-    candidates.push(PathBuf::from("D:/earthmap").join(&relative));
-    candidates.push(PathBuf::from("F:/earthmap").join(relative));
+    for tif_root in configured_tif_roots() {
+        let candidate = if vegetation {
+            normalized_configured_path(&tif_root).join("vegetation")
+        } else {
+            normalized_configured_path(&tif_root)
+        };
+        push_distinct_path(&mut candidates, candidate);
+    }
+    if directory.is_none() {
+        push_distinct_path(&mut candidates, relative);
+    }
     candidates
 }
 

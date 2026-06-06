@@ -1,10 +1,13 @@
 # Run Folder Conventions
 
-Prefer external artifact roots:
+Prefer artifact roots outside source-controlled files. Use `EARTHMAP_OUTPUT_ROOT` when set, or `out/` under the
+repository for local scratch runs:
 
 ```text
-D:\earthmap\quality\photo-parity\vNNN-description
-D:\earthmap\agent-runs\YYYYMMDD-short-task
+<EARTHMAP_OUTPUT_ROOT>/quality/photo-parity/vNNN-description
+<EARTHMAP_OUTPUT_ROOT>/agent-runs/YYYYMMDD-short-task
+out/quality/photo-parity/vNNN-description
+out/agent-runs/YYYYMMDD-short-task
 ```
 
 For `quality-production-sample-batch`, each sample writes:
