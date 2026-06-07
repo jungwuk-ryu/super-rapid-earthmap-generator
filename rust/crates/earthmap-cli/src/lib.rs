@@ -77,7 +77,7 @@ const SURFACE_PHOTO_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
 const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
-const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 const SURFACE_SAMPLING_PROFILE_VERSION: &str = "bilinear-bathymetry-detail-coast-v1";
 const VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME: &str = "earthmap-vanilla-delegated-resume.ndjson";
 const PARALLEL_EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -9944,9 +9944,15 @@ fn push_resume_input_identity(inputs: &mut Vec<Value>, label: &str, path: &Path)
 fn file_identity_for_resume(path: &Path) -> Value {
     let normalized_path = normalized_path_display(path);
     match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => json!({
+            "path": normalized_path,
+            "exists": true,
+            "kind": "directory",
+        }),
         Ok(metadata) => json!({
             "path": normalized_path,
             "exists": true,
+            "kind": "file",
             "len": metadata.len(),
             "modifiedMillis": metadata.modified().ok().and_then(system_time_millis),
         }),
@@ -16935,6 +16941,57 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(!first.to_string().contains("ecoregions.cache"));
+    }
+
+    #[test]
+    fn resume_fingerprint_ignores_runtime_directory_mtime_changes() {
+        let temp = tempdir().unwrap();
+        let tif_root = temp.path().join("TifFiles");
+        let terrain = tif_root.join("terrain");
+        fs::create_dir_all(&terrain).unwrap();
+        let heightmap = temp.path().join("height.tif");
+        let true_marble = terrain.join("TrueMarble.vrt");
+        fs::write(&heightmap, b"height").unwrap();
+        fs::write(&true_marble, b"vrt").unwrap();
+
+        let first = vanilla_delegated_parallel_resume_fingerprint(
+            &heightmap,
+            OutputFormat::LinearV2,
+            250,
+            -157,
+            -74,
+            314,
+            148,
+            ChunkGenerationStatus::Surface,
+            &true_marble,
+            RegionCompressionOptions {
+                linear_compression_level: Some(6),
+                ..RegionCompressionOptions::default()
+            },
+            4.0,
+            "auto",
+        );
+        fs::write(temp.path().join("runtime.log"), b"operator-side log").unwrap();
+        let second = vanilla_delegated_parallel_resume_fingerprint(
+            &heightmap,
+            OutputFormat::LinearV2,
+            250,
+            -157,
+            -74,
+            314,
+            148,
+            ChunkGenerationStatus::Surface,
+            &true_marble,
+            RegionCompressionOptions {
+                linear_compression_level: Some(6),
+                ..RegionCompressionOptions::default()
+            },
+            4.0,
+            "auto",
+        );
+
+        assert_eq!(first, second);
+        assert!(first.to_string().contains("\"kind\":\"directory\""));
     }
 
     #[test]
