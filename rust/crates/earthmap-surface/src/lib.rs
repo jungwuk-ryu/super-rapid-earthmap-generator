@@ -11420,11 +11420,13 @@ pub fn trace_surface_region_columns(
                     valid[sample_index],
                     water,
                     coast_factor,
+                    smoothed_elevation,
                 ) {
                     let material = sample_surface_region_material(
                         material_sampler,
                         settings.texture_mode,
                         water,
+                        coast_factor,
                         longitude,
                         latitude,
                         longitude_span_degrees,
@@ -12136,11 +12138,13 @@ where
                 valid[sample_index],
                 water,
                 coast_factor,
+                smoothed_elevation,
             ) {
                 let sampled_material = sample_surface_region_material(
                     material_sampler,
                     texture_mode,
                     water,
+                    coast_factor,
                     longitude,
                     latitude,
                     longitude_span_degrees,
@@ -12290,23 +12294,40 @@ fn should_sample_surface_material(
     valid: bool,
     water: bool,
     coast_factor: f64,
+    smoothed_elevation_meters: f64,
 ) -> bool {
-    valid
-        && (!water
-            || material_sampler.samples_open_water()
-            || coast_factor >= SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR)
+    if !valid {
+        return false;
+    }
+    if !water {
+        return true;
+    }
+    if coast_factor >= SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR {
+        return true;
+    }
+    material_sampler.samples_open_water()
+        && should_sample_open_ocean_companion_material(smoothed_elevation_meters)
 }
 
 fn sample_surface_region_material(
     material_sampler: &dyn SurfaceMaterialSampler,
     texture_mode: SurfaceTextureMode,
     water: bool,
+    coast_factor: f64,
     longitude: f64,
     latitude: f64,
     longitude_span_degrees: f64,
     latitude_span_degrees: f64,
 ) -> Result<SurfaceMaterialSample> {
     if water && material_sampler.samples_open_water() {
+        if coast_factor < SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR {
+            return material_sampler.sample_open_ocean_water(
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            );
+        }
         return material_sampler.sample_water(
             longitude,
             latitude,
@@ -16846,6 +16867,155 @@ mod tests {
             -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS + 0.01
         ));
         assert!(should_sample_open_ocean_companion_material(f64::NAN));
+    }
+
+    #[test]
+    fn surface_material_sampling_skips_deep_far_water_only() {
+        struct TestSampler {
+            open_water: bool,
+        }
+        impl SurfaceMaterialSampler for TestSampler {
+            fn sample(
+                &self,
+                _longitude: f64,
+                _latitude: f64,
+                _longitude_span_degrees: f64,
+                _latitude_span_degrees: f64,
+            ) -> Result<SurfaceMaterialSample> {
+                Ok(SurfaceMaterialSample::color_only(RgbColor::unavailable()))
+            }
+
+            fn samples_open_water(&self) -> bool {
+                self.open_water
+            }
+        }
+
+        let open_water_sampler = TestSampler { open_water: true };
+        let land_only_sampler = TestSampler { open_water: false };
+        assert!(!should_sample_surface_material(
+            &open_water_sampler,
+            false,
+            false,
+            0.0,
+            100.0
+        ));
+        assert!(should_sample_surface_material(
+            &land_only_sampler,
+            true,
+            false,
+            0.0,
+            100.0
+        ));
+        assert!(should_sample_surface_material(
+            &land_only_sampler,
+            true,
+            true,
+            SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR,
+            -100.0
+        ));
+        assert!(should_sample_surface_material(
+            &open_water_sampler,
+            true,
+            true,
+            0.0,
+            -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS + 0.01
+        ));
+        assert!(!should_sample_surface_material(
+            &open_water_sampler,
+            true,
+            true,
+            0.0,
+            -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS - 0.01
+        ));
+        assert!(!should_sample_surface_material(
+            &land_only_sampler,
+            true,
+            true,
+            0.0,
+            -10.0
+        ));
+    }
+
+    #[test]
+    fn water_material_sampling_uses_light_companion_path_away_from_immediate_coast() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct RoutingSampler {
+            sample_calls: AtomicUsize,
+            water_calls: AtomicUsize,
+            open_ocean_calls: AtomicUsize,
+        }
+
+        impl SurfaceMaterialSampler for RoutingSampler {
+            fn sample(
+                &self,
+                _longitude: f64,
+                _latitude: f64,
+                _longitude_span_degrees: f64,
+                _latitude_span_degrees: f64,
+            ) -> Result<SurfaceMaterialSample> {
+                self.sample_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(SurfaceMaterialSample::color_only(RgbColor::unavailable()))
+            }
+
+            fn samples_open_water(&self) -> bool {
+                true
+            }
+
+            fn sample_water(
+                &self,
+                _longitude: f64,
+                _latitude: f64,
+                _longitude_span_degrees: f64,
+                _latitude_span_degrees: f64,
+            ) -> Result<SurfaceMaterialSample> {
+                self.water_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(SurfaceMaterialSample::color_only(RgbColor::unavailable()))
+            }
+
+            fn sample_open_ocean_water(
+                &self,
+                _longitude: f64,
+                _latitude: f64,
+                _longitude_span_degrees: f64,
+                _latitude_span_degrees: f64,
+            ) -> Result<SurfaceMaterialSample> {
+                self.open_ocean_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(SurfaceMaterialSample::color_only(RgbColor::unavailable()))
+            }
+        }
+
+        let sampler = RoutingSampler::default();
+        sample_surface_region_material(
+            &sampler,
+            SurfaceTextureMode::Photo,
+            true,
+            0.0,
+            0.0,
+            0.0,
+            0.01,
+            0.01,
+        )
+        .unwrap();
+        assert_eq!(sampler.sample_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(sampler.water_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(sampler.open_ocean_calls.load(Ordering::Relaxed), 1);
+
+        sample_surface_region_material(
+            &sampler,
+            SurfaceTextureMode::Photo,
+            true,
+            SURFACE_REGION_WATER_MATERIAL_COAST_FACTOR,
+            0.0,
+            0.0,
+            0.01,
+            0.01,
+        )
+        .unwrap();
+        assert_eq!(sampler.sample_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(sampler.water_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(sampler.open_ocean_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

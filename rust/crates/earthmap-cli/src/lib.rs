@@ -10085,6 +10085,9 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             let stop_queueing = &stop_queueing;
             let surface_material_sampler = &surface_material_sampler;
             let surface_material_path = &surface_material_path;
+            let shared_heightmap_reader = &shared_heightmap_reader;
+            let shared_heightmap_mapping = &shared_heightmap_mapping;
+            let shared_heightmap_cache = &shared_heightmap_cache;
             let resume_completed_regions = &resume_completed_regions;
             let resume_journal = &resume_journal;
             let coordinator = scope.spawn(move || {
@@ -10094,6 +10097,9 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                         let stop_queueing = stop_queueing;
                         let surface_material_sampler = surface_material_sampler;
                         let surface_material_path = surface_material_path;
+                        let shared_heightmap_reader = shared_heightmap_reader;
+                        let shared_heightmap_mapping = shared_heightmap_mapping;
+                        let shared_heightmap_cache = shared_heightmap_cache;
                         let completed_regions = Arc::clone(&resume_completed_regions);
                         let journal = Arc::clone(resume_journal);
                         let sender = coordinator_sender.clone();
@@ -10181,12 +10187,24 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                         &mut settings,
                                         runtime_options.compression,
                                     );
-                                    let report =
-                                        generate_surface_region_with_open_material_sampler(
+                                    let heightmap_sampler = HeightmapScalarSampler::with_row_cache(
+                                        shared_heightmap_reader,
+                                        shared_heightmap_cache,
+                                    );
+                                    let mut prepared =
+                                        prepare_surface_region_sample_with_heightmap_sampler(
                                             &settings,
+                                            shared_heightmap_mapping,
+                                            &heightmap_sampler,
+                                            shared_heightmap_cache.stats(),
                                             Some(surface_material_sampler),
                                         )
                                         .map_err(|error| error.to_string())?;
+                                    prepared.cache_stats = shared_heightmap_cache.stats();
+                                    let report = generate_surface_region_with_prepared_sample(
+                                        &settings, prepared,
+                                    )
+                                    .map_err(|error| error.to_string())?;
                                     let output_bytes = std::fs::metadata(&report.region_file)
                                         .map(|metadata| metadata.len())
                                         .unwrap_or(0);

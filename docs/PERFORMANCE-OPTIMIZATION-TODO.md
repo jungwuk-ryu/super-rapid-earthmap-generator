@@ -168,4 +168,8 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] `prefetchWorkers=4` with Rayon column sampling caused land producer starvation in long-run smoke; one region reached `columnBuildMillis=163594`, so producer count must stay low when each producer uses the Rayon pool internally.
 - [x] `prefetchWorkers=1` avoided starvation but serialized land preparation too much: 30s sample completed 2 regions at about 4.07 average CPU cores.
 - [x] Prefetch disabled long-run smoke completed 6 regions in a 30s sample in the current ocean-heavy row; despite about 3.14 average CPU cores, throughput was better than the tested prefetch configurations for this segment.
-- [ ] Optimize land/coast photo material sampling so full-world progress does not stall on 262,144 per-column material samples per region.
+- [x] Resume check after shared heightmap cache: existing progress was detected as resume, with `regionSkipped=31878` and `resumeFingerprintMatched=true`.
+- [x] Mixed/coast bottleneck found from long-run evidence: region `r.15.27` took `320740ms`, with `surfacePhase.columnBuildMillis=309378`, `sampledMaterialColumns=262144`, `sampledWaterMaterialColumns=186344`, and only ~65% CPU during the sample.
+- [x] Optimize mixed/coast water material sampling so full-world progress does not stall on 262,144 per-column heavy water material samples per region.
+- [x] Re-run `r.15.27` after the material-sampling fix: elapsed `4687ms`, `columnBuildMillis=2119`, `sampledMaterialColumns=262144`, `sampledWaterMaterialColumns=186344`.
+- [x] Confirm `r.15.27` output quality was not changed by the light water companion path: SHA-256 matched the prior generated region (`BBADB6E8DC48EFF3B019A435E8B83E2943B89E06C8D017A1F61CD7AA2D9E6E15`).
