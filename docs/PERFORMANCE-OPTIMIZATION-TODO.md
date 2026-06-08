@@ -166,4 +166,6 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Nested-parallelism hypothesis was rejected for land: land region `r.-60.27` completed with `columnBuildMillis=7635` when column sampling used Rayon, versus 61-62s when column sampling was disabled in the long-run fallback.
 - [x] Terrain-token cache smoke for land region `r.-60.27`: total one-region smoke completed in 12.3s with `columnBuildMillis=7635`; this is smoke evidence only because OS cache can bias single-run timings.
 - [x] `prefetchWorkers=4` with Rayon column sampling caused land producer starvation in long-run smoke; one region reached `columnBuildMillis=163594`, so producer count must stay low when each producer uses the Rayon pool internally.
+- [x] `prefetchWorkers=1` avoided starvation but serialized land preparation too much: 30s sample completed 2 regions at about 4.07 average CPU cores.
+- [x] Prefetch disabled long-run smoke completed 6 regions in a 30s sample in the current ocean-heavy row; despite about 3.14 average CPU cores, throughput was better than the tested prefetch configurations for this segment.
 - [ ] Optimize land/coast photo material sampling so full-world progress does not stall on 262,144 per-column material samples per region.
