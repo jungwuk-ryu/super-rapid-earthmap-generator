@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use earthmap_core::build_info;
 use earthmap_core::commands::{self, CommandStatus};
@@ -39,12 +39,14 @@ use earthmap_region::{
 };
 use earthmap_surface::{
     auto_vertical_scale_for_denominator, classify_surface,
-    generate_surface_region_with_open_material_sampler, surface_y_for_elevation_meters,
+    generate_surface_region_with_open_material_sampler,
+    generate_surface_region_with_prepared_sample,
+    prepare_surface_region_sample_with_open_material_sampler, surface_y_for_elevation_meters,
     EarthDataSurfaceMaterialSampler, EarthSurfaceColumn, HeightOnlySettings,
     LandShallowTopoPhotoSampler, MetImageExportTerrainSampler,
     OsmFeatureKind as SurfaceOsmFeatureKind, OsmRegionFeatureMask as SurfaceOsmRegionFeatureMask,
-    OutputFormat, SurfaceMaterialSample, SurfaceRegionColumnTrace, SurfaceRegionReport,
-    SurfaceRegionSettings, SurfaceTextureMode, WwfEcoregionSampler,
+    OutputFormat, PreparedSurfaceRegionSample, SurfaceMaterialSample, SurfaceRegionColumnTrace,
+    SurfaceRegionReport, SurfaceRegionSettings, SurfaceTextureMode, WwfEcoregionSampler,
     DEFAULT_SURFACE_TILE_CACHE_ENTRIES, DEFAULT_VERTICAL_SCALE, REGION_SIZE_BLOCKS, SEA_LEVEL_Y,
     SURVIVAL_MANIFEST_FILE_NAME,
 };
@@ -73,6 +75,10 @@ const SURFACE_TILE_CACHE_MEMORY_PERCENT: u64 = 12;
 const SURFACE_TILE_CACHE_ASSUMED_ENTRY_BYTES: u64 = 512 * 1024;
 const SURFACE_TILE_CACHE_MIN_ENTRIES: usize = 64;
 const SURFACE_TILE_CACHE_MAX_ENTRIES: usize = 32_768;
+const PREPARED_SURFACE_REGION_ESTIMATED_BYTES: u64 = 128 * BYTES_PER_MIB;
+const PREFETCH_MEMORY_PERCENT: u64 = 20;
+const PREFETCH_MAX_MEMORY_BYTES: u64 = 32 * BYTES_PER_GIB;
+const PREFETCH_SEND_RETRY_MILLIS: u64 = 10;
 const SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
 const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
@@ -3584,6 +3590,47 @@ impl VerticalScaleOption {
 struct GenerationRuntimeOptions {
     compression: RegionCompressionOptions,
     vertical_scale: VerticalScaleOption,
+    prefetch: GenerationPrefetchOptions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenerationPrefetchOptions {
+    enabled: bool,
+    memory_cap_bytes: Option<u64>,
+    queue_regions: Option<usize>,
+    workers: usize,
+}
+
+impl Default for GenerationPrefetchOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            memory_cap_bytes: None,
+            queue_regions: None,
+            workers: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EffectivePrefetchConfig {
+    enabled: bool,
+    memory_cap_bytes: Option<u64>,
+    queue_regions: usize,
+    workers: usize,
+    estimated_region_bytes: u64,
+}
+
+impl EffectivePrefetchConfig {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            memory_cap_bytes: None,
+            queue_regions: 0,
+            workers: 0,
+            estimated_region_bytes: PREPARED_SURFACE_REGION_ESTIMATED_BYTES,
+        }
+    }
 }
 
 fn optional_generation_args(args: &[String], first_optional: usize) -> GenerationOptionalArgs<'_> {
@@ -3687,9 +3734,100 @@ fn parse_generation_runtime_options(
             parsed.vertical_scale = parse_generation_vertical_scale_option(value)?;
             continue;
         }
+        if key.eq_ignore_ascii_case("prefetch")
+            || key.eq_ignore_ascii_case("surfacePrefetch")
+            || key.eq_ignore_ascii_case("evidencePrefetch")
+        {
+            parsed.prefetch.enabled = parse_bool_option("prefetch", value)?;
+            continue;
+        }
+        if key.eq_ignore_ascii_case("prefetchMemoryGB")
+            || key.eq_ignore_ascii_case("prefetchMemoryGiB")
+            || key.eq_ignore_ascii_case("evidencePrefetchMemoryGB")
+            || key.eq_ignore_ascii_case("evidencePrefetchMemoryGiB")
+        {
+            parsed.prefetch.enabled = true;
+            parsed.prefetch.memory_cap_bytes = Some(parse_memory_gib_option(key, value)?);
+            continue;
+        }
+        if key.eq_ignore_ascii_case("prefetchMemory")
+            || key.eq_ignore_ascii_case("prefetchMemoryBytes")
+            || key.eq_ignore_ascii_case("evidencePrefetchMemory")
+            || key.eq_ignore_ascii_case("evidencePrefetchMemoryBytes")
+        {
+            parsed.prefetch.enabled = true;
+            parsed.prefetch.memory_cap_bytes = Some(parse_memory_bytes_option(key, value)?);
+            continue;
+        }
+        if key.eq_ignore_ascii_case("prefetchRegions")
+            || key.eq_ignore_ascii_case("prefetchQueueRegions")
+            || key.eq_ignore_ascii_case("evidencePrefetchRegions")
+        {
+            parsed.prefetch.enabled = true;
+            parsed.prefetch.queue_regions =
+                Some(parse_positive_usize_string("prefetchRegions", value)?);
+            continue;
+        }
+        if key.eq_ignore_ascii_case("prefetchWorkers")
+            || key.eq_ignore_ascii_case("prefetchThreads")
+            || key.eq_ignore_ascii_case("evidencePrefetchWorkers")
+        {
+            parsed.prefetch.enabled = true;
+            parsed.prefetch.workers = parse_positive_usize_string("prefetchWorkers", value)?;
+            continue;
+        }
         return Err(format!("unknown generation option: {key}"));
     }
     Ok(parsed)
+}
+
+fn parse_bool_option(name: &str, value: &str) -> std::result::Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" | "y" | "enabled" => Ok(true),
+        "0" | "false" | "off" | "no" | "n" | "disabled" => Ok(false),
+        _ => Err(format!("{name} must be true/false, on/off, or 1/0")),
+    }
+}
+
+fn parse_memory_gib_option(name: &str, value: &str) -> std::result::Result<u64, String> {
+    parse_decimal_memory_bytes(name, value, BYTES_PER_GIB)
+}
+
+fn parse_memory_bytes_option(name: &str, value: &str) -> std::result::Result<u64, String> {
+    let normalized = value.trim().replace('_', "").to_ascii_lowercase();
+    for (suffix, multiplier) in [
+        ("gib", BYTES_PER_GIB),
+        ("gb", BYTES_PER_GIB),
+        ("mib", BYTES_PER_MIB),
+        ("mb", BYTES_PER_MIB),
+        ("kib", 1024),
+        ("kb", 1024),
+        ("b", 1),
+    ] {
+        if let Some(number) = normalized.strip_suffix(suffix) {
+            return parse_decimal_memory_bytes(name, number, multiplier);
+        }
+    }
+    parse_decimal_memory_bytes(name, &normalized, 1)
+}
+
+fn parse_decimal_memory_bytes(
+    name: &str,
+    value: &str,
+    multiplier: u64,
+) -> std::result::Result<u64, String> {
+    let parsed = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|error| format!("{name} must be a memory size: {error}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!("{name} must be a positive memory size"));
+    }
+    let bytes = parsed * multiplier as f64;
+    if bytes > u64::MAX as f64 {
+        return Err(format!("{name} is too large"));
+    }
+    Ok(bytes.round().max(1.0) as u64)
 }
 
 fn parse_generation_vertical_scale_option(
@@ -3734,6 +3872,46 @@ fn apply_region_compression_options(
 ) {
     settings.mca_compression_level = options.mca_compression_level;
     settings.linear_compression_level = options.linear_compression_level;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn vanilla_delegated_surface_region_settings(
+    heightmap_path: &str,
+    world_dir: &str,
+    level_name: &str,
+    scale: i32,
+    region_x: i32,
+    region_z: i32,
+    format: OutputFormat,
+    cache_rows: usize,
+    status: ChunkGenerationStatus,
+    vertical_scale: f64,
+    surface_material_path: &Path,
+    surface_tile_cache_entries: usize,
+    parallel_column_sampling: bool,
+    compression: RegionCompressionOptions,
+) -> std::result::Result<SurfaceRegionSettings, String> {
+    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+        heightmap_path,
+        world_dir,
+        level_name,
+        0,
+        scale,
+        region_x,
+        region_z,
+        format,
+        cache_rows,
+        false,
+        status,
+        vertical_scale,
+        SurfaceTextureMode::Photo,
+    )
+    .map_err(|error| error.to_string())?;
+    settings.surface_material_path = Some(surface_material_path.to_path_buf());
+    settings.surface_tile_cache_entries = surface_tile_cache_entries;
+    settings.parallel_column_sampling = parallel_column_sampling;
+    apply_region_compression_options(&mut settings, compression);
+    Ok(settings)
 }
 
 fn compression_options_report_line(
@@ -3958,7 +4136,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [prefetchMemoryGB=N]"
     )?;
     writeln!(
         out,
@@ -3994,7 +4172,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [prefetchMemoryGB=N]"
     )?;
     writeln!(
         out,
@@ -9556,6 +9734,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let worker_count = worker_tuning.selected_worker_count.min(region_count).max(1);
     let rayon_threads = worker_tuning.selected_rayon_threads.max(worker_count);
     let parallel_column_sampling = worker_tuning.parallel_column_sampling;
+    let prefetch_config =
+        effective_prefetch_config(runtime_options.prefetch, worker_count, region_count);
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
     let spawn_x = start_region_x
@@ -9621,6 +9801,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "regionWorkerThreads": worker_count,
             "rayonThreads": rayon_threads,
             "parallelColumnSampling": parallel_column_sampling,
+            "prefetchEnabled": prefetch_config.enabled,
+            "prefetchWorkers": prefetch_config.workers,
+            "prefetchQueueRegions": prefetch_config.queue_regions,
+            "prefetchMemoryCapBytes": prefetch_config.memory_cap_bytes,
+            "prefetchEstimatedRegionBytes": prefetch_config.estimated_region_bytes,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
             "resumeJournalRegions": resume.completed_regions.len(),
@@ -9655,165 +9840,401 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
     let mut stats = VanillaDelegatedParallelBatchStats::default();
     let generation_pool = build_surface_photo_rayon_pool(rayon_threads)?;
-    std::thread::scope(|scope| {
-        let coordinator_sender = event_sender.clone();
-        let generation_pool = &generation_pool;
-        let region_queue = &region_queue;
-        let stop_queueing = &stop_queueing;
-        let surface_material_sampler = &surface_material_sampler;
-        let surface_material_path = &surface_material_path;
-        let resume_completed_regions = &resume_completed_regions;
-        let resume_journal = &resume_journal;
-        let coordinator = scope.spawn(move || {
-            generation_pool.scope(|rayon_scope| {
-                for _ in 0..worker_count {
-                    let queue = region_queue;
-                    let stop_queueing = stop_queueing;
-                    let surface_material_sampler = surface_material_sampler;
-                    let surface_material_path = surface_material_path;
-                    let completed_regions = Arc::clone(&resume_completed_regions);
-                    let journal = Arc::clone(resume_journal);
-                    let sender = coordinator_sender.clone();
-                    let fingerprint_matched = resume.fingerprint_matched;
-                    rayon_scope.spawn(move |_| loop {
+    if prefetch_config.enabled {
+        std::thread::scope(|scope| {
+            let (prepared_sender, prepared_receiver) =
+                mpsc::sync_channel::<PreparedVanillaDelegatedRegion>(prefetch_config.queue_regions);
+            let prepared_receiver = Arc::new(Mutex::new(prepared_receiver));
+            for _ in 0..prefetch_config.workers {
+                let prepared_sender = prepared_sender.clone();
+                let sender = event_sender.clone();
+                let generation_pool = &generation_pool;
+                let queue = &region_queue;
+                let stop_queueing = &stop_queueing;
+                let surface_material_sampler = &surface_material_sampler;
+                let surface_material_path = &surface_material_path;
+                let completed_regions = Arc::clone(&resume_completed_regions);
+                scope.spawn(move || loop {
+                    if stop_queueing.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let next_region = {
+                        let mut queue = queue.lock().expect("queue lock");
                         if stop_queueing.load(Ordering::SeqCst) {
-                            break;
+                            None
+                        } else {
+                            queue.pop_front()
                         }
-                        let next_region = {
-                            let mut queue = queue.lock().expect("queue lock");
-                            if stop_queueing.load(Ordering::SeqCst) {
-                                None
-                            } else {
-                                queue.pop_front()
+                    };
+                    let Some((region_x, region_z)) = next_region else {
+                        break;
+                    };
+                    let region_file =
+                        vanilla_delegated_region_file(world, format, region_x, region_z);
+                    if resume.fingerprint_matched
+                        && completed_regions.contains(&(region_x, region_z))
+                    {
+                        let skip_start = Instant::now();
+                        if let Ok(validation) = validate_region_file_for_resume(
+                            &region_file,
+                            region_format_for_output(format),
+                            region_x,
+                            region_z,
+                            REGION_CHUNKS_PER_REGION,
+                        ) {
+                            if sender
+                                .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                    region_x,
+                                    region_z,
+                                    elapsed_millis: skip_start.elapsed().as_millis(),
+                                    chunks: validation.chunk_count,
+                                    output_bytes: validation.file_bytes,
+                                    region_file,
+                                })
+                                .is_err()
+                            {
+                                break;
                             }
-                        };
-                        let Some((region_x, region_z)) = next_region else {
-                            break;
-                        };
-                        let region_file =
-                            vanilla_delegated_region_file(world, format, region_x, region_z);
-                        if fingerprint_matched && completed_regions.contains(&(region_x, region_z))
-                        {
-                            let skip_start = Instant::now();
-                            if let Ok(validation) = validate_region_file_for_resume(
-                                &region_file,
-                                region_format_for_output(format),
-                                region_x,
-                                region_z,
-                                REGION_CHUNKS_PER_REGION,
-                            ) {
-                                if sender
-                                    .send(VanillaDelegatedParallelEvent::RegionSkipped {
-                                        region_x,
-                                        region_z,
-                                        elapsed_millis: skip_start.elapsed().as_millis(),
-                                        chunks: validation.chunk_count,
-                                        output_bytes: validation.file_bytes,
-                                        region_file,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                                continue;
-                            }
+                            continue;
                         }
-                        if sender
-                            .send(VanillaDelegatedParallelEvent::RegionStarted {
-                                region_x,
-                                region_z,
-                                region_file: region_file.clone(),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        };
-                        let region_start = Instant::now();
-                        let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
-                            let mut settings = SurfaceRegionSettings::new_with_texture_options(
+                    }
+                    if sender
+                        .send(VanillaDelegatedParallelEvent::RegionStarted {
+                            region_x,
+                            region_z,
+                            region_file: region_file.clone(),
+                        })
+                        .is_err()
+                    {
+                        break;
+                    };
+                    let started_at = Instant::now();
+                    let failed_region_file = region_file.clone();
+                    let result =
+                        (|| -> std::result::Result<PreparedVanillaDelegatedRegion, String> {
+                            let settings = vanilla_delegated_surface_region_settings(
                                 heightmap_path,
                                 world_dir,
                                 "SR EarthMap Vanilla Delegated",
-                                0,
                                 scale,
                                 region_x,
                                 region_z,
                                 format,
                                 cache_rows,
-                                false,
                                 status,
                                 vertical_scale,
-                                SurfaceTextureMode::Photo,
-                            )
-                            .map_err(|error| error.to_string())?;
-                            settings.surface_material_path = Some((*surface_material_path).clone());
-                            settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                            settings.parallel_column_sampling = parallel_column_sampling;
-                            apply_region_compression_options(
-                                &mut settings,
+                                surface_material_path,
+                                surface_tile_cache_entries,
+                                parallel_column_sampling,
                                 runtime_options.compression,
-                            );
-                            let report = generate_surface_region_with_open_material_sampler(
-                                &settings,
-                                Some(surface_material_sampler),
-                            )
-                            .map_err(|error| error.to_string())?;
-                            let output_bytes = std::fs::metadata(&report.region_file)
-                                .map(|metadata| metadata.len())
-                                .unwrap_or(0);
-                            journal
-                                .lock()
-                                .map_err(|_| "resume journal lock poisoned".to_string())?
-                                .append_region_complete(
-                                    report.region_x,
-                                    report.region_z,
-                                    format,
-                                    report.chunk_count,
-                                    output_bytes,
-                                )?;
-                            Ok(report)
+                            )?;
+                            let sample = generation_pool
+                                .install(|| {
+                                    prepare_surface_region_sample_with_open_material_sampler(
+                                        &settings,
+                                        Some(surface_material_sampler),
+                                    )
+                                })
+                                .map_err(|error| error.to_string())?;
+                            Ok(PreparedVanillaDelegatedRegion {
+                                region_x,
+                                region_z,
+                                region_file,
+                                started_at,
+                                sample,
+                            })
                         })();
-                        match result {
-                            Ok(report) => {
-                                let output_bytes = std::fs::metadata(&report.region_file)
-                                    .map(|metadata| metadata.len())
-                                    .unwrap_or(0);
-                                if sender
-                                    .send(VanillaDelegatedParallelEvent::RegionGenerated {
-                                        elapsed_millis: region_start.elapsed().as_millis(),
-                                        output_bytes,
-                                        report,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Err(message) => {
-                                stop_queueing.store(true, Ordering::SeqCst);
-                                let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
-                                    region_x,
-                                    region_z,
-                                    elapsed_millis: region_start.elapsed().as_millis(),
-                                    region_file,
-                                    message,
-                                });
+                    match result {
+                        Ok(prepared) => {
+                            if !send_prepared_vanilla_region(
+                                &prepared_sender,
+                                stop_queueing,
+                                prepared,
+                            ) {
                                 break;
                             }
                         }
-                    });
-                }
+                        Err(message) => {
+                            stop_queueing.store(true, Ordering::SeqCst);
+                            let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                                region_x,
+                                region_z,
+                                elapsed_millis: started_at.elapsed().as_millis(),
+                                region_file: failed_region_file,
+                                message,
+                            });
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(prepared_sender);
+            for _ in 0..worker_count {
+                let receiver = Arc::clone(&prepared_receiver);
+                let sender = event_sender.clone();
+                let generation_pool = &generation_pool;
+                let stop_queueing = &stop_queueing;
+                let surface_material_path = &surface_material_path;
+                let journal = Arc::clone(&resume_journal);
+                scope.spawn(move || loop {
+                    let prepared = {
+                        let receiver = receiver.lock().expect("prepared queue lock");
+                        receiver.recv().ok()
+                    };
+                    let Some(prepared) = prepared else {
+                        break;
+                    };
+                    if stop_queueing.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let region_x = prepared.region_x;
+                    let region_z = prepared.region_z;
+                    let region_file = prepared.region_file.clone();
+                    let started_at = prepared.started_at;
+                    let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
+                        let settings = vanilla_delegated_surface_region_settings(
+                            heightmap_path,
+                            world_dir,
+                            "SR EarthMap Vanilla Delegated",
+                            scale,
+                            region_x,
+                            region_z,
+                            format,
+                            cache_rows,
+                            status,
+                            vertical_scale,
+                            surface_material_path,
+                            surface_tile_cache_entries,
+                            parallel_column_sampling,
+                            runtime_options.compression,
+                        )?;
+                        let report = generation_pool
+                            .install(|| {
+                                generate_surface_region_with_prepared_sample(
+                                    &settings,
+                                    prepared.sample,
+                                )
+                            })
+                            .map_err(|error| error.to_string())?;
+                        let output_bytes = std::fs::metadata(&report.region_file)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        journal
+                            .lock()
+                            .map_err(|_| "resume journal lock poisoned".to_string())?
+                            .append_region_complete(
+                                report.region_x,
+                                report.region_z,
+                                format,
+                                report.chunk_count,
+                                output_bytes,
+                            )?;
+                        Ok(report)
+                    })();
+                    match result {
+                        Ok(report) => {
+                            let output_bytes = std::fs::metadata(&report.region_file)
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0);
+                            if sender
+                                .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                    elapsed_millis: started_at.elapsed().as_millis(),
+                                    output_bytes,
+                                    report,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(message) => {
+                            stop_queueing.store(true, Ordering::SeqCst);
+                            let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                                region_x,
+                                region_z,
+                                elapsed_millis: started_at.elapsed().as_millis(),
+                                region_file,
+                                message,
+                            });
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(event_sender);
+            while let Ok(event) = event_receiver.recv() {
+                handle_vanilla_delegated_parallel_event(out, &mut stats, event)?;
+            }
+            Ok::<(), String>(())
+        })?;
+    } else {
+        std::thread::scope(|scope| {
+            let coordinator_sender = event_sender.clone();
+            let generation_pool = &generation_pool;
+            let region_queue = &region_queue;
+            let stop_queueing = &stop_queueing;
+            let surface_material_sampler = &surface_material_sampler;
+            let surface_material_path = &surface_material_path;
+            let resume_completed_regions = &resume_completed_regions;
+            let resume_journal = &resume_journal;
+            let coordinator = scope.spawn(move || {
+                generation_pool.scope(|rayon_scope| {
+                    for _ in 0..worker_count {
+                        let queue = region_queue;
+                        let stop_queueing = stop_queueing;
+                        let surface_material_sampler = surface_material_sampler;
+                        let surface_material_path = surface_material_path;
+                        let completed_regions = Arc::clone(&resume_completed_regions);
+                        let journal = Arc::clone(resume_journal);
+                        let sender = coordinator_sender.clone();
+                        let fingerprint_matched = resume.fingerprint_matched;
+                        rayon_scope.spawn(move |_| loop {
+                            if stop_queueing.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let next_region = {
+                                let mut queue = queue.lock().expect("queue lock");
+                                if stop_queueing.load(Ordering::SeqCst) {
+                                    None
+                                } else {
+                                    queue.pop_front()
+                                }
+                            };
+                            let Some((region_x, region_z)) = next_region else {
+                                break;
+                            };
+                            let region_file =
+                                vanilla_delegated_region_file(world, format, region_x, region_z);
+                            if fingerprint_matched
+                                && completed_regions.contains(&(region_x, region_z))
+                            {
+                                let skip_start = Instant::now();
+                                if let Ok(validation) = validate_region_file_for_resume(
+                                    &region_file,
+                                    region_format_for_output(format),
+                                    region_x,
+                                    region_z,
+                                    REGION_CHUNKS_PER_REGION,
+                                ) {
+                                    if sender
+                                        .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                            region_x,
+                                            region_z,
+                                            elapsed_millis: skip_start.elapsed().as_millis(),
+                                            chunks: validation.chunk_count,
+                                            output_bytes: validation.file_bytes,
+                                            region_file,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                            if sender
+                                .send(VanillaDelegatedParallelEvent::RegionStarted {
+                                    region_x,
+                                    region_z,
+                                    region_file: region_file.clone(),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            };
+                            let region_start = Instant::now();
+                            let result =
+                                (|| -> std::result::Result<SurfaceRegionReport, String> {
+                                    let mut settings =
+                                        SurfaceRegionSettings::new_with_texture_options(
+                                            heightmap_path,
+                                            world_dir,
+                                            "SR EarthMap Vanilla Delegated",
+                                            0,
+                                            scale,
+                                            region_x,
+                                            region_z,
+                                            format,
+                                            cache_rows,
+                                            false,
+                                            status,
+                                            vertical_scale,
+                                            SurfaceTextureMode::Photo,
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    settings.surface_material_path =
+                                        Some((*surface_material_path).clone());
+                                    settings.surface_tile_cache_entries =
+                                        surface_tile_cache_entries;
+                                    settings.parallel_column_sampling = parallel_column_sampling;
+                                    apply_region_compression_options(
+                                        &mut settings,
+                                        runtime_options.compression,
+                                    );
+                                    let report =
+                                        generate_surface_region_with_open_material_sampler(
+                                            &settings,
+                                            Some(surface_material_sampler),
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    let output_bytes = std::fs::metadata(&report.region_file)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0);
+                                    journal
+                                        .lock()
+                                        .map_err(|_| "resume journal lock poisoned".to_string())?
+                                        .append_region_complete(
+                                            report.region_x,
+                                            report.region_z,
+                                            format,
+                                            report.chunk_count,
+                                            output_bytes,
+                                        )?;
+                                    Ok(report)
+                                })();
+                            match result {
+                                Ok(report) => {
+                                    let output_bytes = std::fs::metadata(&report.region_file)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0);
+                                    if sender
+                                        .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                            elapsed_millis: region_start.elapsed().as_millis(),
+                                            output_bytes,
+                                            report,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(message) => {
+                                    stop_queueing.store(true, Ordering::SeqCst);
+                                    let _ =
+                                        sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                                            region_x,
+                                            region_z,
+                                            elapsed_millis: region_start.elapsed().as_millis(),
+                                            region_file,
+                                            message,
+                                        });
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                });
             });
-        });
-        drop(event_sender);
-        while let Ok(event) = event_receiver.recv() {
-            handle_vanilla_delegated_parallel_event(out, &mut stats, event)?;
-        }
-        coordinator
-            .join()
-            .map_err(|_| "parallel region worker coordinator panicked".to_string())?;
-        Ok::<(), String>(())
-    })?;
+            drop(event_sender);
+            while let Ok(event) = event_receiver.recv() {
+                handle_vanilla_delegated_parallel_event(out, &mut stats, event)?;
+            }
+            coordinator
+                .join()
+                .map_err(|_| "parallel region worker coordinator panicked".to_string())?;
+            Ok::<(), String>(())
+        })?;
+    }
     if let Ok(journal) = resume_journal.lock() {
         journal.sync()?;
     }
@@ -9859,6 +10280,20 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("regionWorkerThreads={worker_count}"),
         format!("rayonThreads={rayon_threads}"),
         format!("parallelColumnSampling={parallel_column_sampling}"),
+        format!("prefetchEnabled={}", prefetch_config.enabled),
+        format!("prefetchWorkers={}", prefetch_config.workers),
+        format!("prefetchQueueRegions={}", prefetch_config.queue_regions),
+        format!(
+            "prefetchMemoryCapBytes={}",
+            prefetch_config
+                .memory_cap_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+        format!(
+            "prefetchEstimatedRegionBytes={}",
+            prefetch_config.estimated_region_bytes
+        ),
         format!("workerTuningMode={}", worker_tuning.mode),
         format!("workerTuningSamples={}", worker_tuning.sample_count),
         format!("workerTuningLandSamples={}", worker_tuning.land_samples),
@@ -10581,6 +11016,15 @@ enum VanillaDelegatedParallelEvent {
     },
 }
 
+#[derive(Debug)]
+struct PreparedVanillaDelegatedRegion {
+    region_x: i32,
+    region_z: i32,
+    region_file: PathBuf,
+    started_at: Instant,
+    sample: PreparedSurfaceRegionSample,
+}
+
 #[derive(Default)]
 struct VanillaDelegatedParallelBatchStats {
     generated_regions: usize,
@@ -10593,6 +11037,26 @@ struct VanillaDelegatedParallelBatchStats {
     phase_metadata_millis: u128,
     phase_total_internal_millis: u128,
     errors: Vec<String>,
+}
+
+fn send_prepared_vanilla_region(
+    sender: &mpsc::SyncSender<PreparedVanillaDelegatedRegion>,
+    stop_queueing: &AtomicBool,
+    mut prepared: PreparedVanillaDelegatedRegion,
+) -> bool {
+    loop {
+        if stop_queueing.load(Ordering::SeqCst) {
+            return false;
+        }
+        match sender.try_send(prepared) {
+            Ok(()) => return true,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                prepared = returned;
+                std::thread::sleep(Duration::from_millis(PREFETCH_SEND_RETRY_MILLIS));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return false,
+        }
+    }
 }
 
 fn handle_vanilla_delegated_parallel_event(
@@ -12094,6 +12558,50 @@ fn auto_surface_tile_cache_entries_for_memory(
             SURFACE_TILE_CACHE_MIN_ENTRIES,
             SURFACE_TILE_CACHE_MAX_ENTRIES,
         )
+}
+
+fn effective_prefetch_config(
+    options: GenerationPrefetchOptions,
+    worker_count: usize,
+    region_count: usize,
+) -> EffectivePrefetchConfig {
+    if !options.enabled || region_count == 0 {
+        return EffectivePrefetchConfig::disabled();
+    }
+    let memory_cap_bytes = options.memory_cap_bytes.or_else(|| {
+        Some(auto_cache_budget_bytes(
+            total_physical_memory_bytes(),
+            PREFETCH_MEMORY_PERCENT,
+            PREFETCH_MAX_MEMORY_BYTES,
+            1 * BYTES_PER_GIB,
+        ))
+    });
+    let estimated_region_bytes = PREPARED_SURFACE_REGION_ESTIMATED_BYTES.max(1);
+    let memory_limited_regions = memory_cap_bytes
+        .map(|bytes| (bytes / estimated_region_bytes).max(1))
+        .and_then(|regions| usize::try_from(regions).ok())
+        .unwrap_or(usize::MAX);
+    let default_queue_regions = worker_count.saturating_mul(2).max(1);
+    let requested_queue_regions = options
+        .queue_regions
+        .unwrap_or(default_queue_regions)
+        .max(1);
+    let queue_regions = requested_queue_regions
+        .min(memory_limited_regions)
+        .min(region_count)
+        .max(1);
+    let workers = options
+        .workers
+        .max(1)
+        .min(queue_regions)
+        .min(worker_count.max(1));
+    EffectivePrefetchConfig {
+        enabled: queue_regions > 0 && workers > 0,
+        memory_cap_bytes,
+        queue_regions,
+        workers,
+        estimated_region_bytes,
+    }
 }
 
 fn auto_cache_budget_bytes(
@@ -19968,6 +20476,43 @@ mod tests {
         assert_eq!(legacy.vertical_scale.label(), "legacy");
         assert_eq!(explicit.vertical_scale.effective(200), 2.5);
         assert_eq!(explicit.vertical_scale.label(), "explicit");
+    }
+
+    #[test]
+    fn generation_runtime_options_parse_prefetch_memory_and_queue() {
+        let parsed = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &[
+                "prefetchMemoryGB=25".to_string(),
+                "prefetchRegions=3".to_string(),
+                "prefetchWorkers=2".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(parsed.prefetch.enabled);
+        assert_eq!(parsed.prefetch.memory_cap_bytes, Some(25 * BYTES_PER_GIB));
+        assert_eq!(parsed.prefetch.queue_regions, Some(3));
+        assert_eq!(parsed.prefetch.workers, 2);
+    }
+
+    #[test]
+    fn effective_prefetch_config_is_memory_bounded() {
+        let options = GenerationPrefetchOptions {
+            enabled: true,
+            memory_cap_bytes: Some(PREPARED_SURFACE_REGION_ESTIMATED_BYTES),
+            queue_regions: Some(16),
+            workers: 4,
+        };
+        let config = effective_prefetch_config(options, 8, 100);
+
+        assert!(config.enabled);
+        assert_eq!(config.queue_regions, 1);
+        assert_eq!(config.workers, 1);
+        assert_eq!(
+            config.memory_cap_bytes,
+            Some(PREPARED_SURFACE_REGION_ESTIMATED_BYTES)
+        );
     }
 
     #[test]

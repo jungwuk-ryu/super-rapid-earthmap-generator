@@ -402,6 +402,16 @@ pub struct SurfaceRegionReport {
     pub total_nanos: u128,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedSurfaceRegionSample {
+    pub region_x: i32,
+    pub region_z: i32,
+    pub sample: SurfaceRegionSample,
+    pub cache_stats: GeoTiffRowCacheStats,
+    pub surface_material_raster_stats: SurfaceMaterialRasterStats,
+    pub surface_sample_nanos: u128,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SurfaceRegionSamplePhaseNanos {
     pub elevation_fill: u128,
@@ -10770,13 +10780,74 @@ pub fn generate_surface_region_with_open_material_sampler(
 ) -> Result<SurfaceRegionReport> {
     fs::create_dir_all(&settings.world_dir)?;
     fs::create_dir_all(settings.world_dir.join("region"))?;
+    let total_start = Instant::now();
+    let metadata_nanos = write_surface_region_world_metadata(settings)?;
+    let prepared = prepare_surface_region_sample_with_open_material_sampler(
+        settings,
+        surface_material_sampler,
+    )?;
+    generate_surface_region_with_prepared_sample_inner(
+        settings,
+        prepared,
+        metadata_nanos,
+        total_start,
+        false,
+    )
+}
 
+pub fn prepare_surface_region_sample_with_open_material_sampler(
+    settings: &SurfaceRegionSettings,
+    surface_material_sampler: Option<&EarthDataSurfaceMaterialSampler>,
+) -> Result<PreparedSurfaceRegionSample> {
     let reader = GeoTiffHeightmapReader::open(&settings.heightmap_path)?;
     let mapping = mapping_for(reader.metadata(), settings.scale_denominator)?;
     let cache = GeoTiffRowCache::new(&reader, settings.cache_rows)?;
     let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
-    let total_start = Instant::now();
 
+    let phase_start = Instant::now();
+    let sample = sample_surface_region_scaled_with_material_sampler(
+        settings.region_x,
+        settings.region_z,
+        &mapping,
+        &sampler,
+        settings.vertical_scale,
+        settings.texture_mode,
+        surface_material_sampler.map(|sampler| sampler as &dyn SurfaceMaterialSampler),
+        settings.parallel_column_sampling,
+    )?;
+    let surface_sample_nanos = phase_start.elapsed().as_nanos();
+    let surface_material_raster_stats = surface_material_sampler
+        .map(EarthDataSurfaceMaterialSampler::raster_stats)
+        .unwrap_or(SurfaceMaterialRasterStats::EMPTY);
+
+    Ok(PreparedSurfaceRegionSample {
+        region_x: settings.region_x,
+        region_z: settings.region_z,
+        sample,
+        cache_stats: cache.stats(),
+        surface_material_raster_stats,
+        surface_sample_nanos,
+    })
+}
+
+pub fn generate_surface_region_with_prepared_sample(
+    settings: &SurfaceRegionSettings,
+    prepared: PreparedSurfaceRegionSample,
+) -> Result<SurfaceRegionReport> {
+    fs::create_dir_all(&settings.world_dir)?;
+    fs::create_dir_all(settings.world_dir.join("region"))?;
+    let total_start = Instant::now();
+    let metadata_nanos = write_surface_region_world_metadata(settings)?;
+    generate_surface_region_with_prepared_sample_inner(
+        settings,
+        prepared,
+        metadata_nanos,
+        total_start,
+        true,
+    )
+}
+
+fn write_surface_region_world_metadata(settings: &SurfaceRegionSettings) -> Result<u128> {
     let mut metadata_nanos = 0;
     if settings.write_world_metadata {
         let phase_start = Instant::now();
@@ -10798,23 +10869,23 @@ pub fn generate_surface_region_with_open_material_sampler(
         level_dat_template::write(settings.world_dir.join("level.dat"), &level_settings)?;
         metadata_nanos += phase_start.elapsed().as_nanos();
     }
+    Ok(metadata_nanos)
+}
 
-    let phase_start = Instant::now();
-    let region_surface = sample_surface_region_scaled_with_material_sampler(
-        settings.region_x,
-        settings.region_z,
-        &mapping,
-        &sampler,
-        settings.vertical_scale,
-        settings.texture_mode,
-        surface_material_sampler.map(|sampler| sampler as &dyn SurfaceMaterialSampler),
-        settings.parallel_column_sampling,
-    )?;
-    let surface_sample_nanos = phase_start.elapsed().as_nanos();
-    let surface_material_raster_stats = surface_material_sampler
-        .map(EarthDataSurfaceMaterialSampler::raster_stats)
-        .unwrap_or(SurfaceMaterialRasterStats::EMPTY);
-
+fn generate_surface_region_with_prepared_sample_inner(
+    settings: &SurfaceRegionSettings,
+    prepared: PreparedSurfaceRegionSample,
+    mut metadata_nanos: u128,
+    total_start: Instant,
+    prepared_before_total_start: bool,
+) -> Result<SurfaceRegionReport> {
+    if prepared.region_x != settings.region_x || prepared.region_z != settings.region_z {
+        return Err(SurfaceError::invalid(format!(
+            "prepared sample region {},{} does not match settings {},{}",
+            prepared.region_x, prepared.region_z, settings.region_x, settings.region_z
+        )));
+    }
+    let region_surface = prepared.sample;
     struct SurfaceChunkPayloadBuild {
         local_chunk_x: i32,
         local_chunk_z: i32,
@@ -10909,6 +10980,10 @@ pub fn generate_surface_region_with_open_material_sampler(
         write_surface_region_manifest(settings)?;
         metadata_nanos += phase_start.elapsed().as_nanos();
     }
+    let mut total_nanos = total_start.elapsed().as_nanos();
+    if prepared_before_total_start {
+        total_nanos += prepared.surface_sample_nanos;
+    }
 
     Ok(SurfaceRegionReport {
         region_x: settings.region_x,
@@ -10923,16 +10998,16 @@ pub fn generate_surface_region_with_open_material_sampler(
         max_ground_y,
         region_file,
         preview_tile_file: None,
-        cache_stats: cache.stats(),
-        surface_material_raster_stats,
-        surface_sample_nanos,
+        cache_stats: prepared.cache_stats,
+        surface_material_raster_stats: prepared.surface_material_raster_stats,
+        surface_sample_nanos: prepared.surface_sample_nanos,
         sample_phase_nanos: region_surface.phase_nanos(),
         chunk_build_nanos,
         nbt_encode_nanos,
         region_write_nanos,
         preview_nanos: 0,
         metadata_nanos,
-        total_nanos: total_start.elapsed().as_nanos(),
+        total_nanos,
     })
 }
 
