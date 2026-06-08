@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use earthmap_core::build_info;
 use earthmap_core::commands::{self, CommandStatus};
@@ -73,7 +73,12 @@ const SURFACE_TILE_CACHE_MEMORY_PERCENT: u64 = 12;
 const SURFACE_TILE_CACHE_ASSUMED_ENTRY_BYTES: u64 = 512 * 1024;
 const SURFACE_TILE_CACHE_MIN_ENTRIES: usize = 64;
 const SURFACE_TILE_CACHE_MAX_ENTRIES: usize = 32_768;
-const SURFACE_PHOTO_REGION_WORKER_LIMIT: usize = 4;
+const SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT: usize = 4;
+const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
+const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
+const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 10;
+const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
+const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
 const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
@@ -139,6 +144,829 @@ fn configure_surface_photo_rayon_threads(requested_threads: usize) {
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
         .build_global();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurfacePhotoWorkerTuneSampleKind {
+    Land,
+    Ocean,
+    Mixed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfacePhotoWorkerTuneSample {
+    region_x: i32,
+    region_z: i32,
+    kind: SurfacePhotoWorkerTuneSampleKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SurfacePhotoWorkerCandidateResult {
+    worker_count: usize,
+    elapsed_millis: u128,
+    sample_count: usize,
+}
+
+impl SurfacePhotoWorkerCandidateResult {
+    fn millis_per_region(&self) -> f64 {
+        if self.sample_count == 0 {
+            f64::INFINITY
+        } else {
+            self.elapsed_millis as f64 / self.sample_count as f64
+        }
+    }
+
+    fn regions_per_hour(&self) -> f64 {
+        if self.elapsed_millis == 0 {
+            0.0
+        } else {
+            self.sample_count as f64 * 3_600_000.0 / self.elapsed_millis as f64
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SurfacePhotoWorkerTuning {
+    mode: &'static str,
+    requested_threads: usize,
+    selected_worker_count: usize,
+    parallel_column_sampling: bool,
+    sample_count: usize,
+    land_samples: usize,
+    ocean_samples: usize,
+    mixed_samples: usize,
+    candidates: Vec<SurfacePhotoWorkerCandidateResult>,
+    confirmation_candidates: Vec<SurfacePhotoWorkerCandidateResult>,
+    message: Option<String>,
+}
+
+impl SurfacePhotoWorkerTuning {
+    fn fallback(
+        mode: &'static str,
+        requested_threads: usize,
+        submitted_regions: usize,
+        message: impl Into<String>,
+    ) -> Self {
+        let selected_worker_count =
+            fallback_surface_photo_worker_count(requested_threads, submitted_regions);
+        Self {
+            mode,
+            requested_threads,
+            selected_worker_count,
+            parallel_column_sampling: surface_photo_parallel_column_sampling(selected_worker_count),
+            sample_count: 0,
+            land_samples: 0,
+            ocean_samples: 0,
+            mixed_samples: 0,
+            candidates: Vec::new(),
+            confirmation_candidates: Vec::new(),
+            message: Some(message.into()),
+        }
+    }
+
+    fn to_progress_json(&self) -> Value {
+        json!({
+            "mode": self.mode,
+            "requestedThreads": self.requested_threads,
+            "selectedWorkerThreads": self.selected_worker_count,
+            "parallelColumnSampling": self.parallel_column_sampling,
+            "sampleCount": self.sample_count,
+            "landSamples": self.land_samples,
+            "oceanSamples": self.ocean_samples,
+            "mixedSamples": self.mixed_samples,
+            "noiseRatio": SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO,
+            "message": self.message,
+            "candidates": self.candidates.iter().map(|candidate| {
+                json!({
+                    "workerThreads": candidate.worker_count,
+                    "elapsedMillis": u128_to_u64(candidate.elapsed_millis),
+                    "sampleCount": candidate.sample_count,
+                    "millisPerRegion": candidate.millis_per_region(),
+                    "regionsPerHour": candidate.regions_per_hour(),
+                })
+            }).collect::<Vec<_>>(),
+            "confirmationCandidates": self.confirmation_candidates.iter().map(|candidate| {
+                json!({
+                    "workerThreads": candidate.worker_count,
+                    "elapsedMillis": u128_to_u64(candidate.elapsed_millis),
+                    "sampleCount": candidate.sample_count,
+                    "millisPerRegion": candidate.millis_per_region(),
+                    "regionsPerHour": candidate.regions_per_hour(),
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+fn surface_photo_parallel_column_sampling(worker_count: usize) -> bool {
+    worker_count <= SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT
+}
+
+fn fallback_surface_photo_worker_count(
+    requested_threads: usize,
+    submitted_regions: usize,
+) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(requested_threads.max(1));
+    requested_threads
+        .min(submitted_regions.max(1))
+        .min(available.max(1))
+        .max(1)
+}
+
+fn surface_photo_worker_autotune_enabled() -> bool {
+    std::env::var(SURFACE_PHOTO_AUTOTUNE_ENV)
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn surface_photo_worker_candidates(
+    requested_threads: usize,
+    submitted_regions: usize,
+) -> Vec<usize> {
+    let max_workers = requested_threads.min(submitted_regions.max(1)).max(1);
+    let legacy = requested_threads
+        .min(submitted_regions.max(1))
+        .min(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
+        .max(1);
+    if max_workers <= legacy {
+        return vec![max_workers];
+    }
+    let mut candidates = vec![legacy, max_workers];
+    for candidate in [6, 8, 10, 12, 16] {
+        if candidate > legacy && candidate < max_workers {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn select_surface_photo_worker_candidate(
+    candidates: &[SurfacePhotoWorkerCandidateResult],
+    noise_ratio: f64,
+) -> Option<usize> {
+    let best_score = candidates
+        .iter()
+        .map(SurfacePhotoWorkerCandidateResult::millis_per_region)
+        .filter(|score| score.is_finite())
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
+    candidates
+        .iter()
+        .filter(|candidate| candidate.millis_per_region() <= best_score * noise_ratio)
+        .map(|candidate| candidate.worker_count)
+        .min()
+}
+
+fn tune_surface_photo_workers_for_grid(
+    heightmap: &Path,
+    world: &Path,
+    format: OutputFormat,
+    scale: i32,
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
+    requested_threads: usize,
+    status: ChunkGenerationStatus,
+    vertical_scale: f64,
+    surface_material_path: &Path,
+    cache_rows: usize,
+    surface_tile_cache_entries: usize,
+    compression_options: RegionCompressionOptions,
+) -> SurfacePhotoWorkerTuning {
+    let submitted_regions = usize::try_from(cols.saturating_mul(rows)).unwrap_or(usize::MAX);
+    if submitted_regions < SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS || requested_threads <= 1 {
+        return SurfacePhotoWorkerTuning::fallback(
+            "fallback-small-batch",
+            requested_threads,
+            submitted_regions,
+            "batch is too small for startup worker tuning",
+        );
+    }
+    if !surface_photo_worker_autotune_enabled() {
+        return SurfacePhotoWorkerTuning::fallback(
+            "fallback-disabled",
+            requested_threads,
+            submitted_regions,
+            format!("{SURFACE_PHOTO_AUTOTUNE_ENV} disabled worker tuning"),
+        );
+    }
+    let positions = surface_photo_grid_probe_regions(start_region_x, start_region_z, cols, rows);
+    tune_surface_photo_workers_from_regions(
+        heightmap,
+        world,
+        format,
+        scale,
+        requested_threads,
+        status,
+        vertical_scale,
+        surface_material_path,
+        cache_rows,
+        surface_tile_cache_entries,
+        compression_options,
+        submitted_regions,
+        &positions,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tune_surface_photo_workers_for_plan(
+    heightmap: &Path,
+    world: &Path,
+    format: OutputFormat,
+    scale: i32,
+    plan_regions: &[(i32, i32)],
+    submitted_regions: usize,
+    requested_threads: usize,
+    status: ChunkGenerationStatus,
+    vertical_scale: f64,
+    surface_material_path: &Path,
+    cache_rows: usize,
+    surface_tile_cache_entries: usize,
+    compression_options: RegionCompressionOptions,
+) -> SurfacePhotoWorkerTuning {
+    if submitted_regions < SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS || requested_threads <= 1 {
+        return SurfacePhotoWorkerTuning::fallback(
+            "fallback-small-batch",
+            requested_threads,
+            submitted_regions,
+            "batch is too small for startup worker tuning",
+        );
+    }
+    if !surface_photo_worker_autotune_enabled() {
+        return SurfacePhotoWorkerTuning::fallback(
+            "fallback-disabled",
+            requested_threads,
+            submitted_regions,
+            format!("{SURFACE_PHOTO_AUTOTUNE_ENV} disabled worker tuning"),
+        );
+    }
+    let positions = surface_photo_plan_probe_regions(plan_regions, submitted_regions);
+    tune_surface_photo_workers_from_regions(
+        heightmap,
+        world,
+        format,
+        scale,
+        requested_threads,
+        status,
+        vertical_scale,
+        surface_material_path,
+        cache_rows,
+        surface_tile_cache_entries,
+        compression_options,
+        submitted_regions,
+        &positions,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tune_surface_photo_workers_from_regions(
+    heightmap: &Path,
+    world: &Path,
+    format: OutputFormat,
+    scale: i32,
+    requested_threads: usize,
+    status: ChunkGenerationStatus,
+    vertical_scale: f64,
+    surface_material_path: &Path,
+    cache_rows: usize,
+    surface_tile_cache_entries: usize,
+    compression_options: RegionCompressionOptions,
+    submitted_regions: usize,
+    probe_regions: &[(i32, i32)],
+) -> SurfacePhotoWorkerTuning {
+    let candidates = surface_photo_worker_candidates(requested_threads, submitted_regions);
+    if candidates.len() <= 1 {
+        return SurfacePhotoWorkerTuning::fallback(
+            "fallback-single-candidate",
+            requested_threads,
+            submitted_regions,
+            "only one worker candidate is available",
+        );
+    }
+    let samples =
+        match select_surface_photo_tune_samples(heightmap, scale, cache_rows, probe_regions) {
+            Ok(samples) if !samples.is_empty() => samples,
+            Ok(_) => {
+                return SurfacePhotoWorkerTuning::fallback(
+                    "fallback-no-samples",
+                    requested_threads,
+                    submitted_regions,
+                    "no valid land/ocean tuning samples were found",
+                )
+            }
+            Err(error) => {
+                return SurfacePhotoWorkerTuning::fallback(
+                    "fallback-sample-error",
+                    requested_threads,
+                    submitted_regions,
+                    error,
+                )
+            }
+        };
+    let sample_count = samples.len();
+    let land_samples = samples
+        .iter()
+        .filter(|sample| sample.kind == SurfacePhotoWorkerTuneSampleKind::Land)
+        .count();
+    let ocean_samples = samples
+        .iter()
+        .filter(|sample| sample.kind == SurfacePhotoWorkerTuneSampleKind::Ocean)
+        .count();
+    let mixed_samples = sample_count
+        .saturating_sub(land_samples)
+        .saturating_sub(ocean_samples);
+    let tune_root = surface_photo_worker_tune_root(world);
+    let _ = fs::create_dir_all(&tune_root);
+
+    let mut results = Vec::with_capacity(candidates.len());
+    let warmup_worker = candidates
+        .iter()
+        .copied()
+        .find(|candidate| *candidate >= SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
+        .unwrap_or(candidates[0]);
+    if let Some(warmup_sample) = samples.first() {
+        let warmup_dir = tune_root.join("warmup");
+        let _ = benchmark_surface_photo_worker_candidate(
+            heightmap,
+            &warmup_dir,
+            format,
+            scale,
+            std::slice::from_ref(warmup_sample),
+            warmup_worker,
+            status,
+            vertical_scale,
+            surface_material_path,
+            cache_rows,
+            surface_tile_cache_entries,
+            compression_options,
+        );
+    }
+    for worker_count in candidates {
+        let candidate_dir = tune_root.join(format!("workers-{worker_count}"));
+        match benchmark_surface_photo_worker_candidate(
+            heightmap,
+            &candidate_dir,
+            format,
+            scale,
+            &samples,
+            worker_count,
+            status,
+            vertical_scale,
+            surface_material_path,
+            cache_rows,
+            surface_tile_cache_entries,
+            compression_options,
+        ) {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&tune_root);
+                return SurfacePhotoWorkerTuning::fallback(
+                    "fallback-benchmark-error",
+                    requested_threads,
+                    submitted_regions,
+                    error,
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&tune_root);
+    let initial_selected =
+        select_surface_photo_worker_candidate(&results, SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO)
+            .unwrap_or_else(|| {
+                fallback_surface_photo_worker_count(requested_threads, submitted_regions)
+            });
+    let (selected_worker_count, confirmation_candidates) =
+        match confirm_surface_photo_worker_selection(
+            heightmap,
+            &tune_root,
+            format,
+            scale,
+            &samples,
+            status,
+            vertical_scale,
+            surface_material_path,
+            cache_rows,
+            surface_tile_cache_entries,
+            compression_options,
+            &results,
+            initial_selected,
+        ) {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&tune_root);
+                return SurfacePhotoWorkerTuning::fallback(
+                    "fallback-confirmation-error",
+                    requested_threads,
+                    submitted_regions,
+                    error,
+                );
+            }
+        };
+    SurfacePhotoWorkerTuning {
+        mode: "autotuned",
+        requested_threads,
+        selected_worker_count,
+        parallel_column_sampling: surface_photo_parallel_column_sampling(selected_worker_count),
+        sample_count,
+        land_samples,
+        ocean_samples,
+        mixed_samples,
+        candidates: results,
+        confirmation_candidates,
+        message: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_surface_photo_worker_selection(
+    heightmap: &Path,
+    tune_root: &Path,
+    format: OutputFormat,
+    scale: i32,
+    samples: &[SurfacePhotoWorkerTuneSample],
+    status: ChunkGenerationStatus,
+    vertical_scale: f64,
+    surface_material_path: &Path,
+    cache_rows: usize,
+    surface_tile_cache_entries: usize,
+    compression_options: RegionCompressionOptions,
+    results: &[SurfacePhotoWorkerCandidateResult],
+    initial_selected: usize,
+) -> std::result::Result<(usize, Vec<SurfacePhotoWorkerCandidateResult>), String> {
+    let Some(lower_worker) = results
+        .iter()
+        .filter(|candidate| candidate.worker_count < initial_selected)
+        .map(|candidate| candidate.worker_count)
+        .min()
+    else {
+        return Ok((initial_selected, Vec::new()));
+    };
+
+    let selected_result = benchmark_surface_photo_worker_candidate(
+        heightmap,
+        &tune_root.join(format!("confirm-workers-{initial_selected}")),
+        format,
+        scale,
+        samples,
+        initial_selected,
+        status,
+        vertical_scale,
+        surface_material_path,
+        cache_rows,
+        surface_tile_cache_entries,
+        compression_options,
+    )?;
+    let lower_result = benchmark_surface_photo_worker_candidate(
+        heightmap,
+        &tune_root.join(format!("confirm-workers-{lower_worker}")),
+        format,
+        scale,
+        samples,
+        lower_worker,
+        status,
+        vertical_scale,
+        surface_material_path,
+        cache_rows,
+        surface_tile_cache_entries,
+        compression_options,
+    )?;
+    let confirmed_selected = if selected_result.millis_per_region()
+        * SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO
+        < lower_result.millis_per_region()
+    {
+        initial_selected
+    } else {
+        lower_worker
+    };
+    Ok((confirmed_selected, vec![selected_result, lower_result]))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn benchmark_surface_photo_worker_candidate(
+    heightmap: &Path,
+    world: &Path,
+    format: OutputFormat,
+    scale: i32,
+    samples: &[SurfacePhotoWorkerTuneSample],
+    worker_count: usize,
+    status: ChunkGenerationStatus,
+    vertical_scale: f64,
+    surface_material_path: &Path,
+    cache_rows: usize,
+    surface_tile_cache_entries: usize,
+    compression_options: RegionCompressionOptions,
+) -> std::result::Result<SurfacePhotoWorkerCandidateResult, String> {
+    fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
+    let surface_material_sampler = EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+        surface_material_path,
+        surface_tile_cache_entries,
+    )
+    .map_err(|error| error.to_string())?;
+    let region_queue = Mutex::new(VecDeque::from(samples.to_vec()));
+    let stop_queueing = AtomicBool::new(false);
+    let start = Instant::now();
+    let actual_workers = worker_count.min(samples.len()).max(1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(actual_workers);
+        for _ in 0..actual_workers {
+            let queue = &region_queue;
+            let stop_queueing = &stop_queueing;
+            let surface_material_sampler = &surface_material_sampler;
+            handles.push(scope.spawn(move || -> std::result::Result<(), String> {
+                loop {
+                    if stop_queueing.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    let next = {
+                        let mut queue = queue.lock().expect("worker tuning queue lock");
+                        queue.pop_front()
+                    };
+                    let Some(sample) = next else {
+                        return Ok(());
+                    };
+                    let mut settings = SurfaceRegionSettings::new_with_texture_options(
+                        heightmap,
+                        world,
+                        "SR EarthMap Worker Tune",
+                        0,
+                        scale,
+                        sample.region_x,
+                        sample.region_z,
+                        format,
+                        cache_rows,
+                        false,
+                        status,
+                        vertical_scale,
+                        SurfaceTextureMode::Photo,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    settings.surface_material_path = Some(surface_material_path.to_path_buf());
+                    settings.surface_tile_cache_entries = surface_tile_cache_entries;
+                    settings.parallel_column_sampling =
+                        surface_photo_parallel_column_sampling(worker_count);
+                    apply_region_compression_options(&mut settings, compression_options);
+                    generate_surface_region_with_open_material_sampler(
+                        &settings,
+                        Some(surface_material_sampler),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    stop_queueing.store(true, Ordering::SeqCst);
+                    return Err(error);
+                }
+                Err(_) => {
+                    stop_queueing.store(true, Ordering::SeqCst);
+                    return Err("worker tuning thread panicked".to_string());
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(SurfacePhotoWorkerCandidateResult {
+        worker_count,
+        elapsed_millis: start.elapsed().as_millis(),
+        sample_count: samples.len(),
+    })
+}
+
+fn surface_photo_worker_tune_root(world: &Path) -> PathBuf {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "earthmap-worker-tune-{}-{millis}-{}",
+        std::process::id(),
+        sanitize_filename_component(&world.display().to_string())
+    ))
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect()
+}
+
+fn surface_photo_grid_probe_regions(
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
+) -> Vec<(i32, i32)> {
+    let x_offsets = evenly_spaced_i32_offsets(cols, 10);
+    let z_offsets = evenly_spaced_i32_offsets(rows, 10);
+    let mut regions = Vec::new();
+    for z in z_offsets {
+        for &x in &x_offsets {
+            regions.push((
+                start_region_x.wrapping_add(x),
+                start_region_z.wrapping_add(z),
+            ));
+            if regions.len() >= SURFACE_PHOTO_AUTOTUNE_MAX_PROBES {
+                return regions;
+            }
+        }
+    }
+    regions
+}
+
+fn surface_photo_plan_probe_regions(
+    plan_regions: &[(i32, i32)],
+    submitted_regions: usize,
+) -> Vec<(i32, i32)> {
+    let count = submitted_regions.min(plan_regions.len());
+    if count == 0 {
+        return Vec::new();
+    }
+    let offsets = evenly_spaced_usize_offsets(count, SURFACE_PHOTO_AUTOTUNE_MAX_PROBES);
+    offsets
+        .into_iter()
+        .filter_map(|index| plan_regions.get(index).copied())
+        .collect()
+}
+
+fn evenly_spaced_i32_offsets(count: i32, target: usize) -> Vec<i32> {
+    if count <= 0 || target == 0 {
+        return Vec::new();
+    }
+    let count_usize = usize::try_from(count).unwrap_or(usize::MAX);
+    evenly_spaced_usize_offsets(count_usize, target)
+        .into_iter()
+        .filter_map(|value| i32::try_from(value).ok())
+        .collect()
+}
+
+fn evenly_spaced_usize_offsets(count: usize, target: usize) -> Vec<usize> {
+    if count == 0 || target == 0 {
+        return Vec::new();
+    }
+    if count <= target {
+        return (0..count).collect();
+    }
+    let mut offsets = Vec::with_capacity(target);
+    for index in 0..target {
+        let numerator = index * (count - 1);
+        let offset = (numerator + ((target - 1) / 2)) / (target - 1);
+        if offsets.last().copied() != Some(offset) {
+            offsets.push(offset);
+        }
+    }
+    offsets
+}
+
+fn select_surface_photo_tune_samples(
+    heightmap: &Path,
+    scale: i32,
+    cache_rows: usize,
+    probe_regions: &[(i32, i32)],
+) -> std::result::Result<Vec<SurfacePhotoWorkerTuneSample>, String> {
+    let reader = GeoTiffHeightmapReader::open(heightmap).map_err(|error| error.to_string())?;
+    let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
+    let cache = GeoTiffRowCache::new(&reader, cache_rows).map_err(|error| error.to_string())?;
+    let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let mut land = Vec::new();
+    let mut ocean = Vec::new();
+    let mut mixed = Vec::new();
+    for &(region_x, region_z) in probe_regions {
+        let kind = classify_surface_photo_tune_region(&mapping, &sampler, region_x, region_z)?;
+        let sample = SurfacePhotoWorkerTuneSample {
+            region_x,
+            region_z,
+            kind,
+        };
+        match kind {
+            SurfacePhotoWorkerTuneSampleKind::Land => land.push(sample),
+            SurfacePhotoWorkerTuneSampleKind::Ocean => ocean.push(sample),
+            SurfacePhotoWorkerTuneSampleKind::Mixed => mixed.push(sample),
+        }
+        if land.len() >= (SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2)
+            && ocean.len() >= (SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2)
+        {
+            break;
+        }
+    }
+    let mut samples = Vec::with_capacity(SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES);
+    surface_photo_take_samples(
+        &mut samples,
+        &mut ocean,
+        SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2,
+    );
+    surface_photo_take_samples(
+        &mut samples,
+        &mut land,
+        SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2,
+    );
+    while samples.len() < SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES {
+        if let Some(sample) = mixed.pop() {
+            samples.push(sample);
+            continue;
+        }
+        if let Some(sample) = ocean.pop() {
+            samples.push(sample);
+            continue;
+        }
+        if let Some(sample) = land.pop() {
+            samples.push(sample);
+            continue;
+        }
+        break;
+    }
+    Ok(samples)
+}
+
+fn surface_photo_take_samples(
+    samples: &mut Vec<SurfacePhotoWorkerTuneSample>,
+    source: &mut Vec<SurfacePhotoWorkerTuneSample>,
+    count: usize,
+) {
+    for _ in 0..count {
+        let Some(sample) = source.pop() else {
+            return;
+        };
+        samples.push(sample);
+    }
+}
+
+fn classify_surface_photo_tune_region(
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    region_x: i32,
+    region_z: i32,
+) -> std::result::Result<SurfacePhotoWorkerTuneSampleKind, String> {
+    let local_points = [
+        (REGION_SIZE_BLOCKS / 2, REGION_SIZE_BLOCKS / 2),
+        (REGION_SIZE_BLOCKS / 4, REGION_SIZE_BLOCKS / 4),
+        ((REGION_SIZE_BLOCKS * 3) / 4, REGION_SIZE_BLOCKS / 4),
+        (REGION_SIZE_BLOCKS / 4, (REGION_SIZE_BLOCKS * 3) / 4),
+        ((REGION_SIZE_BLOCKS * 3) / 4, (REGION_SIZE_BLOCKS * 3) / 4),
+    ];
+    let mut land = 0;
+    let mut water = 0;
+    for (local_x, local_z) in local_points {
+        if let Some(elevation) =
+            sample_tune_region_elevation(mapping, sampler, region_x, region_z, local_x, local_z)?
+        {
+            if elevation <= 0.0 {
+                water += 1;
+            } else {
+                land += 1;
+            }
+        }
+    }
+    Ok(if water >= 4 && land == 0 {
+        SurfacePhotoWorkerTuneSampleKind::Ocean
+    } else if land >= 3 {
+        SurfacePhotoWorkerTuneSampleKind::Land
+    } else {
+        SurfacePhotoWorkerTuneSampleKind::Mixed
+    })
+}
+
+fn sample_tune_region_elevation(
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    region_x: i32,
+    region_z: i32,
+    local_x: i32,
+    local_z: i32,
+) -> std::result::Result<Option<f64>, String> {
+    let global_block_x = region_x
+        .wrapping_mul(REGION_SIZE_BLOCKS)
+        .wrapping_add(local_x);
+    let global_block_z = region_z
+        .wrapping_mul(REGION_SIZE_BLOCKS)
+        .wrapping_add(local_z);
+    let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+    let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+    if map_x < 0 || map_x >= mapping.width_blocks || map_z < 0 || map_z >= mapping.height_blocks {
+        return Ok(None);
+    }
+    let longitude = mapping
+        .longitude_for_block_x(map_x)
+        .map_err(|error| error.to_string())?;
+    let latitude = mapping
+        .latitude_for_block_z(map_z)
+        .map_err(|error| error.to_string())?;
+    sampler
+        .bilinear_meters(longitude, latitude)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 pub fn run_with_writers<I, S, W, E>(args: I, stdout: &mut W, stderr: &mut E) -> i32
@@ -8527,11 +9355,46 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         runtime_options.vertical_scale.label(),
     );
 
-    let worker_count = threads
-        .min(region_count)
-        .min(SURFACE_PHOTO_REGION_WORKER_LIMIT)
-        .max(1);
     configure_surface_photo_rayon_threads(threads);
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "workerTuningStarted",
+            "requestedThreads": threads,
+            "submittedRegions": region_count,
+            "candidateWorkerThreads": surface_photo_worker_candidates(threads, region_count),
+            "minRegions": SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS,
+            "maxSamples": SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES,
+        }),
+    )?;
+    let worker_tuning = tune_surface_photo_workers_for_grid(
+        heightmap,
+        world,
+        format,
+        scale,
+        start_region_x,
+        start_region_z,
+        cols,
+        rows,
+        threads,
+        status,
+        vertical_scale,
+        &surface_material_path,
+        cache_rows,
+        surface_tile_cache_entries,
+        runtime_options.compression,
+    );
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "workerTuningFinished",
+            "workerTuning": worker_tuning.to_progress_json(),
+        }),
+    )?;
+    let worker_count = worker_tuning.selected_worker_count.min(region_count).max(1);
+    let parallel_column_sampling = worker_tuning.parallel_column_sampling;
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
     let spawn_x = start_region_x
@@ -8591,6 +9454,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "regionCount": region_count,
             "requestedThreads": threads,
             "workerThreads": worker_count,
+            "parallelColumnSampling": parallel_column_sampling,
+            "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
             "resumeJournalRegions": resume.completed_regions.len(),
             "resumeJournal": normalized_path_display(&resume.path),
@@ -8704,7 +9569,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                     .map_err(|error| error.to_string())?;
                     settings.surface_material_path = Some((*surface_material_path).clone());
                     settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                    settings.parallel_column_sampling = worker_count <= 4;
+                    settings.parallel_column_sampling = parallel_column_sampling;
                     apply_region_compression_options(&mut settings, runtime_options.compression);
                     let report = generate_surface_region_with_open_material_sampler(
                         &settings,
@@ -8804,6 +9669,12 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("regionRows={rows}"),
         format!("requestedThreads={threads}"),
         format!("workerThreads={worker_count}"),
+        format!("parallelColumnSampling={parallel_column_sampling}"),
+        format!("workerTuningMode={}", worker_tuning.mode),
+        format!("workerTuningSamples={}", worker_tuning.sample_count),
+        format!("workerTuningLandSamples={}", worker_tuning.land_samples),
+        format!("workerTuningOceanSamples={}", worker_tuning.ocean_samples),
+        format!("workerTuningMixedSamples={}", worker_tuning.mixed_samples),
         "surfaceSamplerStrategy=shared".to_string(),
         format!("sharedCacheRows={cache_rows}"),
         format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
@@ -8956,11 +9827,49 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         vertical_scale,
         runtime_options.vertical_scale.label(),
     );
-    let worker_count = threads
-        .min(submitted_regions)
-        .min(SURFACE_PHOTO_REGION_WORKER_LIMIT)
-        .max(1);
     configure_surface_photo_rayon_threads(threads);
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "workerTuningStarted",
+            "mode": "plan",
+            "requestedThreads": threads,
+            "submittedRegions": submitted_regions,
+            "candidateWorkerThreads": surface_photo_worker_candidates(threads, submitted_regions),
+            "minRegions": SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS,
+            "maxSamples": SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES,
+        }),
+    )?;
+    let worker_tuning = tune_surface_photo_workers_for_plan(
+        heightmap,
+        world,
+        format,
+        scale,
+        &plan_regions,
+        submitted_regions,
+        threads,
+        status,
+        vertical_scale,
+        &surface_material_path,
+        cache_rows,
+        surface_tile_cache_entries,
+        runtime_options.compression,
+    );
+    write_progress_event(
+        out,
+        json!({
+            "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+            "type": "workerTuningFinished",
+            "mode": "plan",
+            "workerTuning": worker_tuning.to_progress_json(),
+        }),
+    )?;
+    let worker_count = worker_tuning
+        .selected_worker_count
+        .min(submitted_regions)
+        .max(1);
+    let parallel_column_sampling = worker_tuning.parallel_column_sampling;
 
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
@@ -9020,6 +9929,8 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "submittedRegions": submitted_regions,
             "requestedThreads": threads,
             "workerThreads": worker_count,
+            "parallelColumnSampling": parallel_column_sampling,
+            "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
             "resumeJournalRegions": resume.completed_regions.len(),
             "resumeJournal": normalized_path_display(&resume.path),
@@ -9128,7 +10039,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
                     .map_err(|error| error.to_string())?;
                     settings.surface_material_path = Some((*surface_material_path).clone());
                     settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                    settings.parallel_column_sampling = worker_count <= 4;
+                    settings.parallel_column_sampling = parallel_column_sampling;
                     apply_region_compression_options(&mut settings, runtime_options.compression);
                     let report = generate_surface_region_with_open_material_sampler(
                         &settings,
@@ -9232,6 +10143,12 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         format!("submittedRegions={submitted_regions}"),
         format!("requestedThreads={threads}"),
         format!("workerThreads={worker_count}"),
+        format!("parallelColumnSampling={parallel_column_sampling}"),
+        format!("workerTuningMode={}", worker_tuning.mode),
+        format!("workerTuningSamples={}", worker_tuning.sample_count),
+        format!("workerTuningLandSamples={}", worker_tuning.land_samples),
+        format!("workerTuningOceanSamples={}", worker_tuning.ocean_samples),
+        format!("workerTuningMixedSamples={}", worker_tuning.mixed_samples),
         format!("surfaceSamplerStrategy=shared"),
         format!("sharedCacheRows={cache_rows}"),
         format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
@@ -9529,6 +10446,16 @@ fn handle_vanilla_delegated_parallel_event(
                     "regionZ": report.region_z,
                     "elapsedMillis": u128_to_u64(elapsed_millis),
                     "chunks": report.chunk_count,
+                    "landColumns": report.land_columns,
+                    "waterColumns": report.water_columns,
+                    "minGroundY": report.min_ground_y,
+                    "maxGroundY": report.max_ground_y,
+                    "surfaceSampleMillis": u128_to_u64(millis(report.surface_sample_nanos)),
+                    "chunkBuildMillis": u128_to_u64(millis(report.chunk_build_nanos)),
+                    "nbtEncodeMillis": u128_to_u64(millis(report.nbt_encode_nanos)),
+                    "regionWriteMillis": u128_to_u64(millis(report.region_write_nanos)),
+                    "metadataMillis": u128_to_u64(millis(report.metadata_nanos)),
+                    "totalInternalMillis": u128_to_u64(millis(report.total_nanos)),
                     "outputBytes": output_bytes,
                     "regionFile": normalized_path_display(&report.region_file),
                 }),
@@ -16631,6 +17558,53 @@ mod tests {
         )
     }
 
+    #[test]
+    fn surface_photo_worker_candidates_keep_legacy_and_requested_options() {
+        assert_eq!(surface_photo_worker_candidates(10, 100), vec![4, 6, 8, 10]);
+        assert_eq!(surface_photo_worker_candidates(3, 100), vec![3]);
+        assert_eq!(surface_photo_worker_candidates(10, 2), vec![2]);
+    }
+
+    #[test]
+    fn surface_photo_worker_selection_chooses_lower_worker_inside_noise_band() {
+        let candidates = vec![
+            SurfacePhotoWorkerCandidateResult {
+                worker_count: 4,
+                elapsed_millis: 1_000,
+                sample_count: 10,
+            },
+            SurfacePhotoWorkerCandidateResult {
+                worker_count: 8,
+                elapsed_millis: 970,
+                sample_count: 10,
+            },
+        ];
+        assert_eq!(
+            select_surface_photo_worker_candidate(&candidates, 1.05),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn surface_photo_worker_selection_takes_clear_speedup() {
+        let candidates = vec![
+            SurfacePhotoWorkerCandidateResult {
+                worker_count: 4,
+                elapsed_millis: 1_000,
+                sample_count: 10,
+            },
+            SurfacePhotoWorkerCandidateResult {
+                worker_count: 8,
+                elapsed_millis: 800,
+                sample_count: 10,
+            },
+        ];
+        assert_eq!(
+            select_surface_photo_worker_candidate(&candidates, 1.05),
+            Some(8)
+        );
+    }
+
     fn generate_single_chunk_render_world(world_dir: &Path, format: TopdownFormat) {
         let region_dir = world_dir.join("region");
         fs::create_dir_all(&region_dir).unwrap();
@@ -17073,6 +18047,71 @@ mod tests {
                 region_file.display()
             )
         );
+    }
+
+    #[test]
+    fn generated_event_includes_per_region_phase_telemetry() {
+        let temp = tempdir().unwrap();
+        let region_file = temp.path().join("region").join("r.3.4.linear");
+        let mut out = Vec::new();
+        let mut stats = VanillaDelegatedParallelBatchStats::default();
+        let report = SurfaceRegionReport {
+            region_x: 3,
+            region_z: 4,
+            output_format: OutputFormat::LinearV2,
+            scale_denominator: 250,
+            vertical_scale: 4.0,
+            chunk_count: 1024,
+            land_columns: 0,
+            water_columns: 262_144,
+            min_ground_y: 12,
+            max_ground_y: 63,
+            region_file: region_file.clone(),
+            preview_tile_file: None,
+            cache_stats: earthmap_geo::GeoTiffRowCacheStats {
+                max_rows: 0,
+                resident_rows: 0,
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+                prefetch_rows: 0,
+                prefetch_requests: 0,
+                prefetch_loads: 0,
+            },
+            surface_material_raster_stats: earthmap_surface::SurfaceMaterialRasterStats::EMPTY,
+            surface_sample_nanos: 4_285_000_000,
+            chunk_build_nanos: 277_000_000,
+            nbt_encode_nanos: 3_757_000_000,
+            region_write_nanos: 76_000_000,
+            preview_nanos: 0,
+            metadata_nanos: 5_000_000,
+            total_nanos: 4_618_000_000,
+        };
+
+        handle_vanilla_delegated_parallel_event(
+            &mut out,
+            &mut stats,
+            VanillaDelegatedParallelEvent::RegionGenerated {
+                elapsed_millis: 4_629,
+                output_bytes: 37_083,
+                report,
+            },
+        )
+        .unwrap();
+
+        let out = String::from_utf8(out).unwrap();
+        let event_line = out.lines().next().unwrap();
+        let event_json = event_line.strip_prefix("event\t").unwrap();
+        let event = serde_json::from_str::<Value>(event_json).unwrap();
+        assert_eq!(event["type"], "regionGenerated");
+        assert_eq!(event["surfaceSampleMillis"], 4_285);
+        assert_eq!(event["chunkBuildMillis"], 277);
+        assert_eq!(event["nbtEncodeMillis"], 3_757);
+        assert_eq!(event["regionWriteMillis"], 76);
+        assert_eq!(event["metadataMillis"], 5);
+        assert_eq!(event["totalInternalMillis"], 4_618);
+        assert_eq!(event["waterColumns"], 262_144);
+        assert_eq!(stats.generated_regions, 1);
     }
 
     #[test]

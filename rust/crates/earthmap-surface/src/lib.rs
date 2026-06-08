@@ -10917,6 +10917,10 @@ pub fn trace_surface_region_columns(
         &mut trace_elevation_fn,
     )?;
     let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
+    let smoothed_center_elevations =
+        surface_region_smoothed_center_elevations(&elevations, &valid, false);
+    let local_relief_center_meters =
+        surface_region_local_relief_center_meters(&elevations, &valid, false);
     let mut columns = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
     let mut coast_factors = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
     let collect_photo_materials =
@@ -10984,10 +10988,8 @@ pub fn trace_surface_region_columns(
             };
             let sample_index = surface_region_extent_index(center_x, center_z);
             let raw_elevation = elevations[sample_index];
-            let smoothed_elevation =
-                surface_region_smoothed_elevation(&elevations, &valid, center_x, center_z);
-            let local_relief_meters =
-                surface_region_local_relief_meters(&elevations, &valid, center_x, center_z);
+            let smoothed_elevation = smoothed_center_elevations[column_index];
+            let local_relief_meters = local_relief_center_meters[column_index];
             let water = water_mask[sample_index];
             let coast_factor = coast_factor_extent[sample_index];
             let base_column = classify_shaped_surface_scaled(
@@ -11220,6 +11222,8 @@ const MAX_VERTICAL_SCALE: f64 = 4.0;
 const MIN_SURFACE_Y: i32 = -60;
 const MAX_SURFACE_Y: i32 = 319;
 const SURFACE_REGION_RELIEF_RADIUS: i32 = 4;
+static SURFACE_SMOOTH_KERNEL: OnceLock<Vec<(i32, i32, f64)>> = OnceLock::new();
+static SURFACE_RELIEF_KERNEL: OnceLock<Vec<(i32, i32)>> = OnceLock::new();
 
 pub fn classify_surface(
     elevation_meters: f64,
@@ -11633,6 +11637,27 @@ where
     let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
     let collect_photo_materials =
         texture_mode == SurfaceTextureMode::Photo && material_sampler.is_some();
+    let smoothed_center_elevations =
+        surface_region_smoothed_center_elevations(&elevations, &valid, parallel_column_sampling);
+    if let Some(open_ocean) = try_sample_open_ocean_surface_region(
+        region_block_x,
+        region_block_z,
+        mapping,
+        vertical_scale,
+        material_sampler,
+        longitude_span_degrees,
+        latitude_span_degrees,
+        &valid,
+        &water_mask,
+        &coast_factor_extent,
+        &smoothed_center_elevations,
+        parallel_column_sampling,
+    )? {
+        return Ok(open_ocean);
+    }
+    let local_relief_center_meters = material_sampler.map(|_| {
+        surface_region_local_relief_center_meters(&elevations, &valid, parallel_column_sampling)
+    });
 
     struct SurfaceColumnSampleBuild {
         column: EarthSurfaceColumn,
@@ -11666,8 +11691,7 @@ where
             mapping.latitude_for_block_z(map_z)?
         };
         let sample_index = surface_region_extent_index(center_x, center_z);
-        let smoothed_elevation =
-            surface_region_smoothed_elevation(&elevations, &valid, center_x, center_z);
+        let smoothed_elevation = smoothed_center_elevations[column_index];
         let water = water_mask[sample_index];
         let coast_factor = coast_factor_extent[sample_index];
         let mut column = classify_shaped_surface_scaled(
@@ -11696,8 +11720,10 @@ where
                     longitude_span_degrees,
                     latitude_span_degrees,
                 )?;
-                local_relief_meters =
-                    surface_region_local_relief_meters(&elevations, &valid, center_x, center_z);
+                local_relief_meters = local_relief_center_meters
+                    .as_ref()
+                    .map(|relief| relief[column_index])
+                    .unwrap_or(0.0);
                 column = apply_surface_region_semantic_material_sample(
                     column,
                     &sampled_material,
@@ -11857,6 +11883,164 @@ fn sample_surface_region_material(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn try_sample_open_ocean_surface_region(
+    region_block_x: i32,
+    region_block_z: i32,
+    mapping: &EarthScaleMapping,
+    vertical_scale: f64,
+    material_sampler: Option<&dyn SurfaceMaterialSampler>,
+    longitude_span_degrees: f64,
+    latitude_span_degrees: f64,
+    valid: &[bool],
+    water_mask: &[bool],
+    coast_factor_extent: &[f64],
+    smoothed_center_elevations: &[f64],
+    parallel_column_sampling: bool,
+) -> Result<Option<SurfaceRegionSample>> {
+    if !surface_region_open_ocean_fast_path_eligible(valid, water_mask, coast_factor_extent) {
+        return Ok(None);
+    }
+
+    struct OpenOceanColumnBuild {
+        column: EarthSurfaceColumn,
+    }
+
+    let build_column = |column_index| -> Result<OpenOceanColumnBuild> {
+        let local_z = column_index / SURFACE_REGION_WIDTH;
+        let local_x = column_index % SURFACE_REGION_WIDTH;
+        let global_block_x = region_block_x.wrapping_add(local_x as i32);
+        let global_block_z = region_block_z.wrapping_add(local_z as i32);
+        let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+        let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+        let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
+            0.0
+        } else {
+            mapping.longitude_for_block_x(map_x)?
+        };
+        let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
+            0.0
+        } else {
+            mapping.latitude_for_block_z(map_z)?
+        };
+        let smoothed_elevation = smoothed_center_elevations[column_index];
+        let mut column = classify_shaped_surface_scaled(
+            smoothed_elevation,
+            longitude,
+            latitude,
+            true,
+            0.0,
+            vertical_scale,
+        )?;
+        if let Some(material_sampler) = material_sampler {
+            if material_sampler.samples_open_water() {
+                let material = material_sampler.sample_water(
+                    longitude,
+                    latitude,
+                    longitude_span_degrees,
+                    latitude_span_degrees,
+                )?;
+                column = apply_surface_region_semantic_material_sample(
+                    column,
+                    &material,
+                    smoothed_elevation,
+                    longitude,
+                    latitude,
+                    0.0,
+                    0.0,
+                    vertical_scale,
+                )?;
+            }
+        }
+        Ok(OpenOceanColumnBuild {
+            column: clean_coastal_surface_column(&column, 0.0),
+        })
+    };
+
+    let builds = if parallel_column_sampling {
+        (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+            .into_par_iter()
+            .map(build_column)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        let mut builds = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
+        for column_index in 0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH) {
+            builds.push(build_column(column_index)?);
+        }
+        builds
+    };
+    if !builds.iter().all(|build| build.column.water) {
+        return Ok(None);
+    }
+    SurfaceRegionSample::new(builds.into_iter().map(|build| build.column).collect()).map(Some)
+}
+
+fn surface_region_open_ocean_fast_path_eligible(
+    valid: &[bool],
+    water_mask: &[bool],
+    coast_factor_extent: &[f64],
+) -> bool {
+    valid
+        .iter()
+        .zip(water_mask.iter())
+        .zip(coast_factor_extent.iter())
+        .all(|((&valid, &water), &coast_factor)| valid && water && coast_factor <= f64::EPSILON)
+}
+
+fn surface_region_smoothed_center_elevations(
+    elevations: &[f64],
+    valid: &[bool],
+    parallel: bool,
+) -> Vec<f64> {
+    let build = |column_index| {
+        let local_z = column_index / SURFACE_REGION_WIDTH;
+        let local_x = column_index % SURFACE_REGION_WIDTH;
+        surface_region_smoothed_elevation(
+            elevations,
+            valid,
+            local_x + SURFACE_REGION_COAST_RADIUS,
+            local_z + SURFACE_REGION_COAST_RADIUS,
+        )
+    };
+    if parallel {
+        (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+            .into_par_iter()
+            .map(build)
+            .collect()
+    } else {
+        (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+            .map(build)
+            .collect()
+    }
+}
+
+fn surface_region_local_relief_center_meters(
+    elevations: &[f64],
+    valid: &[bool],
+    parallel: bool,
+) -> Vec<f64> {
+    let build = |column_index| {
+        let local_z = column_index / SURFACE_REGION_WIDTH;
+        let local_x = column_index % SURFACE_REGION_WIDTH;
+        surface_region_local_relief_meters(
+            elevations,
+            valid,
+            local_x + SURFACE_REGION_COAST_RADIUS,
+            local_z + SURFACE_REGION_COAST_RADIUS,
+        )
+    };
+    if parallel {
+        (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+            .into_par_iter()
+            .map(build)
+            .collect()
+    } else {
+        (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+            .map(build)
+            .collect()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_surface_region_semantic_material_sample(
     semantic_column: EarthSurfaceColumn,
     sample: &SurfaceMaterialSample,
@@ -11965,29 +12149,47 @@ fn surface_region_local_relief_meters(
     }
     let mut min_elevation = elevations[center_index];
     let mut max_elevation = elevations[center_index];
-    for dz in -SURFACE_REGION_RELIEF_RADIUS..=SURFACE_REGION_RELIEF_RADIUS {
-        for dx in -SURFACE_REGION_RELIEF_RADIUS..=SURFACE_REGION_RELIEF_RADIUS {
-            let x = center_x as i32 + dx;
-            let z = center_z as i32 + dz;
-            if x < 0
-                || x >= SURFACE_REGION_EXTENT as i32
-                || z < 0
-                || z >= SURFACE_REGION_EXTENT as i32
-            {
-                continue;
-            }
-            let x = x as usize;
-            let z = z as usize;
-            let index = surface_region_extent_index(x, z);
-            if !valid[index] {
-                continue;
-            }
-            let elevation = elevations[index];
-            min_elevation = min_elevation.min(elevation);
-            max_elevation = max_elevation.max(elevation);
+    for &(dx, dz) in surface_relief_kernel() {
+        let x = center_x as i32 + dx;
+        let z = center_z as i32 + dz;
+        if x < 0 || x >= SURFACE_REGION_EXTENT as i32 || z < 0 || z >= SURFACE_REGION_EXTENT as i32
+        {
+            continue;
         }
+        let index = surface_region_extent_index(x as usize, z as usize);
+        if !valid[index] {
+            continue;
+        }
+        let elevation = elevations[index];
+        min_elevation = min_elevation.min(elevation);
+        max_elevation = max_elevation.max(elevation);
     }
     max_elevation - min_elevation
+}
+
+fn surface_smooth_kernel() -> &'static [(i32, i32, f64)] {
+    SURFACE_SMOOTH_KERNEL.get_or_init(|| {
+        let mut kernel = Vec::new();
+        for dz in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
+            for dx in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
+                let distance_squared = f64::from((dx * dx) + (dz * dz));
+                kernel.push((dx, dz, 1.0 / (1.0 + distance_squared)));
+            }
+        }
+        kernel
+    })
+}
+
+fn surface_relief_kernel() -> &'static [(i32, i32)] {
+    SURFACE_RELIEF_KERNEL.get_or_init(|| {
+        let mut kernel = Vec::new();
+        for dz in -SURFACE_REGION_RELIEF_RADIUS..=SURFACE_REGION_RELIEF_RADIUS {
+            for dx in -SURFACE_REGION_RELIEF_RADIUS..=SURFACE_REGION_RELIEF_RADIUS {
+                kernel.push((dx, dz));
+            }
+        }
+        kernel
+    })
 }
 
 pub fn smooth_surface_classes(
@@ -13738,26 +13940,18 @@ fn surface_chunk_smoothed_elevation(
 ) -> f64 {
     let mut weighted = 0.0;
     let mut weights = 0.0;
-    for dz in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
-        for dx in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
-            let x = center_x as i32 + dx;
-            let z = center_z as i32 + dz;
-            if x < 0
-                || x >= SURFACE_CHUNK_EXTENT as i32
-                || z < 0
-                || z >= SURFACE_CHUNK_EXTENT as i32
-            {
-                continue;
-            }
-            let index = surface_chunk_extent_index(x as usize, z as usize);
-            if !valid[index] {
-                continue;
-            }
-            let distance_squared = f64::from((dx * dx) + (dz * dz));
-            let weight = 1.0 / (1.0 + distance_squared);
-            weighted += elevations[index] * weight;
-            weights += weight;
+    for &(dx, dz, weight) in surface_smooth_kernel() {
+        let x = center_x as i32 + dx;
+        let z = center_z as i32 + dz;
+        if x < 0 || x >= SURFACE_CHUNK_EXTENT as i32 || z < 0 || z >= SURFACE_CHUNK_EXTENT as i32 {
+            continue;
         }
+        let index = surface_chunk_extent_index(x as usize, z as usize);
+        if !valid[index] {
+            continue;
+        }
+        weighted += elevations[index] * weight;
+        weights += weight;
     }
     if weights == 0.0 {
         0.0
@@ -13848,26 +14042,19 @@ fn surface_region_smoothed_elevation(
 ) -> f64 {
     let mut weighted = 0.0;
     let mut weights = 0.0;
-    for dz in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
-        for dx in -SURFACE_CHUNK_SMOOTH_RADIUS..=SURFACE_CHUNK_SMOOTH_RADIUS {
-            let x = center_x as i32 + dx;
-            let z = center_z as i32 + dz;
-            if x < 0
-                || x >= SURFACE_REGION_EXTENT as i32
-                || z < 0
-                || z >= SURFACE_REGION_EXTENT as i32
-            {
-                continue;
-            }
-            let index = surface_region_extent_index(x as usize, z as usize);
-            if !valid[index] {
-                continue;
-            }
-            let distance_squared = f64::from((dx * dx) + (dz * dz));
-            let weight = 1.0 / (1.0 + distance_squared);
-            weighted += elevations[index] * weight;
-            weights += weight;
+    for &(dx, dz, weight) in surface_smooth_kernel() {
+        let x = center_x as i32 + dx;
+        let z = center_z as i32 + dz;
+        if x < 0 || x >= SURFACE_REGION_EXTENT as i32 || z < 0 || z >= SURFACE_REGION_EXTENT as i32
+        {
+            continue;
         }
+        let index = surface_region_extent_index(x as usize, z as usize);
+        if !valid[index] {
+            continue;
+        }
+        weighted += elevations[index] * weight;
+        weights += weight;
     }
     if weights == 0.0 {
         0.0
@@ -16153,6 +16340,75 @@ struct ChunkBuild {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_ocean_fast_path_requires_all_valid_water_and_no_coast() {
+        let len = SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT;
+        let valid = vec![true; len];
+        let water = vec![true; len];
+        let coast = vec![0.0; len];
+        assert!(surface_region_open_ocean_fast_path_eligible(
+            &valid, &water, &coast
+        ));
+
+        let mut with_land = water.clone();
+        with_land[surface_region_extent_index(
+            SURFACE_REGION_COAST_RADIUS,
+            SURFACE_REGION_COAST_RADIUS,
+        )] = false;
+        assert!(!surface_region_open_ocean_fast_path_eligible(
+            &valid, &with_land, &coast
+        ));
+
+        let mut with_invalid = valid.clone();
+        with_invalid[0] = false;
+        assert!(!surface_region_open_ocean_fast_path_eligible(
+            &with_invalid,
+            &water,
+            &coast
+        ));
+
+        let mut with_coast = coast.clone();
+        with_coast[0] = 0.1;
+        assert!(!surface_region_open_ocean_fast_path_eligible(
+            &valid,
+            &water,
+            &with_coast
+        ));
+    }
+
+    #[test]
+    fn precomputed_region_smoothing_and_relief_match_direct_neighborhoods() {
+        let len = SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT;
+        let mut elevations = vec![0.0; len];
+        let mut valid = vec![true; len];
+        for z in 0..SURFACE_REGION_EXTENT {
+            for x in 0..SURFACE_REGION_EXTENT {
+                elevations[surface_region_extent_index(x, z)] =
+                    ((x as f64) * 0.75) - ((z as f64) * 0.25) + ((x ^ z) % 7) as f64;
+            }
+        }
+        valid[surface_region_extent_index(
+            SURFACE_REGION_COAST_RADIUS + 12,
+            SURFACE_REGION_COAST_RADIUS + 6,
+        )] = false;
+
+        let smoothed = surface_region_smoothed_center_elevations(&elevations, &valid, false);
+        let relief = surface_region_local_relief_center_meters(&elevations, &valid, false);
+        for (local_x, local_z) in [(0, 0), (12, 6), (128, 257), (511, 511)] {
+            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+            let center_x = local_x + SURFACE_REGION_COAST_RADIUS;
+            let center_z = local_z + SURFACE_REGION_COAST_RADIUS;
+            assert_eq!(
+                smoothed[column_index],
+                surface_region_smoothed_elevation(&elevations, &valid, center_x, center_z)
+            );
+            assert_eq!(
+                relief[column_index],
+                surface_region_local_relief_meters(&elevations, &valid, center_x, center_z)
+            );
+        }
+    }
 
     #[test]
     fn surface_texture_mode_parse_matches_java_aliases() {
