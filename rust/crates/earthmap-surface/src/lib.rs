@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -39,6 +40,7 @@ const DATA_ROOT_ENV: &str = "EARTHMAP_DATA_ROOT";
 const TIF_ROOT_ENV: &str = "EARTHMAP_TIF_ROOT";
 
 static PHOTO_SURFACE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 16_384;
 
 fn photo_surface_trace_enabled() -> bool {
     cfg!(test)
@@ -52,6 +54,10 @@ fn photo_surface_trace_enabled() -> bool {
                 })
                 .unwrap_or(false)
         })
+}
+
+thread_local! {
+    static PHOTO_CIEDE_CACHE: RefCell<HashMap<u64, f64>> = RefCell::new(HashMap::with_capacity(PHOTO_CIEDE_CACHE_MAX_ENTRIES));
 }
 
 fn photo_surface_trace(args: fmt::Arguments<'_>) -> String {
@@ -387,12 +393,30 @@ pub struct SurfaceRegionReport {
     pub cache_stats: GeoTiffRowCacheStats,
     pub surface_material_raster_stats: SurfaceMaterialRasterStats,
     pub surface_sample_nanos: u128,
+    pub sample_phase_nanos: SurfaceRegionSamplePhaseNanos,
     pub chunk_build_nanos: u128,
     pub nbt_encode_nanos: u128,
     pub region_write_nanos: u128,
     pub preview_nanos: u128,
     pub metadata_nanos: u128,
     pub total_nanos: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SurfaceRegionSamplePhaseNanos {
+    pub elevation_fill: u128,
+    pub water_mask: u128,
+    pub coast_factor: u128,
+    pub smooth_precompute: u128,
+    pub relief_precompute: u128,
+    pub open_ocean_fast_path: u128,
+    pub column_build: u128,
+    pub photo_profile: u128,
+    pub photo_apply: u128,
+    pub post_process: u128,
+    pub sampled_material_columns: u64,
+    pub sampled_land_material_columns: u64,
+    pub sampled_water_material_columns: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -485,16 +509,36 @@ impl SurfaceChunkSample {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SurfaceRegionSample {
     columns: Vec<EarthSurfaceColumn>,
+    phase_nanos: SurfaceRegionSamplePhaseNanos,
 }
 
 impl SurfaceRegionSample {
     pub fn new(columns: Vec<EarthSurfaceColumn>) -> Result<Self> {
+        Self::new_with_phase_nanos(columns, SurfaceRegionSamplePhaseNanos::default())
+    }
+
+    fn new_with_phase_nanos(
+        columns: Vec<EarthSurfaceColumn>,
+        phase_nanos: SurfaceRegionSamplePhaseNanos,
+    ) -> Result<Self> {
         if columns.len() != SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH {
             return Err(SurfaceError::invalid(
                 "columns must contain one entry per region column",
             ));
         }
-        Ok(Self { columns })
+        Ok(Self {
+            columns,
+            phase_nanos,
+        })
+    }
+
+    pub fn phase_nanos(&self) -> SurfaceRegionSamplePhaseNanos {
+        self.phase_nanos
+    }
+
+    fn with_phase_nanos(mut self, phase_nanos: SurfaceRegionSamplePhaseNanos) -> Self {
+        self.phase_nanos = phase_nanos;
+        self
     }
 
     pub fn width(&self) -> usize {
@@ -5188,30 +5232,40 @@ fn photo_solver_tinted_vegetation_biome(
     } else {
         input.semantic_column.biome_id.as_str()
     };
-    photo_solver_grass_biomes(
+    let mut best: Option<(&str, f64)> = None;
+    for_each_photo_solver_grass_biome(
         fallback,
         &input.sample,
         input.elevation_meters,
         input.latitude,
         input.local_relief_meters,
-    )
-    .into_iter()
-    .filter(|biome| !biome.trim().is_empty())
-    .min_by(|left, right| {
-        photo_weighted_render_distance(source, top, left)
-            .partial_cmp(&photo_weighted_render_distance(source, top, right))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-    .unwrap_or_else(|| fallback.to_string())
+        |biome| {
+            if biome.trim().is_empty() {
+                return;
+            }
+            let distance = photo_weighted_render_distance(source, top, biome);
+            if best.as_ref().is_none_or(|(_, current)| distance < *current) {
+                best = Some((biome, distance));
+            }
+        },
+    );
+    best.map(|(biome, _)| biome.to_string())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
-fn photo_solver_grass_biomes(
-    fallback: &str,
-    sample: &SurfaceMaterialSample,
+#[derive(Clone, Copy, Debug)]
+struct PhotoGrassBiomeCandidates<'a> {
+    base: &'a str,
+    preferred: &'a str,
+}
+
+fn photo_solver_grass_biome_candidates<'a>(
+    fallback: &'a str,
+    sample: &'a SurfaceMaterialSample,
     elevation_meters: f64,
     latitude: f64,
     local_relief_meters: f64,
-) -> Vec<String> {
+) -> PhotoGrassBiomeCandidates<'a> {
     let base = if fallback.trim().is_empty() {
         "minecraft:plains"
     } else {
@@ -5251,15 +5305,29 @@ fn photo_solver_grass_biomes(
     } else {
         base
     };
-    let mut candidates = Vec::with_capacity(PHOTO_GRASS_RENDER_BIOMES.len() + 2);
-    candidates.push(preferred.to_string());
-    candidates.push(base.to_string());
-    candidates.extend(
-        PHOTO_GRASS_RENDER_BIOMES
-            .iter()
-            .map(|biome| biome.to_string()),
+    PhotoGrassBiomeCandidates { base, preferred }
+}
+
+fn for_each_photo_solver_grass_biome<'a>(
+    fallback: &'a str,
+    sample: &'a SurfaceMaterialSample,
+    elevation_meters: f64,
+    latitude: f64,
+    local_relief_meters: f64,
+    mut visit: impl FnMut(&'a str),
+) {
+    let candidates = photo_solver_grass_biome_candidates(
+        fallback,
+        sample,
+        elevation_meters,
+        latitude,
+        local_relief_meters,
     );
-    candidates
+    visit(candidates.preferred);
+    visit(candidates.base);
+    for biome in PHOTO_GRASS_RENDER_BIOMES {
+        visit(biome);
+    }
 }
 
 fn is_photo_solver_forest_biome(biome: &str) -> bool {
@@ -5462,14 +5530,14 @@ struct PhotoSurfaceSolve {
 
 #[derive(Clone, Copy, Debug)]
 struct PhotoRenderMetrics {
-    lab: [f64; 3],
+    rgb: i32,
     luma: f64,
 }
 
 impl PhotoRenderMetrics {
     fn new(render_rgb: i32) -> Self {
         Self {
-            lab: photo_rgb_i32_to_lab(render_rgb),
+            rgb: render_rgb,
             luma: photo_luma_rgb(render_rgb),
         }
     }
@@ -5477,8 +5545,8 @@ impl PhotoRenderMetrics {
 
 #[derive(Clone, Copy, Debug)]
 struct JavaStandardPaletteCandidateContext {
-    target_lab: [f64; 3],
-    source_lab: [f64; 3],
+    target_rgb: i32,
+    source_rgb: i32,
     source_luma: f64,
     snow_context: bool,
     dark_standard_shadow: bool,
@@ -5487,8 +5555,8 @@ struct JavaStandardPaletteCandidateContext {
 impl JavaStandardPaletteCandidateContext {
     fn new(input: &PhotoSurfaceInput, source: RgbColor, target: RgbColor) -> Self {
         Self {
-            target_lab: photo_rgb_color_to_lab(target),
-            source_lab: photo_rgb_color_to_lab(source),
+            target_rgb: rgb_color_to_i32(target),
+            source_rgb: rgb_color_to_i32(source),
             source_luma: photo_luma(source),
             snow_context: photo_solver_snow_evidence(input, source),
             dark_standard_shadow: photo_solver_dark_standard_shadow(input),
@@ -5511,49 +5579,51 @@ fn java_standard_vegetation_palette_solve(
         java_standard_render_anchor_weight(source, token_color, token),
     );
     let candidate_context = JavaStandardPaletteCandidateContext::new(input, source, target);
-    let grass_biomes = photo_solver_grass_biomes(
-        &input.semantic_column.biome_id,
-        &input.sample,
-        input.elevation_meters,
-        input.latitude,
-        input.local_relief_meters,
-    );
     let mut best: Option<PhotoSurfaceSolve> = None;
     for &top in PHOTO_SOLVER_CANDIDATE_BLOCKS {
         if is_tinted_vegetation_block(top) {
-            for biome in &grass_biomes {
-                if biome.trim().is_empty() {
-                    continue;
-                }
-                let candidate = java_standard_palette_candidate_with_context(
-                    input,
-                    candidate_context,
-                    token,
-                    top,
-                    biome.clone(),
-                );
-                if best
-                    .as_ref()
-                    .is_none_or(|current| candidate.score < current.score)
-                {
-                    best = Some(candidate);
-                }
-            }
+            for_each_photo_solver_grass_biome(
+                &input.semantic_column.biome_id,
+                &input.sample,
+                input.elevation_meters,
+                input.latitude,
+                input.local_relief_meters,
+                |biome| {
+                    if biome.trim().is_empty() {
+                        return;
+                    }
+                    let score = java_standard_palette_candidate_score_with_context(
+                        input,
+                        candidate_context,
+                        token,
+                        top,
+                        biome,
+                    );
+                    if best.as_ref().is_none_or(|current| score < current.score) {
+                        best = Some(PhotoSurfaceSolve {
+                            top_block_state_id: top,
+                            biome_id: biome.to_string(),
+                            score,
+                        });
+                    }
+                },
+            );
         } else {
             let biome =
-                compatible_biome_for_palette_non_grass(&input.semantic_column.biome_id, top);
-            let candidate = java_standard_palette_candidate_with_context(
+                compatible_biome_for_palette_non_grass_cow(&input.semantic_column.biome_id, top);
+            let score = java_standard_palette_candidate_score_with_context(
                 input,
                 candidate_context,
                 token,
                 top,
-                biome,
+                biome.as_ref(),
             );
-            if best
-                .as_ref()
-                .is_none_or(|current| candidate.score < current.score)
-            {
-                best = Some(candidate);
+            if best.as_ref().is_none_or(|current| score < current.score) {
+                best = Some(PhotoSurfaceSolve {
+                    top_block_state_id: top,
+                    biome_id: biome.into_owned(),
+                    score,
+                });
             }
         }
     }
@@ -5582,10 +5652,13 @@ fn java_standard_palette_candidate_with_context(
     top: i32,
     biome: String,
 ) -> PhotoSurfaceSolve {
-    let render_metrics = photo_render_metrics_for_surface(top, &biome);
-    let base_score = java_standard_palette_candidate_base_score(context, render_metrics);
-    let score =
-        base_score + java_standard_palette_candidate_bias_with_context(input, context, token, top);
+    let score = java_standard_palette_candidate_score_with_context(
+        input,
+        context,
+        token,
+        top,
+        biome.as_str(),
+    );
     PhotoSurfaceSolve {
         top_block_state_id: top,
         biome_id: biome,
@@ -5593,11 +5666,23 @@ fn java_standard_palette_candidate_with_context(
     }
 }
 
+fn java_standard_palette_candidate_score_with_context(
+    input: &PhotoSurfaceInput,
+    context: JavaStandardPaletteCandidateContext,
+    token: MetTerrainMatch,
+    top: i32,
+    biome: &str,
+) -> f64 {
+    let render_metrics = photo_render_metrics_for_surface(top, biome);
+    let base_score = java_standard_palette_candidate_base_score(context, render_metrics);
+    base_score + java_standard_palette_candidate_bias_with_context(input, context, token, top)
+}
+
 fn java_standard_palette_candidate_base_score(
     context: JavaStandardPaletteCandidateContext,
     render_metrics: PhotoRenderMetrics,
 ) -> f64 {
-    photo_ciede2000(context.target_lab, render_metrics.lab)
+    photo_ciede2000_rgb_pair_cached(context.target_rgb, render_metrics.rgb)
         + java_standard_source_render_preservation_score_with_context(context, render_metrics)
 }
 
@@ -6000,7 +6085,7 @@ fn java_standard_source_render_preservation_score_with_context(
     context: JavaStandardPaletteCandidateContext,
     render_metrics: PhotoRenderMetrics,
 ) -> f64 {
-    let ciede = photo_ciede2000(context.source_lab, render_metrics.lab) * 0.16;
+    let ciede = photo_ciede2000_rgb_pair_cached(context.source_rgb, render_metrics.rgb) * 0.16;
     let luma_gap = (context.source_luma - render_metrics.luma).abs();
     ciede + (luma_gap - 8.0).max(0.0) * 0.045
 }
@@ -6196,42 +6281,45 @@ fn direct_java_standard_vegetation_recipe_solve(
     } else {
         PALETTE_VEGETATED_CANDIDATES
     };
-    let target_lab = photo_rgb_color_to_lab(target);
-    let grass_biomes = photo_solver_grass_biomes(
-        &input.semantic_column.biome_id,
-        &input.sample,
-        input.elevation_meters,
-        input.latitude,
-        input.local_relief_meters,
-    );
+    let target_rgb = rgb_color_to_i32(target);
     let mut best: Option<PhotoSurfaceSolve> = None;
     for &top in blocks {
         if top == block_state_ids::SNOW_BLOCK {
             continue;
         }
         if is_tinted_vegetation_block(top) {
-            for biome in &grass_biomes {
-                if biome.trim().is_empty() {
-                    continue;
-                }
-                let candidate =
-                    token_recipe_candidate_with_target_lab(target_lab, top, biome.clone());
-                if best
-                    .as_ref()
-                    .is_none_or(|current| candidate.score < current.score)
-                {
-                    best = Some(candidate);
-                }
-            }
+            for_each_photo_solver_grass_biome(
+                &input.semantic_column.biome_id,
+                &input.sample,
+                input.elevation_meters,
+                input.latitude,
+                input.local_relief_meters,
+                |biome| {
+                    if biome.trim().is_empty() {
+                        return;
+                    }
+                    let score =
+                        token_recipe_candidate_score_with_target_rgb(target_rgb, top, biome);
+                    if best.as_ref().is_none_or(|current| score < current.score) {
+                        best = Some(PhotoSurfaceSolve {
+                            top_block_state_id: top,
+                            biome_id: biome.to_string(),
+                            score,
+                        });
+                    }
+                },
+            );
         } else {
             let biome =
-                compatible_biome_for_palette_non_grass(&input.semantic_column.biome_id, top);
-            let candidate = token_recipe_candidate_with_target_lab(target_lab, top, biome);
-            if best
-                .as_ref()
-                .is_none_or(|current| candidate.score < current.score)
-            {
-                best = Some(candidate);
+                compatible_biome_for_palette_non_grass_cow(&input.semantic_column.biome_id, top);
+            let score =
+                token_recipe_candidate_score_with_target_rgb(target_rgb, top, biome.as_ref());
+            if best.as_ref().is_none_or(|current| score < current.score) {
+                best = Some(PhotoSurfaceSolve {
+                    top_block_state_id: top,
+                    biome_id: biome.into_owned(),
+                    score,
+                });
             }
         }
     }
@@ -6284,17 +6372,9 @@ fn java_standard_dry_grass_texture_candidate(
         })
 }
 
-fn token_recipe_candidate_with_target_lab(
-    target_lab: [f64; 3],
-    top: i32,
-    biome: String,
-) -> PhotoSurfaceSolve {
-    let render_metrics = photo_render_metrics_for_surface(top, &biome);
-    PhotoSurfaceSolve {
-        top_block_state_id: top,
-        biome_id: biome,
-        score: photo_ciede2000(target_lab, render_metrics.lab),
-    }
+fn token_recipe_candidate_score_with_target_rgb(target_rgb: i32, top: i32, biome: &str) -> f64 {
+    let render_metrics = photo_render_metrics_for_surface(top, biome);
+    photo_ciede2000_rgb_pair_cached(target_rgb, render_metrics.rgb)
 }
 
 fn photo_render_metrics_for_surface(top: i32, biome: &str) -> PhotoRenderMetrics {
@@ -6416,29 +6496,33 @@ fn photo_solver_olive_vegetation_like_metrics(metrics: SurfaceColorMetrics) -> b
 }
 
 fn compatible_biome_for_palette_non_grass(biome: &str, top: i32) -> String {
+    compatible_biome_for_palette_non_grass_cow(biome, top).into_owned()
+}
+
+fn compatible_biome_for_palette_non_grass_cow(biome: &str, top: i32) -> Cow<'_, str> {
     let fallback = if biome.trim().is_empty() {
         "minecraft:plains"
     } else {
         biome
     };
     if top == block_state_ids::SNOW_BLOCK {
-        return "minecraft:snowy_plains".to_string();
+        return Cow::Borrowed("minecraft:snowy_plains");
     }
     if top == block_state_ids::SAND || is_photo_solver_pale_sand_carrier(top) {
         return if fallback.contains("beach") {
-            "minecraft:beach".to_string()
+            Cow::Borrowed("minecraft:beach")
         } else {
-            fallback.to_string()
+            Cow::Borrowed(fallback)
         };
     }
     if top == block_state_ids::RED_SAND || is_photo_solver_red_sandstone_carrier(top) {
         return if fallback.contains("badlands") {
-            fallback.to_string()
+            Cow::Borrowed(fallback)
         } else {
-            "minecraft:badlands".to_string()
+            Cow::Borrowed("minecraft:badlands")
         };
     }
-    fallback.to_string()
+    Cow::Borrowed(fallback)
 }
 
 fn is_photo_solver_coastal_sand_halo_candidate(top: i32, input: &PhotoSurfaceInput) -> bool {
@@ -6517,6 +6601,14 @@ fn token_rgb(token: MetTerrainMatch) -> i32 {
     )
 }
 
+fn rgb_color_to_i32(color: RgbColor) -> i32 {
+    rgb(
+        i32::from(color.red),
+        i32::from(color.green),
+        i32::from(color.blue),
+    )
+}
+
 fn photo_blend(source: RgbColor, anchor: RgbColor, anchor_weight: f64) -> RgbColor {
     let t = anchor_weight.clamp(0.0, 1.0);
     RgbColor::of(
@@ -6540,18 +6632,30 @@ fn photo_rgb_distance_squared(left: RgbColor, right: RgbColor) -> i32 {
 }
 
 fn photo_ciede2000_rgb_rgb(left_rgb: i32, right_rgb: i32) -> f64 {
-    photo_ciede2000(
-        photo_rgb_i32_to_lab(left_rgb),
-        photo_rgb_i32_to_lab(right_rgb),
-    )
+    photo_ciede2000_rgb_pair_cached(left_rgb, right_rgb)
 }
 
-fn photo_rgb_color_to_lab(color: RgbColor) -> [f64; 3] {
-    photo_rgb_to_lab(
-        i32::from(color.red),
-        i32::from(color.green),
-        i32::from(color.blue),
-    )
+fn photo_ciede2000_rgb_pair_cached(left_rgb: i32, right_rgb: i32) -> f64 {
+    let key = photo_ciede_cache_key(left_rgb, right_rgb);
+    if let Some(cached) = PHOTO_CIEDE_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
+        return cached;
+    }
+    let value = photo_ciede2000(
+        photo_rgb_i32_to_lab(left_rgb),
+        photo_rgb_i32_to_lab(right_rgb),
+    );
+    PHOTO_CIEDE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= PHOTO_CIEDE_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(key, value);
+    });
+    value
+}
+
+fn photo_ciede_cache_key(left_rgb: i32, right_rgb: i32) -> u64 {
+    (((left_rgb as u32 as u64) & 0x00ff_ffff) << 24) | ((right_rgb as u32 as u64) & 0x00ff_ffff)
 }
 
 fn photo_rgb_i32_to_lab(color: i32) -> [f64; 3] {
@@ -10822,6 +10926,7 @@ pub fn generate_surface_region_with_open_material_sampler(
         cache_stats: cache.stats(),
         surface_material_raster_stats,
         surface_sample_nanos,
+        sample_phase_nanos: region_surface.phase_nanos(),
         chunk_build_nanos,
         nbt_encode_nanos,
         region_write_nanos,
@@ -11594,6 +11699,8 @@ where
     F: FnMut(f64, f64) -> Result<f64>,
 {
     let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let mut phase_nanos = SurfaceRegionSamplePhaseNanos::default();
+    let phase_start = Instant::now();
     let mut elevations = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     let mut valid = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     let region_block_x = region_x.wrapping_mul(REGION_SIZE_BLOCKS);
@@ -11620,10 +11727,12 @@ where
             valid[index] = true;
         }
     }
+    phase_nanos.elevation_fill = phase_start.elapsed().as_nanos();
 
     let longitude_span_degrees = 360.0 / f64::from(mapping.width_blocks);
     let latitude_span_degrees =
         (mapping.max_latitude - mapping.min_latitude) / f64::from(mapping.height_blocks);
+    let phase_start = Instant::now();
     let water_mask = surface_region_water_decision_mask_with_coverage(
         &elevations,
         &valid,
@@ -11634,11 +11743,17 @@ where
         latitude_span_degrees,
         &mut elevation_fn,
     )?;
+    phase_nanos.water_mask = phase_start.elapsed().as_nanos();
+    let phase_start = Instant::now();
     let coast_factor_extent = surface_region_coast_factors(&valid, &water_mask);
+    phase_nanos.coast_factor = phase_start.elapsed().as_nanos();
     let collect_photo_materials =
         texture_mode == SurfaceTextureMode::Photo && material_sampler.is_some();
+    let phase_start = Instant::now();
     let smoothed_center_elevations =
         surface_region_smoothed_center_elevations(&elevations, &valid, parallel_column_sampling);
+    phase_nanos.smooth_precompute = phase_start.elapsed().as_nanos();
+    let phase_start = Instant::now();
     if let Some(open_ocean) = try_sample_open_ocean_surface_region(
         region_block_x,
         region_block_z,
@@ -11653,16 +11768,21 @@ where
         &smoothed_center_elevations,
         parallel_column_sampling,
     )? {
-        return Ok(open_ocean);
+        phase_nanos.open_ocean_fast_path = phase_start.elapsed().as_nanos();
+        return Ok(open_ocean.with_phase_nanos(phase_nanos));
     }
+    phase_nanos.open_ocean_fast_path = phase_start.elapsed().as_nanos();
+    let phase_start = Instant::now();
     let local_relief_center_meters = material_sampler.map(|_| {
         surface_region_local_relief_center_meters(&elevations, &valid, parallel_column_sampling)
     });
+    phase_nanos.relief_precompute = phase_start.elapsed().as_nanos();
 
     struct SurfaceColumnSampleBuild {
         column: EarthSurfaceColumn,
         coast_factor: f64,
         material: Option<SurfaceMaterialSample>,
+        sampled_water: bool,
         smoothed_elevation: f64,
         longitude: f64,
         latitude: f64,
@@ -11742,6 +11862,7 @@ where
             column,
             coast_factor,
             material,
+            sampled_water: water,
             smoothed_elevation,
             longitude,
             latitude,
@@ -11750,6 +11871,7 @@ where
             global_block_z,
         })
     };
+    let phase_start = Instant::now();
     let column_builds = if parallel_column_sampling {
         (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
             .into_par_iter()
@@ -11762,12 +11884,26 @@ where
         }
         column_builds
     };
+    phase_nanos.column_build = phase_start.elapsed().as_nanos();
+    phase_nanos.sampled_material_columns = column_builds
+        .iter()
+        .filter(|build| build.material.is_some())
+        .count() as u64;
+    phase_nanos.sampled_land_material_columns = column_builds
+        .iter()
+        .filter(|build| build.material.is_some() && !build.sampled_water)
+        .count() as u64;
+    phase_nanos.sampled_water_material_columns = column_builds
+        .iter()
+        .filter(|build| build.material.is_some() && build.sampled_water)
+        .count() as u64;
     let coast_factors = column_builds
         .iter()
         .map(|build| build.coast_factor)
         .collect::<Vec<_>>();
 
     let columns = if collect_photo_materials {
+        let phase_start = Instant::now();
         let mut photo_token_luma_profile = PhotoSurfaceTokenLumaProfile::default();
         for build in &column_builds {
             if let Some(material) = build.material.as_ref() {
@@ -11777,7 +11913,9 @@ where
             }
         }
         let photo_token_luma_profile = Arc::new(photo_token_luma_profile);
-        column_builds
+        phase_nanos.photo_profile = phase_start.elapsed().as_nanos();
+        let phase_start = Instant::now();
+        let columns = column_builds
             .into_par_iter()
             .map(|build| -> Result<EarthSurfaceColumn> {
                 if let Some(material) = build.material {
@@ -11800,7 +11938,9 @@ where
                 }
                 Ok(build.column)
             })
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>>>()?;
+        phase_nanos.photo_apply = phase_start.elapsed().as_nanos();
+        columns
     } else {
         column_builds
             .into_iter()
@@ -11808,13 +11948,15 @@ where
             .collect::<Vec<_>>()
     };
 
+    let phase_start = Instant::now();
     let cleaned = post_process_surface_region_columns(
         &columns,
         &coast_factors,
         SURFACE_REGION_WIDTH,
         texture_mode,
     )?;
-    SurfaceRegionSample::new(cleaned)
+    phase_nanos.post_process = phase_start.elapsed().as_nanos();
+    SurfaceRegionSample::new_with_phase_nanos(cleaned, phase_nanos)
 }
 
 fn post_process_surface_region_columns(

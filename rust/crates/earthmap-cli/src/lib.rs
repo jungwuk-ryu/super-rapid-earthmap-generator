@@ -10451,6 +10451,19 @@ fn handle_vanilla_delegated_parallel_event(
                     "minGroundY": report.min_ground_y,
                     "maxGroundY": report.max_ground_y,
                     "surfaceSampleMillis": u128_to_u64(millis(report.surface_sample_nanos)),
+                    "surfacePhase.elevationFillMillis": u128_to_u64(millis(report.sample_phase_nanos.elevation_fill)),
+                    "surfacePhase.waterMaskMillis": u128_to_u64(millis(report.sample_phase_nanos.water_mask)),
+                    "surfacePhase.coastFactorMillis": u128_to_u64(millis(report.sample_phase_nanos.coast_factor)),
+                    "surfacePhase.smoothPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.smooth_precompute)),
+                    "surfacePhase.reliefPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.relief_precompute)),
+                    "surfacePhase.openOceanFastPathMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_fast_path)),
+                    "surfacePhase.columnBuildMillis": u128_to_u64(millis(report.sample_phase_nanos.column_build)),
+                    "surfacePhase.photoProfileMillis": u128_to_u64(millis(report.sample_phase_nanos.photo_profile)),
+                    "surfacePhase.photoApplyMillis": u128_to_u64(millis(report.sample_phase_nanos.photo_apply)),
+                    "surfacePhase.postProcessMillis": u128_to_u64(millis(report.sample_phase_nanos.post_process)),
+                    "surfacePhase.sampledMaterialColumns": report.sample_phase_nanos.sampled_material_columns,
+                    "surfacePhase.sampledLandMaterialColumns": report.sample_phase_nanos.sampled_land_material_columns,
+                    "surfacePhase.sampledWaterMaterialColumns": report.sample_phase_nanos.sampled_water_material_columns,
                     "chunkBuildMillis": u128_to_u64(millis(report.chunk_build_nanos)),
                     "nbtEncodeMillis": u128_to_u64(millis(report.nbt_encode_nanos)),
                     "regionWriteMillis": u128_to_u64(millis(report.region_write_nanos)),
@@ -18080,6 +18093,21 @@ mod tests {
             },
             surface_material_raster_stats: earthmap_surface::SurfaceMaterialRasterStats::EMPTY,
             surface_sample_nanos: 4_285_000_000,
+            sample_phase_nanos: earthmap_surface::SurfaceRegionSamplePhaseNanos {
+                elevation_fill: 1_000_000_000,
+                water_mask: 200_000_000,
+                coast_factor: 30_000_000,
+                smooth_precompute: 40_000_000,
+                relief_precompute: 50_000_000,
+                open_ocean_fast_path: 60_000_000,
+                column_build: 700_000_000,
+                photo_profile: 80_000_000,
+                photo_apply: 900_000_000,
+                post_process: 100_000_000,
+                sampled_material_columns: 262_144,
+                sampled_land_material_columns: 0,
+                sampled_water_material_columns: 262_144,
+            },
             chunk_build_nanos: 277_000_000,
             nbt_encode_nanos: 3_757_000_000,
             region_write_nanos: 76_000_000,
@@ -18105,6 +18133,19 @@ mod tests {
         let event = serde_json::from_str::<Value>(event_json).unwrap();
         assert_eq!(event["type"], "regionGenerated");
         assert_eq!(event["surfaceSampleMillis"], 4_285);
+        assert_eq!(event["surfacePhase.elevationFillMillis"], 1_000);
+        assert_eq!(event["surfacePhase.waterMaskMillis"], 200);
+        assert_eq!(event["surfacePhase.coastFactorMillis"], 30);
+        assert_eq!(event["surfacePhase.smoothPrecomputeMillis"], 40);
+        assert_eq!(event["surfacePhase.reliefPrecomputeMillis"], 50);
+        assert_eq!(event["surfacePhase.openOceanFastPathMillis"], 60);
+        assert_eq!(event["surfacePhase.columnBuildMillis"], 700);
+        assert_eq!(event["surfacePhase.photoProfileMillis"], 80);
+        assert_eq!(event["surfacePhase.photoApplyMillis"], 900);
+        assert_eq!(event["surfacePhase.postProcessMillis"], 100);
+        assert_eq!(event["surfacePhase.sampledMaterialColumns"], 262_144);
+        assert_eq!(event["surfacePhase.sampledLandMaterialColumns"], 0);
+        assert_eq!(event["surfacePhase.sampledWaterMaterialColumns"], 262_144);
         assert_eq!(event["chunkBuildMillis"], 277);
         assert_eq!(event["nbtEncodeMillis"], 3_757);
         assert_eq!(event["regionWriteMillis"], 76);
@@ -21238,6 +21279,7 @@ sourceLookupCells=1\n",
             },
             surface_material_raster_stats: earthmap_surface::SurfaceMaterialRasterStats::EMPTY,
             surface_sample_nanos: 2_900_000,
+            sample_phase_nanos: earthmap_surface::SurfaceRegionSamplePhaseNanos::default(),
             chunk_build_nanos: 3_100_000,
             nbt_encode_nanos: 4_200_000,
             region_write_nanos: 5_300_000,
@@ -21323,6 +21365,7 @@ manifestFile={}\n",
             },
             surface_material_raster_stats: earthmap_surface::SurfaceMaterialRasterStats::EMPTY,
             surface_sample_nanos: 2_900_000,
+            sample_phase_nanos: earthmap_surface::SurfaceRegionSamplePhaseNanos::default(),
             chunk_build_nanos: 3_100_000,
             nbt_encode_nanos: 4_200_000,
             region_write_nanos: 5_300_000,
