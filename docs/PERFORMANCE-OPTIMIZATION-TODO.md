@@ -106,7 +106,7 @@
 - [x] Add prefetch timing telemetry for send wait, ready-queue wait, consumer pool wait, and consumer elapsed time.
 - [x] Cache per-region open-ocean longitudes and latitudes so the open-ocean fast path does not recompute map coordinates for every column.
 - [x] Expand the thread-local surface sampler L1 cache from one entry to a small direct-mapped cache to reduce global cache-lock traffic during land material sampling.
-- [x] Widen the prefetch consumer/output Rayon pool so ocean-heavy regions are not capped by a 4-thread chunk/NBT stage.
+- [x] Test and reject widening the prefetch consumer/output Rayon pool: it helped small ocean smoke but badly hurt land/photo regions.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
 - [x] Reduce startup worker tuning cost so long runs do not spend many minutes generating benchmark regions before the real batch.
 
@@ -170,7 +170,7 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Open-ocean longitude/latitude cache smoke for `r.-64.28`: `allDone=true`, `openOceanFastPathMillis=2318`, `surfaceSampleMillis=3406`; this is smoke evidence only because OS cache can bias single-run timings.
 - [x] Thread-local L1 cache smoke for land region `r.-62.28`: `allDone=true`, `columnBuildMillis=6262`, and SHA-256 matched the existing generated region (`44B96C79ACE24EA6C7A4E913B1A806C09114F9D4DC537609A29B4913240338E2`).
 - [x] L1-cache long-run sample improved some land regions (`r.-55.28`/`r.-54.28` column build about 24-25s) but land-heavy regions such as `r.-50.28` through `r.-53.28` still spend about 43-46s in `surfacePhase.columnBuildMillis`; the remaining bottleneck is material/photo/evidence sampling, not queue wait or region write.
-- [x] Output-pool smoke for ocean regions used `prefetchSampleRayonThreads=8` and `prefetchOutputRayonThreads=8`; 4 ocean regions completed in `8378ms`, and `r.-36.28` SHA-256 matched the existing generated region (`6F6CE0EFC06D956FCE477EF7C787E1465470D6DD3571BEE8893C4DC0E1C5112C`).
+- [x] Output-pool widening experiment: small ocean smoke used `prefetchSampleRayonThreads=8` and `prefetchOutputRayonThreads=8`; 4 ocean regions completed in `8378ms`, and `r.-36.28` SHA-256 matched the existing generated region (`6F6CE0EFC06D956FCE477EF7C787E1465470D6DD3571BEE8893C4DC0E1C5112C`), but the long-run sample regressed land/photo work (`r.17.28` had `photoApplyMillis=90092`), so the active split was restored to `12 sample / 4 output`.
 - [x] Startup tuning follow-up: reduced candidate samples to land/mixed/ocean coverage with fewer Rayon candidates.
 - [x] Resume sample with `prefetchWorkers=4`: PID 24980 averaged 3.5 CPU cores over 30s, generated no additional completed regions during the sample, and showed pure-ocean `openOceanFastPathMillis` up to 57.7s.
 - [x] Open-ocean fast-path smoke after RGB/terrain-token split: region `r.-112.27` dropped from the long-run log's `openOceanFastPathMillis=57724` to `2575`; total one-region smoke completed in 5.6s. This is smoke evidence only because OS cache can bias single-run timings.

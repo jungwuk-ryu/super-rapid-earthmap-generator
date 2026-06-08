@@ -802,12 +802,10 @@ fn split_prefetch_rayon_threads(
         return (1, 1);
     }
     let consumer_threads = if total >= 8 {
-        (total / 2).max(consumer_workers.max(2))
+        consumer_workers.min((total / 4).max(2)).max(1)
     } else {
-        (total / 2).max(consumer_workers.max(1))
-    }
-    .min(total)
-    .max(1);
+        consumer_workers.min((total / 4).max(1)).max(1)
+    };
     let sample_threads = total
         .saturating_sub(consumer_threads)
         .max(prefetch_workers.max(1));
@@ -18470,10 +18468,10 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_rayon_split_keeps_output_pool_wide_enough_for_ocean_regions() {
-        assert_eq!(split_prefetch_rayon_threads(16, 2, 4), (8, 8));
-        assert_eq!(split_prefetch_rayon_threads(8, 2, 4), (4, 4));
-        assert_eq!(split_prefetch_rayon_threads(2, 1, 4), (1, 2));
+    fn prefetch_rayon_split_keeps_sample_pool_wide_for_photo_regions() {
+        assert_eq!(split_prefetch_rayon_threads(16, 2, 4), (12, 4));
+        assert_eq!(split_prefetch_rayon_threads(8, 2, 4), (6, 2));
+        assert_eq!(split_prefetch_rayon_threads(2, 1, 4), (1, 1));
     }
 
     #[test]
