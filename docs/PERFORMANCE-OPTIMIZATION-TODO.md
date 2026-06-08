@@ -131,6 +131,7 @@
 - [ ] Preserve visual quality, bathymetry, coastline behavior, Linear/MCA compatibility, and resume semantics.
 - [x] Smoke test prefetch path on a 1-region Linear run.
 - [x] Split pure open-ocean water evidence from coastal/photo water sampling so open ocean keeps bathymetry and ocean temperature without per-cell RGB/terrain-token raster work.
+- [x] Skip companion water sampling for deep open-ocean columns when the primary heightmap already supplies trusted bathymetry; keep companion sampling for shallow or unknown depths.
 
 ### Restart Command
 
@@ -156,3 +157,4 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Startup tuning follow-up: reduced candidate samples to land/mixed/ocean coverage with fewer Rayon candidates.
 - [x] Resume sample with `prefetchWorkers=4`: PID 24980 averaged 3.5 CPU cores over 30s, generated no additional completed regions during the sample, and showed pure-ocean `openOceanFastPathMillis` up to 57.7s.
 - [x] Open-ocean fast-path smoke after RGB/terrain-token split: region `r.-112.27` dropped from the long-run log's `openOceanFastPathMillis=57724` to `2575`; total one-region smoke completed in 5.6s. This is smoke evidence only because OS cache can bias single-run timings.
+- [x] Deep open-ocean companion-skip smoke: region `r.-120.27` dropped from the long-run log's `openOceanFastPathMillis=9968` to `2481`; total one-region smoke completed in 5.4s. This is smoke evidence only because OS cache can bias single-run timings.

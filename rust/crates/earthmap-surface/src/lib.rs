@@ -12255,7 +12255,9 @@ fn try_sample_open_ocean_surface_region(
             vertical_scale,
         )?;
         if let Some(material_sampler) = material_sampler {
-            if material_sampler.samples_open_water() {
+            if material_sampler.samples_open_water()
+                && should_sample_open_ocean_companion_material(smoothed_elevation)
+            {
                 let material = material_sampler.sample_open_ocean_water(
                     longitude,
                     latitude,
@@ -12295,6 +12297,13 @@ fn try_sample_open_ocean_surface_region(
         return Ok(None);
     }
     SurfaceRegionSample::new(builds.into_iter().map(|build| build.column).collect()).map(Some)
+}
+
+const OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS: f64 = SHAPED_ELEVATION_METERS_PER_BLOCK;
+
+fn should_sample_open_ocean_companion_material(smoothed_elevation_meters: f64) -> bool {
+    !smoothed_elevation_meters.is_finite()
+        || smoothed_elevation_meters > -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS
 }
 
 fn surface_region_open_ocean_fast_path_eligible(
@@ -16698,6 +16707,20 @@ mod tests {
             &water,
             &with_coast
         ));
+    }
+
+    #[test]
+    fn open_ocean_companion_sampling_keeps_shallow_or_unknown_depths() {
+        assert!(!should_sample_open_ocean_companion_material(
+            -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS - 0.01
+        ));
+        assert!(!should_sample_open_ocean_companion_material(
+            -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS
+        ));
+        assert!(should_sample_open_ocean_companion_material(
+            -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS + 0.01
+        ));
+        assert!(should_sample_open_ocean_companion_material(f64::NAN));
     }
 
     #[test]
