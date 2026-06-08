@@ -10909,13 +10909,36 @@ pub fn prepare_surface_region_sample_with_open_material_sampler(
     let mapping = mapping_for(reader.metadata(), settings.scale_denominator)?;
     let cache = GeoTiffRowCache::new(&reader, settings.cache_rows)?;
     let sampler = HeightmapScalarSampler::with_row_cache(&reader, &cache);
+    let mut prepared = prepare_surface_region_sample_with_heightmap_sampler(
+        settings,
+        &mapping,
+        &sampler,
+        cache.stats(),
+        surface_material_sampler,
+    )?;
+    prepared.cache_stats = cache.stats();
+    Ok(prepared)
+}
 
+pub fn prepare_surface_region_sample_with_heightmap_sampler(
+    settings: &SurfaceRegionSettings,
+    mapping: &EarthScaleMapping,
+    sampler: &HeightmapScalarSampler<'_>,
+    cache_stats: GeoTiffRowCacheStats,
+    surface_material_sampler: Option<&EarthDataSurfaceMaterialSampler>,
+) -> Result<PreparedSurfaceRegionSample> {
+    if mapping.denominator != settings.scale_denominator {
+        return Err(SurfaceError::invalid(format!(
+            "heightmap mapping scale 1:{} does not match region settings scale 1:{}",
+            mapping.denominator, settings.scale_denominator
+        )));
+    }
     let phase_start = Instant::now();
     let sample = sample_surface_region_scaled_with_material_sampler(
         settings.region_x,
         settings.region_z,
-        &mapping,
-        &sampler,
+        mapping,
+        sampler,
         settings.vertical_scale,
         settings.texture_mode,
         surface_material_sampler.map(|sampler| sampler as &dyn SurfaceMaterialSampler),
@@ -10930,7 +10953,7 @@ pub fn prepare_surface_region_sample_with_open_material_sampler(
         region_x: settings.region_x,
         region_z: settings.region_z,
         sample,
-        cache_stats: cache.stats(),
+        cache_stats,
         surface_material_raster_stats,
         surface_sample_nanos,
     })

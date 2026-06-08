@@ -41,7 +41,7 @@ use earthmap_surface::{
     auto_vertical_scale_for_denominator, classify_surface,
     generate_surface_region_with_open_material_sampler,
     generate_surface_region_with_prepared_sample,
-    prepare_surface_region_sample_with_open_material_sampler, surface_y_for_elevation_meters,
+    prepare_surface_region_sample_with_heightmap_sampler, surface_y_for_elevation_meters,
     EarthDataSurfaceMaterialSampler, EarthSurfaceColumn, HeightOnlySettings,
     LandShallowTopoPhotoSampler, MetImageExportTerrainSampler,
     OsmFeatureKind as SurfaceOsmFeatureKind, OsmRegionFeatureMask as SurfaceOsmRegionFeatureMask,
@@ -9770,6 +9770,12 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         surface_tile_cache_entries,
     )
     .map_err(|error| error.to_string())?;
+    let shared_heightmap_reader =
+        GeoTiffHeightmapReader::open(heightmap).map_err(|error| error.to_string())?;
+    let shared_heightmap_mapping = mapping_for(shared_heightmap_reader.metadata(), scale)
+        .map_err(|error| error.to_string())?;
+    let shared_heightmap_cache = GeoTiffRowCache::new(&shared_heightmap_reader, cache_rows)
+        .map_err(|error| error.to_string())?;
     let setup_millis = setup_start.elapsed().as_millis();
 
     write_progress_event(
@@ -9845,6 +9851,9 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                 let stop_queueing = &stop_queueing;
                 let surface_material_sampler = &surface_material_sampler;
                 let surface_material_path = &surface_material_path;
+                let shared_heightmap_reader = &shared_heightmap_reader;
+                let shared_heightmap_mapping = &shared_heightmap_mapping;
+                let shared_heightmap_cache = &shared_heightmap_cache;
                 let completed_regions = Arc::clone(&resume_completed_regions);
                 scope.spawn(move || loop {
                     if stop_queueing.load(Ordering::SeqCst) {
@@ -9920,14 +9929,23 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                 parallel_column_sampling,
                                 runtime_options.compression,
                             )?;
-                            let sample = generation_pool
-                                .install(|| {
-                                    prepare_surface_region_sample_with_open_material_sampler(
+                            let sample = generation_pool.install(|| {
+                                let heightmap_sampler = HeightmapScalarSampler::with_row_cache(
+                                    shared_heightmap_reader,
+                                    shared_heightmap_cache,
+                                );
+                                let mut sample =
+                                    prepare_surface_region_sample_with_heightmap_sampler(
                                         &settings,
+                                        shared_heightmap_mapping,
+                                        &heightmap_sampler,
+                                        shared_heightmap_cache.stats(),
                                         Some(surface_material_sampler),
                                     )
-                                })
-                                .map_err(|error| error.to_string())?;
+                                    .map_err(|error| error.to_string())?;
+                                sample.cache_stats = shared_heightmap_cache.stats();
+                                Ok::<PreparedSurfaceRegionSample, String>(sample)
+                            })?;
                             Ok(PreparedVanillaDelegatedRegion {
                                 region_x,
                                 region_z,

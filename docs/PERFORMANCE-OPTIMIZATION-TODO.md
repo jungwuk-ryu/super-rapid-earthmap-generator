@@ -99,6 +99,7 @@
 - [x] Sample CPU utilization after resume.
 - [x] Identify and optimize the slow pure-ocean fast path that kept CPU usage low after prefetch.
 - [x] Avoid nested region-worker plus column-level Rayon parallelism in fallback worker configuration.
+- [x] Share the heightmap reader and row cache across prefetch producers so adjacent regions do not reopen and reread the same rows.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
 - [x] Reduce startup worker tuning cost so long runs do not spend many minutes generating benchmark regions before the real batch.
 
@@ -160,3 +161,5 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Open-ocean fast-path smoke after RGB/terrain-token split: region `r.-112.27` dropped from the long-run log's `openOceanFastPathMillis=57724` to `2575`; total one-region smoke completed in 5.6s. This is smoke evidence only because OS cache can bias single-run timings.
 - [x] Deep open-ocean companion-skip smoke: region `r.-120.27` dropped from the long-run log's `openOceanFastPathMillis=9968` to `2481`; total one-region smoke completed in 5.4s. This is smoke evidence only because OS cache can bias single-run timings.
 - [x] Long-run sample after deep-ocean skip still averaged only 2.06 CPU cores over 30s with `parallelColumnSampling=true`, indicating nested parallelism/fallback configuration remained a bottleneck.
+- [x] Shared heightmap cache smoke reduced ocean `elevationFillMillis` from about 5.1s to about 1.3s on the same row, but land regions still show `columnBuildMillis` around 61-62s when all columns need photo material sampling.
+- [ ] Optimize land/coast photo material sampling so full-world progress does not stall on 262,144 per-column material samples per region.
