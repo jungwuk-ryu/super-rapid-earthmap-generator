@@ -176,3 +176,8 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Startup auto-tuning stall found: full Earth resume spent more than 2 minutes in `workerTuningStarted` before normal batch progress logs, because it benchmarked serial-column candidates and 6/8 intermediate worker candidates by generating real regions.
 - [x] Reduce startup worker tuning to a short land+mixed comparison between legacy 4 workers and requested workers, using column-parallel candidates only.
 - [x] Full resume after tuning reduction used only two candidates: 4 workers at `14788ms/region` and 10 workers at `12847.5ms/region`; selected 10 workers, `rayonThreads=16`, `parallelColumnSampling=true`.
+- [x] Reject the 10-worker tuning result as invalid for this architecture: with only 2 tune samples, the 10-worker candidate only exercised 2 active workers, while the real full run started 10 nested-Rayon region tasks and produced no completed region after more than 90 seconds.
+- [x] Single-region control for `r.17.27` completed in `8136ms` with `columnBuildMillis=5161`, proving the no-completion full run was concurrency starvation rather than an inherently slow region.
+- [x] Move no-prefetch generation to per-worker heightmap and surface material readers/caches so worker threads do not contend on one shared sampler.
+- [x] Cap surface photo region workers at the legacy 4-worker limit while column-parallel sampling uses the Rayon pool internally.
+- [x] Check 1 worker versus 4 worker land throughput: 1 worker / 16 Rayon generated 4 land regions in `69200ms` (~208 regions/hour), while the 4-worker full run completed comparable land regions in about `45s` (~320 regions/hour), so the 4-worker cap remains the better current default.

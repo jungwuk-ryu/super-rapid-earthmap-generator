@@ -345,6 +345,7 @@ fn fallback_surface_photo_worker_count(
     requested_threads
         .min(submitted_regions.max(1))
         .min(available.max(1))
+        .min(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
         .max(1)
 }
 
@@ -371,10 +372,7 @@ fn surface_photo_worker_candidates(
     if max_workers <= legacy {
         return vec![max_workers];
     }
-    let mut candidates = vec![legacy, max_workers];
-    candidates.sort_unstable();
-    candidates.dedup();
-    candidates
+    vec![legacy]
 }
 
 fn surface_photo_worker_candidate_configs(
@@ -698,66 +696,77 @@ fn benchmark_surface_photo_worker_candidate(
     compression_options: RegionCompressionOptions,
 ) -> std::result::Result<SurfacePhotoWorkerCandidateResult, String> {
     fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
-    let surface_material_sampler = EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
-        surface_material_path,
-        surface_tile_cache_entries,
-    )
-    .map_err(|error| error.to_string())?;
     let region_queue = Mutex::new(VecDeque::from(samples.to_vec()));
     let stop_queueing = AtomicBool::new(false);
     let start = Instant::now();
     let actual_workers = candidate.worker_count.min(samples.len()).max(1);
+    let surface_tile_cache_entries_per_worker =
+        surface_tile_cache_entries.div_ceil(actual_workers).max(1);
     let worker_error = Mutex::new(None::<String>);
     let pool = build_surface_photo_rayon_pool(candidate.rayon_threads)?;
     pool.scope(|scope| {
         for _ in 0..actual_workers {
             let queue = &region_queue;
             let stop_queueing = &stop_queueing;
-            let surface_material_sampler = &surface_material_sampler;
             let worker_error = &worker_error;
-            scope.spawn(move |_| loop {
-                if stop_queueing.load(Ordering::SeqCst) {
-                    return;
-                }
-                let next = {
-                    let mut queue = queue.lock().expect("worker tuning queue lock");
-                    queue.pop_front()
-                };
-                let Some(sample) = next else {
-                    return;
-                };
-                let result = (|| -> std::result::Result<(), String> {
-                    let mut settings = SurfaceRegionSettings::new_with_texture_options(
-                        heightmap,
-                        world,
-                        "SR EarthMap Worker Tune",
-                        0,
-                        scale,
-                        sample.region_x,
-                        sample.region_z,
-                        format,
-                        cache_rows,
-                        false,
-                        status,
-                        vertical_scale,
-                        SurfaceTextureMode::Photo,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    settings.surface_material_path = Some(surface_material_path.to_path_buf());
-                    settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                    settings.parallel_column_sampling = candidate.parallel_column_sampling;
-                    apply_region_compression_options(&mut settings, compression_options);
-                    generate_surface_region_with_open_material_sampler(
-                        &settings,
-                        Some(surface_material_sampler),
-                    )
-                    .map_err(|error| error.to_string())?;
-                    Ok(())
-                })();
-                if let Err(error) = result {
-                    stop_queueing.store(true, Ordering::SeqCst);
-                    *worker_error.lock().expect("worker tuning error lock") = Some(error);
-                    return;
+            scope.spawn(move |_| {
+                let surface_material_sampler =
+                    match EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+                        surface_material_path,
+                        surface_tile_cache_entries_per_worker,
+                    ) {
+                        Ok(sampler) => sampler,
+                        Err(error) => {
+                            stop_queueing.store(true, Ordering::SeqCst);
+                            *worker_error.lock().expect("worker tuning error lock") =
+                                Some(error.to_string());
+                            return;
+                        }
+                    };
+                loop {
+                    if stop_queueing.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let next = {
+                        let mut queue = queue.lock().expect("worker tuning queue lock");
+                        queue.pop_front()
+                    };
+                    let Some(sample) = next else {
+                        return;
+                    };
+                    let result = (|| -> std::result::Result<(), String> {
+                        let mut settings = SurfaceRegionSettings::new_with_texture_options(
+                            heightmap,
+                            world,
+                            "SR EarthMap Worker Tune",
+                            0,
+                            scale,
+                            sample.region_x,
+                            sample.region_z,
+                            format,
+                            cache_rows,
+                            false,
+                            status,
+                            vertical_scale,
+                            SurfaceTextureMode::Photo,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        settings.surface_material_path = Some(surface_material_path.to_path_buf());
+                        settings.surface_tile_cache_entries = surface_tile_cache_entries_per_worker;
+                        settings.parallel_column_sampling = candidate.parallel_column_sampling;
+                        apply_region_compression_options(&mut settings, compression_options);
+                        generate_surface_region_with_open_material_sampler(
+                            &settings,
+                            Some(&surface_material_sampler),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        stop_queueing.store(true, Ordering::SeqCst);
+                        *worker_error.lock().expect("worker tuning error lock") = Some(error);
+                        return;
+                    }
                 }
             });
         }
@@ -9615,6 +9624,9 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let worker_count = worker_tuning.selected_worker_count.min(region_count).max(1);
     let rayon_threads = worker_tuning.selected_rayon_threads.max(worker_count);
     let parallel_column_sampling = worker_tuning.parallel_column_sampling;
+    let heightmap_cache_rows_per_worker = cache_rows.div_ceil(worker_count).max(1);
+    let surface_tile_cache_entries_per_worker =
+        surface_tile_cache_entries.div_ceil(worker_count).max(1);
     let prefetch_config =
         effective_prefetch_config(runtime_options.prefetch, worker_count, region_count);
     let setup_start = Instant::now();
@@ -9972,11 +9984,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             let generation_pool = &generation_pool;
             let region_queue = &region_queue;
             let stop_queueing = &stop_queueing;
-            let surface_material_sampler = &surface_material_sampler;
             let surface_material_path = &surface_material_path;
-            let shared_heightmap_reader = &shared_heightmap_reader;
-            let shared_heightmap_mapping = &shared_heightmap_mapping;
-            let shared_heightmap_cache = &shared_heightmap_cache;
             let resume_completed_regions = &resume_completed_regions;
             let resume_journal = &resume_journal;
             let coordinator = scope.spawn(move || {
@@ -9984,158 +9992,198 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                     for _ in 0..worker_count {
                         let queue = region_queue;
                         let stop_queueing = stop_queueing;
-                        let surface_material_sampler = surface_material_sampler;
                         let surface_material_path = surface_material_path;
-                        let shared_heightmap_reader = shared_heightmap_reader;
-                        let shared_heightmap_mapping = shared_heightmap_mapping;
-                        let shared_heightmap_cache = shared_heightmap_cache;
                         let completed_regions = Arc::clone(&resume_completed_regions);
                         let journal = Arc::clone(resume_journal);
                         let sender = coordinator_sender.clone();
                         let fingerprint_matched = resume.fingerprint_matched;
-                        rayon_scope.spawn(move |_| loop {
-                            if stop_queueing.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            let next_region = {
-                                let mut queue = queue.lock().expect("queue lock");
-                                if stop_queueing.load(Ordering::SeqCst) {
-                                    None
-                                } else {
-                                    queue.pop_front()
-                                }
-                            };
-                            let Some((region_x, region_z)) = next_region else {
-                                break;
-                            };
-                            let region_file =
-                                vanilla_delegated_region_file(world, format, region_x, region_z);
-                            if fingerprint_matched
-                                && completed_regions.contains(&(region_x, region_z))
-                            {
-                                let skip_start = Instant::now();
-                                if let Ok(validation) = validate_region_file_for_resume(
-                                    &region_file,
-                                    region_format_for_output(format),
-                                    region_x,
-                                    region_z,
-                                    REGION_CHUNKS_PER_REGION,
-                                ) {
-                                    if sender
-                                        .send(VanillaDelegatedParallelEvent::RegionSkipped {
-                                            region_x,
-                                            region_z,
-                                            elapsed_millis: skip_start.elapsed().as_millis(),
-                                            chunks: validation.chunk_count,
-                                            output_bytes: validation.file_bytes,
-                                            region_file,
-                                        })
-                                        .is_err()
-                                    {
-                                        break;
+                        rayon_scope.spawn(move |_| {
+                            let worker_heightmap_reader =
+                                match GeoTiffHeightmapReader::open(heightmap_path) {
+                                    Ok(reader) => reader,
+                                    Err(_) => {
+                                        stop_queueing.store(true, Ordering::SeqCst);
+                                        return;
                                     }
-                                    continue;
-                                }
-                            }
-                            if sender
-                                .send(VanillaDelegatedParallelEvent::RegionStarted {
-                                    region_x,
-                                    region_z,
-                                    region_file: region_file.clone(),
-                                })
-                                .is_err()
-                            {
-                                break;
-                            };
-                            let region_start = Instant::now();
-                            let result =
-                                (|| -> std::result::Result<SurfaceRegionReport, String> {
-                                    let mut settings =
-                                        SurfaceRegionSettings::new_with_texture_options(
-                                            heightmap_path,
-                                            world_dir,
-                                            "SR EarthMap Vanilla Delegated",
-                                            0,
-                                            scale,
-                                            region_x,
-                                            region_z,
-                                            format,
-                                            cache_rows,
-                                            false,
-                                            status,
-                                            vertical_scale,
-                                            SurfaceTextureMode::Photo,
-                                        )
-                                        .map_err(|error| error.to_string())?;
-                                    settings.surface_material_path =
-                                        Some((*surface_material_path).clone());
-                                    settings.surface_tile_cache_entries =
-                                        surface_tile_cache_entries;
-                                    settings.parallel_column_sampling = parallel_column_sampling;
-                                    apply_region_compression_options(
-                                        &mut settings,
-                                        runtime_options.compression,
-                                    );
-                                    let heightmap_sampler = HeightmapScalarSampler::with_row_cache(
-                                        shared_heightmap_reader,
-                                        shared_heightmap_cache,
-                                    );
-                                    let mut prepared =
-                                        prepare_surface_region_sample_with_heightmap_sampler(
-                                            &settings,
-                                            shared_heightmap_mapping,
-                                            &heightmap_sampler,
-                                            shared_heightmap_cache.stats(),
-                                            Some(surface_material_sampler),
-                                        )
-                                        .map_err(|error| error.to_string())?;
-                                    prepared.cache_stats = shared_heightmap_cache.stats();
-                                    let report = generate_surface_region_with_prepared_sample(
-                                        &settings, prepared,
-                                    )
-                                    .map_err(|error| error.to_string())?;
-                                    let output_bytes = std::fs::metadata(&report.region_file)
-                                        .map(|metadata| metadata.len())
-                                        .unwrap_or(0);
-                                    journal
-                                        .lock()
-                                        .map_err(|_| "resume journal lock poisoned".to_string())?
-                                        .append_region_complete(
-                                            report.region_x,
-                                            report.region_z,
-                                            format,
-                                            report.chunk_count,
-                                            output_bytes,
-                                        )?;
-                                    Ok(report)
-                                })();
-                            match result {
-                                Ok(report) => {
-                                    let output_bytes = std::fs::metadata(&report.region_file)
-                                        .map(|metadata| metadata.len())
-                                        .unwrap_or(0);
-                                    if sender
-                                        .send(VanillaDelegatedParallelEvent::RegionGenerated {
-                                            elapsed_millis: region_start.elapsed().as_millis(),
-                                            output_bytes,
-                                            report,
-                                        })
-                                        .is_err()
-                                    {
-                                        break;
+                                };
+                            let worker_heightmap_mapping =
+                                match mapping_for(worker_heightmap_reader.metadata(), scale) {
+                                    Ok(mapping) => mapping,
+                                    Err(_) => {
+                                        stop_queueing.store(true, Ordering::SeqCst);
+                                        return;
                                     }
-                                }
-                                Err(message) => {
+                                };
+                            let worker_heightmap_cache = match GeoTiffRowCache::new(
+                                &worker_heightmap_reader,
+                                heightmap_cache_rows_per_worker,
+                            ) {
+                                Ok(cache) => cache,
+                                Err(_) => {
                                     stop_queueing.store(true, Ordering::SeqCst);
-                                    let _ =
-                                        sender.send(VanillaDelegatedParallelEvent::RegionFailed {
-                                            region_x,
-                                            region_z,
-                                            elapsed_millis: region_start.elapsed().as_millis(),
-                                            region_file,
-                                            message,
-                                        });
+                                    return;
+                                }
+                            };
+                            let worker_surface_material_sampler =
+                                match EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+                                    surface_material_path,
+                                    surface_tile_cache_entries_per_worker,
+                                ) {
+                                    Ok(sampler) => sampler,
+                                    Err(_) => {
+                                        stop_queueing.store(true, Ordering::SeqCst);
+                                        return;
+                                    }
+                                };
+                            let heightmap_sampler = HeightmapScalarSampler::with_row_cache(
+                                &worker_heightmap_reader,
+                                &worker_heightmap_cache,
+                            );
+                            loop {
+                                if stop_queueing.load(Ordering::SeqCst) {
                                     break;
+                                }
+                                let next_region = {
+                                    let mut queue = queue.lock().expect("queue lock");
+                                    if stop_queueing.load(Ordering::SeqCst) {
+                                        None
+                                    } else {
+                                        queue.pop_front()
+                                    }
+                                };
+                                let Some((region_x, region_z)) = next_region else {
+                                    break;
+                                };
+                                let region_file = vanilla_delegated_region_file(
+                                    world, format, region_x, region_z,
+                                );
+                                if fingerprint_matched
+                                    && completed_regions.contains(&(region_x, region_z))
+                                {
+                                    let skip_start = Instant::now();
+                                    if let Ok(validation) = validate_region_file_for_resume(
+                                        &region_file,
+                                        region_format_for_output(format),
+                                        region_x,
+                                        region_z,
+                                        REGION_CHUNKS_PER_REGION,
+                                    ) {
+                                        if sender
+                                            .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                                region_x,
+                                                region_z,
+                                                elapsed_millis: skip_start.elapsed().as_millis(),
+                                                chunks: validation.chunk_count,
+                                                output_bytes: validation.file_bytes,
+                                                region_file,
+                                            })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                if sender
+                                    .send(VanillaDelegatedParallelEvent::RegionStarted {
+                                        region_x,
+                                        region_z,
+                                        region_file: region_file.clone(),
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                };
+                                let region_start = Instant::now();
+                                let result =
+                                    (|| -> std::result::Result<SurfaceRegionReport, String> {
+                                        let mut settings =
+                                            SurfaceRegionSettings::new_with_texture_options(
+                                                heightmap_path,
+                                                world_dir,
+                                                "SR EarthMap Vanilla Delegated",
+                                                0,
+                                                scale,
+                                                region_x,
+                                                region_z,
+                                                format,
+                                                heightmap_cache_rows_per_worker,
+                                                false,
+                                                status,
+                                                vertical_scale,
+                                                SurfaceTextureMode::Photo,
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        settings.surface_material_path =
+                                            Some((*surface_material_path).clone());
+                                        settings.surface_tile_cache_entries =
+                                            surface_tile_cache_entries_per_worker;
+                                        settings.parallel_column_sampling =
+                                            parallel_column_sampling;
+                                        apply_region_compression_options(
+                                            &mut settings,
+                                            runtime_options.compression,
+                                        );
+                                        let mut prepared =
+                                            prepare_surface_region_sample_with_heightmap_sampler(
+                                                &settings,
+                                                &worker_heightmap_mapping,
+                                                &heightmap_sampler,
+                                                worker_heightmap_cache.stats(),
+                                                Some(&worker_surface_material_sampler),
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        prepared.cache_stats = worker_heightmap_cache.stats();
+                                        let report = generate_surface_region_with_prepared_sample(
+                                            &settings, prepared,
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                        let output_bytes = std::fs::metadata(&report.region_file)
+                                            .map(|metadata| metadata.len())
+                                            .unwrap_or(0);
+                                        journal
+                                            .lock()
+                                            .map_err(|_| {
+                                                "resume journal lock poisoned".to_string()
+                                            })?
+                                            .append_region_complete(
+                                                report.region_x,
+                                                report.region_z,
+                                                format,
+                                                report.chunk_count,
+                                                output_bytes,
+                                            )?;
+                                        Ok(report)
+                                    })();
+                                match result {
+                                    Ok(report) => {
+                                        let output_bytes = std::fs::metadata(&report.region_file)
+                                            .map(|metadata| metadata.len())
+                                            .unwrap_or(0);
+                                        if sender
+                                            .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                                elapsed_millis: region_start.elapsed().as_millis(),
+                                                output_bytes,
+                                                report,
+                                            })
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(message) => {
+                                        stop_queueing.store(true, Ordering::SeqCst);
+                                        let _ = sender.send(
+                                            VanillaDelegatedParallelEvent::RegionFailed {
+                                                region_x,
+                                                region_z,
+                                                elapsed_millis: region_start.elapsed().as_millis(),
+                                                region_file,
+                                                message,
+                                            },
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -10216,8 +10264,17 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("workerTuningLandSamples={}", worker_tuning.land_samples),
         format!("workerTuningOceanSamples={}", worker_tuning.ocean_samples),
         format!("workerTuningMixedSamples={}", worker_tuning.mixed_samples),
-        "surfaceSamplerStrategy=shared".to_string(),
+        format!(
+            "surfaceSamplerStrategy={}",
+            if prefetch_config.enabled {
+                "prefetch-shared"
+            } else {
+                "per-worker-heightmap-material"
+            }
+        ),
         format!("sharedCacheRows={cache_rows}"),
+        format!("heightmapCacheRowsPerWorker={heightmap_cache_rows_per_worker}"),
+        format!("surfaceTileCacheEntriesPerWorker={surface_tile_cache_entries_per_worker}"),
         format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
         format!("verticalScale={vertical_scale}"),
         format!(
@@ -18266,7 +18323,7 @@ mod tests {
 
     #[test]
     fn surface_photo_worker_candidates_keep_legacy_and_requested_options() {
-        assert_eq!(surface_photo_worker_candidates(10, 100), vec![4, 10]);
+        assert_eq!(surface_photo_worker_candidates(10, 100), vec![4]);
         assert_eq!(surface_photo_worker_candidates(3, 100), vec![3]);
         assert_eq!(surface_photo_worker_candidates(10, 2), vec![2]);
     }
@@ -18295,13 +18352,7 @@ mod tests {
             tuned_rayon,
             surface_photo_parallel_column_sampling(4, tuned_rayon)
         )));
-        let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(10);
-        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
-            10,
-            tuned_rayon,
-            surface_photo_parallel_column_sampling(10, tuned_rayon)
-        )));
-        assert_eq!(configs.len(), 2);
+        assert_eq!(configs.len(), 1);
     }
 
     #[test]
