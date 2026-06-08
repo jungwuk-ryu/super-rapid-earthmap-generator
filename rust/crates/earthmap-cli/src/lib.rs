@@ -82,11 +82,11 @@ const PREFETCH_SEND_RETRY_MILLIS: u64 = 10;
 const SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
 const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
-const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 4;
+const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 2;
 const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
 const SURFACE_PHOTO_AUTOTUNE_LAND_TARGET: usize = 1;
-const SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET: usize = 2;
-const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 1;
+const SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET: usize = 1;
+const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 0;
 const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
@@ -372,11 +372,6 @@ fn surface_photo_worker_candidates(
         return vec![max_workers];
     }
     let mut candidates = vec![legacy, max_workers];
-    for candidate in [6, 8, 10, 12, 16] {
-        if candidate > legacy && candidate < max_workers {
-            candidates.push(candidate);
-        }
-    }
     candidates.sort_unstable();
     candidates.dedup();
     candidates
@@ -390,11 +385,6 @@ fn surface_photo_worker_candidate_configs(
     let default_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads);
     let mut configs = Vec::new();
     for worker_count in region_workers {
-        configs.push(SurfacePhotoWorkerCandidateConfig::new(
-            worker_count,
-            worker_count,
-            false,
-        ));
         let mut rayon_candidates = vec![default_rayon_threads.max(worker_count)];
         rayon_candidates.sort_unstable();
         rayon_candidates.dedup();
@@ -674,32 +664,8 @@ fn tune_surface_photo_workers_from_regions(
                     true,
                 )
             });
-    let (selected_config, confirmation_candidates) = match confirm_surface_photo_worker_selection(
-        heightmap,
-        &tune_root,
-        format,
-        scale,
-        &samples,
-        status,
-        vertical_scale,
-        surface_material_path,
-        cache_rows,
-        surface_tile_cache_entries,
-        compression_options,
-        &results,
-        initial_selected,
-    ) {
-        Ok(confirmed) => confirmed,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&tune_root);
-            return SurfacePhotoWorkerTuning::fallback(
-                "fallback-confirmation-error",
-                requested_threads,
-                submitted_regions,
-                error,
-            );
-        }
-    };
+    let selected_config = initial_selected;
+    let confirmation_candidates = Vec::new();
     SurfacePhotoWorkerTuning {
         mode: "autotuned",
         requested_threads,
@@ -714,83 +680,6 @@ fn tune_surface_photo_workers_from_regions(
         confirmation_candidates,
         message: None,
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn confirm_surface_photo_worker_selection(
-    heightmap: &Path,
-    tune_root: &Path,
-    format: OutputFormat,
-    scale: i32,
-    samples: &[SurfacePhotoWorkerTuneSample],
-    status: ChunkGenerationStatus,
-    vertical_scale: f64,
-    surface_material_path: &Path,
-    cache_rows: usize,
-    surface_tile_cache_entries: usize,
-    compression_options: RegionCompressionOptions,
-    results: &[SurfacePhotoWorkerCandidateResult],
-    initial_selected: SurfacePhotoWorkerCandidateConfig,
-) -> std::result::Result<
-    (
-        SurfacePhotoWorkerCandidateConfig,
-        Vec<SurfacePhotoWorkerCandidateResult>,
-    ),
-    String,
-> {
-    let selected_rank = initial_selected.resource_rank();
-    let Some(lower_config) = results
-        .iter()
-        .map(SurfacePhotoWorkerCandidateResult::config)
-        .filter(|candidate| candidate.resource_rank() < selected_rank)
-        .min_by_key(|candidate| candidate.resource_rank())
-    else {
-        return Ok((initial_selected, Vec::new()));
-    };
-
-    let selected_result = benchmark_surface_photo_worker_candidate(
-        heightmap,
-        &tune_root.join(format!(
-            "confirm-workers-{}-rayon-{}",
-            initial_selected.worker_count, initial_selected.rayon_threads
-        )),
-        format,
-        scale,
-        samples,
-        initial_selected,
-        status,
-        vertical_scale,
-        surface_material_path,
-        cache_rows,
-        surface_tile_cache_entries,
-        compression_options,
-    )?;
-    let lower_result = benchmark_surface_photo_worker_candidate(
-        heightmap,
-        &tune_root.join(format!(
-            "confirm-workers-{}-rayon-{}",
-            lower_config.worker_count, lower_config.rayon_threads
-        )),
-        format,
-        scale,
-        samples,
-        lower_config,
-        status,
-        vertical_scale,
-        surface_material_path,
-        cache_rows,
-        surface_tile_cache_entries,
-        compression_options,
-    )?;
-    let confirmed_selected = if selected_result.millis_per_region()
-        * SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO
-        < lower_result.millis_per_region()
-    {
-        initial_selected
-    } else {
-        lower_config
-    };
-    Ok((confirmed_selected, vec![selected_result, lower_result]))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -18377,7 +18266,7 @@ mod tests {
 
     #[test]
     fn surface_photo_worker_candidates_keep_legacy_and_requested_options() {
-        assert_eq!(surface_photo_worker_candidates(10, 100), vec![4, 6, 8, 10]);
+        assert_eq!(surface_photo_worker_candidates(10, 100), vec![4, 10]);
         assert_eq!(surface_photo_worker_candidates(3, 100), vec![3]);
         assert_eq!(surface_photo_worker_candidates(10, 2), vec![2]);
     }
@@ -18398,22 +18287,21 @@ mod tests {
     }
 
     #[test]
-    fn surface_photo_worker_candidate_configs_separate_region_and_column_axes() {
+    fn surface_photo_worker_candidate_configs_compare_legacy_and_requested_parallel_workers() {
         let configs = surface_photo_worker_candidate_configs(10, 100);
-        let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(6);
-        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(6, 6, false)));
+        let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(4);
         assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
-            6,
+            4,
             tuned_rayon,
-            surface_photo_parallel_column_sampling(6, tuned_rayon)
+            surface_photo_parallel_column_sampling(4, tuned_rayon)
         )));
-        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(10, 10, false)));
         let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(10);
         assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
             10,
             tuned_rayon,
             surface_photo_parallel_column_sampling(10, tuned_rayon)
         )));
+        assert_eq!(configs.len(), 2);
     }
 
     #[test]
@@ -18427,24 +18315,24 @@ mod tests {
     #[test]
     fn surface_photo_worker_selection_chooses_lower_worker_inside_noise_band() {
         let candidates = vec![
-            surface_photo_candidate_result(4, 4, false, 1_000),
-            surface_photo_candidate_result(8, 8, false, 970),
+            surface_photo_candidate_result(4, 16, true, 1_000),
+            surface_photo_candidate_result(8, 16, true, 970),
         ];
         assert_eq!(
             select_surface_photo_worker_candidate(&candidates, 1.05),
-            Some(SurfacePhotoWorkerCandidateConfig::new(4, 4, false))
+            Some(SurfacePhotoWorkerCandidateConfig::new(4, 16, true))
         );
     }
 
     #[test]
     fn surface_photo_worker_selection_takes_clear_speedup() {
         let candidates = vec![
-            surface_photo_candidate_result(4, 4, false, 1_000),
-            surface_photo_candidate_result(8, 8, false, 800),
+            surface_photo_candidate_result(4, 16, true, 1_000),
+            surface_photo_candidate_result(8, 16, true, 800),
         ];
         assert_eq!(
             select_surface_photo_worker_candidate(&candidates, 1.05),
-            Some(SurfacePhotoWorkerCandidateConfig::new(8, 8, false))
+            Some(SurfacePhotoWorkerCandidateConfig::new(8, 16, true))
         );
     }
 

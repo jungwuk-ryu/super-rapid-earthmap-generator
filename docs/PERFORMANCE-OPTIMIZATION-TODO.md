@@ -173,3 +173,6 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Optimize mixed/coast water material sampling so full-world progress does not stall on 262,144 per-column heavy water material samples per region.
 - [x] Re-run `r.15.27` after the material-sampling fix: elapsed `4687ms`, `columnBuildMillis=2119`, `sampledMaterialColumns=262144`, `sampledWaterMaterialColumns=186344`.
 - [x] Confirm `r.15.27` output quality was not changed by the light water companion path: SHA-256 matched the prior generated region (`BBADB6E8DC48EFF3B019A435E8B83E2943B89E06C8D017A1F61CD7AA2D9E6E15`).
+- [x] Startup auto-tuning stall found: full Earth resume spent more than 2 minutes in `workerTuningStarted` before normal batch progress logs, because it benchmarked serial-column candidates and 6/8 intermediate worker candidates by generating real regions.
+- [x] Reduce startup worker tuning to a short land+mixed comparison between legacy 4 workers and requested workers, using column-parallel candidates only.
+- [x] Full resume after tuning reduction used only two candidates: 4 workers at `14788ms/region` and 10 workers at `12847.5ms/region`; selected 10 workers, `rayonThreads=16`, `parallelColumnSampling=true`.
