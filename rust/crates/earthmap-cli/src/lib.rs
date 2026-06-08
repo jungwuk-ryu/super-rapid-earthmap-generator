@@ -11197,9 +11197,7 @@ fn handle_vanilla_delegated_parallel_event(
             stats.phase_region_write_millis += millis(report.region_write_nanos);
             stats.phase_metadata_millis += millis(report.metadata_nanos);
             stats.phase_total_internal_millis += millis(report.total_nanos);
-            write_progress_event(
-                out,
-                json!({
+            let mut event = json!({
                     "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
                     "type": "regionGenerated",
                     "regionX": report.region_x,
@@ -11235,8 +11233,46 @@ fn handle_vanilla_delegated_parallel_event(
                     "consumerElapsedMillis": prefetch_timing.map(|timing| u128_to_u64(timing.consumer_elapsed)),
                     "outputBytes": output_bytes,
                     "regionFile": normalized_path_display(&report.region_file),
-                }),
-            )?;
+                });
+            if let Some(object) = event.as_object_mut() {
+                object.insert(
+                    "surfaceMaterialRaster.sourceCount".to_string(),
+                    json!(report.surface_material_raster_stats.source_count),
+                );
+                object.insert(
+                    "surfaceMaterialRaster.openReaders".to_string(),
+                    json!(report.surface_material_raster_stats.open_readers),
+                );
+                object.insert(
+                    "surfaceMaterialRaster.residentTiles".to_string(),
+                    json!(report.surface_material_raster_stats.resident_tiles),
+                );
+                object.insert(
+                    "surfaceMaterialRaster.tileHits".to_string(),
+                    json!(report.surface_material_raster_stats.tile_hits),
+                );
+                object.insert(
+                    "surfaceMaterialRaster.tileMisses".to_string(),
+                    json!(report.surface_material_raster_stats.tile_misses),
+                );
+                object.insert(
+                    "surfaceMaterialRaster.tileEvictions".to_string(),
+                    json!(report.surface_material_raster_stats.tile_evictions),
+                );
+                object.insert(
+                    "surfaceMaterialRaster.sampleNearestRequests".to_string(),
+                    json!(report
+                        .surface_material_raster_stats
+                        .sample_nearest_requests),
+                );
+                object.insert(
+                    "surfaceMaterialRaster.sampleAveragedRequests".to_string(),
+                    json!(report
+                        .surface_material_raster_stats
+                        .sample_averaged_requests),
+                );
+            }
+            write_progress_event(out, event)?;
             writeln!(
                 out,
                 "region,generated,{},{},{},{},{},{},",

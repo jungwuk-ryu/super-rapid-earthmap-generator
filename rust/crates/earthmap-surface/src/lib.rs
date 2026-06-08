@@ -40,7 +40,7 @@ const DATA_ROOT_ENV: &str = "EARTHMAP_DATA_ROOT";
 const TIF_ROOT_ENV: &str = "EARTHMAP_TIF_ROOT";
 
 static PHOTO_SURFACE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
-const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 16_384;
+const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 262_144;
 
 fn photo_surface_trace_enabled() -> bool {
     cfg!(test)
@@ -7385,7 +7385,7 @@ struct SurfaceSamplerThreadCacheEntry<T> {
     value: T,
 }
 
-const SURFACE_SAMPLER_L1_SLOTS: usize = 64;
+const SURFACE_SAMPLER_L1_SLOTS: usize = 4096;
 
 thread_local! {
     static SURFACE_MATERIAL_SAMPLE_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
