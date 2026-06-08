@@ -181,3 +181,5 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Move no-prefetch generation to per-worker heightmap and surface material readers/caches so worker threads do not contend on one shared sampler.
 - [x] Cap surface photo region workers at the legacy 4-worker limit while column-parallel sampling uses the Rayon pool internally.
 - [x] Check 1 worker versus 4 worker land throughput: 1 worker / 16 Rayon generated 4 land regions in `69200ms` (~208 regions/hour), while the 4-worker full run completed comparable land regions in about `45s` (~320 regions/hour), so the 4-worker cap remains the better current default.
+- [x] For the current scattered resume holes, restart with `workerThreads=1` and `RAYON_NUM_THREADS=16`: regions `r.20.27`, `r.21.27`, and `r.22.27` completed in `8489ms`, `14420ms`, and `14958ms`; this avoids the far-apart tile-cache thrash seen when 4 workers started isolated holes concurrently.
+- [ ] Design a locality-aware resume scheduler so incomplete regions are grouped by nearby runs instead of starting far-apart holes concurrently.
