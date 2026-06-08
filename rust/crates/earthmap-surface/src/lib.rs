@@ -12369,6 +12369,14 @@ fn try_sample_open_ocean_surface_region(
     if !surface_region_open_ocean_fast_path_eligible(valid, water_mask, coast_factor_extent) {
         return Ok(None);
     }
+    if let Some(uniform) = try_sample_uniform_deep_open_ocean_surface_region(
+        region_block_z,
+        mapping,
+        vertical_scale,
+        smoothed_center_elevations,
+    )? {
+        return Ok(Some(uniform));
+    }
 
     struct OpenOceanColumnBuild {
         column: EarthSurfaceColumn,
@@ -12446,6 +12454,56 @@ fn try_sample_open_ocean_surface_region(
 }
 
 const OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS: f64 = SHAPED_ELEVATION_METERS_PER_BLOCK;
+const UNIFORM_DEEP_OPEN_OCEAN_SOURCE_DEPTH_BLOCKS: f64 = 128.0;
+
+fn try_sample_uniform_deep_open_ocean_surface_region(
+    region_block_z: i32,
+    mapping: &EarthScaleMapping,
+    vertical_scale: f64,
+    smoothed_center_elevations: &[f64],
+) -> Result<Option<SurfaceRegionSample>> {
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let deep_floor_threshold_meters = -((UNIFORM_DEEP_OPEN_OCEAN_SOURCE_DEPTH_BLOCKS
+        * ELEVATION_METERS_PER_BLOCK)
+        / vertical_scale);
+    if !smoothed_center_elevations
+        .iter()
+        .all(|&elevation| elevation.is_finite() && elevation <= deep_floor_threshold_meters)
+    {
+        return Ok(None);
+    }
+
+    let mut biome = None::<String>;
+    for local_z in 0..SURFACE_REGION_WIDTH {
+        let global_block_z = region_block_z.wrapping_add(local_z as i32);
+        let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+        let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
+            0.0
+        } else {
+            mapping.latitude_for_block_z(map_z)?
+        };
+        let row_biome = biome_id(-10_000.0, 0.0, latitude, true, MIN_SURFACE_Y, 0.0);
+        match biome.as_ref() {
+            Some(existing) if existing != &row_biome => return Ok(None),
+            Some(_) => {}
+            None => biome = Some(row_biome),
+        }
+    }
+
+    let column = clean_coastal_surface_column(
+        &EarthSurfaceColumn::new(
+            true,
+            MIN_SURFACE_Y,
+            SEA_LEVEL_Y,
+            block_state_ids::GRAVEL,
+            block_state_ids::GRAVEL,
+            biome.unwrap_or_else(|| "minecraft:deep_ocean".to_string()),
+            "height-rule",
+        ),
+        0.0,
+    );
+    SurfaceRegionSample::new(vec![column; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH]).map(Some)
+}
 
 fn should_sample_open_ocean_companion_material(smoothed_elevation_meters: f64) -> bool {
     !smoothed_elevation_meters.is_finite()
@@ -16867,6 +16925,24 @@ mod tests {
             -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS + 0.01
         ));
         assert!(should_sample_open_ocean_companion_material(f64::NAN));
+    }
+
+    #[test]
+    fn uniform_deep_open_ocean_fast_path_reuses_one_floor_column() {
+        let mapping = EarthScaleMapping::for_denominator(250, -90.0, 90.0).unwrap();
+        let elevations = vec![-2_000.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        let sample =
+            try_sample_uniform_deep_open_ocean_surface_region(0, &mapping, 4.0, &elevations)
+                .unwrap()
+                .expect("deep equatorial ocean should be uniform");
+        assert_eq!(
+            sample.columns().len(),
+            SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH
+        );
+        let first = &sample.columns()[0];
+        assert!(first.water);
+        assert_eq!(first.ground_surface_y, MIN_SURFACE_Y);
+        assert!(sample.columns().iter().all(|column| column == first));
     }
 
     #[test]
