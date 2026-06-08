@@ -102,6 +102,8 @@
 - [x] Share the heightmap reader and row cache across prefetch producers so adjacent regions do not reopen and reread the same rows.
 - [x] Cache terrain-token photo evidence on coarse photo cells instead of sampling it once per block column.
 - [x] Move prefetch producers to per-producer heightmap/material readers and bounded per-producer caches so prefetch does not serialize on one shared raster sampler.
+- [x] Split prefetch surface-sample Rayon work from consumer chunk/NBT Rayon work so prepared samples do not starve region encoding.
+- [x] Add prefetch timing telemetry for send wait, ready-queue wait, consumer pool wait, and consumer elapsed time.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
 - [x] Reduce startup worker tuning cost so long runs do not spend many minutes generating benchmark regions before the real batch.
 
@@ -159,6 +161,8 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Release build: `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
 - [x] Prefetch smoke: 1 region, Linear, `prefetchMemoryGB=1`, `allDone=true`
 - [x] Producer-local prefetch smoke: 1 region, Linear, `prefetchMemoryGB=1`, `prefetchWorkers=2`, `allDone=true`, elapsed `6049ms`, output directory `agent-runs/smoke-prefetch-producerlocal-20260609-062806`.
+- [x] Split-pool prefetch smoke: 1 region, Linear, `allDone=true`, telemetry included `prefetchSendWaitMillis=0`, `prefetchReadyQueueWaitMillis=0`, and `consumerPoolWaitMillis=26`.
+- [x] Split-pool 4-region smoke used `prefetchWorkers=2`, `prefetchSampleRayonThreads=12`, `prefetchOutputRayonThreads=4`, and showed pool wait near zero; remaining time was dominated by `surfacePhase.columnBuildMillis`.
 - [x] Startup tuning follow-up: reduced candidate samples to land/mixed/ocean coverage with fewer Rayon candidates.
 - [x] Resume sample with `prefetchWorkers=4`: PID 24980 averaged 3.5 CPU cores over 30s, generated no additional completed regions during the sample, and showed pure-ocean `openOceanFastPathMillis` up to 57.7s.
 - [x] Open-ocean fast-path smoke after RGB/terrain-token split: region `r.-112.27` dropped from the long-run log's `openOceanFastPathMillis=57724` to `2575`; total one-region smoke completed in 5.6s. This is smoke evidence only because OS cache can bias single-run timings.

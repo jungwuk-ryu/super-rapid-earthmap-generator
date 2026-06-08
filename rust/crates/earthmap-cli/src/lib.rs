@@ -792,6 +792,26 @@ fn build_surface_photo_rayon_pool(
         .map_err(|error| error.to_string())
 }
 
+fn split_prefetch_rayon_threads(
+    rayon_threads: usize,
+    prefetch_workers: usize,
+    consumer_workers: usize,
+) -> (usize, usize) {
+    let total = rayon_threads.max(1);
+    if total == 1 {
+        return (1, 1);
+    }
+    let consumer_threads = if total >= 8 {
+        consumer_workers.min((total / 4).max(2)).max(1)
+    } else {
+        consumer_workers.min((total / 4).max(1)).max(1)
+    };
+    let sample_threads = total
+        .saturating_sub(consumer_threads)
+        .max(prefetch_workers.max(1));
+    (sample_threads, consumer_threads)
+}
+
 fn surface_photo_worker_tune_root(world: &Path) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9634,6 +9654,12 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let prefetch_surface_tile_cache_entries_per_worker = surface_tile_cache_entries
         .div_ceil(prefetch_config.workers.max(1))
         .max(1);
+    let (prefetch_sample_rayon_threads, prefetch_output_rayon_threads) = if prefetch_config.enabled
+    {
+        split_prefetch_rayon_threads(rayon_threads, prefetch_config.workers, worker_count)
+    } else {
+        (0, 0)
+    };
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
     let spawn_x = start_region_x
@@ -9699,6 +9725,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "prefetchQueueRegions": prefetch_config.queue_regions,
             "prefetchMemoryCapBytes": prefetch_config.memory_cap_bytes,
             "prefetchEstimatedRegionBytes": prefetch_config.estimated_region_bytes,
+            "prefetchSampleRayonThreads": prefetch_sample_rayon_threads,
+            "prefetchOutputRayonThreads": prefetch_output_rayon_threads,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
             "resumeJournalRegions": resume.completed_regions.len(),
@@ -9732,8 +9760,9 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let (event_sender, event_receiver) =
         mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
     let mut stats = VanillaDelegatedParallelBatchStats::default();
-    let generation_pool = build_surface_photo_rayon_pool(rayon_threads)?;
     if prefetch_config.enabled {
+        let prefetch_sample_pool = build_surface_photo_rayon_pool(prefetch_sample_rayon_threads)?;
+        let prefetch_output_pool = build_surface_photo_rayon_pool(prefetch_output_rayon_threads)?;
         std::thread::scope(|scope| {
             let (prepared_sender, prepared_receiver) =
                 mpsc::sync_channel::<PreparedVanillaDelegatedRegion>(prefetch_config.queue_regions);
@@ -9741,7 +9770,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             for _ in 0..prefetch_config.workers {
                 let prepared_sender = prepared_sender.clone();
                 let sender = event_sender.clone();
-                let generation_pool = &generation_pool;
+                let prefetch_sample_pool = &prefetch_sample_pool;
                 let queue = &region_queue;
                 let stop_queueing = &stop_queueing;
                 let surface_material_path = &surface_material_path;
@@ -9858,7 +9887,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                     parallel_column_sampling,
                                     runtime_options.compression,
                                 )?;
-                                let sample = generation_pool.install(|| {
+                                let sample = prefetch_sample_pool.install(|| {
                                     let producer_heightmap_sampler =
                                         HeightmapScalarSampler::with_row_cache(
                                             &producer_heightmap_reader,
@@ -9881,6 +9910,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                     region_z,
                                     region_file,
                                     started_at,
+                                    prepared_at: Instant::now(),
+                                    prefetch_send_wait_millis: 0,
                                     sample,
                                 })
                             })();
@@ -9913,7 +9944,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             for _ in 0..worker_count {
                 let receiver = Arc::clone(&prepared_receiver);
                 let sender = event_sender.clone();
-                let generation_pool = &generation_pool;
+                let prefetch_output_pool = &prefetch_output_pool;
                 let stop_queueing = &stop_queueing;
                 let surface_material_path = &surface_material_path;
                 let journal = Arc::clone(&resume_journal);
@@ -9932,7 +9963,14 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                     let region_z = prepared.region_z;
                     let region_file = prepared.region_file.clone();
                     let started_at = prepared.started_at;
-                    let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
+                    let ready_queue_wait_millis = prepared.prepared_at.elapsed().as_millis();
+                    let prefetch_send_wait_millis = prepared.prefetch_send_wait_millis;
+                    let consumer_started_at = Instant::now();
+                    let result =
+                        (|| -> std::result::Result<
+                            (SurfaceRegionReport, PrefetchTimingMillis),
+                            String,
+                        > {
                         let settings = vanilla_delegated_surface_region_settings(
                             heightmap_path,
                             world_dir,
@@ -9949,7 +9987,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                             parallel_column_sampling,
                             runtime_options.compression,
                         )?;
-                        let report = generation_pool
+                        let output_pool_start = Instant::now();
+                        let report = prefetch_output_pool
                             .install(|| {
                                 generate_surface_region_with_prepared_sample(
                                     &settings,
@@ -9957,6 +9996,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                 )
                             })
                             .map_err(|error| error.to_string())?;
+                        let consumer_pool_elapsed_millis = output_pool_start.elapsed().as_millis();
+                        let consumer_work_millis = millis(report.total_nanos)
+                            .saturating_sub(millis(report.surface_sample_nanos));
+                        let consumer_pool_wait_millis =
+                            consumer_pool_elapsed_millis.saturating_sub(consumer_work_millis);
                         let output_bytes = std::fs::metadata(&report.region_file)
                             .map(|metadata| metadata.len())
                             .unwrap_or(0);
@@ -9970,10 +10014,18 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                 report.chunk_count,
                                 output_bytes,
                             )?;
-                        Ok(report)
+                        Ok((
+                            report,
+                            PrefetchTimingMillis {
+                                send_wait: prefetch_send_wait_millis,
+                                ready_queue_wait: ready_queue_wait_millis,
+                                consumer_pool_wait: consumer_pool_wait_millis,
+                                consumer_elapsed: consumer_started_at.elapsed().as_millis(),
+                            },
+                        ))
                     })();
                     match result {
-                        Ok(report) => {
+                        Ok((report, prefetch_timing)) => {
                             let output_bytes = std::fs::metadata(&report.region_file)
                                 .map(|metadata| metadata.len())
                                 .unwrap_or(0);
@@ -9982,6 +10034,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                     elapsed_millis: started_at.elapsed().as_millis(),
                                     output_bytes,
                                     report,
+                                    prefetch_timing: Some(prefetch_timing),
                                 })
                                 .is_err()
                             {
@@ -10009,6 +10062,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             Ok::<(), String>(())
         })?;
     } else {
+        let generation_pool = build_surface_photo_rayon_pool(rayon_threads)?;
         std::thread::scope(|scope| {
             let coordinator_sender = event_sender.clone();
             let generation_pool = &generation_pool;
@@ -10195,6 +10249,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                                 elapsed_millis: region_start.elapsed().as_millis(),
                                                 output_bytes,
                                                 report,
+                                                prefetch_timing: None,
                                             })
                                             .is_err()
                                         {
@@ -10725,6 +10780,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
                                         elapsed_millis: region_start.elapsed().as_millis(),
                                         output_bytes,
                                         report,
+                                        prefetch_timing: None,
                                     })
                                     .is_err()
                                 {
@@ -11010,6 +11066,7 @@ enum VanillaDelegatedParallelEvent {
         elapsed_millis: u128,
         output_bytes: u64,
         report: SurfaceRegionReport,
+        prefetch_timing: Option<PrefetchTimingMillis>,
     },
     RegionFailed {
         region_x: i32,
@@ -11026,7 +11083,17 @@ struct PreparedVanillaDelegatedRegion {
     region_z: i32,
     region_file: PathBuf,
     started_at: Instant,
+    prepared_at: Instant,
+    prefetch_send_wait_millis: u128,
     sample: PreparedSurfaceRegionSample,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PrefetchTimingMillis {
+    send_wait: u128,
+    ready_queue_wait: u128,
+    consumer_pool_wait: u128,
+    consumer_elapsed: u128,
 }
 
 #[derive(Default)]
@@ -11048,10 +11115,12 @@ fn send_prepared_vanilla_region(
     stop_queueing: &AtomicBool,
     mut prepared: PreparedVanillaDelegatedRegion,
 ) -> bool {
+    let wait_start = Instant::now();
     loop {
         if stop_queueing.load(Ordering::SeqCst) {
             return false;
         }
+        prepared.prefetch_send_wait_millis = wait_start.elapsed().as_millis();
         match sender.try_send(prepared) {
             Ok(()) => return true,
             Err(mpsc::TrySendError::Full(returned)) => {
@@ -11119,6 +11188,7 @@ fn handle_vanilla_delegated_parallel_event(
             elapsed_millis,
             output_bytes,
             report,
+            prefetch_timing,
         } => {
             stats.generated_regions += 1;
             stats.phase_surface_sample_millis += millis(report.surface_sample_nanos);
@@ -11159,6 +11229,10 @@ fn handle_vanilla_delegated_parallel_event(
                     "regionWriteMillis": u128_to_u64(millis(report.region_write_nanos)),
                     "metadataMillis": u128_to_u64(millis(report.metadata_nanos)),
                     "totalInternalMillis": u128_to_u64(millis(report.total_nanos)),
+                    "prefetchSendWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.send_wait)),
+                    "prefetchReadyQueueWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.ready_queue_wait)),
+                    "consumerPoolWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.consumer_pool_wait)),
+                    "consumerElapsedMillis": prefetch_timing.map(|timing| u128_to_u64(timing.consumer_elapsed)),
                     "outputBytes": output_bytes,
                     "regionFile": normalized_path_display(&report.region_file),
                 }),
@@ -18939,6 +19013,7 @@ mod tests {
                 elapsed_millis: 4_629,
                 output_bytes: 37_083,
                 report,
+                prefetch_timing: None,
             },
         )
         .unwrap();
