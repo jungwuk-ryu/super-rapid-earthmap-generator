@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use earthmap_geo::EarthScaleMapping;
+use earthmap_geo::{EarthScaleMapping, GeoTiffHeightmapReader};
 use eframe::egui;
 use serde_json::Value;
 
@@ -312,7 +312,10 @@ impl GenerationOptions {
 
     fn resolved_region_grid(&self) -> RegionGrid {
         match self.extent_mode {
-            ExtentMode::WholeEarth => full_earth_region_grid(self.scale),
+            ExtentMode::WholeEarth => {
+                full_earth_region_grid_for_heightmap(self.scale, &self.heightmap_path)
+                    .unwrap_or_else(|| full_earth_region_grid(self.scale))
+            }
             ExtentMode::Preset => region_grid_for_bounds(self.scale, self.preset.bounds())
                 .unwrap_or_else(|| manual_region_grid(self)),
             ExtentMode::Bounds => region_grid_for_bounds(self.scale, self.bounds)
@@ -376,6 +379,22 @@ fn manual_region_grid(options: &GenerationOptions) -> RegionGrid {
     }
 }
 
+fn full_earth_region_grid_for_heightmap(scale: i32, heightmap_path: &str) -> Option<RegionGrid> {
+    let trimmed = heightmap_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let reader = GeoTiffHeightmapReader::open(Path::new(trimmed)).ok()?;
+    let metadata = reader.metadata();
+    let mapping = EarthScaleMapping::for_denominator(
+        scale.max(1),
+        metadata.top_left_latitude - (f64::from(metadata.height) * metadata.pixel_height_degrees),
+        metadata.top_left_latitude,
+    )
+    .ok()?;
+    Some(region_grid_for_mapping(&mapping))
+}
+
 fn full_earth_region_grid(scale: i32) -> RegionGrid {
     let Ok(mapping) = EarthScaleMapping::for_denominator(
         scale.max(1),
@@ -389,6 +408,10 @@ fn full_earth_region_grid(scale: i32) -> RegionGrid {
             rows: 40,
         };
     };
+    region_grid_for_mapping(&mapping)
+}
+
+fn region_grid_for_mapping(mapping: &EarthScaleMapping) -> RegionGrid {
     let start_x = floor_div_i32(-(mapping.width_blocks / 2), REGION_SIZE_BLOCKS);
     let end_x = floor_div_i32(
         mapping.width_blocks - 1 - (mapping.width_blocks / 2),
@@ -2096,6 +2119,21 @@ mod tests {
                 start_region_z: -20,
                 cols: 80,
                 rows: 40
+            }
+        );
+    }
+
+    #[test]
+    fn whole_earth_heightmap_extent_grid_matches_cli_describe_grid() {
+        let mapping = EarthScaleMapping::for_denominator(250, -84.0, 84.0).unwrap();
+        let grid = region_grid_for_mapping(&mapping);
+        assert_eq!(
+            grid,
+            RegionGrid {
+                start_region_x: -157,
+                start_region_z: -74,
+                cols: 314,
+                rows: 148
             }
         );
     }
