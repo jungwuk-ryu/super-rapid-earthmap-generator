@@ -82,11 +82,11 @@ const PREFETCH_SEND_RETRY_MILLIS: u64 = 10;
 const SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
 const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
-const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 10;
+const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 4;
 const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
-const SURFACE_PHOTO_AUTOTUNE_LAND_TARGET: usize = 4;
-const SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET: usize = 4;
-const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 2;
+const SURFACE_PHOTO_AUTOTUNE_LAND_TARGET: usize = 1;
+const SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET: usize = 2;
+const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 1;
 const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
@@ -388,7 +388,6 @@ fn surface_photo_worker_candidate_configs(
 ) -> Vec<SurfacePhotoWorkerCandidateConfig> {
     let region_workers = surface_photo_worker_candidates(requested_threads, submitted_regions);
     let default_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads);
-    let explicit_rayon_threads = explicit_rayon_num_threads();
     let mut configs = Vec::new();
     for worker_count in region_workers {
         configs.push(SurfacePhotoWorkerCandidateConfig::new(
@@ -397,13 +396,6 @@ fn surface_photo_worker_candidate_configs(
             false,
         ));
         let mut rayon_candidates = vec![default_rayon_threads.max(worker_count)];
-        if explicit_rayon_threads.is_none() {
-            let midpoint = default_rayon_threads
-                .saturating_add(worker_count)
-                .div_ceil(2)
-                .max(worker_count);
-            rayon_candidates.push(midpoint);
-        }
         rayon_candidates.sort_unstable();
         rayon_candidates.dedup();
         for rayon_threads in rayon_candidates {
