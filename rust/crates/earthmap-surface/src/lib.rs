@@ -7372,6 +7372,7 @@ pub struct EarthDataSurfaceMaterialSampler {
     material_cache: ShardedAccessCache<SurfaceMaterialSample>,
     photo_color_cache: ShardedAccessCache<RgbColor>,
     photo_evidence_cache: ShardedAccessCache<SurfaceMaterialSample>,
+    terrain_token_cache: ShardedAccessCache<RgbColor>,
     ocean_cache: ShardedAccessCache<SurfaceMaterialSample>,
     open_ocean_cache: ShardedAccessCache<SurfaceMaterialSample>,
     ecoregion_cache: ShardedAccessCache<EcoregionEvidence>,
@@ -7388,6 +7389,7 @@ thread_local! {
     static SURFACE_MATERIAL_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
     static SURFACE_PHOTO_COLOR_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<RgbColor>>> = RefCell::new(None);
     static SURFACE_PHOTO_EVIDENCE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
+    static SURFACE_TERRAIN_TOKEN_COLOR_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<RgbColor>>> = RefCell::new(None);
     static SURFACE_OCEAN_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
     static SURFACE_OPEN_OCEAN_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
     static SURFACE_ECOREGION_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<EcoregionEvidence>>> = RefCell::new(None);
@@ -7518,6 +7520,10 @@ impl EarthDataSurfaceMaterialSampler {
                 Self::PHOTO_EVIDENCE_CACHE_ENTRIES,
                 Self::CACHE_SHARDS,
             ),
+            terrain_token_cache: ShardedAccessCache::new(
+                Self::MATERIAL_CACHE_ENTRIES,
+                Self::CACHE_SHARDS,
+            ),
             ocean_cache: ShardedAccessCache::new(Self::OCEAN_CACHE_ENTRIES, Self::CACHE_SHARDS),
             open_ocean_cache: ShardedAccessCache::new(
                 Self::OCEAN_CACHE_ENTRIES,
@@ -7557,7 +7563,13 @@ impl EarthDataSurfaceMaterialSampler {
         if let Some(cached) =
             surface_sampler_l1_get(&SURFACE_MATERIAL_SAMPLE_L1, sampler_id, cell.key)
         {
-            return Ok(self.with_terrain_token(&cached, longitude, latitude));
+            return Ok(self.with_terrain_token_cached(
+                &cached,
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            ));
         }
         if let Some(cached) = self
             .material_cache
@@ -7569,7 +7581,13 @@ impl EarthDataSurfaceMaterialSampler {
                 cell.key,
                 cached.clone(),
             );
-            return Ok(self.with_terrain_token(&cached, longitude, latitude));
+            return Ok(self.with_terrain_token_cached(
+                &cached,
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            ));
         }
         let sampled = self.sample_land_uncached(
             cell.center_longitude,
@@ -7588,7 +7606,13 @@ impl EarthDataSurfaceMaterialSampler {
             cell.key,
             sample.clone(),
         );
-        Ok(self.with_terrain_token(&sample, longitude, latitude))
+        Ok(self.with_terrain_token_cached(
+            &sample,
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        ))
     }
 
     fn sample_photo_with_coarse_evidence(
@@ -7610,7 +7634,13 @@ impl EarthDataSurfaceMaterialSampler {
             longitude_span_degrees,
             latitude_span_degrees,
         )?;
-        Ok(self.with_terrain_token(&evidence.with_color(color), longitude, latitude))
+        Ok(self.with_terrain_token_cached(
+            &evidence.with_color(color),
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        ))
     }
 
     fn sample_photo_color(
@@ -7899,7 +7929,13 @@ impl EarthDataSurfaceMaterialSampler {
         let sampler_id = self.thread_cache_id();
         if let Some(cached) = surface_sampler_l1_get(&SURFACE_OCEAN_SAMPLE_L1, sampler_id, cell.key)
         {
-            return Ok(self.with_terrain_token(&cached, longitude, latitude));
+            return Ok(self.with_terrain_token_cached(
+                &cached,
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            ));
         }
         if let Some(cached) = self
             .ocean_cache
@@ -7911,7 +7947,13 @@ impl EarthDataSurfaceMaterialSampler {
                 cell.key,
                 cached.clone(),
             );
-            return Ok(self.with_terrain_token(&cached, longitude, latitude));
+            return Ok(self.with_terrain_token_cached(
+                &cached,
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            ));
         }
         let sampled = self.sample_ocean_uncached(
             cell.center_longitude,
@@ -7930,7 +7972,13 @@ impl EarthDataSurfaceMaterialSampler {
             cell.key,
             sample.clone(),
         );
-        Ok(self.with_terrain_token(&sample, longitude, latitude))
+        Ok(self.with_terrain_token_cached(
+            &sample,
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        ))
     }
 
     fn sample_ocean_uncached(
@@ -8041,7 +8089,51 @@ impl EarthDataSurfaceMaterialSampler {
         )
     }
 
-    fn sample_terrain_token_color(&self, longitude: f64, latitude: f64) -> RgbColor {
+    fn sample_terrain_token_color_cached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> RgbColor {
+        if self.terrain_tokens.is_none() {
+            return RgbColor::unavailable();
+        }
+        let cell_degrees = photo_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let cell = quantized_cell(longitude, latitude, cell_degrees);
+        let sampler_id = self.thread_cache_id();
+        if let Some(cached) =
+            surface_sampler_l1_get(&SURFACE_TERRAIN_TOKEN_COLOR_L1, sampler_id, cell.key)
+        {
+            return cached;
+        }
+        if let Ok(Some(cached)) = self
+            .terrain_token_cache
+            .get(cell.key, "surface terrain token cache lock poisoned")
+        {
+            surface_sampler_l1_put(
+                &SURFACE_TERRAIN_TOKEN_COLOR_L1,
+                sampler_id,
+                cell.key,
+                cached,
+            );
+            return cached;
+        }
+        let sampled =
+            self.sample_terrain_token_color_uncached(cell.center_longitude, cell.center_latitude);
+        let color = self
+            .terrain_token_cache
+            .insert_or_get(
+                cell.key,
+                sampled,
+                "surface terrain token cache lock poisoned",
+            )
+            .unwrap_or(sampled);
+        surface_sampler_l1_put(&SURFACE_TERRAIN_TOKEN_COLOR_L1, sampler_id, cell.key, color);
+        color
+    }
+
+    fn sample_terrain_token_color_uncached(&self, longitude: f64, latitude: f64) -> RgbColor {
         let Some(terrain_tokens) = self.terrain_tokens.as_ref() else {
             return RgbColor::unavailable();
         };
@@ -8050,13 +8142,23 @@ impl EarthDataSurfaceMaterialSampler {
             .unwrap_or_else(|_| RgbColor::unavailable())
     }
 
-    fn with_terrain_token(
+    fn with_terrain_token_cached(
         &self,
         sample: &SurfaceMaterialSample,
         longitude: f64,
         latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
     ) -> SurfaceMaterialSample {
-        with_surface_terrain_token(sample, self.sample_terrain_token_color(longitude, latitude))
+        with_surface_terrain_token(
+            sample,
+            self.sample_terrain_token_color_cached(
+                longitude,
+                latitude,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            ),
+        )
     }
 }
 
