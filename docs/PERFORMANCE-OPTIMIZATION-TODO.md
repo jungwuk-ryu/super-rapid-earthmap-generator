@@ -83,3 +83,58 @@
   - `regionGenerated` includes surface/chunk/NBT/write phase timings.
   - 8-region auto-tune smoke selected 4 workers over 6 workers for the tested Sahara sample set.
 - `cargo test --manifest-path rust/Cargo.toml --workspace --locked` passed.
+
+## Active Follow-Up: Crash And Sustained CPU Utilization
+
+### Scope
+
+- [x] Treat `process finished with code -1073741819` as a native crash, not an agent-initiated stop.
+- [x] Record Windows Error Reporting evidence for the crash.
+- [x] Map the crash fault offset to a function or collect a reproducible dump.
+- [ ] Determine whether the crash is in Rust code, raster/native dependency code, allocator code, or process shutdown.
+- [ ] Fix the crash if it is caused by project code or unsafe dependency usage that we can avoid.
+- [ ] Implement bounded prefetch/evidence preparation for full-region generation.
+- [ ] Honor a user-configurable memory cap for prefetch/evidence buffering.
+- [ ] Resume the full Earth 1:250 Linear generation with about a 25GB prefetch memory cap.
+- [ ] Sample CPU utilization after resume.
+- [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
+
+### Current Crash Evidence
+
+- [x] Crashed process: `D:\earthmap\super-rapid-earthmap-generator\rust\target-latest\release\earthmap-rs.exe`
+- [x] Exit code: `-1073741819` (`0xC0000005`, access violation)
+- [x] Runtime before crash: `1336.379s`
+- [x] WER event type: `APPCRASH`
+- [x] Faulting module: `earthmap-rs.exe`
+- [x] Fault offset: `0x0000000000322de3`
+- [x] Symbolized function: `earthmap_surface::sanitize_surface_column_for_production`
+- [x] WER archive: `C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_earthmap-rs.exe_e0d3b81434ca9f1ce1ea57a6e01b41381e37bcfa_5a4a99de_c63f15f4-4db7-4228-9ceb-1f9fd480a53a`
+- [x] Check whether the archive contains a usable dump or only `Report.wer`.
+- [ ] If no dump exists, enable a local dump or add targeted diagnostics before the next long run.
+- [ ] Verify whether removing or feature-gating the CLI `mimalloc` global allocator eliminates the access violation.
+
+### Prefetch/Evidence Queue Design Checklist
+
+- [ ] Identify the exact synchronous input-preparation path that leaves region workers idle.
+- [ ] Separate "evidence preparation" from "chunk/region writing" where the API allows it.
+- [ ] Add a bounded producer/consumer queue so prepared work is ready before workers need it.
+- [ ] Use one or more prefetch workers only when they improve measured throughput.
+- [ ] Keep memory bounded by the user cap and by automatic system-memory safety margins.
+- [ ] Evict evidence immediately after the owning region is generated.
+- [ ] Avoid assuming OS filesystem cache behavior in benchmarks.
+- [ ] Test land, coast, and ocean workloads separately because their evidence mix differs.
+- [ ] Preserve visual quality, bathymetry, coastline behavior, Linear/MCA compatibility, and resume semantics.
+
+### Restart Command
+
+- [ ] Stop or confirm inactive any stale `earthmap-rs.exe` process targeting the same output directory before restart.
+- [ ] Restart only after crash diagnostics and prefetch changes are verified.
+- [ ] Use command:
+
+```powershell
+earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\HQheightmap.tif D:\earthmap\1-250-earth-linear 250 -157 -74 314 148 linear 8 surface surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt verticalScale=auto linearCompression=6
+```
+
+- [ ] Set prefetch/evidence memory cap to about `25GB`.
+- [ ] Confirm resume mode uses existing `D:\earthmap\1-250-earth-linear` progress instead of starting fresh.
+- [ ] Record sustained CPU usage, read throughput, write throughput, completed regions/hour, and peak memory.
