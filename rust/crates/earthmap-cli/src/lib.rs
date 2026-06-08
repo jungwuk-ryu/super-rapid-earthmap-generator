@@ -331,8 +331,8 @@ impl SurfacePhotoWorkerTuning {
     }
 }
 
-fn surface_photo_parallel_column_sampling(_worker_count: usize, rayon_threads: usize) -> bool {
-    rayon_threads > 1
+fn surface_photo_parallel_column_sampling(worker_count: usize, rayon_threads: usize) -> bool {
+    worker_count <= 1 && rayon_threads > 1
 }
 
 fn fallback_surface_photo_worker_count(
@@ -18378,6 +18378,14 @@ mod tests {
             tuned_rayon,
             surface_photo_parallel_column_sampling(10, tuned_rayon)
         )));
+    }
+
+    #[test]
+    fn surface_photo_parallel_column_sampling_avoids_nested_parallelism() {
+        assert!(surface_photo_parallel_column_sampling(1, 2));
+        assert!(!surface_photo_parallel_column_sampling(1, 1));
+        assert!(!surface_photo_parallel_column_sampling(2, 16));
+        assert!(!surface_photo_parallel_column_sampling(8, 16));
     }
 
     #[test]
