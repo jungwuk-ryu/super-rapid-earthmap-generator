@@ -95,8 +95,9 @@
 - [x] Fix or avoid the most likely native allocator crash path by making CLI `mimalloc` opt-in.
 - [x] Implement bounded prefetch/evidence preparation for full-region generation.
 - [x] Honor a user-configurable memory cap for prefetch/evidence buffering.
-- [ ] Resume the full Earth 1:250 Linear generation with about a 25GB prefetch memory cap.
-- [ ] Sample CPU utilization after resume.
+- [x] Resume the full Earth 1:250 Linear generation with about a 25GB prefetch memory cap.
+- [x] Sample CPU utilization after resume.
+- [x] Identify and optimize the slow pure-ocean fast path that kept CPU usage low after prefetch.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
 - [x] Reduce startup worker tuning cost so long runs do not spend many minutes generating benchmark regions before the real batch.
 
@@ -122,13 +123,14 @@
 - [x] Separate "evidence preparation" from "chunk/region writing" where the API allows it.
 - [x] Add a bounded producer/consumer queue so prepared work is ready before workers need it.
 - [x] Default to one prefetch worker and keep queue depth bounded by memory and worker count.
-- [ ] Measure whether additional prefetch workers improve throughput before increasing them.
+- [x] Measure whether additional prefetch workers improve throughput before increasing them.
 - [x] Keep memory bounded by the user cap and by automatic system-memory safety margins.
 - [x] Evict evidence immediately after the owning region is generated.
 - [ ] Avoid assuming OS filesystem cache behavior in benchmarks.
 - [ ] Test land, coast, and ocean workloads separately because their evidence mix differs.
 - [ ] Preserve visual quality, bathymetry, coastline behavior, Linear/MCA compatibility, and resume semantics.
 - [x] Smoke test prefetch path on a 1-region Linear run.
+- [x] Split pure open-ocean water evidence from coastal/photo water sampling so open ocean keeps bathymetry and ocean temperature without per-cell RGB/terrain-token raster work.
 
 ### Restart Command
 
@@ -152,3 +154,5 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Release build: `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
 - [x] Prefetch smoke: 1 region, Linear, `prefetchMemoryGB=1`, `allDone=true`
 - [x] Startup tuning follow-up: reduced candidate samples to land/mixed/ocean coverage with fewer Rayon candidates.
+- [x] Resume sample with `prefetchWorkers=4`: PID 24980 averaged 3.5 CPU cores over 30s, generated no additional completed regions during the sample, and showed pure-ocean `openOceanFastPathMillis` up to 57.7s.
+- [x] Open-ocean fast-path smoke after RGB/terrain-token split: region `r.-112.27` dropped from the long-run log's `openOceanFastPathMillis=57724` to `2575`; total one-region smoke completed in 5.6s. This is smoke evidence only because OS cache can bias single-run timings.

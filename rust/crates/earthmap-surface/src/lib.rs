@@ -7298,6 +7298,21 @@ pub trait SurfaceMaterialSampler: Send + Sync {
             latitude_span_degrees,
         )
     }
+
+    fn sample_open_ocean_water(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample_water(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -7358,6 +7373,7 @@ pub struct EarthDataSurfaceMaterialSampler {
     photo_color_cache: ShardedAccessCache<RgbColor>,
     photo_evidence_cache: ShardedAccessCache<SurfaceMaterialSample>,
     ocean_cache: ShardedAccessCache<SurfaceMaterialSample>,
+    open_ocean_cache: ShardedAccessCache<SurfaceMaterialSample>,
     ecoregion_cache: ShardedAccessCache<EcoregionEvidence>,
 }
 
@@ -7373,6 +7389,7 @@ thread_local! {
     static SURFACE_PHOTO_COLOR_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<RgbColor>>> = RefCell::new(None);
     static SURFACE_PHOTO_EVIDENCE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
     static SURFACE_OCEAN_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
+    static SURFACE_OPEN_OCEAN_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
     static SURFACE_ECOREGION_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<EcoregionEvidence>>> = RefCell::new(None);
 }
 
@@ -7502,6 +7519,10 @@ impl EarthDataSurfaceMaterialSampler {
                 Self::CACHE_SHARDS,
             ),
             ocean_cache: ShardedAccessCache::new(Self::OCEAN_CACHE_ENTRIES, Self::CACHE_SHARDS),
+            open_ocean_cache: ShardedAccessCache::new(
+                Self::OCEAN_CACHE_ENTRIES,
+                Self::CACHE_SHARDS,
+            ),
             ecoregion_cache: ShardedAccessCache::new(
                 Self::ECOREGION_CACHE_ENTRIES,
                 Self::CACHE_SHARDS,
@@ -7950,6 +7971,76 @@ impl EarthDataSurfaceMaterialSampler {
         )
     }
 
+    fn sample_open_ocean_water_cached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let cell = quantized_cell(longitude, latitude, cell_degrees);
+        let sampler_id = self.thread_cache_id();
+        if let Some(cached) =
+            surface_sampler_l1_get(&SURFACE_OPEN_OCEAN_SAMPLE_L1, sampler_id, cell.key)
+        {
+            return Ok(cached);
+        }
+        if let Some(cached) = self
+            .open_ocean_cache
+            .get(cell.key, "surface open ocean cache lock poisoned")?
+        {
+            surface_sampler_l1_put(
+                &SURFACE_OPEN_OCEAN_SAMPLE_L1,
+                sampler_id,
+                cell.key,
+                cached.clone(),
+            );
+            return Ok(cached);
+        }
+        let sampled =
+            self.sample_open_ocean_water_uncached(cell.center_longitude, cell.center_latitude);
+        let sample = self.open_ocean_cache.insert_or_get(
+            cell.key,
+            sampled,
+            "surface open ocean cache lock poisoned",
+        )?;
+        surface_sampler_l1_put(
+            &SURFACE_OPEN_OCEAN_SAMPLE_L1,
+            sampler_id,
+            cell.key,
+            sample.clone(),
+        );
+        Ok(sample)
+    }
+
+    fn sample_open_ocean_water_uncached(
+        &self,
+        longitude: f64,
+        latitude: f64,
+    ) -> SurfaceMaterialSample {
+        SurfaceMaterialSample::new(
+            RgbColor::unavailable(),
+            RgbColor::unavailable(),
+            TerrainTokenSource::None,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            SurfaceMaterialSample::UNKNOWN,
+            sample_rounded(self.ocean_temperature.as_ref(), longitude, latitude),
+            sample_bathymetry_meters(self.bathymetry.as_ref(), longitude, latitude),
+            SurfaceMaterialSample::UNKNOWN,
+            "",
+            "",
+            0.0,
+        )
+    }
+
     fn sample_terrain_token_color(&self, longitude: f64, latitude: f64) -> RgbColor {
         let Some(terrain_tokens) = self.terrain_tokens.as_ref() else {
             return RgbColor::unavailable();
@@ -8012,6 +8103,21 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
         latitude_span_degrees: f64,
     ) -> Result<SurfaceMaterialSample> {
         self.sample_water_cached(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
+
+    fn sample_open_ocean_water(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample_open_ocean_water_cached(
             longitude,
             latitude,
             longitude_span_degrees,
@@ -12150,7 +12256,7 @@ fn try_sample_open_ocean_surface_region(
         )?;
         if let Some(material_sampler) = material_sampler {
             if material_sampler.samples_open_water() {
-                let material = material_sampler.sample_water(
+                let material = material_sampler.sample_open_ocean_water(
                     longitude,
                     latitude,
                     longitude_span_degrees,
@@ -23275,6 +23381,26 @@ mod tests {
         assert_eq!(sampler.raster_stats().sample_averaged_requests, 2);
 
         assert_eq!(sampler.sample_water(1.25, 0.75, 0.0, 0.0).unwrap(), water);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 2);
+
+        let open_ocean = sampler
+            .sample_open_ocean_water(1.25, 0.75, 0.0, 0.0)
+            .unwrap();
+        assert_eq!(open_ocean.color, RgbColor::unavailable());
+        assert_eq!(open_ocean.terrain_token_color, RgbColor::unavailable());
+        assert_eq!(open_ocean.terrain_token_source, TerrainTokenSource::None);
+        assert_eq!(open_ocean.climate_class, SurfaceMaterialSample::UNKNOWN);
+        assert_eq!(open_ocean.ocean_temperature, 12);
+        assert_eq!(open_ocean.bathymetry_meters, -123);
+        assert_eq!(open_ocean.slope_permille, SurfaceMaterialSample::UNKNOWN);
+        assert_eq!(sampler.raster_stats().sample_averaged_requests, 2);
+
+        assert_eq!(
+            sampler
+                .sample_open_ocean_water(1.25, 0.75, 0.0, 0.0)
+                .unwrap(),
+            open_ocean
+        );
         assert_eq!(sampler.raster_stats().sample_averaged_requests, 2);
 
         let photo = sampler.sample_photo(1.25, 0.75, 0.0, 0.0).unwrap();
