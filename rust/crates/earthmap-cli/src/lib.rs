@@ -9576,14 +9576,17 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         .map_err(|error| error.to_string())?;
     let manifest_file = write_vanilla_delegated_parallel_manifest(
         world,
+        heightmap,
         format,
         scale,
         start_region_x,
         start_region_z,
         cols,
         rows,
+        threads,
         status,
         &surface_material_path,
+        runtime_options.compression,
         vertical_scale,
         runtime_options.vertical_scale.label(),
     )
@@ -10083,13 +10086,16 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         .map_err(|error| error.to_string())?;
     let manifest_file = write_vanilla_delegated_plan_manifest(
         world,
+        heightmap,
         format,
         scale,
         plan_path,
         plan_regions.len(),
         submitted_regions,
+        threads,
         status,
         &surface_material_path,
+        runtime_options.compression,
         vertical_scale,
         runtime_options.vertical_scale.label(),
     )
@@ -17414,14 +17420,17 @@ fn write_exploration_only_manifest(
 #[allow(clippy::too_many_arguments)]
 fn write_vanilla_delegated_parallel_manifest(
     world_dir: &Path,
+    heightmap_path: &Path,
     format: OutputFormat,
     scale_denominator: i32,
     start_region_x: i32,
     start_region_z: i32,
     cols: i32,
     rows: i32,
+    requested_threads: usize,
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
+    compression_options: RegionCompressionOptions,
     vertical_scale: f64,
     vertical_scale_mode: &str,
 ) -> io::Result<std::path::PathBuf> {
@@ -17443,6 +17452,10 @@ fn write_vanilla_delegated_parallel_manifest(
         scale_denominator.to_string(),
     );
     values.insert(
+        "generation.heightmapPath".to_string(),
+        normalized_path_display(heightmap_path),
+    );
+    values.insert(
         "generation.startRegionX".to_string(),
         start_region_x.to_string(),
     );
@@ -17452,6 +17465,10 @@ fn write_vanilla_delegated_parallel_manifest(
     );
     values.insert("generation.regionCols".to_string(), cols.to_string());
     values.insert("generation.regionRows".to_string(), rows.to_string());
+    values.insert(
+        "generation.threads".to_string(),
+        requested_threads.max(1).to_string(),
+    );
     values.insert(
         "generation.chunkStatus".to_string(),
         status.id().to_string(),
@@ -17473,6 +17490,18 @@ fn write_vanilla_delegated_parallel_manifest(
         "generation.surfaceMaterialPath".to_string(),
         normalized_path_display(surface_material_path),
     );
+    if let Some(level) = compression_options.linear_compression_level {
+        values.insert(
+            "generation.linearCompressionLevel".to_string(),
+            level.to_string(),
+        );
+    }
+    if let Some(level) = compression_options.mca_compression_level {
+        values.insert(
+            "generation.mcaCompressionLevel".to_string(),
+            level.to_string(),
+        );
+    }
     values.insert(
         "generation.progressionPlacementPolicy".to_string(),
         "none".to_string(),
@@ -17516,13 +17545,16 @@ fn write_vanilla_delegated_parallel_manifest(
 #[allow(clippy::too_many_arguments)]
 fn write_vanilla_delegated_plan_manifest(
     world_dir: &Path,
+    heightmap_path: &Path,
     format: OutputFormat,
     scale_denominator: i32,
     plan_csv: &Path,
     planned_regions: usize,
     submitted_regions: usize,
+    requested_threads: usize,
     status: ChunkGenerationStatus,
     surface_material_path: &Path,
+    compression_options: RegionCompressionOptions,
     vertical_scale: f64,
     vertical_scale_mode: &str,
 ) -> io::Result<std::path::PathBuf> {
@@ -17544,6 +17576,10 @@ fn write_vanilla_delegated_plan_manifest(
         scale_denominator.to_string(),
     );
     values.insert(
+        "generation.heightmapPath".to_string(),
+        normalized_path_display(heightmap_path),
+    );
+    values.insert(
         "generation.planCsv".to_string(),
         normalized_path_display(plan_csv),
     );
@@ -17554,6 +17590,10 @@ fn write_vanilla_delegated_plan_manifest(
     values.insert(
         "generation.submittedRegions".to_string(),
         submitted_regions.to_string(),
+    );
+    values.insert(
+        "generation.threads".to_string(),
+        requested_threads.max(1).to_string(),
     );
     values.insert(
         "generation.chunkStatus".to_string(),
@@ -17576,6 +17616,18 @@ fn write_vanilla_delegated_plan_manifest(
         "generation.surfaceMaterialPath".to_string(),
         normalized_path_display(surface_material_path),
     );
+    if let Some(level) = compression_options.linear_compression_level {
+        values.insert(
+            "generation.linearCompressionLevel".to_string(),
+            level.to_string(),
+        );
+    }
+    if let Some(level) = compression_options.mca_compression_level {
+        values.insert(
+            "generation.mcaCompressionLevel".to_string(),
+            level.to_string(),
+        );
+    }
     values.insert(
         "generation.progressionPlacementPolicy".to_string(),
         "none".to_string(),
@@ -18219,31 +18271,45 @@ mod tests {
     fn vanilla_delegated_manifests_record_surface_sampling_profile() {
         let temp = tempdir().unwrap();
         let material = temp.path().join("TrueMarble.vrt");
+        let heightmap = temp.path().join("heightmap.tif");
         fs::write(&material, b"vrt").unwrap();
+        fs::write(&heightmap, b"heightmap").unwrap();
 
         let parallel_manifest = write_vanilla_delegated_parallel_manifest(
             &temp.path().join("parallel"),
+            &heightmap,
             OutputFormat::LinearV2,
             200,
             1,
             2,
             3,
             4,
+            10,
             ChunkGenerationStatus::Surface,
             &material,
+            RegionCompressionOptions {
+                linear_compression_level: Some(6),
+                ..RegionCompressionOptions::default()
+            },
             4.0,
             "auto",
         )
         .unwrap();
         let plan_manifest = write_vanilla_delegated_plan_manifest(
             &temp.path().join("plan"),
+            &heightmap,
             OutputFormat::LinearV2,
             200,
             &temp.path().join("plan.csv"),
             12,
             10,
+            10,
             ChunkGenerationStatus::Surface,
             &material,
+            RegionCompressionOptions {
+                linear_compression_level: Some(6),
+                ..RegionCompressionOptions::default()
+            },
             4.0,
             "auto",
         )
@@ -18254,6 +18320,9 @@ mod tests {
             assert!(text.contains(&format!(
                 "generation.surfaceSamplingProfile={SURFACE_SAMPLING_PROFILE_VERSION}\n"
             )));
+            assert!(text.contains("generation.heightmapPath="));
+            assert!(text.contains("generation.threads=10\n"));
+            assert!(text.contains("generation.linearCompressionLevel=6\n"));
         }
     }
 

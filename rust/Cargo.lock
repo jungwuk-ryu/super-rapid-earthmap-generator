@@ -895,6 +895,7 @@ dependencies = [
  "png 0.17.16",
  "rfd",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

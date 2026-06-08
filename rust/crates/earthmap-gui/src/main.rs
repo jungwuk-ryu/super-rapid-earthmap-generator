@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -23,6 +23,8 @@ const TIF_ROOT_ENV: &str = "EARTHMAP_TIF_ROOT";
 const SURFACE_RASTER_ENV: &str = "EARTHMAP_SURFACE_RASTER";
 const OUTPUT_ROOT_ENV: &str = "EARTHMAP_OUTPUT_ROOT";
 const DEFAULT_WORLD_DIR_NAME: &str = "earthmap-gui-world";
+const SURVIVAL_MANIFEST_FILE_NAME: &str = "earthmap-survival.properties";
+const VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME: &str = "earthmap-vanilla-delegated-resume.ndjson";
 const DEFAULT_CACHE_ROWS: &str = "auto";
 const DEFAULT_SURFACE_TILE_CACHE_ENTRIES: &str = "auto";
 const DEFAULT_VERTICAL_SCALE: &str = "auto";
@@ -549,6 +551,390 @@ fn path_status(label: &str, path: &str, file: bool) -> String {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ExistingProjectSettingsPatch {
+    heightmap_path: Option<String>,
+    tif_root: Option<String>,
+    true_marble_path: Option<String>,
+    scale: Option<i32>,
+    grid: Option<RegionGrid>,
+    format: Option<OutputFormatChoice>,
+    linear_compression_level: Option<i32>,
+    mca_compression_level: Option<u32>,
+    threads: Option<usize>,
+    status: Option<ChunkStatusChoice>,
+    vertical_scale: Option<String>,
+    loaded_manifest: bool,
+    loaded_resume_fingerprint: bool,
+    unsupported_plan: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ExistingProjectSettingsReport {
+    loaded_manifest: bool,
+    loaded_resume_fingerprint: bool,
+    grid: RegionGrid,
+}
+
+fn apply_existing_project_settings(
+    options: &mut GenerationOptions,
+    world_dir: &Path,
+) -> Result<Option<ExistingProjectSettingsReport>, String> {
+    let Some(patch) = load_existing_project_settings_patch(world_dir)? else {
+        return Ok(None);
+    };
+    if patch.unsupported_plan && patch.grid.is_none() {
+        return Err("plan-based project metadata was found, but the GUI can resume region-grid projects only".to_string());
+    }
+    let Some(grid) = patch.grid else {
+        return Err("project metadata does not include a resumable region grid".to_string());
+    };
+
+    options.world_dir = world_dir.display().to_string();
+    if let Some(value) = patch.heightmap_path {
+        options.heightmap_path = value;
+    }
+    if let Some(value) = patch.true_marble_path {
+        options.true_marble_path = value;
+    }
+    if let Some(value) = patch.tif_root {
+        options.tif_root = value;
+    } else if let Some(value) = infer_tif_root_from_surface_raster(&options.true_marble_path) {
+        options.tif_root = value;
+    }
+    if let Some(value) = patch.scale {
+        options.scale = value.max(1);
+    }
+    options.extent_mode = ExtentMode::RegionGrid;
+    options.start_region_x = grid.start_region_x;
+    options.start_region_z = grid.start_region_z;
+    options.cols = grid.cols.max(1);
+    options.rows = grid.rows.max(1);
+    if let Some(value) = patch.format {
+        options.format = value;
+    }
+    if let Some(value) = patch.linear_compression_level {
+        options.linear_compression_level = value.clamp(1, 22);
+    }
+    if let Some(value) = patch.mca_compression_level {
+        options.mca_compression_level = value.min(9);
+    }
+    if let Some(value) = patch.threads {
+        options.threads = value.max(1);
+    }
+    if let Some(value) = patch.status {
+        options.status = value;
+    }
+    if let Some(value) = patch.vertical_scale {
+        options.vertical_scale = value;
+    }
+
+    Ok(Some(ExistingProjectSettingsReport {
+        loaded_manifest: patch.loaded_manifest,
+        loaded_resume_fingerprint: patch.loaded_resume_fingerprint,
+        grid,
+    }))
+}
+
+fn load_existing_project_settings_patch(
+    world_dir: &Path,
+) -> Result<Option<ExistingProjectSettingsPatch>, String> {
+    let manifest_patch = load_manifest_project_settings(world_dir)?;
+    let resume_patch = load_resume_fingerprint_project_settings(world_dir)?;
+    if manifest_patch.is_none() && resume_patch.is_none() {
+        return Ok(None);
+    }
+    let mut merged = manifest_patch.unwrap_or_default();
+    if let Some(resume_patch) = resume_patch {
+        merged.merge_prefer_new(resume_patch);
+    }
+    Ok(Some(merged))
+}
+
+impl ExistingProjectSettingsPatch {
+    fn merge_prefer_new(&mut self, other: Self) {
+        self.heightmap_path = other.heightmap_path.or(self.heightmap_path.take());
+        self.tif_root = other.tif_root.or(self.tif_root.take());
+        self.true_marble_path = other.true_marble_path.or(self.true_marble_path.take());
+        self.scale = other.scale.or(self.scale);
+        self.grid = other.grid.or(self.grid);
+        self.format = other.format.or(self.format);
+        self.linear_compression_level = other
+            .linear_compression_level
+            .or(self.linear_compression_level);
+        self.mca_compression_level = other.mca_compression_level.or(self.mca_compression_level);
+        self.threads = other.threads.or(self.threads);
+        self.status = other.status.or(self.status);
+        self.vertical_scale = other.vertical_scale.or(self.vertical_scale.take());
+        self.loaded_manifest |= other.loaded_manifest;
+        self.loaded_resume_fingerprint |= other.loaded_resume_fingerprint;
+        self.unsupported_plan |= other.unsupported_plan;
+    }
+}
+
+fn load_manifest_project_settings(
+    world_dir: &Path,
+) -> Result<Option<ExistingProjectSettingsPatch>, String> {
+    let manifest_path = world_dir.join(SURVIVAL_MANIFEST_FILE_NAME);
+    if !manifest_path.is_file() {
+        return Ok(None);
+    }
+    let values = read_manifest_properties(&manifest_path)?;
+    let mut patch = ExistingProjectSettingsPatch {
+        loaded_manifest: true,
+        ..ExistingProjectSettingsPatch::default()
+    };
+    patch.heightmap_path = manifest_string(&values, "generation.heightmapPath");
+    patch.true_marble_path = manifest_string(&values, "generation.surfaceMaterialPath");
+    patch.tif_root = patch
+        .true_marble_path
+        .as_deref()
+        .and_then(infer_tif_root_from_surface_raster);
+    patch.scale = manifest_i32(&values, "generation.scaleDenominator");
+    patch.format = manifest_string(&values, "generation.format")
+        .as_deref()
+        .and_then(parse_output_format_choice);
+    patch.threads = manifest_usize(&values, "generation.threads");
+    patch.status = manifest_string(&values, "generation.chunkStatus")
+        .as_deref()
+        .and_then(parse_chunk_status_choice);
+    patch.vertical_scale = manifest_vertical_scale(
+        values
+            .get("generation.verticalScaleMode")
+            .map(String::as_str),
+        values.get("generation.verticalScale").map(String::as_str),
+    );
+    patch.linear_compression_level = manifest_i32(&values, "generation.linearCompressionLevel")
+        .or_else(|| manifest_i32(&values, "generation.linearCompression"));
+    patch.mca_compression_level = manifest_u32(&values, "generation.mcaCompressionLevel")
+        .or_else(|| manifest_u32(&values, "generation.mcaCompression"));
+    patch.grid = match (
+        manifest_i32(&values, "generation.startRegionX"),
+        manifest_i32(&values, "generation.startRegionZ"),
+        manifest_i32(&values, "generation.regionCols"),
+        manifest_i32(&values, "generation.regionRows"),
+    ) {
+        (Some(start_region_x), Some(start_region_z), Some(cols), Some(rows)) => Some(RegionGrid {
+            start_region_x,
+            start_region_z,
+            cols: cols.max(1),
+            rows: rows.max(1),
+        }),
+        _ => None,
+    };
+    patch.unsupported_plan = values.contains_key("generation.planCsv") && patch.grid.is_none();
+    Ok(Some(patch))
+}
+
+fn load_resume_fingerprint_project_settings(
+    world_dir: &Path,
+) -> Result<Option<ExistingProjectSettingsPatch>, String> {
+    let journal_path = world_dir.join(VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME);
+    if !journal_path.is_file() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(&journal_path)
+        .map_err(|error| format!("failed to open resume journal: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|error| format!("failed to read resume journal: {error}"))?;
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(line.trim())
+        .map_err(|error| format!("failed to parse resume journal fingerprint: {error}"))?;
+    let fingerprint = value.get("fingerprint").unwrap_or(&value);
+    let mut patch = ExistingProjectSettingsPatch {
+        loaded_resume_fingerprint: true,
+        ..ExistingProjectSettingsPatch::default()
+    };
+    let command = fingerprint
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    patch.unsupported_plan = command.contains("plan-parallel");
+    patch.heightmap_path = json_path_string(fingerprint, "heightmap");
+    patch.true_marble_path = json_path_string(fingerprint, "surfaceMaterial");
+    patch.tif_root = patch
+        .true_marble_path
+        .as_deref()
+        .and_then(infer_tif_root_from_surface_raster);
+    patch.scale = json_i32(fingerprint, "scale");
+    patch.format = fingerprint
+        .get("format")
+        .and_then(Value::as_str)
+        .and_then(parse_output_format_choice);
+    patch.status = fingerprint
+        .get("chunkStatus")
+        .and_then(Value::as_str)
+        .and_then(parse_chunk_status_choice);
+    patch.vertical_scale = manifest_vertical_scale(
+        fingerprint.get("verticalScaleMode").and_then(Value::as_str),
+        fingerprint
+            .get("verticalScale")
+            .map(json_number_or_string_text)
+            .as_deref(),
+    );
+    if let Some(compression) = fingerprint.get("compression") {
+        patch.linear_compression_level = json_i32(compression, "linear");
+        patch.mca_compression_level =
+            json_u64(compression, "mca").and_then(|value| u32::try_from(value).ok());
+    }
+    patch.grid = match (
+        json_i32(fingerprint, "startRegionX"),
+        json_i32(fingerprint, "startRegionZ"),
+        json_i32(fingerprint, "regionCols"),
+        json_i32(fingerprint, "regionRows"),
+    ) {
+        (Some(start_region_x), Some(start_region_z), Some(cols), Some(rows)) => Some(RegionGrid {
+            start_region_x,
+            start_region_z,
+            cols: cols.max(1),
+            rows: rows.max(1),
+        }),
+        _ => None,
+    };
+    Ok(Some(patch))
+}
+
+fn read_manifest_properties(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let mut values = BTreeMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        values.insert(
+            key.trim().to_string(),
+            unescape_manifest_value(value.trim()),
+        );
+    }
+    Ok(values)
+}
+
+fn unescape_manifest_value(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => output.push('\\'),
+            Some('r') => output.push('\r'),
+            Some('n') => output.push('\n'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
+}
+
+fn manifest_string(values: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    values
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+        .map(ToOwned::to_owned)
+}
+
+fn manifest_i32(values: &BTreeMap<String, String>, key: &str) -> Option<i32> {
+    manifest_string(values, key)?.parse().ok()
+}
+
+fn manifest_u32(values: &BTreeMap<String, String>, key: &str) -> Option<u32> {
+    manifest_string(values, key)?.parse().ok()
+}
+
+fn manifest_usize(values: &BTreeMap<String, String>, key: &str) -> Option<usize> {
+    manifest_string(values, key)?.parse().ok()
+}
+
+fn manifest_vertical_scale(mode: Option<&str>, value: Option<&str>) -> Option<String> {
+    let mode = mode.map(str::trim).filter(|mode| !mode.is_empty());
+    match mode {
+        Some(mode) if mode.eq_ignore_ascii_case("auto") => Some("auto".to_string()),
+        Some(mode) if mode.eq_ignore_ascii_case("legacy") => Some("legacy".to_string()),
+        Some(mode) if mode.eq_ignore_ascii_case("explicit") => value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+        Some(mode) => Some(mode.to_string()),
+        None => value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
+    }
+}
+
+fn parse_output_format_choice(value: &str) -> Option<OutputFormatChoice> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "linear" | "linear_v2" | "linearv2") {
+        Some(OutputFormatChoice::Linear)
+    } else if matches!(normalized.as_str(), "mca" | "anvil") {
+        Some(OutputFormatChoice::Mca)
+    } else {
+        None
+    }
+}
+
+fn parse_chunk_status_choice(value: &str) -> Option<ChunkStatusChoice> {
+    let normalized = value
+        .trim()
+        .strip_prefix("minecraft:")
+        .unwrap_or_else(|| value.trim())
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "surface" => Some(ChunkStatusChoice::Surface),
+        "carvers" => Some(ChunkStatusChoice::Carvers),
+        _ => None,
+    }
+}
+
+fn infer_tif_root_from_surface_raster(path: &str) -> Option<String> {
+    let path = Path::new(path.trim());
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name.eq_ignore_ascii_case("TrueMarble.vrt") {
+        return None;
+    }
+    let terrain_dir = path.parent()?;
+    if terrain_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("terrain"))
+    {
+        terrain_dir.parent().map(|root| root.display().to_string())
+    } else {
+        None
+    }
+}
+
+fn json_path_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)?
+        .get("path")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn json_number_or_string_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
 fn scan_existing_region_files(
     world_dir: &Path,
     extension: &str,
@@ -959,6 +1345,8 @@ struct EarthMapGuiApp {
     map_overlay: MapOverlayState,
     run: Option<GenerationRun>,
     log_lines: Vec<String>,
+    loaded_project_world_dir: String,
+    project_settings_status: Option<String>,
 }
 
 impl Default for EarthMapGuiApp {
@@ -969,15 +1357,72 @@ impl Default for EarthMapGuiApp {
             map_overlay: MapOverlayState::default(),
             run: None,
             log_lines: Vec::new(),
+            loaded_project_world_dir: String::new(),
+            project_settings_status: None,
         }
     }
 }
 
 impl EarthMapGuiApp {
+    fn apply_existing_project_settings_for_world_dir(&mut self) {
+        if self.run.is_some() {
+            return;
+        }
+        let world_dir_text = self.options.world_dir.trim().to_string();
+        if world_dir_text.is_empty() || self.loaded_project_world_dir == world_dir_text {
+            return;
+        }
+        let world_dir = PathBuf::from(&world_dir_text);
+        match apply_existing_project_settings(&mut self.options, &world_dir) {
+            Ok(Some(report)) => {
+                self.loaded_project_world_dir = self.options.world_dir.trim().to_string();
+                let existing_regions = self.reload_existing_region_progress();
+                let source = match (report.loaded_manifest, report.loaded_resume_fingerprint) {
+                    (true, true) => "manifest and resume journal",
+                    (true, false) => "manifest",
+                    (false, true) => "resume journal",
+                    (false, false) => "project metadata",
+                };
+                let total_regions = (report.grid.cols.max(1) as usize)
+                    .saturating_mul(report.grid.rows.max(1) as usize);
+                let message = format!(
+                    "Loaded project settings from {source}; {existing_regions}/{total_regions} existing regions detected."
+                );
+                self.project_settings_status = Some(message.clone());
+                self.push_log_line(message);
+            }
+            Ok(None) => {
+                self.loaded_project_world_dir.clear();
+                self.project_settings_status = None;
+            }
+            Err(error) => {
+                self.loaded_project_world_dir = world_dir_text;
+                self.project_settings_status = Some(format!("Project settings: {error}"));
+            }
+        }
+    }
+
+    fn reload_existing_region_progress(&mut self) -> usize {
+        let grid = self.options.resolved_region_grid();
+        let total_regions = (grid.cols.max(1) as usize).saturating_mul(grid.rows.max(1) as usize);
+        self.progress = ProgressState::default();
+        self.progress.reset_from_batch(grid, total_regions);
+        let existing_regions = scan_existing_region_files(
+            Path::new(self.options.world_dir.trim()),
+            self.options.format.region_extension(),
+            grid,
+        );
+        let existing_region_count = existing_regions.len();
+        self.progress.mark_existing_regions(existing_regions);
+        self.map_overlay.status_dirty = true;
+        existing_region_count
+    }
+
     fn start_generation(&mut self) {
         if self.run.is_some() {
             return;
         }
+        self.apply_existing_project_settings_for_world_dir();
         if let Some(error) = self.options.validation_error() {
             self.log_lines.push(format!("Configuration error: {error}"));
             return;
@@ -1362,14 +1807,24 @@ impl eframe::App for EarthMapGuiApp {
                 ui.separator();
                 ui.heading("World");
                 ui.label("World directory");
+                let mut world_dir_changed = false;
                 ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.options.world_dir);
+                    let response = ui.text_edit_singleline(&mut self.options.world_dir);
+                    world_dir_changed |= response.changed();
                     if ui.button("Browse").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.options.world_dir = path.display().to_string();
+                            world_dir_changed = true;
                         }
                     }
                 });
+                if world_dir_changed {
+                    self.loaded_project_world_dir.clear();
+                    self.apply_existing_project_settings_for_world_dir();
+                }
+                if let Some(status) = &self.project_settings_status {
+                    ui.small(status);
+                }
                 ui.horizontal(|ui| {
                     ui.label("Scale denominator");
                     ui.add(egui::DragValue::new(&mut self.options.scale).range(1..=100_000));
@@ -1966,6 +2421,139 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[12], "verticalScale=legacy");
+    }
+
+    fn write_existing_parallel_project_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let world = root.join("world");
+        let heightmap = root.join("heightmap.tif");
+        let true_marble = root.join("TifFiles").join("terrain").join("TrueMarble.vrt");
+        std::fs::create_dir_all(true_marble.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(world.join("region")).unwrap();
+        std::fs::write(&heightmap, b"heightmap").unwrap();
+        std::fs::write(&true_marble, b"vrt").unwrap();
+        std::fs::write(world.join("region").join("r.-157.-74.linear"), b"region").unwrap();
+        std::fs::write(
+            world.join(SURVIVAL_MANIFEST_FILE_NAME),
+            format!(
+                "# SR EarthMap survival manifest\n\
+generator.name=vanilla-delegated-regions-parallel\n\
+generation.format=LINEAR_V2\n\
+generation.scaleDenominator=250\n\
+generation.startRegionX=-157\n\
+generation.startRegionZ=-74\n\
+generation.regionCols=314\n\
+generation.regionRows=148\n\
+generation.chunkStatus=minecraft:surface\n\
+generation.surfaceMaterialPath={}\n\
+generation.verticalScale=4\n\
+generation.verticalScaleMode=auto\n",
+                true_marble.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let fingerprint = serde_json::json!({
+            "schemaVersion": 2,
+            "type": "fingerprint",
+            "fingerprint": {
+                "command": "generate-vanilla-delegated-regions-parallel",
+                "format": "LINEAR_V2",
+                "scale": 250,
+                "startRegionX": -157,
+                "startRegionZ": -74,
+                "regionCols": 314,
+                "regionRows": 148,
+                "chunkStatus": "minecraft:surface",
+                "verticalScale": 4.0,
+                "verticalScaleMode": "auto",
+                "heightmap": {
+                    "path": heightmap.display().to_string()
+                },
+                "surfaceMaterial": {
+                    "path": true_marble.display().to_string()
+                },
+                "compression": {
+                    "linear": 6,
+                    "mca": null
+                }
+            }
+        });
+        std::fs::write(
+            world.join(VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME),
+            format!("{fingerprint}\n"),
+        )
+        .unwrap();
+        (world, heightmap)
+    }
+
+    #[test]
+    fn existing_project_settings_restore_resume_ready_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let (world, heightmap) = write_existing_parallel_project_fixture(temp.path());
+        let mut options = GenerationOptions {
+            world_dir: world.display().to_string(),
+            heightmap_path: "wrong-heightmap.tif".to_string(),
+            scale: 1000,
+            start_region_x: 0,
+            start_region_z: 0,
+            cols: 1,
+            rows: 1,
+            linear_compression_level: 4,
+            ..GenerationOptions::default()
+        };
+
+        let report = apply_existing_project_settings(&mut options, &world)
+            .unwrap()
+            .unwrap();
+
+        assert!(report.loaded_manifest);
+        assert!(report.loaded_resume_fingerprint);
+        assert_eq!(options.heightmap_path, heightmap.display().to_string());
+        assert_eq!(
+            options.tif_root,
+            temp.path().join("TifFiles").display().to_string()
+        );
+        assert_eq!(options.scale, 250);
+        assert_eq!(options.extent_mode, ExtentMode::RegionGrid);
+        assert_eq!(options.start_region_x, -157);
+        assert_eq!(options.start_region_z, -74);
+        assert_eq!(options.cols, 314);
+        assert_eq!(options.rows, 148);
+        assert_eq!(options.format, OutputFormatChoice::Linear);
+        assert_eq!(options.linear_compression_level, 6);
+        assert_eq!(options.status, ChunkStatusChoice::Surface);
+        assert_eq!(options.vertical_scale, "auto");
+
+        let args = build_generation_args(&options);
+        assert_eq!(args[1], heightmap.display().to_string());
+        assert_eq!(args[2], world.display().to_string());
+        assert_eq!(args[3], "250");
+        assert_eq!(args[4], "-157");
+        assert_eq!(args[5], "-74");
+        assert_eq!(args[6], "314");
+        assert_eq!(args[7], "148");
+        assert_eq!(args[13], "linearCompression=6");
+    }
+
+    #[test]
+    fn gui_world_dir_project_load_marks_existing_regions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (world, _) = write_existing_parallel_project_fixture(temp.path());
+        let mut app = EarthMapGuiApp {
+            options: GenerationOptions {
+                world_dir: world.display().to_string(),
+                ..GenerationOptions::default()
+            },
+            ..EarthMapGuiApp::default()
+        };
+
+        app.apply_existing_project_settings_for_world_dir();
+
+        assert_eq!(app.progress.total_regions, 314 * 148);
+        assert_eq!(app.progress.completed_regions, 1);
+        assert!(app
+            .project_settings_status
+            .as_deref()
+            .is_some_and(|status| status.contains("1/46472 existing regions")));
     }
 
     #[test]
