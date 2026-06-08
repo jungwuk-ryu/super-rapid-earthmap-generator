@@ -92,9 +92,9 @@
 - [x] Record Windows Error Reporting evidence for the crash.
 - [x] Map the crash fault offset to a function or collect a reproducible dump.
 - [ ] Determine whether the crash is in Rust code, raster/native dependency code, allocator code, or process shutdown.
-- [ ] Fix the crash if it is caused by project code or unsafe dependency usage that we can avoid.
-- [ ] Implement bounded prefetch/evidence preparation for full-region generation.
-- [ ] Honor a user-configurable memory cap for prefetch/evidence buffering.
+- [x] Fix or avoid the most likely native allocator crash path by making CLI `mimalloc` opt-in.
+- [x] Implement bounded prefetch/evidence preparation for full-region generation.
+- [x] Honor a user-configurable memory cap for prefetch/evidence buffering.
 - [ ] Resume the full Earth 1:250 Linear generation with about a 25GB prefetch memory cap.
 - [ ] Sample CPU utilization after resume.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
@@ -110,20 +110,24 @@
 - [x] Symbolized function: `earthmap_surface::sanitize_surface_column_for_production`
 - [x] WER archive: `C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_earthmap-rs.exe_e0d3b81434ca9f1ce1ea57a6e01b41381e37bcfa_5a4a99de_c63f15f4-4db7-4228-9ceb-1f9fd480a53a`
 - [x] Check whether the archive contains a usable dump or only `Report.wer`.
-- [ ] If no dump exists, enable a local dump or add targeted diagnostics before the next long run.
-- [ ] Verify whether removing or feature-gating the CLI `mimalloc` global allocator eliminates the access violation.
+- [x] If no dump exists, enable a local dump or add targeted diagnostics before the next long run.
+- [x] Feature-gate the CLI `mimalloc` global allocator so the default binary avoids that native crash candidate.
+- [ ] Confirm the resumed long run no longer hits `0xC0000005`.
+- [x] Local dump target: `D:\earthmap\super-rapid-earthmap-generator\agent-runs\crash-dumps`
 
 ### Prefetch/Evidence Queue Design Checklist
 
-- [ ] Identify the exact synchronous input-preparation path that leaves region workers idle.
-- [ ] Separate "evidence preparation" from "chunk/region writing" where the API allows it.
-- [ ] Add a bounded producer/consumer queue so prepared work is ready before workers need it.
-- [ ] Use one or more prefetch workers only when they improve measured throughput.
-- [ ] Keep memory bounded by the user cap and by automatic system-memory safety margins.
-- [ ] Evict evidence immediately after the owning region is generated.
+- [x] Identify the exact synchronous input-preparation path that leaves region workers idle.
+- [x] Separate "evidence preparation" from "chunk/region writing" where the API allows it.
+- [x] Add a bounded producer/consumer queue so prepared work is ready before workers need it.
+- [x] Default to one prefetch worker and keep queue depth bounded by memory and worker count.
+- [ ] Measure whether additional prefetch workers improve throughput before increasing them.
+- [x] Keep memory bounded by the user cap and by automatic system-memory safety margins.
+- [x] Evict evidence immediately after the owning region is generated.
 - [ ] Avoid assuming OS filesystem cache behavior in benchmarks.
 - [ ] Test land, coast, and ocean workloads separately because their evidence mix differs.
 - [ ] Preserve visual quality, bathymetry, coastline behavior, Linear/MCA compatibility, and resume semantics.
+- [x] Smoke test prefetch path on a 1-region Linear run.
 
 ### Restart Command
 
@@ -138,3 +142,11 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [ ] Set prefetch/evidence memory cap to about `25GB`.
 - [ ] Confirm resume mode uses existing `D:\earthmap\1-250-earth-linear` progress instead of starting fresh.
 - [ ] Record sustained CPU usage, read throughput, write throughput, completed regions/hour, and peak memory.
+
+### Verification Notes
+
+- [x] `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli prefetch --locked`
+- [x] `cargo test --manifest-path rust\Cargo.toml -p earthmap-surface --lib --locked`
+- [x] `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli --lib --locked`
+- [x] Release build: `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
+- [x] Prefetch smoke: 1 region, Linear, `prefetchMemoryGB=1`, `allDone=true`
