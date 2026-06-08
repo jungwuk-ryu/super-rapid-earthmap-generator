@@ -15,10 +15,14 @@ earthmap-quality = { path = "../earthmap-quality" }
 earthmap-region = { path = "../earthmap-region" }
 earthmap-surface = { path = "../earthmap-surface" }
 image.workspace = true
-mimalloc.workspace = true
+mimalloc = { workspace = true, optional = true }
 png.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
+
+[features]
+default = []
+fast-allocator = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile.workspace = true
