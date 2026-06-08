@@ -1,6 +1,7 @@
 build/
 .idea/
 rust/target/
+rust/target-latest/
 vendor/minecraft/*/server.jar
 *.iml
 *.log
