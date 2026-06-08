@@ -110,6 +110,7 @@
 - [x] Expand the photo CIEDE calculation cache from 16,384 entries to 262,144 entries after the faster material path exposed `surfacePhase.photoApplyMillis` as the next hot phase.
 - [x] Add per-region surface material raster stats to `regionGenerated` telemetry so future samples can separate raster tile misses from material/photo cache CPU work.
 - [x] Add thread-local RGB tile and VRT source-reader caches to reduce repeated mutex traffic inside TrueMarble averaged sampling.
+- [x] Add an open-ocean direct classifier for columns that do not need companion material, bypassing the generic classify/cleanup/sanitize chain while preserving the same final column.
 - [x] Test and reject widening the prefetch consumer/output Rayon pool: it helped small ocean smoke but badly hurt land/photo regions.
 - [x] Re-test `prefetchWorkers=2` after the larger material caches; reject it again for the current land row because it increased land region times and reduced average CPU versus `prefetchWorkers=1`.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
@@ -182,6 +183,7 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Full resume with `prefetchWorkers=1`, 25GB cap, larger material caches: `resumeFingerprintMatched=true`, `r.122.28` generated in `9164ms` with `columnBuildMillis=5343`, while a 60s sample averaged `4.38` CPU cores; this is improved throughput but not the requested all-core utilization.
 - [x] Full resume with `prefetchWorkers=2`, 25GB cap, larger material caches: `resumeFingerprintMatched=true`, but land regions `r.129.28` and `r.130.28` took about `29s` each, mixed regions `r.131.28` and `r.132.28` took `37-38s`, and the 60s sample averaged only `3.3` CPU cores, so `prefetchWorkers=2` remains rejected for land-heavy rows.
 - [x] Full resume with thread-local RGB tile/VRT reader cache and `prefetchWorkers=1`: `resumeFingerprintMatched=true`; the sampled row was open ocean, averaging `2.83` CPU cores with regions around `3.5-3.7s`, so the next bottleneck is open-ocean/NBT throughput or workload-adaptive scheduling rather than TrueMarble material sampling.
+- [x] Open-ocean direct classifier smoke for `r.150.28`: output SHA-256 matched the existing generated region (`332D696C845D202AF98C1B47C69F7382E0E2B7F8B136DFCEB0784EACDB4A267C`), `openOceanFastPathMillis` dropped to `949`, `surfaceSampleMillis=2016`, and `elapsedMillis=3201`.
 - [x] Startup tuning follow-up: reduced candidate samples to land/mixed/ocean coverage with fewer Rayon candidates.
 - [x] Resume sample with `prefetchWorkers=4`: PID 24980 averaged 3.5 CPU cores over 30s, generated no additional completed regions during the sample, and showed pure-ocean `openOceanFastPathMillis` up to 57.7s.
 - [x] Open-ocean fast-path smoke after RGB/terrain-token split: region `r.-112.27` dropped from the long-run log's `openOceanFastPathMillis=57724` to `2575`; total one-region smoke completed in 5.6s. This is smoke evidence only because OS cache can bias single-run timings.

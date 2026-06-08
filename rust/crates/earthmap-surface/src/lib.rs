@@ -12425,18 +12425,22 @@ fn try_sample_open_ocean_surface_region(
         let longitude = longitudes[local_x];
         let latitude = latitudes[local_z];
         let smoothed_elevation = smoothed_center_elevations[column_index];
-        let mut column = classify_shaped_surface_scaled(
-            smoothed_elevation,
-            longitude,
-            latitude,
-            true,
-            0.0,
-            vertical_scale,
-        )?;
-        if let Some(material_sampler) = material_sampler {
-            if material_sampler.samples_open_water()
-                && should_sample_open_ocean_companion_material(smoothed_elevation)
-            {
+        let needs_companion_material = material_sampler
+            .map(|sampler| {
+                sampler.samples_open_water()
+                    && should_sample_open_ocean_companion_material(smoothed_elevation)
+            })
+            .unwrap_or(false);
+        let column = if needs_companion_material {
+            let mut column = classify_shaped_surface_scaled(
+                smoothed_elevation,
+                longitude,
+                latitude,
+                true,
+                0.0,
+                vertical_scale,
+            )?;
+            if let Some(material_sampler) = material_sampler {
                 let material = material_sampler.sample_open_ocean_water(
                     longitude,
                     latitude,
@@ -12454,9 +12458,17 @@ fn try_sample_open_ocean_surface_region(
                     vertical_scale,
                 )?;
             }
-        }
+            clean_coastal_surface_column(&column, 0.0)
+        } else {
+            classify_open_ocean_surface_scaled(
+                smoothed_elevation,
+                longitude,
+                latitude,
+                vertical_scale,
+            )?
+        };
         Ok(OpenOceanColumnBuild {
-            column: clean_coastal_surface_column(&column, 0.0),
+            column,
         })
     };
 
@@ -12528,6 +12540,40 @@ fn try_sample_uniform_deep_open_ocean_surface_region(
         0.0,
     );
     SurfaceRegionSample::new(vec![column; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH]).map(Some)
+}
+
+fn classify_open_ocean_surface_scaled(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    vertical_scale: f64,
+) -> Result<EarthSurfaceColumn> {
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let ground_y =
+        shaped_ground_surface_y(elevation_meters, longitude, latitude, true, 0.0, vertical_scale);
+    let biome = water_biome_id(latitude, ground_y);
+    let depth = 1.max(SEA_LEVEL_Y - ground_y);
+    let top = if depth <= 6 {
+        block_state_ids::CLAY
+    } else if depth <= 18 {
+        block_state_ids::GRAVEL
+    } else {
+        block_state_ids::STONE
+    };
+    let decision_source = if top == block_state_ids::GRAVEL {
+        "height-rule"
+    } else {
+        "height-rule+natural-surface"
+    };
+    Ok(EarthSurfaceColumn::new(
+        true,
+        ground_y,
+        SEA_LEVEL_Y,
+        top,
+        top,
+        biome,
+        decision_source,
+    ))
 }
 
 fn should_sample_open_ocean_companion_material(smoothed_elevation_meters: f64) -> bool {
@@ -14121,29 +14167,7 @@ pub fn biome_id(
 ) -> String {
     let abs_lat = latitude.abs();
     if water {
-        if abs_lat >= 70.0 {
-            return "minecraft:frozen_ocean".to_string();
-        }
-        let depth = 1.max(SEA_LEVEL_Y - surface_y);
-        if depth >= 28 {
-            if abs_lat <= 34.0 {
-                return "minecraft:deep_lukewarm_ocean".to_string();
-            }
-            if abs_lat >= 56.0 {
-                return "minecraft:deep_cold_ocean".to_string();
-            }
-            return "minecraft:deep_ocean".to_string();
-        }
-        if abs_lat <= 23.5 {
-            return "minecraft:warm_ocean".to_string();
-        }
-        if abs_lat <= 38.0 {
-            return "minecraft:lukewarm_ocean".to_string();
-        }
-        if abs_lat >= 55.0 {
-            return "minecraft:cold_ocean".to_string();
-        }
-        return "minecraft:ocean".to_string();
+        return water_biome_id(latitude, surface_y).to_string();
     }
     if is_beach_band(coast_factor, surface_y, longitude, latitude) {
         return "minecraft:beach".to_string();
@@ -14164,6 +14188,33 @@ pub fn biome_id(
         return "minecraft:savanna".to_string();
     }
     "minecraft:plains".to_string()
+}
+
+fn water_biome_id(latitude: f64, surface_y: i32) -> &'static str {
+    let abs_lat = latitude.abs();
+    if abs_lat >= 70.0 {
+        return "minecraft:frozen_ocean";
+    }
+    let depth = 1.max(SEA_LEVEL_Y - surface_y);
+    if depth >= 28 {
+        if abs_lat <= 34.0 {
+            return "minecraft:deep_lukewarm_ocean";
+        }
+        if abs_lat >= 56.0 {
+            return "minecraft:deep_cold_ocean";
+        }
+        return "minecraft:deep_ocean";
+    }
+    if abs_lat <= 23.5 {
+        return "minecraft:warm_ocean";
+    }
+    if abs_lat <= 38.0 {
+        return "minecraft:lukewarm_ocean";
+    }
+    if abs_lat >= 55.0 {
+        return "minecraft:cold_ocean";
+    }
+    "minecraft:ocean"
 }
 
 fn height_only_chunk(
@@ -16968,6 +17019,28 @@ mod tests {
         assert!(first.water);
         assert_eq!(first.ground_surface_y, MIN_SURFACE_Y);
         assert!(sample.columns().iter().all(|column| column == first));
+    }
+
+    #[test]
+    fn open_ocean_direct_classifier_matches_general_sanitized_path() {
+        for &(elevation, longitude, latitude) in &[
+            (-10.0, 125.0, -20.0),
+            (-80.0, 151.0, -34.0),
+            (-350.0, -150.0, 30.0),
+            (-1_250.0, -30.0, 58.0),
+            (-2_000.0, 0.0, 72.0),
+        ] {
+            let general = clean_coastal_surface_column(
+                &classify_shaped_surface_scaled(
+                    elevation, longitude, latitude, true, 0.0, 4.0,
+                )
+                .unwrap(),
+                0.0,
+            );
+            let direct =
+                classify_open_ocean_surface_scaled(elevation, longitude, latitude, 4.0).unwrap();
+            assert_eq!(direct, general);
+        }
     }
 
     #[test]
