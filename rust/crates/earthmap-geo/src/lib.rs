@@ -303,11 +303,7 @@ fn vrt_reader_thread_cache_get(
     })
 }
 
-fn vrt_reader_thread_cache_put(
-    mosaic_id: u64,
-    source_index: usize,
-    reader: Arc<GeoTiffRgbReader>,
-) {
+fn vrt_reader_thread_cache_put(mosaic_id: u64, source_index: usize, reader: Arc<GeoTiffRgbReader>) {
     VRT_READER_THREAD_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let slot = thread_cache_slot(mosaic_id, source_index as u64, cache.len());
@@ -320,9 +316,7 @@ fn vrt_reader_thread_cache_put(
 }
 
 fn thread_cache_slot(primary: u64, secondary: u64, len: usize) -> usize {
-    let mixed = primary
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .rotate_left(17)
+    let mixed = primary.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(17)
         ^ secondary.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     (mixed as usize) % len.max(1)
 }
@@ -1325,8 +1319,7 @@ impl VrtRgbMosaicReader {
         let source = &self.sources[source_index];
         let source_x = source.source_x(pixel_x);
         let source_y = source.source_y(pixel_y);
-        let reader = if let Some(reader) =
-            vrt_reader_thread_cache_get(self.cache_id, source_index)
+        let reader = if let Some(reader) = vrt_reader_thread_cache_get(self.cache_id, source_index)
         {
             reader
         } else {

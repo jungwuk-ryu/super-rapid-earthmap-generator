@@ -11198,42 +11198,42 @@ fn handle_vanilla_delegated_parallel_event(
             stats.phase_metadata_millis += millis(report.metadata_nanos);
             stats.phase_total_internal_millis += millis(report.total_nanos);
             let mut event = json!({
-                    "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
-                    "type": "regionGenerated",
-                    "regionX": report.region_x,
-                    "regionZ": report.region_z,
-                    "elapsedMillis": u128_to_u64(elapsed_millis),
-                    "chunks": report.chunk_count,
-                    "landColumns": report.land_columns,
-                    "waterColumns": report.water_columns,
-                    "minGroundY": report.min_ground_y,
-                    "maxGroundY": report.max_ground_y,
-                    "surfaceSampleMillis": u128_to_u64(millis(report.surface_sample_nanos)),
-                    "surfacePhase.elevationFillMillis": u128_to_u64(millis(report.sample_phase_nanos.elevation_fill)),
-                    "surfacePhase.waterMaskMillis": u128_to_u64(millis(report.sample_phase_nanos.water_mask)),
-                    "surfacePhase.coastFactorMillis": u128_to_u64(millis(report.sample_phase_nanos.coast_factor)),
-                    "surfacePhase.smoothPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.smooth_precompute)),
-                    "surfacePhase.reliefPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.relief_precompute)),
-                    "surfacePhase.openOceanFastPathMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_fast_path)),
-                    "surfacePhase.columnBuildMillis": u128_to_u64(millis(report.sample_phase_nanos.column_build)),
-                    "surfacePhase.photoProfileMillis": u128_to_u64(millis(report.sample_phase_nanos.photo_profile)),
-                    "surfacePhase.photoApplyMillis": u128_to_u64(millis(report.sample_phase_nanos.photo_apply)),
-                    "surfacePhase.postProcessMillis": u128_to_u64(millis(report.sample_phase_nanos.post_process)),
-                    "surfacePhase.sampledMaterialColumns": report.sample_phase_nanos.sampled_material_columns,
-                    "surfacePhase.sampledLandMaterialColumns": report.sample_phase_nanos.sampled_land_material_columns,
-                    "surfacePhase.sampledWaterMaterialColumns": report.sample_phase_nanos.sampled_water_material_columns,
-                    "chunkBuildMillis": u128_to_u64(millis(report.chunk_build_nanos)),
-                    "nbtEncodeMillis": u128_to_u64(millis(report.nbt_encode_nanos)),
-                    "regionWriteMillis": u128_to_u64(millis(report.region_write_nanos)),
-                    "metadataMillis": u128_to_u64(millis(report.metadata_nanos)),
-                    "totalInternalMillis": u128_to_u64(millis(report.total_nanos)),
-                    "prefetchSendWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.send_wait)),
-                    "prefetchReadyQueueWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.ready_queue_wait)),
-                    "consumerPoolWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.consumer_pool_wait)),
-                    "consumerElapsedMillis": prefetch_timing.map(|timing| u128_to_u64(timing.consumer_elapsed)),
-                    "outputBytes": output_bytes,
-                    "regionFile": normalized_path_display(&report.region_file),
-                });
+                "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+                "type": "regionGenerated",
+                "regionX": report.region_x,
+                "regionZ": report.region_z,
+                "elapsedMillis": u128_to_u64(elapsed_millis),
+                "chunks": report.chunk_count,
+                "landColumns": report.land_columns,
+                "waterColumns": report.water_columns,
+                "minGroundY": report.min_ground_y,
+                "maxGroundY": report.max_ground_y,
+                "surfaceSampleMillis": u128_to_u64(millis(report.surface_sample_nanos)),
+                "surfacePhase.elevationFillMillis": u128_to_u64(millis(report.sample_phase_nanos.elevation_fill)),
+                "surfacePhase.waterMaskMillis": u128_to_u64(millis(report.sample_phase_nanos.water_mask)),
+                "surfacePhase.coastFactorMillis": u128_to_u64(millis(report.sample_phase_nanos.coast_factor)),
+                "surfacePhase.smoothPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.smooth_precompute)),
+                "surfacePhase.reliefPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.relief_precompute)),
+                "surfacePhase.openOceanFastPathMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_fast_path)),
+                "surfacePhase.columnBuildMillis": u128_to_u64(millis(report.sample_phase_nanos.column_build)),
+                "surfacePhase.photoProfileMillis": u128_to_u64(millis(report.sample_phase_nanos.photo_profile)),
+                "surfacePhase.photoApplyMillis": u128_to_u64(millis(report.sample_phase_nanos.photo_apply)),
+                "surfacePhase.postProcessMillis": u128_to_u64(millis(report.sample_phase_nanos.post_process)),
+                "surfacePhase.sampledMaterialColumns": report.sample_phase_nanos.sampled_material_columns,
+                "surfacePhase.sampledLandMaterialColumns": report.sample_phase_nanos.sampled_land_material_columns,
+                "surfacePhase.sampledWaterMaterialColumns": report.sample_phase_nanos.sampled_water_material_columns,
+                "chunkBuildMillis": u128_to_u64(millis(report.chunk_build_nanos)),
+                "nbtEncodeMillis": u128_to_u64(millis(report.nbt_encode_nanos)),
+                "regionWriteMillis": u128_to_u64(millis(report.region_write_nanos)),
+                "metadataMillis": u128_to_u64(millis(report.metadata_nanos)),
+                "totalInternalMillis": u128_to_u64(millis(report.total_nanos)),
+                "prefetchSendWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.send_wait)),
+                "prefetchReadyQueueWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.ready_queue_wait)),
+                "consumerPoolWaitMillis": prefetch_timing.map(|timing| u128_to_u64(timing.consumer_pool_wait)),
+                "consumerElapsedMillis": prefetch_timing.map(|timing| u128_to_u64(timing.consumer_elapsed)),
+                "outputBytes": output_bytes,
+                "regionFile": normalized_path_display(&report.region_file),
+            });
             if let Some(object) = event.as_object_mut() {
                 object.insert(
                     "surfaceMaterialRaster.sourceCount".to_string(),
@@ -11261,15 +11261,15 @@ fn handle_vanilla_delegated_parallel_event(
                 );
                 object.insert(
                     "surfaceMaterialRaster.sampleNearestRequests".to_string(),
-                    json!(report
-                        .surface_material_raster_stats
-                        .sample_nearest_requests),
+                    json!(report.surface_material_raster_stats.sample_nearest_requests),
                 );
                 object.insert(
                     "surfaceMaterialRaster.sampleAveragedRequests".to_string(),
-                    json!(report
-                        .surface_material_raster_stats
-                        .sample_averaged_requests),
+                    json!(
+                        report
+                            .surface_material_raster_stats
+                            .sample_averaged_requests
+                    ),
                 );
             }
             write_progress_event(out, event)?;

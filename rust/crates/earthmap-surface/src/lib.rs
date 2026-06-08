@@ -12467,9 +12467,7 @@ fn try_sample_open_ocean_surface_region(
                 vertical_scale,
             )?
         };
-        Ok(OpenOceanColumnBuild {
-            column,
-        })
+        Ok(OpenOceanColumnBuild { column })
     };
 
     let builds = if parallel_column_sampling {
@@ -12549,8 +12547,14 @@ fn classify_open_ocean_surface_scaled(
     vertical_scale: f64,
 ) -> Result<EarthSurfaceColumn> {
     let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
-    let ground_y =
-        shaped_ground_surface_y(elevation_meters, longitude, latitude, true, 0.0, vertical_scale);
+    let ground_y = shaped_ground_surface_y(
+        elevation_meters,
+        longitude,
+        latitude,
+        true,
+        0.0,
+        vertical_scale,
+    );
     let biome = water_biome_id(latitude, ground_y);
     let depth = 1.max(SEA_LEVEL_Y - ground_y);
     let top = if depth <= 6 {
@@ -17031,10 +17035,8 @@ mod tests {
             (-2_000.0, 0.0, 72.0),
         ] {
             let general = clean_coastal_surface_column(
-                &classify_shaped_surface_scaled(
-                    elevation, longitude, latitude, true, 0.0, 4.0,
-                )
-                .unwrap(),
+                &classify_shaped_surface_scaled(elevation, longitude, latitude, true, 0.0, 4.0)
+                    .unwrap(),
                 0.0,
             );
             let direct =
