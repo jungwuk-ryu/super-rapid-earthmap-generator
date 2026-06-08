@@ -12382,23 +12382,34 @@ fn try_sample_open_ocean_surface_region(
         column: EarthSurfaceColumn,
     }
 
+    let longitudes = (0..SURFACE_REGION_WIDTH)
+        .map(|local_x| {
+            let global_block_x = region_block_x.wrapping_add(local_x as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            if map_x < 0 || map_x >= mapping.width_blocks {
+                Ok(0.0)
+            } else {
+                mapping.longitude_for_block_x(map_x).map_err(Into::into)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let latitudes = (0..SURFACE_REGION_WIDTH)
+        .map(|local_z| {
+            let global_block_z = region_block_z.wrapping_add(local_z as i32);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            if map_z < 0 || map_z >= mapping.height_blocks {
+                Ok(0.0)
+            } else {
+                mapping.latitude_for_block_z(map_z).map_err(Into::into)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let build_column = |column_index| -> Result<OpenOceanColumnBuild> {
         let local_z = column_index / SURFACE_REGION_WIDTH;
         let local_x = column_index % SURFACE_REGION_WIDTH;
-        let global_block_x = region_block_x.wrapping_add(local_x as i32);
-        let global_block_z = region_block_z.wrapping_add(local_z as i32);
-        let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
-        let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
-        let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
-            0.0
-        } else {
-            mapping.longitude_for_block_x(map_x)?
-        };
-        let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
-            0.0
-        } else {
-            mapping.latitude_for_block_z(map_z)?
-        };
+        let longitude = longitudes[local_x];
+        let latitude = latitudes[local_z];
         let smoothed_elevation = smoothed_center_elevations[column_index];
         let mut column = classify_shaped_surface_scaled(
             smoothed_elevation,
