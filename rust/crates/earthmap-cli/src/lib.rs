@@ -9629,6 +9629,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         surface_tile_cache_entries.div_ceil(worker_count).max(1);
     let prefetch_config =
         effective_prefetch_config(runtime_options.prefetch, worker_count, region_count);
+    let prefetch_heightmap_cache_rows_per_worker =
+        cache_rows.div_ceil(prefetch_config.workers.max(1)).max(1);
+    let prefetch_surface_tile_cache_entries_per_worker = surface_tile_cache_entries
+        .div_ceil(prefetch_config.workers.max(1))
+        .max(1);
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
     let spawn_x = start_region_x
@@ -9666,17 +9671,6 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     .map_err(|error| error.to_string())?;
     let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
     let stale_temp_files = cleanup_stale_region_temp_files(&world.join("region"));
-    let surface_material_sampler = EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
-        &surface_material_path,
-        surface_tile_cache_entries,
-    )
-    .map_err(|error| error.to_string())?;
-    let shared_heightmap_reader =
-        GeoTiffHeightmapReader::open(heightmap).map_err(|error| error.to_string())?;
-    let shared_heightmap_mapping = mapping_for(shared_heightmap_reader.metadata(), scale)
-        .map_err(|error| error.to_string())?;
-    let shared_heightmap_cache = GeoTiffRowCache::new(&shared_heightmap_reader, cache_rows)
-        .map_err(|error| error.to_string())?;
     let setup_millis = setup_start.elapsed().as_millis();
 
     write_progress_event(
@@ -9750,131 +9744,167 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                 let generation_pool = &generation_pool;
                 let queue = &region_queue;
                 let stop_queueing = &stop_queueing;
-                let surface_material_sampler = &surface_material_sampler;
                 let surface_material_path = &surface_material_path;
-                let shared_heightmap_reader = &shared_heightmap_reader;
-                let shared_heightmap_mapping = &shared_heightmap_mapping;
-                let shared_heightmap_cache = &shared_heightmap_cache;
                 let completed_regions = Arc::clone(&resume_completed_regions);
-                scope.spawn(move || loop {
-                    if stop_queueing.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let next_region = {
-                        let mut queue = queue.lock().expect("queue lock");
-                        if stop_queueing.load(Ordering::SeqCst) {
-                            None
-                        } else {
-                            queue.pop_front()
+                scope.spawn(move || {
+                    let producer_heightmap_reader =
+                        match GeoTiffHeightmapReader::open(heightmap_path) {
+                            Ok(reader) => reader,
+                            Err(_) => {
+                                stop_queueing.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                    let producer_heightmap_mapping =
+                        match mapping_for(producer_heightmap_reader.metadata(), scale) {
+                            Ok(mapping) => mapping,
+                            Err(_) => {
+                                stop_queueing.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                    let producer_heightmap_cache = match GeoTiffRowCache::new(
+                        &producer_heightmap_reader,
+                        prefetch_heightmap_cache_rows_per_worker,
+                    ) {
+                        Ok(cache) => cache,
+                        Err(_) => {
+                            stop_queueing.store(true, Ordering::SeqCst);
+                            return;
                         }
                     };
-                    let Some((region_x, region_z)) = next_region else {
-                        break;
-                    };
-                    let region_file =
-                        vanilla_delegated_region_file(world, format, region_x, region_z);
-                    if resume.fingerprint_matched
-                        && completed_regions.contains(&(region_x, region_z))
-                    {
-                        let skip_start = Instant::now();
-                        if let Ok(validation) = validate_region_file_for_resume(
-                            &region_file,
-                            region_format_for_output(format),
-                            region_x,
-                            region_z,
-                            REGION_CHUNKS_PER_REGION,
+                    let producer_surface_material_sampler =
+                        match EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+                            surface_material_path,
+                            prefetch_surface_tile_cache_entries_per_worker,
                         ) {
-                            if sender
-                                .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                            Ok(sampler) => sampler,
+                            Err(_) => {
+                                stop_queueing.store(true, Ordering::SeqCst);
+                                return;
+                            }
+                        };
+                    loop {
+                        if stop_queueing.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let next_region = {
+                            let mut queue = queue.lock().expect("queue lock");
+                            if stop_queueing.load(Ordering::SeqCst) {
+                                None
+                            } else {
+                                queue.pop_front()
+                            }
+                        };
+                        let Some((region_x, region_z)) = next_region else {
+                            break;
+                        };
+                        let region_file =
+                            vanilla_delegated_region_file(world, format, region_x, region_z);
+                        if resume.fingerprint_matched
+                            && completed_regions.contains(&(region_x, region_z))
+                        {
+                            let skip_start = Instant::now();
+                            if let Ok(validation) = validate_region_file_for_resume(
+                                &region_file,
+                                region_format_for_output(format),
+                                region_x,
+                                region_z,
+                                REGION_CHUNKS_PER_REGION,
+                            ) {
+                                if sender
+                                    .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                        region_x,
+                                        region_z,
+                                        elapsed_millis: skip_start.elapsed().as_millis(),
+                                        chunks: validation.chunk_count,
+                                        output_bytes: validation.file_bytes,
+                                        region_file,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                        if sender
+                            .send(VanillaDelegatedParallelEvent::RegionStarted {
+                                region_x,
+                                region_z,
+                                region_file: region_file.clone(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        };
+                        let started_at = Instant::now();
+                        let failed_region_file = region_file.clone();
+                        let result =
+                            (|| -> std::result::Result<PreparedVanillaDelegatedRegion, String> {
+                                let settings = vanilla_delegated_surface_region_settings(
+                                    heightmap_path,
+                                    world_dir,
+                                    "SR EarthMap Vanilla Delegated",
+                                    scale,
                                     region_x,
                                     region_z,
-                                    elapsed_millis: skip_start.elapsed().as_millis(),
-                                    chunks: validation.chunk_count,
-                                    output_bytes: validation.file_bytes,
+                                    format,
+                                    prefetch_heightmap_cache_rows_per_worker,
+                                    status,
+                                    vertical_scale,
+                                    surface_material_path,
+                                    prefetch_surface_tile_cache_entries_per_worker,
+                                    parallel_column_sampling,
+                                    runtime_options.compression,
+                                )?;
+                                let sample = generation_pool.install(|| {
+                                    let producer_heightmap_sampler =
+                                        HeightmapScalarSampler::with_row_cache(
+                                            &producer_heightmap_reader,
+                                            &producer_heightmap_cache,
+                                        );
+                                    let mut sample =
+                                        prepare_surface_region_sample_with_heightmap_sampler(
+                                            &settings,
+                                            &producer_heightmap_mapping,
+                                            &producer_heightmap_sampler,
+                                            producer_heightmap_cache.stats(),
+                                            Some(&producer_surface_material_sampler),
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    sample.cache_stats = producer_heightmap_cache.stats();
+                                    Ok::<PreparedSurfaceRegionSample, String>(sample)
+                                })?;
+                                Ok(PreparedVanillaDelegatedRegion {
+                                    region_x,
+                                    region_z,
                                     region_file,
+                                    started_at,
+                                    sample,
                                 })
-                                .is_err()
-                            {
+                            })();
+                        match result {
+                            Ok(prepared) => {
+                                if !send_prepared_vanilla_region(
+                                    &prepared_sender,
+                                    stop_queueing,
+                                    prepared,
+                                ) {
+                                    break;
+                                }
+                            }
+                            Err(message) => {
+                                stop_queueing.store(true, Ordering::SeqCst);
+                                let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                                    region_x,
+                                    region_z,
+                                    elapsed_millis: started_at.elapsed().as_millis(),
+                                    region_file: failed_region_file,
+                                    message,
+                                });
                                 break;
                             }
-                            continue;
-                        }
-                    }
-                    if sender
-                        .send(VanillaDelegatedParallelEvent::RegionStarted {
-                            region_x,
-                            region_z,
-                            region_file: region_file.clone(),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    };
-                    let started_at = Instant::now();
-                    let failed_region_file = region_file.clone();
-                    let result =
-                        (|| -> std::result::Result<PreparedVanillaDelegatedRegion, String> {
-                            let settings = vanilla_delegated_surface_region_settings(
-                                heightmap_path,
-                                world_dir,
-                                "SR EarthMap Vanilla Delegated",
-                                scale,
-                                region_x,
-                                region_z,
-                                format,
-                                cache_rows,
-                                status,
-                                vertical_scale,
-                                surface_material_path,
-                                surface_tile_cache_entries,
-                                parallel_column_sampling,
-                                runtime_options.compression,
-                            )?;
-                            let sample = generation_pool.install(|| {
-                                let heightmap_sampler = HeightmapScalarSampler::with_row_cache(
-                                    shared_heightmap_reader,
-                                    shared_heightmap_cache,
-                                );
-                                let mut sample =
-                                    prepare_surface_region_sample_with_heightmap_sampler(
-                                        &settings,
-                                        shared_heightmap_mapping,
-                                        &heightmap_sampler,
-                                        shared_heightmap_cache.stats(),
-                                        Some(surface_material_sampler),
-                                    )
-                                    .map_err(|error| error.to_string())?;
-                                sample.cache_stats = shared_heightmap_cache.stats();
-                                Ok::<PreparedSurfaceRegionSample, String>(sample)
-                            })?;
-                            Ok(PreparedVanillaDelegatedRegion {
-                                region_x,
-                                region_z,
-                                region_file,
-                                started_at,
-                                sample,
-                            })
-                        })();
-                    match result {
-                        Ok(prepared) => {
-                            if !send_prepared_vanilla_region(
-                                &prepared_sender,
-                                stop_queueing,
-                                prepared,
-                            ) {
-                                break;
-                            }
-                        }
-                        Err(message) => {
-                            stop_queueing.store(true, Ordering::SeqCst);
-                            let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
-                                region_x,
-                                region_z,
-                                elapsed_millis: started_at.elapsed().as_millis(),
-                                region_file: failed_region_file,
-                                message,
-                            });
-                            break;
                         }
                     }
                 });
