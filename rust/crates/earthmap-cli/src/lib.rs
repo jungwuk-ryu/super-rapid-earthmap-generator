@@ -78,6 +78,9 @@ const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
 const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
 const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 10;
 const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
+const SURFACE_PHOTO_AUTOTUNE_LAND_TARGET: usize = 4;
+const SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET: usize = 4;
+const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 2;
 const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
@@ -137,13 +140,27 @@ fn configure_surface_photo_rayon_threads(requested_threads: usize) {
     if std::env::var_os("RAYON_NUM_THREADS").is_some() {
         return;
     }
-    let rayon_threads = requested_threads
-        .saturating_mul(SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER)
-        .max(requested_threads.max(1))
-        .min(SURFACE_PHOTO_RAYON_THREAD_LIMIT);
+    let rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(rayon_threads)
         .build_global();
+}
+
+fn configured_surface_photo_rayon_thread_count(requested_threads: usize) -> usize {
+    if let Some(explicit) = explicit_rayon_num_threads() {
+        return explicit.max(1);
+    }
+    requested_threads
+        .saturating_mul(SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER)
+        .max(requested_threads.max(1))
+        .min(SURFACE_PHOTO_RAYON_THREAD_LIMIT)
+}
+
+fn explicit_rayon_num_threads() -> Option<usize> {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,14 +177,49 @@ struct SurfacePhotoWorkerTuneSample {
     kind: SurfacePhotoWorkerTuneSampleKind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SurfacePhotoWorkerCandidateConfig {
+    worker_count: usize,
+    rayon_threads: usize,
+    parallel_column_sampling: bool,
+}
+
+impl SurfacePhotoWorkerCandidateConfig {
+    fn new(worker_count: usize, rayon_threads: usize, parallel_column_sampling: bool) -> Self {
+        Self {
+            worker_count: worker_count.max(1),
+            rayon_threads: rayon_threads.max(worker_count.max(1)),
+            parallel_column_sampling,
+        }
+    }
+
+    fn resource_rank(self) -> (usize, usize, bool) {
+        (
+            self.rayon_threads,
+            self.worker_count,
+            self.parallel_column_sampling,
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct SurfacePhotoWorkerCandidateResult {
     worker_count: usize,
+    rayon_threads: usize,
+    parallel_column_sampling: bool,
     elapsed_millis: u128,
     sample_count: usize,
 }
 
 impl SurfacePhotoWorkerCandidateResult {
+    fn config(&self) -> SurfacePhotoWorkerCandidateConfig {
+        SurfacePhotoWorkerCandidateConfig::new(
+            self.worker_count,
+            self.rayon_threads,
+            self.parallel_column_sampling,
+        )
+    }
+
     fn millis_per_region(&self) -> f64 {
         if self.sample_count == 0 {
             f64::INFINITY
@@ -190,6 +242,7 @@ struct SurfacePhotoWorkerTuning {
     mode: &'static str,
     requested_threads: usize,
     selected_worker_count: usize,
+    selected_rayon_threads: usize,
     parallel_column_sampling: bool,
     sample_count: usize,
     land_samples: usize,
@@ -209,11 +262,17 @@ impl SurfacePhotoWorkerTuning {
     ) -> Self {
         let selected_worker_count =
             fallback_surface_photo_worker_count(requested_threads, submitted_regions);
+        let selected_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads)
+            .max(selected_worker_count);
         Self {
             mode,
             requested_threads,
             selected_worker_count,
-            parallel_column_sampling: surface_photo_parallel_column_sampling(selected_worker_count),
+            selected_rayon_threads,
+            parallel_column_sampling: surface_photo_parallel_column_sampling(
+                selected_worker_count,
+                selected_rayon_threads,
+            ),
             sample_count: 0,
             land_samples: 0,
             ocean_samples: 0,
@@ -229,6 +288,8 @@ impl SurfacePhotoWorkerTuning {
             "mode": self.mode,
             "requestedThreads": self.requested_threads,
             "selectedWorkerThreads": self.selected_worker_count,
+            "selectedRegionWorkerThreads": self.selected_worker_count,
+            "selectedRayonThreads": self.selected_rayon_threads,
             "parallelColumnSampling": self.parallel_column_sampling,
             "sampleCount": self.sample_count,
             "landSamples": self.land_samples,
@@ -239,6 +300,9 @@ impl SurfacePhotoWorkerTuning {
             "candidates": self.candidates.iter().map(|candidate| {
                 json!({
                     "workerThreads": candidate.worker_count,
+                    "regionWorkerThreads": candidate.worker_count,
+                    "rayonThreads": candidate.rayon_threads,
+                    "parallelColumnSampling": candidate.parallel_column_sampling,
                     "elapsedMillis": u128_to_u64(candidate.elapsed_millis),
                     "sampleCount": candidate.sample_count,
                     "millisPerRegion": candidate.millis_per_region(),
@@ -248,6 +312,9 @@ impl SurfacePhotoWorkerTuning {
             "confirmationCandidates": self.confirmation_candidates.iter().map(|candidate| {
                 json!({
                     "workerThreads": candidate.worker_count,
+                    "regionWorkerThreads": candidate.worker_count,
+                    "rayonThreads": candidate.rayon_threads,
+                    "parallelColumnSampling": candidate.parallel_column_sampling,
                     "elapsedMillis": u128_to_u64(candidate.elapsed_millis),
                     "sampleCount": candidate.sample_count,
                     "millisPerRegion": candidate.millis_per_region(),
@@ -258,8 +325,8 @@ impl SurfacePhotoWorkerTuning {
     }
 }
 
-fn surface_photo_parallel_column_sampling(worker_count: usize) -> bool {
-    worker_count <= SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT
+fn surface_photo_parallel_column_sampling(_worker_count: usize, rayon_threads: usize) -> bool {
+    rayon_threads > 1
 }
 
 fn fallback_surface_photo_worker_count(
@@ -309,10 +376,62 @@ fn surface_photo_worker_candidates(
     candidates
 }
 
+fn surface_photo_worker_candidate_configs(
+    requested_threads: usize,
+    submitted_regions: usize,
+) -> Vec<SurfacePhotoWorkerCandidateConfig> {
+    let region_workers = surface_photo_worker_candidates(requested_threads, submitted_regions);
+    let default_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads);
+    let explicit_rayon_threads = explicit_rayon_num_threads();
+    let mut configs = Vec::new();
+    for worker_count in region_workers {
+        configs.push(SurfacePhotoWorkerCandidateConfig::new(
+            worker_count,
+            worker_count,
+            false,
+        ));
+        let mut rayon_candidates = vec![default_rayon_threads.max(worker_count)];
+        if explicit_rayon_threads.is_none() {
+            let midpoint = default_rayon_threads
+                .saturating_add(worker_count)
+                .div_ceil(2)
+                .max(worker_count);
+            rayon_candidates.push(midpoint);
+        }
+        rayon_candidates.sort_unstable();
+        rayon_candidates.dedup();
+        for rayon_threads in rayon_candidates {
+            configs.push(SurfacePhotoWorkerCandidateConfig::new(
+                worker_count,
+                rayon_threads,
+                surface_photo_parallel_column_sampling(worker_count, rayon_threads),
+            ));
+        }
+    }
+    configs.sort_by_key(|config| {
+        (
+            config.worker_count,
+            config.rayon_threads,
+            config.parallel_column_sampling,
+        )
+    });
+    configs.dedup();
+    configs
+}
+
+fn surface_photo_worker_candidate_config_json(config: SurfacePhotoWorkerCandidateConfig) -> Value {
+    json!({
+        "workerThreads": config.worker_count,
+        "regionWorkerThreads": config.worker_count,
+        "rayonThreads": config.rayon_threads,
+        "parallelColumnSampling": config.parallel_column_sampling,
+    })
+}
+
 fn select_surface_photo_worker_candidate(
     candidates: &[SurfacePhotoWorkerCandidateResult],
     noise_ratio: f64,
-) -> Option<usize> {
+) -> Option<SurfacePhotoWorkerCandidateConfig> {
     let best_score = candidates
         .iter()
         .map(SurfacePhotoWorkerCandidateResult::millis_per_region)
@@ -321,8 +440,8 @@ fn select_surface_photo_worker_candidate(
     candidates
         .iter()
         .filter(|candidate| candidate.millis_per_region() <= best_score * noise_ratio)
-        .map(|candidate| candidate.worker_count)
-        .min()
+        .map(SurfacePhotoWorkerCandidateResult::config)
+        .min_by_key(|config| config.resource_rank())
 }
 
 fn tune_surface_photo_workers_for_grid(
@@ -443,7 +562,7 @@ fn tune_surface_photo_workers_from_regions(
     submitted_regions: usize,
     probe_regions: &[(i32, i32)],
 ) -> SurfacePhotoWorkerTuning {
-    let candidates = surface_photo_worker_candidates(requested_threads, submitted_regions);
+    let candidates = surface_photo_worker_candidate_configs(requested_threads, submitted_regions);
     if candidates.len() <= 1 {
         return SurfacePhotoWorkerTuning::fallback(
             "fallback-single-candidate",
@@ -491,7 +610,7 @@ fn tune_surface_photo_workers_from_regions(
     let warmup_worker = candidates
         .iter()
         .copied()
-        .find(|candidate| *candidate >= SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
+        .find(|candidate| candidate.worker_count >= SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
         .unwrap_or(candidates[0]);
     if let Some(warmup_sample) = samples.first() {
         let warmup_dir = tune_root.join("warmup");
@@ -510,15 +629,24 @@ fn tune_surface_photo_workers_from_regions(
             compression_options,
         );
     }
-    for worker_count in candidates {
-        let candidate_dir = tune_root.join(format!("workers-{worker_count}"));
+    for candidate in candidates {
+        let candidate_dir = tune_root.join(format!(
+            "workers-{}-rayon-{}-columns-{}",
+            candidate.worker_count,
+            candidate.rayon_threads,
+            if candidate.parallel_column_sampling {
+                "parallel"
+            } else {
+                "serial"
+            }
+        ));
         match benchmark_surface_photo_worker_candidate(
             heightmap,
             &candidate_dir,
             format,
             scale,
             &samples,
-            worker_count,
+            candidate,
             status,
             vertical_scale,
             surface_material_path,
@@ -542,40 +670,44 @@ fn tune_surface_photo_workers_from_regions(
     let initial_selected =
         select_surface_photo_worker_candidate(&results, SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO)
             .unwrap_or_else(|| {
-                fallback_surface_photo_worker_count(requested_threads, submitted_regions)
+                SurfacePhotoWorkerCandidateConfig::new(
+                    fallback_surface_photo_worker_count(requested_threads, submitted_regions),
+                    configured_surface_photo_rayon_thread_count(requested_threads),
+                    true,
+                )
             });
-    let (selected_worker_count, confirmation_candidates) =
-        match confirm_surface_photo_worker_selection(
-            heightmap,
-            &tune_root,
-            format,
-            scale,
-            &samples,
-            status,
-            vertical_scale,
-            surface_material_path,
-            cache_rows,
-            surface_tile_cache_entries,
-            compression_options,
-            &results,
-            initial_selected,
-        ) {
-            Ok(confirmed) => confirmed,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&tune_root);
-                return SurfacePhotoWorkerTuning::fallback(
-                    "fallback-confirmation-error",
-                    requested_threads,
-                    submitted_regions,
-                    error,
-                );
-            }
-        };
+    let (selected_config, confirmation_candidates) = match confirm_surface_photo_worker_selection(
+        heightmap,
+        &tune_root,
+        format,
+        scale,
+        &samples,
+        status,
+        vertical_scale,
+        surface_material_path,
+        cache_rows,
+        surface_tile_cache_entries,
+        compression_options,
+        &results,
+        initial_selected,
+    ) {
+        Ok(confirmed) => confirmed,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&tune_root);
+            return SurfacePhotoWorkerTuning::fallback(
+                "fallback-confirmation-error",
+                requested_threads,
+                submitted_regions,
+                error,
+            );
+        }
+    };
     SurfacePhotoWorkerTuning {
         mode: "autotuned",
         requested_threads,
-        selected_worker_count,
-        parallel_column_sampling: surface_photo_parallel_column_sampling(selected_worker_count),
+        selected_worker_count: selected_config.worker_count,
+        selected_rayon_threads: selected_config.rayon_threads,
+        parallel_column_sampling: selected_config.parallel_column_sampling,
         sample_count,
         land_samples,
         ocean_samples,
@@ -600,20 +732,30 @@ fn confirm_surface_photo_worker_selection(
     surface_tile_cache_entries: usize,
     compression_options: RegionCompressionOptions,
     results: &[SurfacePhotoWorkerCandidateResult],
-    initial_selected: usize,
-) -> std::result::Result<(usize, Vec<SurfacePhotoWorkerCandidateResult>), String> {
-    let Some(lower_worker) = results
+    initial_selected: SurfacePhotoWorkerCandidateConfig,
+) -> std::result::Result<
+    (
+        SurfacePhotoWorkerCandidateConfig,
+        Vec<SurfacePhotoWorkerCandidateResult>,
+    ),
+    String,
+> {
+    let selected_rank = initial_selected.resource_rank();
+    let Some(lower_config) = results
         .iter()
-        .filter(|candidate| candidate.worker_count < initial_selected)
-        .map(|candidate| candidate.worker_count)
-        .min()
+        .map(SurfacePhotoWorkerCandidateResult::config)
+        .filter(|candidate| candidate.resource_rank() < selected_rank)
+        .min_by_key(|candidate| candidate.resource_rank())
     else {
         return Ok((initial_selected, Vec::new()));
     };
 
     let selected_result = benchmark_surface_photo_worker_candidate(
         heightmap,
-        &tune_root.join(format!("confirm-workers-{initial_selected}")),
+        &tune_root.join(format!(
+            "confirm-workers-{}-rayon-{}",
+            initial_selected.worker_count, initial_selected.rayon_threads
+        )),
         format,
         scale,
         samples,
@@ -627,11 +769,14 @@ fn confirm_surface_photo_worker_selection(
     )?;
     let lower_result = benchmark_surface_photo_worker_candidate(
         heightmap,
-        &tune_root.join(format!("confirm-workers-{lower_worker}")),
+        &tune_root.join(format!(
+            "confirm-workers-{}-rayon-{}",
+            lower_config.worker_count, lower_config.rayon_threads
+        )),
         format,
         scale,
         samples,
-        lower_worker,
+        lower_config,
         status,
         vertical_scale,
         surface_material_path,
@@ -645,7 +790,7 @@ fn confirm_surface_photo_worker_selection(
     {
         initial_selected
     } else {
-        lower_worker
+        lower_config
     };
     Ok((confirmed_selected, vec![selected_result, lower_result]))
 }
@@ -657,7 +802,7 @@ fn benchmark_surface_photo_worker_candidate(
     format: OutputFormat,
     scale: i32,
     samples: &[SurfacePhotoWorkerTuneSample],
-    worker_count: usize,
+    candidate: SurfacePhotoWorkerCandidateConfig,
     status: ChunkGenerationStatus,
     vertical_scale: f64,
     surface_material_path: &Path,
@@ -674,25 +819,27 @@ fn benchmark_surface_photo_worker_candidate(
     let region_queue = Mutex::new(VecDeque::from(samples.to_vec()));
     let stop_queueing = AtomicBool::new(false);
     let start = Instant::now();
-    let actual_workers = worker_count.min(samples.len()).max(1);
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(actual_workers);
+    let actual_workers = candidate.worker_count.min(samples.len()).max(1);
+    let worker_error = Mutex::new(None::<String>);
+    let pool = build_surface_photo_rayon_pool(candidate.rayon_threads)?;
+    pool.scope(|scope| {
         for _ in 0..actual_workers {
             let queue = &region_queue;
             let stop_queueing = &stop_queueing;
             let surface_material_sampler = &surface_material_sampler;
-            handles.push(scope.spawn(move || -> std::result::Result<(), String> {
-                loop {
-                    if stop_queueing.load(Ordering::SeqCst) {
-                        return Ok(());
-                    }
-                    let next = {
-                        let mut queue = queue.lock().expect("worker tuning queue lock");
-                        queue.pop_front()
-                    };
-                    let Some(sample) = next else {
-                        return Ok(());
-                    };
+            let worker_error = &worker_error;
+            scope.spawn(move |_| loop {
+                if stop_queueing.load(Ordering::SeqCst) {
+                    return;
+                }
+                let next = {
+                    let mut queue = queue.lock().expect("worker tuning queue lock");
+                    queue.pop_front()
+                };
+                let Some(sample) = next else {
+                    return;
+                };
+                let result = (|| -> std::result::Result<(), String> {
                     let mut settings = SurfaceRegionSettings::new_with_texture_options(
                         heightmap,
                         world,
@@ -711,37 +858,42 @@ fn benchmark_surface_photo_worker_candidate(
                     .map_err(|error| error.to_string())?;
                     settings.surface_material_path = Some(surface_material_path.to_path_buf());
                     settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                    settings.parallel_column_sampling =
-                        surface_photo_parallel_column_sampling(worker_count);
+                    settings.parallel_column_sampling = candidate.parallel_column_sampling;
                     apply_region_compression_options(&mut settings, compression_options);
                     generate_surface_region_with_open_material_sampler(
                         &settings,
                         Some(surface_material_sampler),
                     )
                     .map_err(|error| error.to_string())?;
-                }
-            }));
-        }
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
+                    Ok(())
+                })();
+                if let Err(error) = result {
                     stop_queueing.store(true, Ordering::SeqCst);
-                    return Err(error);
+                    *worker_error.lock().expect("worker tuning error lock") = Some(error);
+                    return;
                 }
-                Err(_) => {
-                    stop_queueing.store(true, Ordering::SeqCst);
-                    return Err("worker tuning thread panicked".to_string());
-                }
-            }
+            });
         }
-        Ok(())
-    })?;
+    });
+    if let Some(error) = worker_error.into_inner().expect("worker tuning error lock") {
+        return Err(error);
+    }
     Ok(SurfacePhotoWorkerCandidateResult {
-        worker_count,
+        worker_count: candidate.worker_count,
+        rayon_threads: candidate.rayon_threads,
+        parallel_column_sampling: candidate.parallel_column_sampling,
         elapsed_millis: start.elapsed().as_millis(),
         sample_count: samples.len(),
     })
+}
+
+fn build_surface_photo_rayon_pool(
+    rayon_threads: usize,
+) -> std::result::Result<rayon::ThreadPool, String> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon_threads.max(1))
+        .build()
+        .map_err(|error| error.to_string())
 }
 
 fn surface_photo_worker_tune_root(world: &Path) -> PathBuf {
@@ -855,8 +1007,9 @@ fn select_surface_photo_tune_samples(
             SurfacePhotoWorkerTuneSampleKind::Ocean => ocean.push(sample),
             SurfacePhotoWorkerTuneSampleKind::Mixed => mixed.push(sample),
         }
-        if land.len() >= (SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2)
-            && ocean.len() >= (SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2)
+        if land.len() >= SURFACE_PHOTO_AUTOTUNE_LAND_TARGET
+            && mixed.len() >= SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET
+            && ocean.len() >= SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET
         {
             break;
         }
@@ -864,13 +1017,14 @@ fn select_surface_photo_tune_samples(
     let mut samples = Vec::with_capacity(SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES);
     surface_photo_take_samples(
         &mut samples,
-        &mut ocean,
-        SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2,
+        &mut mixed,
+        SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET,
     );
+    surface_photo_take_samples(&mut samples, &mut land, SURFACE_PHOTO_AUTOTUNE_LAND_TARGET);
     surface_photo_take_samples(
         &mut samples,
-        &mut land,
-        SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES / 2,
+        &mut ocean,
+        SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET,
     );
     while samples.len() < SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES {
         if let Some(sample) = mixed.pop() {
@@ -929,10 +1083,12 @@ fn classify_surface_photo_tune_region(
             }
         }
     }
-    Ok(if water >= 4 && land == 0 {
-        SurfacePhotoWorkerTuneSampleKind::Ocean
-    } else if land >= 3 {
+    Ok(if land > 0 && water > 0 {
+        SurfacePhotoWorkerTuneSampleKind::Mixed
+    } else if land > 0 {
         SurfacePhotoWorkerTuneSampleKind::Land
+    } else if water > 0 {
+        SurfacePhotoWorkerTuneSampleKind::Ocean
     } else {
         SurfacePhotoWorkerTuneSampleKind::Mixed
     })
@@ -9364,6 +9520,10 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "requestedThreads": threads,
             "submittedRegions": region_count,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, region_count),
+            "candidateWorkerConfigs": surface_photo_worker_candidate_configs(threads, region_count)
+                .into_iter()
+                .map(surface_photo_worker_candidate_config_json)
+                .collect::<Vec<_>>(),
             "minRegions": SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS,
             "maxSamples": SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES,
         }),
@@ -9394,6 +9554,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         }),
     )?;
     let worker_count = worker_tuning.selected_worker_count.min(region_count).max(1);
+    let rayon_threads = worker_tuning.selected_rayon_threads.max(worker_count);
     let parallel_column_sampling = worker_tuning.parallel_column_sampling;
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
@@ -9454,6 +9615,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "regionCount": region_count,
             "requestedThreads": threads,
             "workerThreads": worker_count,
+            "regionWorkerThreads": worker_count,
+            "rayonThreads": rayon_threads,
             "parallelColumnSampling": parallel_column_sampling,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
@@ -9488,143 +9651,164 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let (event_sender, event_receiver) =
         mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
     let mut stats = VanillaDelegatedParallelBatchStats::default();
+    let generation_pool = build_surface_photo_rayon_pool(rayon_threads)?;
     std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let queue = &region_queue;
-            let stop_queueing = &stop_queueing;
-            let surface_material_sampler = &surface_material_sampler;
-            let surface_material_path = &surface_material_path;
-            let completed_regions = Arc::clone(&resume_completed_regions);
-            let journal = Arc::clone(&resume_journal);
-            let sender = event_sender.clone();
-            let fingerprint_matched = resume.fingerprint_matched;
-            scope.spawn(move || loop {
-                if stop_queueing.load(Ordering::SeqCst) {
-                    break;
-                }
-                let next_region = {
-                    let mut queue = queue.lock().expect("queue lock");
-                    if stop_queueing.load(Ordering::SeqCst) {
-                        None
-                    } else {
-                        queue.pop_front()
-                    }
-                };
-                let Some((region_x, region_z)) = next_region else {
-                    break;
-                };
-                let region_file = vanilla_delegated_region_file(world, format, region_x, region_z);
-                if fingerprint_matched && completed_regions.contains(&(region_x, region_z)) {
-                    let skip_start = Instant::now();
-                    if let Ok(validation) = validate_region_file_for_resume(
-                        &region_file,
-                        region_format_for_output(format),
-                        region_x,
-                        region_z,
-                        REGION_CHUNKS_PER_REGION,
-                    ) {
-                        if sender
-                            .send(VanillaDelegatedParallelEvent::RegionSkipped {
+        let coordinator_sender = event_sender.clone();
+        let generation_pool = &generation_pool;
+        let region_queue = &region_queue;
+        let stop_queueing = &stop_queueing;
+        let surface_material_sampler = &surface_material_sampler;
+        let surface_material_path = &surface_material_path;
+        let resume_completed_regions = &resume_completed_regions;
+        let resume_journal = &resume_journal;
+        let coordinator = scope.spawn(move || {
+            generation_pool.scope(|rayon_scope| {
+                for _ in 0..worker_count {
+                    let queue = region_queue;
+                    let stop_queueing = stop_queueing;
+                    let surface_material_sampler = surface_material_sampler;
+                    let surface_material_path = surface_material_path;
+                    let completed_regions = Arc::clone(&resume_completed_regions);
+                    let journal = Arc::clone(resume_journal);
+                    let sender = coordinator_sender.clone();
+                    let fingerprint_matched = resume.fingerprint_matched;
+                    rayon_scope.spawn(move |_| loop {
+                        if stop_queueing.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let next_region = {
+                            let mut queue = queue.lock().expect("queue lock");
+                            if stop_queueing.load(Ordering::SeqCst) {
+                                None
+                            } else {
+                                queue.pop_front()
+                            }
+                        };
+                        let Some((region_x, region_z)) = next_region else {
+                            break;
+                        };
+                        let region_file =
+                            vanilla_delegated_region_file(world, format, region_x, region_z);
+                        if fingerprint_matched && completed_regions.contains(&(region_x, region_z))
+                        {
+                            let skip_start = Instant::now();
+                            if let Ok(validation) = validate_region_file_for_resume(
+                                &region_file,
+                                region_format_for_output(format),
                                 region_x,
                                 region_z,
-                                elapsed_millis: skip_start.elapsed().as_millis(),
-                                chunks: validation.chunk_count,
-                                output_bytes: validation.file_bytes,
-                                region_file,
-                            })
-                            .is_err()
-                        {
-                            break;
+                                REGION_CHUNKS_PER_REGION,
+                            ) {
+                                if sender
+                                    .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                        region_x,
+                                        region_z,
+                                        elapsed_millis: skip_start.elapsed().as_millis(),
+                                        chunks: validation.chunk_count,
+                                        output_bytes: validation.file_bytes,
+                                        region_file,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
-                        continue;
-                    }
-                }
-                if sender
-                    .send(VanillaDelegatedParallelEvent::RegionStarted {
-                        region_x,
-                        region_z,
-                        region_file: region_file.clone(),
-                    })
-                    .is_err()
-                {
-                    break;
-                };
-                let region_start = Instant::now();
-                let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
-                    let mut settings = SurfaceRegionSettings::new_with_texture_options(
-                        heightmap_path,
-                        world_dir,
-                        "SR EarthMap Vanilla Delegated",
-                        0,
-                        scale,
-                        region_x,
-                        region_z,
-                        format,
-                        cache_rows,
-                        false,
-                        status,
-                        vertical_scale,
-                        SurfaceTextureMode::Photo,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    settings.surface_material_path = Some((*surface_material_path).clone());
-                    settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                    settings.parallel_column_sampling = parallel_column_sampling;
-                    apply_region_compression_options(&mut settings, runtime_options.compression);
-                    let report = generate_surface_region_with_open_material_sampler(
-                        &settings,
-                        Some(surface_material_sampler),
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let output_bytes = std::fs::metadata(&report.region_file)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-                    journal
-                        .lock()
-                        .map_err(|_| "resume journal lock poisoned".to_string())?
-                        .append_region_complete(
-                            report.region_x,
-                            report.region_z,
-                            format,
-                            report.chunk_count,
-                            output_bytes,
-                        )?;
-                    Ok(report)
-                })();
-                match result {
-                    Ok(report) => {
-                        let output_bytes = std::fs::metadata(&report.region_file)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0);
                         if sender
-                            .send(VanillaDelegatedParallelEvent::RegionGenerated {
-                                elapsed_millis: region_start.elapsed().as_millis(),
-                                output_bytes,
-                                report,
+                            .send(VanillaDelegatedParallelEvent::RegionStarted {
+                                region_x,
+                                region_z,
+                                region_file: region_file.clone(),
                             })
                             .is_err()
                         {
                             break;
+                        };
+                        let region_start = Instant::now();
+                        let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
+                            let mut settings = SurfaceRegionSettings::new_with_texture_options(
+                                heightmap_path,
+                                world_dir,
+                                "SR EarthMap Vanilla Delegated",
+                                0,
+                                scale,
+                                region_x,
+                                region_z,
+                                format,
+                                cache_rows,
+                                false,
+                                status,
+                                vertical_scale,
+                                SurfaceTextureMode::Photo,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            settings.surface_material_path = Some((*surface_material_path).clone());
+                            settings.surface_tile_cache_entries = surface_tile_cache_entries;
+                            settings.parallel_column_sampling = parallel_column_sampling;
+                            apply_region_compression_options(
+                                &mut settings,
+                                runtime_options.compression,
+                            );
+                            let report = generate_surface_region_with_open_material_sampler(
+                                &settings,
+                                Some(surface_material_sampler),
+                            )
+                            .map_err(|error| error.to_string())?;
+                            let output_bytes = std::fs::metadata(&report.region_file)
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0);
+                            journal
+                                .lock()
+                                .map_err(|_| "resume journal lock poisoned".to_string())?
+                                .append_region_complete(
+                                    report.region_x,
+                                    report.region_z,
+                                    format,
+                                    report.chunk_count,
+                                    output_bytes,
+                                )?;
+                            Ok(report)
+                        })();
+                        match result {
+                            Ok(report) => {
+                                let output_bytes = std::fs::metadata(&report.region_file)
+                                    .map(|metadata| metadata.len())
+                                    .unwrap_or(0);
+                                if sender
+                                    .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                        elapsed_millis: region_start.elapsed().as_millis(),
+                                        output_bytes,
+                                        report,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(message) => {
+                                stop_queueing.store(true, Ordering::SeqCst);
+                                let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                                    region_x,
+                                    region_z,
+                                    elapsed_millis: region_start.elapsed().as_millis(),
+                                    region_file,
+                                    message,
+                                });
+                                break;
+                            }
                         }
-                    }
-                    Err(message) => {
-                        stop_queueing.store(true, Ordering::SeqCst);
-                        let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
-                            region_x,
-                            region_z,
-                            elapsed_millis: region_start.elapsed().as_millis(),
-                            region_file,
-                            message,
-                        });
-                        break;
-                    }
+                    });
                 }
             });
-        }
+        });
         drop(event_sender);
         while let Ok(event) = event_receiver.recv() {
             handle_vanilla_delegated_parallel_event(out, &mut stats, event)?;
         }
+        coordinator
+            .join()
+            .map_err(|_| "parallel region worker coordinator panicked".to_string())?;
         Ok::<(), String>(())
     })?;
     if let Ok(journal) = resume_journal.lock() {
@@ -9669,6 +9853,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("regionRows={rows}"),
         format!("requestedThreads={threads}"),
         format!("workerThreads={worker_count}"),
+        format!("regionWorkerThreads={worker_count}"),
+        format!("rayonThreads={rayon_threads}"),
         format!("parallelColumnSampling={parallel_column_sampling}"),
         format!("workerTuningMode={}", worker_tuning.mode),
         format!("workerTuningSamples={}", worker_tuning.sample_count),
@@ -9837,6 +10023,10 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "requestedThreads": threads,
             "submittedRegions": submitted_regions,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, submitted_regions),
+            "candidateWorkerConfigs": surface_photo_worker_candidate_configs(threads, submitted_regions)
+                .into_iter()
+                .map(surface_photo_worker_candidate_config_json)
+                .collect::<Vec<_>>(),
             "minRegions": SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS,
             "maxSamples": SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES,
         }),
@@ -9869,6 +10059,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         .selected_worker_count
         .min(submitted_regions)
         .max(1);
+    let rayon_threads = worker_tuning.selected_rayon_threads.max(worker_count);
     let parallel_column_sampling = worker_tuning.parallel_column_sampling;
 
     let setup_start = Instant::now();
@@ -9929,6 +10120,8 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "submittedRegions": submitted_regions,
             "requestedThreads": threads,
             "workerThreads": worker_count,
+            "regionWorkerThreads": worker_count,
+            "rayonThreads": rayon_threads,
             "parallelColumnSampling": parallel_column_sampling,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
@@ -9958,143 +10151,164 @@ fn generate_vanilla_delegated_plan_parallel_impl(
     let (event_sender, event_receiver) =
         mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
     let mut stats = VanillaDelegatedParallelBatchStats::default();
+    let generation_pool = build_surface_photo_rayon_pool(rayon_threads)?;
     std::thread::scope(|scope| {
-        for _ in 0..worker_count {
-            let queue = &region_queue;
-            let stop_queueing = &stop_queueing;
-            let surface_material_sampler = &surface_material_sampler;
-            let surface_material_path = &surface_material_path;
-            let completed_regions = Arc::clone(&resume_completed_regions);
-            let journal = Arc::clone(&resume_journal);
-            let sender = event_sender.clone();
-            let fingerprint_matched = resume.fingerprint_matched;
-            scope.spawn(move || loop {
-                if stop_queueing.load(Ordering::SeqCst) {
-                    break;
-                }
-                let next_region = {
-                    let mut queue = queue.lock().expect("queue lock");
-                    if stop_queueing.load(Ordering::SeqCst) {
-                        None
-                    } else {
-                        queue.pop_front()
-                    }
-                };
-                let Some((region_x, region_z)) = next_region else {
-                    break;
-                };
-                let region_file = vanilla_delegated_region_file(world, format, region_x, region_z);
-                if fingerprint_matched && completed_regions.contains(&(region_x, region_z)) {
-                    let skip_start = Instant::now();
-                    if let Ok(validation) = validate_region_file_for_resume(
-                        &region_file,
-                        region_format_for_output(format),
-                        region_x,
-                        region_z,
-                        REGION_CHUNKS_PER_REGION,
-                    ) {
-                        if sender
-                            .send(VanillaDelegatedParallelEvent::RegionSkipped {
+        let coordinator_sender = event_sender.clone();
+        let generation_pool = &generation_pool;
+        let region_queue = &region_queue;
+        let stop_queueing = &stop_queueing;
+        let surface_material_sampler = &surface_material_sampler;
+        let surface_material_path = &surface_material_path;
+        let resume_completed_regions = &resume_completed_regions;
+        let resume_journal = &resume_journal;
+        let coordinator = scope.spawn(move || {
+            generation_pool.scope(|rayon_scope| {
+                for _ in 0..worker_count {
+                    let queue = region_queue;
+                    let stop_queueing = stop_queueing;
+                    let surface_material_sampler = surface_material_sampler;
+                    let surface_material_path = surface_material_path;
+                    let completed_regions = Arc::clone(&resume_completed_regions);
+                    let journal = Arc::clone(resume_journal);
+                    let sender = coordinator_sender.clone();
+                    let fingerprint_matched = resume.fingerprint_matched;
+                    rayon_scope.spawn(move |_| loop {
+                        if stop_queueing.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let next_region = {
+                            let mut queue = queue.lock().expect("queue lock");
+                            if stop_queueing.load(Ordering::SeqCst) {
+                                None
+                            } else {
+                                queue.pop_front()
+                            }
+                        };
+                        let Some((region_x, region_z)) = next_region else {
+                            break;
+                        };
+                        let region_file =
+                            vanilla_delegated_region_file(world, format, region_x, region_z);
+                        if fingerprint_matched && completed_regions.contains(&(region_x, region_z))
+                        {
+                            let skip_start = Instant::now();
+                            if let Ok(validation) = validate_region_file_for_resume(
+                                &region_file,
+                                region_format_for_output(format),
                                 region_x,
                                 region_z,
-                                elapsed_millis: skip_start.elapsed().as_millis(),
-                                chunks: validation.chunk_count,
-                                output_bytes: validation.file_bytes,
-                                region_file,
-                            })
-                            .is_err()
-                        {
-                            break;
+                                REGION_CHUNKS_PER_REGION,
+                            ) {
+                                if sender
+                                    .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                        region_x,
+                                        region_z,
+                                        elapsed_millis: skip_start.elapsed().as_millis(),
+                                        chunks: validation.chunk_count,
+                                        output_bytes: validation.file_bytes,
+                                        region_file,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                continue;
+                            }
                         }
-                        continue;
-                    }
-                }
-                if sender
-                    .send(VanillaDelegatedParallelEvent::RegionStarted {
-                        region_x,
-                        region_z,
-                        region_file: region_file.clone(),
-                    })
-                    .is_err()
-                {
-                    break;
-                };
-                let region_start = Instant::now();
-                let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
-                    let mut settings = SurfaceRegionSettings::new_with_texture_options(
-                        heightmap_path,
-                        world_dir,
-                        "SR EarthMap Vanilla Delegated Plan",
-                        0,
-                        scale,
-                        region_x,
-                        region_z,
-                        format,
-                        cache_rows,
-                        false,
-                        status,
-                        vertical_scale,
-                        SurfaceTextureMode::Photo,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    settings.surface_material_path = Some((*surface_material_path).clone());
-                    settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                    settings.parallel_column_sampling = parallel_column_sampling;
-                    apply_region_compression_options(&mut settings, runtime_options.compression);
-                    let report = generate_surface_region_with_open_material_sampler(
-                        &settings,
-                        Some(surface_material_sampler),
-                    )
-                    .map_err(|error| error.to_string())?;
-                    let output_bytes = std::fs::metadata(&report.region_file)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-                    journal
-                        .lock()
-                        .map_err(|_| "resume journal lock poisoned".to_string())?
-                        .append_region_complete(
-                            report.region_x,
-                            report.region_z,
-                            format,
-                            report.chunk_count,
-                            output_bytes,
-                        )?;
-                    Ok(report)
-                })();
-                match result {
-                    Ok(report) => {
-                        let output_bytes = std::fs::metadata(&report.region_file)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0);
                         if sender
-                            .send(VanillaDelegatedParallelEvent::RegionGenerated {
-                                elapsed_millis: region_start.elapsed().as_millis(),
-                                output_bytes,
-                                report,
+                            .send(VanillaDelegatedParallelEvent::RegionStarted {
+                                region_x,
+                                region_z,
+                                region_file: region_file.clone(),
                             })
                             .is_err()
                         {
                             break;
+                        };
+                        let region_start = Instant::now();
+                        let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
+                            let mut settings = SurfaceRegionSettings::new_with_texture_options(
+                                heightmap_path,
+                                world_dir,
+                                "SR EarthMap Vanilla Delegated Plan",
+                                0,
+                                scale,
+                                region_x,
+                                region_z,
+                                format,
+                                cache_rows,
+                                false,
+                                status,
+                                vertical_scale,
+                                SurfaceTextureMode::Photo,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            settings.surface_material_path = Some((*surface_material_path).clone());
+                            settings.surface_tile_cache_entries = surface_tile_cache_entries;
+                            settings.parallel_column_sampling = parallel_column_sampling;
+                            apply_region_compression_options(
+                                &mut settings,
+                                runtime_options.compression,
+                            );
+                            let report = generate_surface_region_with_open_material_sampler(
+                                &settings,
+                                Some(surface_material_sampler),
+                            )
+                            .map_err(|error| error.to_string())?;
+                            let output_bytes = std::fs::metadata(&report.region_file)
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0);
+                            journal
+                                .lock()
+                                .map_err(|_| "resume journal lock poisoned".to_string())?
+                                .append_region_complete(
+                                    report.region_x,
+                                    report.region_z,
+                                    format,
+                                    report.chunk_count,
+                                    output_bytes,
+                                )?;
+                            Ok(report)
+                        })();
+                        match result {
+                            Ok(report) => {
+                                let output_bytes = std::fs::metadata(&report.region_file)
+                                    .map(|metadata| metadata.len())
+                                    .unwrap_or(0);
+                                if sender
+                                    .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                        elapsed_millis: region_start.elapsed().as_millis(),
+                                        output_bytes,
+                                        report,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(message) => {
+                                stop_queueing.store(true, Ordering::SeqCst);
+                                let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                                    region_x,
+                                    region_z,
+                                    elapsed_millis: region_start.elapsed().as_millis(),
+                                    region_file,
+                                    message,
+                                });
+                                break;
+                            }
                         }
-                    }
-                    Err(message) => {
-                        stop_queueing.store(true, Ordering::SeqCst);
-                        let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
-                            region_x,
-                            region_z,
-                            elapsed_millis: region_start.elapsed().as_millis(),
-                            region_file,
-                            message,
-                        });
-                        break;
-                    }
+                    });
                 }
             });
-        }
+        });
         drop(event_sender);
         while let Ok(event) = event_receiver.recv() {
             handle_vanilla_delegated_parallel_event(out, &mut stats, event)?;
         }
+        coordinator
+            .join()
+            .map_err(|_| "parallel plan worker coordinator panicked".to_string())?;
         Ok::<(), String>(())
     })?;
     if let Ok(journal) = resume_journal.lock() {
@@ -10143,6 +10357,8 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         format!("submittedRegions={submitted_regions}"),
         format!("requestedThreads={threads}"),
         format!("workerThreads={worker_count}"),
+        format!("regionWorkerThreads={worker_count}"),
+        format!("rayonThreads={rayon_threads}"),
         format!("parallelColumnSampling={parallel_column_sampling}"),
         format!("workerTuningMode={}", worker_tuning.mode),
         format!("workerTuningSamples={}", worker_tuning.sample_count),
@@ -17578,43 +17794,61 @@ mod tests {
         assert_eq!(surface_photo_worker_candidates(10, 2), vec![2]);
     }
 
+    fn surface_photo_candidate_result(
+        worker_count: usize,
+        rayon_threads: usize,
+        parallel_column_sampling: bool,
+        elapsed_millis: u128,
+    ) -> SurfacePhotoWorkerCandidateResult {
+        SurfacePhotoWorkerCandidateResult {
+            worker_count,
+            rayon_threads,
+            parallel_column_sampling,
+            elapsed_millis,
+            sample_count: 10,
+        }
+    }
+
+    #[test]
+    fn surface_photo_worker_candidate_configs_separate_region_and_column_axes() {
+        let configs = surface_photo_worker_candidate_configs(10, 100);
+        let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(6);
+        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(6, 6, false)));
+        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
+            6,
+            tuned_rayon,
+            surface_photo_parallel_column_sampling(6, tuned_rayon)
+        )));
+        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(10, 10, false)));
+        let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(10);
+        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
+            10,
+            tuned_rayon,
+            surface_photo_parallel_column_sampling(10, tuned_rayon)
+        )));
+    }
+
     #[test]
     fn surface_photo_worker_selection_chooses_lower_worker_inside_noise_band() {
         let candidates = vec![
-            SurfacePhotoWorkerCandidateResult {
-                worker_count: 4,
-                elapsed_millis: 1_000,
-                sample_count: 10,
-            },
-            SurfacePhotoWorkerCandidateResult {
-                worker_count: 8,
-                elapsed_millis: 970,
-                sample_count: 10,
-            },
+            surface_photo_candidate_result(4, 4, false, 1_000),
+            surface_photo_candidate_result(8, 8, false, 970),
         ];
         assert_eq!(
             select_surface_photo_worker_candidate(&candidates, 1.05),
-            Some(4)
+            Some(SurfacePhotoWorkerCandidateConfig::new(4, 4, false))
         );
     }
 
     #[test]
     fn surface_photo_worker_selection_takes_clear_speedup() {
         let candidates = vec![
-            SurfacePhotoWorkerCandidateResult {
-                worker_count: 4,
-                elapsed_millis: 1_000,
-                sample_count: 10,
-            },
-            SurfacePhotoWorkerCandidateResult {
-                worker_count: 8,
-                elapsed_millis: 800,
-                sample_count: 10,
-            },
+            surface_photo_candidate_result(4, 4, false, 1_000),
+            surface_photo_candidate_result(8, 8, false, 800),
         ];
         assert_eq!(
             select_surface_photo_worker_candidate(&candidates, 1.05),
-            Some(8)
+            Some(SurfacePhotoWorkerCandidateConfig::new(8, 8, false))
         );
     }
 
