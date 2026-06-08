@@ -7385,43 +7385,57 @@ struct SurfaceSamplerThreadCacheEntry<T> {
     value: T,
 }
 
+const SURFACE_SAMPLER_L1_SLOTS: usize = 64;
+
 thread_local! {
-    static SURFACE_MATERIAL_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
-    static SURFACE_PHOTO_COLOR_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<RgbColor>>> = RefCell::new(None);
-    static SURFACE_PHOTO_EVIDENCE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
-    static SURFACE_TERRAIN_TOKEN_COLOR_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<RgbColor>>> = RefCell::new(None);
-    static SURFACE_OCEAN_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
-    static SURFACE_OPEN_OCEAN_SAMPLE_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>> = RefCell::new(None);
-    static SURFACE_ECOREGION_L1: RefCell<Option<SurfaceSamplerThreadCacheEntry<EcoregionEvidence>>> = RefCell::new(None);
+    static SURFACE_MATERIAL_SAMPLE_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
+    static SURFACE_PHOTO_COLOR_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<RgbColor>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
+    static SURFACE_PHOTO_EVIDENCE_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
+    static SURFACE_TERRAIN_TOKEN_COLOR_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<RgbColor>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
+    static SURFACE_OCEAN_SAMPLE_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
+    static SURFACE_OPEN_OCEAN_SAMPLE_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<SurfaceMaterialSample>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
+    static SURFACE_ECOREGION_L1: RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<EcoregionEvidence>>>> = RefCell::new(vec![None; SURFACE_SAMPLER_L1_SLOTS]);
 }
 
 fn surface_sampler_l1_get<T: Clone + 'static>(
-    cache: &'static LocalKey<RefCell<Option<SurfaceSamplerThreadCacheEntry<T>>>>,
+    cache: &'static LocalKey<RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<T>>>>>,
     sampler_id: usize,
     key: i64,
 ) -> Option<T> {
     cache.with(|cache| {
+        let cache = cache.borrow();
+        let slot = surface_sampler_l1_slot(sampler_id, key, cache.len());
         cache
-            .borrow()
-            .as_ref()
+            .get(slot)
+            .and_then(Option::as_ref)
             .filter(|entry| entry.sampler_id == sampler_id && entry.key == key)
             .map(|entry| entry.value.clone())
     })
 }
 
 fn surface_sampler_l1_put<T: Clone + 'static>(
-    cache: &'static LocalKey<RefCell<Option<SurfaceSamplerThreadCacheEntry<T>>>>,
+    cache: &'static LocalKey<RefCell<Vec<Option<SurfaceSamplerThreadCacheEntry<T>>>>>,
     sampler_id: usize,
     key: i64,
     value: T,
 ) {
     cache.with(|cache| {
-        *cache.borrow_mut() = Some(SurfaceSamplerThreadCacheEntry {
+        let mut cache = cache.borrow_mut();
+        let slot = surface_sampler_l1_slot(sampler_id, key, cache.len());
+        cache[slot] = Some(SurfaceSamplerThreadCacheEntry {
             sampler_id,
             key,
             value,
         });
     });
+}
+
+fn surface_sampler_l1_slot(sampler_id: usize, key: i64, len: usize) -> usize {
+    let mixed = (key as u64)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(17)
+        ^ (sampler_id as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (mixed as usize) % len.max(1)
 }
 
 impl EarthDataSurfaceMaterialSampler {
