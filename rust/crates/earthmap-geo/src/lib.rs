@@ -199,6 +199,7 @@ pub struct GeoTiffRgbReaderStats {
 
 #[derive(Debug)]
 pub struct GeoTiffRgbReader {
+    cache_id: u64,
     file: Mutex<File>,
     width: i32,
     height: i32,
@@ -210,6 +211,7 @@ pub struct GeoTiffRgbReader {
     tile_byte_counts: Vec<usize>,
     tile_cache_entries: usize,
     tile_state: Mutex<RgbTileState>,
+    tile_l1_hits: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -236,8 +238,98 @@ struct CachedTile {
     access_stamp: u64,
 }
 
+#[derive(Clone, Debug)]
+struct RgbTileThreadCacheEntry {
+    reader_id: u64,
+    tile_index: usize,
+    bytes: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug)]
+struct VrtReaderThreadCacheEntry {
+    mosaic_id: u64,
+    source_index: usize,
+    reader: Arc<GeoTiffRgbReader>,
+}
+
+const RGB_TILE_THREAD_CACHE_SLOTS: usize = 64;
+const VRT_READER_THREAD_CACHE_SLOTS: usize = 16;
+static NEXT_GEO_TIFF_RGB_READER_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_VRT_RGB_MOSAIC_READER_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static RGB_TILE_THREAD_CACHE: RefCell<Vec<Option<RgbTileThreadCacheEntry>>> =
+        RefCell::new(vec![None; RGB_TILE_THREAD_CACHE_SLOTS]);
+    static VRT_READER_THREAD_CACHE: RefCell<Vec<Option<VrtReaderThreadCacheEntry>>> =
+        RefCell::new(vec![None; VRT_READER_THREAD_CACHE_SLOTS]);
+}
+
+fn rgb_tile_thread_cache_get(reader_id: u64, tile_index: usize) -> Option<Arc<[u8]>> {
+    RGB_TILE_THREAD_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let slot = thread_cache_slot(reader_id, tile_index as u64, cache.len());
+        cache
+            .get(slot)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.reader_id == reader_id && entry.tile_index == tile_index)
+            .map(|entry| Arc::clone(&entry.bytes))
+    })
+}
+
+fn rgb_tile_thread_cache_put(reader_id: u64, tile_index: usize, bytes: Arc<[u8]>) {
+    RGB_TILE_THREAD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let slot = thread_cache_slot(reader_id, tile_index as u64, cache.len());
+        cache[slot] = Some(RgbTileThreadCacheEntry {
+            reader_id,
+            tile_index,
+            bytes,
+        });
+    });
+}
+
+fn vrt_reader_thread_cache_get(
+    mosaic_id: u64,
+    source_index: usize,
+) -> Option<Arc<GeoTiffRgbReader>> {
+    VRT_READER_THREAD_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        let slot = thread_cache_slot(mosaic_id, source_index as u64, cache.len());
+        cache
+            .get(slot)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.mosaic_id == mosaic_id && entry.source_index == source_index)
+            .map(|entry| Arc::clone(&entry.reader))
+    })
+}
+
+fn vrt_reader_thread_cache_put(
+    mosaic_id: u64,
+    source_index: usize,
+    reader: Arc<GeoTiffRgbReader>,
+) {
+    VRT_READER_THREAD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let slot = thread_cache_slot(mosaic_id, source_index as u64, cache.len());
+        cache[slot] = Some(VrtReaderThreadCacheEntry {
+            mosaic_id,
+            source_index,
+            reader,
+        });
+    });
+}
+
+fn thread_cache_slot(primary: u64, secondary: u64, len: usize) -> usize {
+    let mixed = primary
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .rotate_left(17)
+        ^ secondary.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (mixed as usize) % len.max(1)
+}
+
 #[derive(Debug)]
 pub struct VrtRgbMosaicReader {
+    cache_id: u64,
     vrt_path: PathBuf,
     raster_width: i32,
     raster_height: i32,
@@ -1008,13 +1100,19 @@ impl GeoTiffRgbReader {
         GeoTiffRgbReaderStats {
             max_tile_cache_entries: self.tile_cache_entries,
             resident_tiles: state.tiles.len(),
-            tile_hits: state.tile_hits,
+            tile_hits: state
+                .tile_hits
+                .saturating_add(self.tile_l1_hits.load(Ordering::Relaxed)),
             tile_misses: state.tile_misses,
             tile_evictions: state.tile_evictions,
         }
     }
 
     fn tile(&self, tile_index: usize) -> Result<Arc<[u8]>> {
+        if let Some(bytes) = rgb_tile_thread_cache_get(self.cache_id, tile_index) {
+            self.tile_l1_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(bytes);
+        }
         let mut state = self
             .tile_state
             .lock()
@@ -1027,7 +1125,9 @@ impl GeoTiffRgbReader {
                 .get_mut(&tile_index)
                 .expect("tile was just checked");
             tile.access_stamp = stamp;
-            return Ok(Arc::clone(&tile.bytes));
+            let bytes = Arc::clone(&tile.bytes);
+            rgb_tile_thread_cache_put(self.cache_id, tile_index, Arc::clone(&bytes));
+            return Ok(bytes);
         }
         state.tile_misses += 1;
         let offset = self.tile_offsets[tile_index];
@@ -1047,6 +1147,7 @@ impl GeoTiffRgbReader {
             },
         );
         trim_rgb_tile_cache_locked(&mut state, self.tile_cache_entries);
+        rgb_tile_thread_cache_put(self.cache_id, tile_index, Arc::clone(&bytes));
         Ok(bytes)
     }
 }
@@ -1077,6 +1178,7 @@ impl VrtRgbMosaicReader {
             parsed.raster_height,
         );
         Ok(Self {
+            cache_id: NEXT_VRT_RGB_MOSAIC_READER_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             vrt_path,
             raster_width: parsed.raster_width,
             raster_height: parsed.raster_height,
@@ -1223,7 +1325,11 @@ impl VrtRgbMosaicReader {
         let source = &self.sources[source_index];
         let source_x = source.source_x(pixel_x);
         let source_y = source.source_y(pixel_y);
-        let reader = {
+        let reader = if let Some(reader) =
+            vrt_reader_thread_cache_get(self.cache_id, source_index)
+        {
+            reader
+        } else {
             let reader_key = VrtReaderKey {
                 path: source.path.clone(),
             };
@@ -1248,6 +1354,7 @@ impl VrtRgbMosaicReader {
                     .expect("reader was inserted or already present"),
             )
         };
+        vrt_reader_thread_cache_put(self.cache_id, source_index, Arc::clone(&reader));
         reader.sample_pixel_packed(source_x, source_y)
     }
 }
@@ -2807,6 +2914,7 @@ fn parse_rgb_tiff(file: &mut File, tile_cache_entries: usize) -> Result<GeoTiffR
         .map(|value| usize_from_i32_exact_u64(value, "tile byte count"))
         .collect::<Result<Vec<_>>>()?;
     Ok(GeoTiffRgbReader {
+        cache_id: NEXT_GEO_TIFF_RGB_READER_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         file: Mutex::new(
             file.try_clone()
                 .map_err(|error| GeoError::invalid(error.to_string()))?,
@@ -2822,6 +2930,7 @@ fn parse_rgb_tiff(file: &mut File, tile_cache_entries: usize) -> Result<GeoTiffR
         tile_byte_counts,
         tile_cache_entries,
         tile_state: Mutex::new(RgbTileState::default()),
+        tile_l1_hits: AtomicU64::new(0),
     })
 }
 
