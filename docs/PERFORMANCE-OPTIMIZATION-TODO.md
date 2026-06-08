@@ -98,6 +98,7 @@
 - [ ] Resume the full Earth 1:250 Linear generation with about a 25GB prefetch memory cap.
 - [ ] Sample CPU utilization after resume.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
+- [x] Reduce startup worker tuning cost so long runs do not spend many minutes generating benchmark regions before the real batch.
 
 ### Current Crash Evidence
 
@@ -150,3 +151,4 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli --lib --locked`
 - [x] Release build: `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
 - [x] Prefetch smoke: 1 region, Linear, `prefetchMemoryGB=1`, `allDone=true`
+- [x] Startup tuning follow-up: reduced candidate samples to land/mixed/ocean coverage with fewer Rayon candidates.
