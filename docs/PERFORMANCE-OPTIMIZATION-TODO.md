@@ -290,4 +290,16 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [ ] Re-run representative land and ocean smoke tests after the next open-ocean data-structure optimization.
 - [x] Resume the 1:250 full Earth Linear run again with the requested 25GB prefetch cap: PID `29728`, log `agent-runs/full-earth-resume-answercrash-25w1-20260609-152749`, `prefetchWorkers=1`, `prefetchMemoryGB=25`; early log shows `validResume` region skips against `D:\earthmap\1-250-earth-linear`.
 - [x] First 30s sample of PID `29728`: average `7.66` CPU cores, private memory about `2.07GB`, `regionGenerated=90`, `regionSkipped=34952`. Latest pure-ocean regions `r.56.37` through `r.67.37` completed in about `0.95-1.12s` each with `prefetchReadyQueueWaitMillis` around `1-2ms`.
+- [x] Second 30s sample of PID `29728`: average `7.41` CPU cores, `regionGenerated=308`, `regionSkipped=34952`; latest 120 generated regions were 109 ocean, 10 mixed, 1 land. Ocean averaged `elapsedMillis=1103.39`, `surfaceSampleMillis=661.61`, `consumerElapsedMillis=438.85`; mixed/land slowed on `surfacePhase.columnBuildMillis`.
+- [x] Stopped PID `29728` before queue-depth code changes and land transition profiling.
+- [x] Land detail smoke for `r.-62.38` matched the existing SHA-256 output and showed the same region can complete in `elapsedMillis=12185`, `surfaceSampleMillis=11042`, with detail telemetry enabled; this made full-run land transition interference more likely than an inherently 20s single-region cost.
+- [x] Queue-depth transition smoke for `r.-72.38..r.-62.38`: default deep queue wall `52.693s`, `prefetchRegions=2` wall `47.003s`, `prefetchRegions=1` wall `46.159s`, all 11/11 SHA-256 outputs matched. Deep prepared-region queues can let ocean output backlog overlap and slow the next land sample.
+- [x] Queue-depth ocean smoke for `r.100.33..r.107.33`: default, `prefetchRegions=2`, and `prefetchRegions=1` all stayed around `6.4-6.5s` wall with 8/8 SHA-256 matches, so a shallow default queue does not hurt pure-ocean throughput on this sample.
+- [x] Changed the default prefetch queue depth from `worker_count * 2` to `prefetchWorkers`, preserving explicit `prefetchRegions=N` overrides.
+- [x] Verification after queue-depth change:
+  - `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli --lib --locked prefetch`
+  - `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli --lib --locked`
+  - Release build: `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
+  - Default transition smoke `agent-runs/smoke-transition-default-after-qdepth-x-72-z38-11r-20260609-154616`: `prefetchQueueRegions=1`, all outputs matched SHA-256, wall `56.589s` in a noisy run.
+  - Default ocean smoke `agent-runs/smoke-ocean-default-after-qdepth-100-33-8r-20260609-154742`: `prefetchQueueRegions=1`, 8/8 SHA-256 outputs matched, average `elapsedMillis=1028.62`.
 - [ ] Confirm whether sustained CPU improves beyond the current ~6.34-core sample on the resumed run.
