@@ -257,6 +257,10 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
   - `cargo test --manifest-path rust\Cargo.toml -p earthmap-surface --lib --locked`
   - `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli --lib --locked`
   - `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
+- [x] Full resume after indexed companion table: PID `20936`, log `agent-runs/full-earth-resume-open-ocean-companion-25w1-20260609-133932`, `resumeFingerprintMatched=true`, 25GB cap, `prefetchWorkers=1`; after initial resume work, a 60s sample averaged `3.7` CPU cores. Latest pure-ocean regions completed around `1.56-1.68s` with `openOceanCompanionPrecomputeMillis` commonly `0.75-0.86s` and `consumerElapsedMillis` about `0.55s`.
+- [x] Stop PID `20936` before additional code changes; this run confirmed the remaining pure-ocean CPU plateau is not output/NBT but single-producer companion precompute.
+- [x] Rejected an ocean-only assist producer scheduler experiment: 8-region smoke `agent-runs/smoke-open-ocean-assist-8r-100-33-20260609-135111` matched SHA-256 but only slightly changed wall time, 32-region smoke `agent-runs/smoke-open-ocean-assist-32r-100-33-20260609-135159` averaged `3.9` CPU cores while crossing mixed/land regions, and full resume `agent-runs/full-earth-resume-ocean-assist-25w1-20260609-135346` averaged only `3.51` CPU cores. The code was removed instead of committed.
+- [ ] Design a safe ocean-only concurrency path so pure open-ocean companion precompute can overlap across regions without reintroducing the land/photo starvation seen with simple `prefetchWorkers=2`.
 - [ ] Reduce open-ocean `EarthSurfaceColumn` allocation/clone overhead without changing bathymetry, biome, or output hashes.
 - [ ] Test whether avoiding per-chunk column clone copies in `generate_surface_region_with_prepared_sample_inner` improves pure-ocean consumer time without changing output.
 - [ ] Re-run representative land and ocean smoke tests after the next open-ocean data-structure optimization.
