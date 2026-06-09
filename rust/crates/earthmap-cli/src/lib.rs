@@ -828,13 +828,13 @@ fn open_ocean_prefetch_output_rayon_threads(
     let base = base_output_threads.max(1);
     if total >= 16 {
         return consumer_workers
-            .saturating_mul(3)
+            .saturating_mul(6)
             .min(total.saturating_sub(2).max(1))
             .max(base);
     }
     if total >= 8 {
         return consumer_workers
-            .saturating_mul(2)
+            .saturating_mul(3)
             .min(total.saturating_sub(1).max(1))
             .max(base);
     }
@@ -18595,7 +18595,9 @@ mod tests {
 
     #[test]
     fn open_ocean_prefetch_output_pool_can_use_more_threads_than_land_output() {
-        assert_eq!(open_ocean_prefetch_output_rayon_threads(16, 3, 4), 12);
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(16, 3, 2), 12);
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(16, 3, 4), 14);
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(8, 2, 2), 6);
         assert_eq!(open_ocean_prefetch_output_rayon_threads(8, 2, 4), 7);
         assert_eq!(open_ocean_prefetch_output_rayon_threads(2, 1, 4), 1);
     }
