@@ -302,4 +302,10 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
   - Release build: `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
   - Default transition smoke `agent-runs/smoke-transition-default-after-qdepth-x-72-z38-11r-20260609-154616`: `prefetchQueueRegions=1`, all outputs matched SHA-256, wall `56.589s` in a noisy run.
   - Default ocean smoke `agent-runs/smoke-ocean-default-after-qdepth-100-33-8r-20260609-154742`: `prefetchQueueRegions=1`, 8/8 SHA-256 outputs matched, average `elapsedMillis=1028.62`.
+- [x] Full resume after queue-depth change: PID `23920`, log `agent-runs/full-earth-resume-qdepth1-25w1-20260609-154955`, `resumeFingerprintMatched=true`, `resumeJournalRegions=35266`, `prefetchQueueRegions=1`.
+- [x] First 30s sample of PID `23920`: average `7.32` CPU cores, `regionGenerated=54`, `regionSkipped=35266`. Latest 80 regions were all ocean with average `elapsedMillis=947.16`, `surfaceSampleMillis=542.16`, `openOceanCompanionPrecomputeMillis=177.4`, and `consumerElapsedMillis=402.68`.
+- [x] Follow-up sample after PID `23920` crossed mixed regions: latest 80 had 73 ocean and 7 mixed. Mixed averaged `elapsedMillis=9582.57`, `surfaceSampleMillis=8181.14`, `columnBuildMillis=6388.29`; slow examples included `r.147.38` at `elapsedMillis=20718`, `columnBuildMillis=16624`.
+- [x] Stopped PID `23920` before photo-apply profiling.
+- [x] Detail smoke for `r.147.38` matched the existing SHA-256 output and completed in `elapsedMillis=12471`, showing full-run `20.7s` was partly scheduling/contention. Detail subphases: `photoApplyMillis=5480`, `columnBuildMillis=3601`, `columnSemanticApplyMillis=5229` summed across columns.
+- [x] Tested and rejected owned `PhotoSurfaceDecision -> EarthSurfaceColumn` conversion: SHA-256 still matched for `r.147.38`, but `photoApplyMillis` regressed from `5480` to `6330` and elapsed regressed to `13416`; code was reverted and the release binary rebuilt from the accepted code.
 - [ ] Confirm whether sustained CPU improves beyond the current ~6.34-core sample on the resumed run.
