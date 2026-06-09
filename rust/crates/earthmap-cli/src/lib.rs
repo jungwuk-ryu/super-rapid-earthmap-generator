@@ -814,6 +814,24 @@ fn split_prefetch_rayon_threads(
     (sample_threads, consumer_threads)
 }
 
+fn open_ocean_prefetch_output_rayon_threads(
+    rayon_threads: usize,
+    base_output_threads: usize,
+    consumer_workers: usize,
+) -> usize {
+    let total = rayon_threads.max(1);
+    let base = base_output_threads.max(1);
+    if total >= 16 {
+        return (consumer_workers.saturating_add(2))
+            .min(total.saturating_sub(1).max(1))
+            .max(base);
+    }
+    if total >= 8 {
+        return consumer_workers.min(3).max(base);
+    }
+    base
+}
+
 fn surface_photo_worker_tune_root(world: &Path) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9663,6 +9681,15 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     } else {
         (0, 0)
     };
+    let prefetch_open_ocean_output_rayon_threads = if prefetch_config.enabled {
+        open_ocean_prefetch_output_rayon_threads(
+            rayon_threads,
+            prefetch_output_rayon_threads,
+            worker_count,
+        )
+    } else {
+        0
+    };
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
     let spawn_x = start_region_x
@@ -9730,6 +9757,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "prefetchEstimatedRegionBytes": prefetch_config.estimated_region_bytes,
             "prefetchSampleRayonThreads": prefetch_sample_rayon_threads,
             "prefetchOutputRayonThreads": prefetch_output_rayon_threads,
+            "prefetchOpenOceanOutputRayonThreads": prefetch_open_ocean_output_rayon_threads,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
             "resumeJournalRegions": resume.completed_regions.len(),
@@ -9766,6 +9794,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     if prefetch_config.enabled {
         let prefetch_sample_pool = build_surface_photo_rayon_pool(prefetch_sample_rayon_threads)?;
         let prefetch_output_pool = build_surface_photo_rayon_pool(prefetch_output_rayon_threads)?;
+        let prefetch_open_ocean_output_pool =
+            build_surface_photo_rayon_pool(prefetch_open_ocean_output_rayon_threads)?;
         std::thread::scope(|scope| {
             let (prepared_sender, prepared_receiver) =
                 mpsc::sync_channel::<PreparedVanillaDelegatedRegion>(prefetch_config.queue_regions);
@@ -9948,6 +9978,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                 let receiver = Arc::clone(&prepared_receiver);
                 let sender = event_sender.clone();
                 let prefetch_output_pool = &prefetch_output_pool;
+                let prefetch_open_ocean_output_pool = &prefetch_open_ocean_output_pool;
                 let stop_queueing = &stop_queueing;
                 let surface_material_path = &surface_material_path;
                 let journal = Arc::clone(&resume_journal);
@@ -9966,6 +9997,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                     let region_z = prepared.region_z;
                     let region_file = prepared.region_file.clone();
                     let started_at = prepared.started_at;
+                    let use_open_ocean_output_pool =
+                        prepared.sample.sample.phase_nanos().open_ocean_fast_path > 0;
                     let ready_queue_wait_millis = prepared.prepared_at.elapsed().as_millis();
                     let prefetch_send_wait_millis = prepared.prefetch_send_wait_millis;
                     let consumer_started_at = Instant::now();
@@ -9991,7 +10024,12 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                             runtime_options.compression,
                         )?;
                         let output_pool_start = Instant::now();
-                        let report = prefetch_output_pool
+                        let output_pool = if use_open_ocean_output_pool {
+                            prefetch_open_ocean_output_pool
+                        } else {
+                            prefetch_output_pool
+                        };
+                        let report = output_pool
                             .install(|| {
                                 generate_surface_region_with_prepared_sample(
                                     &settings,
@@ -18513,6 +18551,13 @@ mod tests {
         assert_eq!(split_prefetch_rayon_threads(16, 2, 4), (13, 3));
         assert_eq!(split_prefetch_rayon_threads(8, 2, 4), (6, 2));
         assert_eq!(split_prefetch_rayon_threads(2, 1, 4), (1, 1));
+    }
+
+    #[test]
+    fn open_ocean_prefetch_output_pool_can_use_more_threads_than_land_output() {
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(16, 3, 4), 6);
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(8, 2, 4), 3);
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(2, 1, 4), 1);
     }
 
     #[test]
