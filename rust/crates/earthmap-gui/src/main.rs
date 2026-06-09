@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use earthmap_geo::{EarthScaleMapping, GeoTiffHeightmapReader};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[global_allocator]
@@ -43,6 +44,7 @@ const WORLD_MAP_BACKGROUND_PNG: &[u8] =
     include_bytes!("../assets/world-background-truemarble-2048.png");
 const MAX_STATUS_TEXTURE_DIMENSION: usize = 2048;
 const STATUS_TEXTURE_UPLOAD_INTERVAL: Duration = Duration::from_millis(250);
+const GUI_OPTIONS_STORAGE_KEY: &str = "earthmap-gui.generation-options.v1";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,11 +92,11 @@ fn run_gui() -> Result<(), eframe::Error> {
     eframe::run_native(
         "EarthMap Generator",
         options,
-        Box::new(|_| Ok(Box::new(EarthMapGuiApp::default()))),
+        Box::new(|creation_context| Ok(Box::new(EarthMapGuiApp::new(creation_context)))),
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum OutputFormatChoice {
     Linear,
     Mca,
@@ -116,7 +118,7 @@ impl OutputFormatChoice {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ChunkStatusChoice {
     Surface,
     Carvers,
@@ -131,7 +133,7 @@ impl ChunkStatusChoice {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum ExtentMode {
     WholeEarth,
     Preset,
@@ -150,7 +152,7 @@ impl ExtentMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum AreaPreset {
     Korea,
     Australia,
@@ -181,7 +183,7 @@ impl AreaPreset {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 struct GeoBounds {
     west_longitude: f64,
     east_longitude: f64,
@@ -205,7 +207,7 @@ impl GeoBounds {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct RegionGrid {
     start_region_x: i32,
     start_region_z: i32,
@@ -213,7 +215,7 @@ struct RegionGrid {
     rows: i32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct GenerationOptions {
     heightmap_path: String,
     tif_root: String,
@@ -1364,6 +1366,20 @@ impl Default for EarthMapGuiApp {
 }
 
 impl EarthMapGuiApp {
+    fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
+        let mut app = Self::default();
+        if let Some(storage) = creation_context.storage {
+            if let Some(options) = storage
+                .get_string(GUI_OPTIONS_STORAGE_KEY)
+                .and_then(|encoded| serde_json::from_str::<GenerationOptions>(&encoded).ok())
+            {
+                app.options = options;
+                app.apply_existing_project_settings_for_world_dir();
+            }
+        }
+        app
+    }
+
     fn apply_existing_project_settings_for_world_dir(&mut self) {
         if self.run.is_some() {
             return;
@@ -1706,6 +1722,12 @@ impl EarthMapGuiApp {
 }
 
 impl eframe::App for EarthMapGuiApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Ok(encoded) = serde_json::to_string(&self.options) {
+            storage.set_string(GUI_OPTIONS_STORAGE_KEY, encoded);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_worker_events();
         let ctx = ui.ctx().clone();
@@ -2532,6 +2554,42 @@ generation.verticalScaleMode=auto\n",
         assert_eq!(args[6], "314");
         assert_eq!(args[7], "148");
         assert_eq!(args[13], "linearCompression=6");
+    }
+
+    #[test]
+    fn generation_options_persist_round_trip() {
+        let options = GenerationOptions {
+            heightmap_path: "C:\\data\\height.tif".to_string(),
+            tif_root: "D:\\earthmap\\TifFiles".to_string(),
+            true_marble_path: "D:\\earthmap\\TifFiles\\terrain\\TrueMarble.vrt".to_string(),
+            world_dir: "D:\\earthmap\\1-250-earth-linear".to_string(),
+            scale: 250,
+            extent_mode: ExtentMode::WholeEarth,
+            preset: AreaPreset::Korea,
+            bounds: GeoBounds::new(124.0, 132.0, 43.5, 33.0),
+            start_region_x: -157,
+            start_region_z: -74,
+            cols: 314,
+            rows: 148,
+            format: OutputFormatChoice::Linear,
+            linear_compression_level: 6,
+            mca_compression_level: 5,
+            threads: 10,
+            status: ChunkStatusChoice::Surface,
+            vertical_scale: "auto".to_string(),
+            cache_rows: "auto".to_string(),
+            surface_tile_cache_entries: "auto".to_string(),
+            rayon_threads: "12".to_string(),
+        };
+
+        let encoded = serde_json::to_string(&options).unwrap();
+        let decoded: GenerationOptions = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.world_dir, options.world_dir);
+        assert_eq!(decoded.scale, 250);
+        assert_eq!(decoded.extent_mode, ExtentMode::WholeEarth);
+        assert_eq!(decoded.linear_compression_level, 6);
+        assert_eq!(decoded.threads, 10);
+        assert_eq!(decoded.rayon_threads, "12");
     }
 
     #[test]

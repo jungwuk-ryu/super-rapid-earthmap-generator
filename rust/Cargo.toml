@@ -28,7 +28,7 @@ camino = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 csv = "1"
-eframe = "0.34.3"
+eframe = { version = "0.34.3", features = ["persistence"] }
 flate2 = { version = "1", default-features = false, features = ["zlib-default"] }
 geo = "0.30"
 geo-types = "0.7"
