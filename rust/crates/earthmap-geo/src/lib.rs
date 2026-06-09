@@ -407,6 +407,13 @@ pub struct GeoTiffRowCache<'a> {
     state: Mutex<RowCacheState>,
 }
 
+#[derive(Debug)]
+pub struct GeoTiffFloat32RowCache<'a> {
+    reader: &'a GeoTiffFloat32Reader,
+    max_rows: usize,
+    state: Mutex<Float32RowCacheState>,
+}
+
 #[derive(Debug, Default)]
 struct RowCacheState {
     rows: BTreeMap<i32, CachedRow>,
@@ -422,6 +429,21 @@ struct RowCacheState {
 #[derive(Clone, Debug)]
 struct CachedRow {
     values: Arc<[i16]>,
+    access_stamp: u64,
+}
+
+#[derive(Debug, Default)]
+struct Float32RowCacheState {
+    rows: BTreeMap<i32, CachedFloat32Row>,
+    access_clock: u64,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CachedFloat32Row {
+    values: Arc<[f32]>,
     access_stamp: u64,
 }
 
@@ -621,6 +643,46 @@ impl GeoTiffFloat32Reader {
         Ok(f32::from_le_bytes(
             bytes.try_into().expect("sample read length is 4"),
         ))
+    }
+
+    pub fn read_row(&self, y: i32, destination: &mut [f32]) -> Result<()> {
+        if y < 0 || y >= self.metadata.height {
+            return Err(GeoError::invalid(format!("row outside raster: {y}")));
+        }
+        if destination.len() < self.metadata.width as usize {
+            return Err(GeoError::invalid(
+                "destination is smaller than raster width",
+            ));
+        }
+        let expected_bytes = usize::try_from(self.metadata.width)
+            .ok()
+            .and_then(|width| width.checked_mul(4))
+            .ok_or_else(|| GeoError::invalid("row byte count overflow"))?;
+        let byte_count = self.strip_byte_counts[y as usize];
+        if byte_count < expected_bytes {
+            return Err(GeoError::invalid(format!(
+                "strip byte count is too small for row {y}: {byte_count}"
+            )));
+        }
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| GeoError::invalid("Float32 GeoTIFF file lock poisoned"))?;
+        let row = read_exact_at(&mut file, self.strip_offsets[y as usize], expected_bytes)?;
+        for (index, sample) in destination
+            .iter_mut()
+            .take(self.metadata.width as usize)
+            .enumerate()
+        {
+            let offset = index * 4;
+            *sample = f32::from_le_bytes([
+                row[offset],
+                row[offset + 1],
+                row[offset + 2],
+                row[offset + 3],
+            ]);
+        }
+        Ok(())
     }
 
     pub fn pixel_x(&self, longitude: f64) -> i32 {
@@ -2014,6 +2076,119 @@ impl<'a> GeoTiffRowCache<'a> {
     }
 }
 
+impl<'a> GeoTiffFloat32RowCache<'a> {
+    pub fn new(reader: &'a GeoTiffFloat32Reader, max_rows: usize) -> Result<Self> {
+        if max_rows == 0 {
+            return Err(GeoError::invalid("maxRows must be positive"));
+        }
+        Ok(Self {
+            reader,
+            max_rows,
+            state: Mutex::new(Float32RowCacheState::default()),
+        })
+    }
+
+    pub fn sample_bilinear(&self, longitude: f64, latitude: f64) -> Result<Option<f64>> {
+        let pixel_x = ((longitude - self.reader.metadata.top_left_longitude)
+            / self.reader.metadata.pixel_width_degrees)
+            - 0.5;
+        let pixel_y = ((self.reader.metadata.top_left_latitude - latitude)
+            / self.reader.metadata.pixel_height_degrees)
+            - 0.5;
+        let floor_x = pixel_x.floor();
+        let floor_y = pixel_y.floor();
+        let x0 = clamp(floor_x as i32, self.reader.metadata.width);
+        let y0 = clamp(floor_y as i32, self.reader.metadata.height);
+        let x1 = clamp(x0 + 1, self.reader.metadata.width);
+        let y1 = clamp(y0 + 1, self.reader.metadata.height);
+        let tx = clamp_unit(pixel_x - floor_x);
+        let ty = clamp_unit(pixel_y - floor_y);
+
+        let samples = [
+            (
+                self.sample_optional_at_pixel(x0, y0)?,
+                (1.0 - tx) * (1.0 - ty),
+            ),
+            (self.sample_optional_at_pixel(x1, y0)?, tx * (1.0 - ty)),
+            (self.sample_optional_at_pixel(x0, y1)?, (1.0 - tx) * ty),
+            (self.sample_optional_at_pixel(x1, y1)?, tx * ty),
+        ];
+        let mut weighted = 0.0;
+        let mut weight_sum = 0.0;
+        for (sample, weight) in samples {
+            if let Some(value) = sample {
+                weighted += value * weight;
+                weight_sum += weight;
+            }
+        }
+        if weight_sum == 0.0 {
+            Ok(None)
+        } else {
+            Ok(Some(weighted / weight_sum))
+        }
+    }
+
+    pub fn sample_at_pixel(&self, x: i32, y: i32) -> Result<f32> {
+        self.reader.require_pixel(x, y)?;
+        let row = self.row_arc(y)?;
+        let x =
+            usize::try_from(x).map_err(|_| GeoError::invalid(format!("x outside raster: {x}")))?;
+        row.get(x)
+            .copied()
+            .ok_or_else(|| GeoError::invalid(format!("x outside raster: {x}")))
+    }
+
+    fn row_arc(&self, y: i32) -> Result<Arc<[f32]>> {
+        if y < 0 || y >= self.reader.metadata().height {
+            return Err(GeoError::invalid(format!("row outside raster: {y}")));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GeoError::invalid("Float32 row cache lock poisoned"))?;
+        if state.rows.contains_key(&y) {
+            state.hits += 1;
+            let stamp = touch_float32_state(&mut state);
+            let row = state.rows.get_mut(&y).expect("row was just checked");
+            row.access_stamp = stamp;
+            return Ok(Arc::clone(&row.values));
+        }
+
+        state.misses += 1;
+        let loaded = self.load_row(y)?;
+        let stamp = touch_float32_state(&mut state);
+        state.rows.insert(
+            y,
+            CachedFloat32Row {
+                values: Arc::clone(&loaded),
+                access_stamp: stamp,
+            },
+        );
+        trim_float32_cache_locked(&mut state, self.max_rows);
+        Ok(loaded)
+    }
+
+    fn load_row(&self, y: i32) -> Result<Arc<[f32]>> {
+        let mut row = vec![0.0f32; self.reader.metadata().width as usize];
+        self.reader.read_row(y, &mut row)?;
+        Ok(Arc::from(row.into_boxed_slice()))
+    }
+
+    fn sample_optional_at_pixel(&self, x: i32, y: i32) -> Result<Option<f64>> {
+        let value = f64::from(self.sample_at_pixel(x, y)?);
+        if !value.is_finite()
+            || self
+                .reader
+                .metadata
+                .no_data_value
+                .is_some_and(|no_data| java_double_compare_equal(value, no_data))
+        {
+            return Ok(None);
+        }
+        Ok(Some(value))
+    }
+}
+
 #[derive(Debug)]
 pub struct HeightmapScalarSampler<'a> {
     reader: &'a GeoTiffHeightmapReader,
@@ -2260,6 +2435,23 @@ fn touch_state(state: &mut RowCacheState) -> u64 {
 }
 
 fn trim_cache_locked(state: &mut RowCacheState, max_rows: usize) {
+    while state.rows.len() > max_rows {
+        let Some((&oldest_y, _)) = state.rows.iter().min_by_key(|(_y, row)| row.access_stamp)
+        else {
+            return;
+        };
+        if state.rows.remove(&oldest_y).is_some() {
+            state.evictions += 1;
+        }
+    }
+}
+
+fn touch_float32_state(state: &mut Float32RowCacheState) -> u64 {
+    state.access_clock += 1;
+    state.access_clock
+}
+
+fn trim_float32_cache_locked(state: &mut Float32RowCacheState, max_rows: usize) {
     while state.rows.len() > max_rows {
         let Some((&oldest_y, _)) = state.rows.iter().min_by_key(|(_y, row)| row.access_stamp)
         else {
@@ -4005,6 +4197,20 @@ mod tests {
         let interpolated = reader.sample_bilinear(10.5, 19.5).unwrap().unwrap();
         assert!((interpolated - (11.0 / 3.0)).abs() < 0.000_001);
         assert_eq!(reader.sample_bilinear(9.99, 19.75).unwrap(), Some(1.25));
+        let row_cache = GeoTiffFloat32RowCache::new(&reader, 2).unwrap();
+        assert_eq!(row_cache.sample_at_pixel(0, 0).unwrap(), 1.25);
+        assert_eq!(
+            row_cache.sample_bilinear(10.25, 19.75).unwrap(),
+            reader.sample_bilinear(10.25, 19.75).unwrap()
+        );
+        assert_eq!(
+            row_cache.sample_bilinear(10.5, 19.5).unwrap(),
+            reader.sample_bilinear(10.5, 19.5).unwrap()
+        );
+        assert_eq!(
+            row_cache.sample_bilinear(9.99, 19.75).unwrap(),
+            reader.sample_bilinear(9.99, 19.75).unwrap()
+        );
 
         let u16_path = temp.path().join("tiny-single-band-u16.tif");
         fs::write(

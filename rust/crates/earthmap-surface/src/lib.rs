@@ -13,9 +13,10 @@ use std::time::Instant;
 
 use earthmap_core::build_info;
 use earthmap_geo::{
-    EarthScaleMapping, GeoError, GeoTiffFloat32Reader, GeoTiffHeightmapReader, GeoTiffMetadata,
-    GeoTiffRgbReader, GeoTiffRowCache, GeoTiffRowCacheStats, GeoTiffSingleBandReader,
-    HeightmapScalarSampler, RgbColor, VrtRgbMosaicReader, DEFAULT_RGB_TILE_CACHE_ENTRIES,
+    EarthScaleMapping, GeoError, GeoTiffFloat32Reader, GeoTiffFloat32RowCache,
+    GeoTiffHeightmapReader, GeoTiffMetadata, GeoTiffRgbReader, GeoTiffRowCache,
+    GeoTiffRowCacheStats, GeoTiffSingleBandReader, HeightmapScalarSampler, RgbColor,
+    VrtRgbMosaicReader, DEFAULT_RGB_TILE_CACHE_ENTRIES,
 };
 use earthmap_minecraft::block_state_ids;
 use earthmap_minecraft::chunk_generation_status::ChunkGenerationStatus;
@@ -38,6 +39,7 @@ pub const SURVIVAL_MANIFEST_FILE_NAME: &str = "earthmap-survival.properties";
 
 const DATA_ROOT_ENV: &str = "EARTHMAP_DATA_ROOT";
 const TIF_ROOT_ENV: &str = "EARTHMAP_TIF_ROOT";
+const OPEN_OCEAN_BATHYMETRY_ROW_CACHE_ROWS: usize = 256;
 
 static PHOTO_SURFACE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 262_144;
@@ -7263,6 +7265,10 @@ pub mod surface_data_evidence {
 }
 
 pub trait SurfaceMaterialSampler: Send + Sync {
+    fn as_earth_data_surface_material_sampler(&self) -> Option<&EarthDataSurfaceMaterialSampler> {
+        None
+    }
+
     fn sample(
         &self,
         longitude: f64,
@@ -8119,6 +8125,15 @@ impl EarthDataSurfaceMaterialSampler {
         longitude: f64,
         latitude: f64,
     ) -> SurfaceMaterialSample {
+        self.sample_open_ocean_water_uncached_with_bathymetry_cache(longitude, latitude, None)
+    }
+
+    fn sample_open_ocean_water_uncached_with_bathymetry_cache(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        bathymetry_cache: Option<&GeoTiffFloat32RowCache<'_>>,
+    ) -> SurfaceMaterialSample {
         SurfaceMaterialSample::new(
             RgbColor::unavailable(),
             RgbColor::unavailable(),
@@ -8133,12 +8148,74 @@ impl EarthDataSurfaceMaterialSampler {
             SurfaceMaterialSample::UNKNOWN,
             SurfaceMaterialSample::UNKNOWN,
             sample_rounded(self.ocean_temperature.as_ref(), longitude, latitude),
-            sample_bathymetry_meters(self.bathymetry.as_ref(), longitude, latitude),
+            sample_bathymetry_meters_with_cache(
+                self.bathymetry.as_ref(),
+                bathymetry_cache,
+                longitude,
+                latitude,
+            ),
             SurfaceMaterialSample::UNKNOWN,
             "",
             "",
             0.0,
         )
+    }
+
+    fn precompute_open_ocean_companion_materials_with_row_cache(
+        &self,
+        longitudes: &[f64],
+        latitudes: &[f64],
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+        smoothed_center_elevations: &[f64],
+    ) -> Result<Option<OpenOceanCompanionMaterials>> {
+        if !self.samples_open_water() || !self.samples_open_ocean_water_by_material_cell() {
+            return Ok(None);
+        }
+        let bathymetry_cache = self
+            .bathymetry
+            .as_ref()
+            .map(|reader| GeoTiffFloat32RowCache::new(reader, OPEN_OCEAN_BATHYMETRY_ROW_CACHE_ROWS))
+            .transpose()?;
+        let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let mut cell_indices = HashMap::<i64, usize>::new();
+        let mut samples = Vec::<SurfaceMaterialSample>::new();
+        let mut column_samples = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        for local_z in 0..SURFACE_REGION_WIDTH {
+            let latitude = latitudes[local_z];
+            for local_x in 0..SURFACE_REGION_WIDTH {
+                let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+                if !should_sample_open_ocean_companion_material(
+                    smoothed_center_elevations[column_index],
+                ) {
+                    continue;
+                }
+                let longitude = longitudes[local_x];
+                let cell = quantized_cell(longitude, latitude, cell_degrees);
+                let sample_index = if let Some(&index) = cell_indices.get(&cell.key) {
+                    index
+                } else {
+                    let sample = self.sample_open_ocean_water_uncached_with_bathymetry_cache(
+                        cell.center_longitude,
+                        cell.center_latitude,
+                        bathymetry_cache.as_ref(),
+                    );
+                    let index = samples.len();
+                    cell_indices.insert(cell.key, index);
+                    samples.push(sample);
+                    index
+                };
+                column_samples[column_index] = Some(sample_index);
+            }
+        }
+        if samples.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(OpenOceanCompanionMaterials {
+                column_samples,
+                samples,
+            }))
+        }
     }
 
     fn sample_terrain_token_color_cached(
@@ -8215,6 +8292,10 @@ impl EarthDataSurfaceMaterialSampler {
 }
 
 impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
+    fn as_earth_data_surface_material_sampler(&self) -> Option<&EarthDataSurfaceMaterialSampler> {
+        Some(self)
+    }
+
     fn sample(
         &self,
         longitude: f64,
@@ -11064,10 +11145,24 @@ fn sample_bathymetry_meters(
     longitude: f64,
     latitude: f64,
 ) -> i32 {
+    sample_bathymetry_meters_with_cache(reader, None, longitude, latitude)
+}
+
+fn sample_bathymetry_meters_with_cache(
+    reader: Option<&GeoTiffFloat32Reader>,
+    cache: Option<&GeoTiffFloat32RowCache<'_>>,
+    longitude: f64,
+    latitude: f64,
+) -> i32 {
     let Some(reader) = reader else {
         return SurfaceMaterialSample::UNKNOWN;
     };
-    match reader.sample_bilinear(longitude, latitude) {
+    let sample = if let Some(cache) = cache {
+        cache.sample_bilinear(longitude, latitude)
+    } else {
+        reader.sample_bilinear(longitude, latitude)
+    };
+    match sample {
         Ok(Some(value)) if value.is_finite() => SurfaceMaterialSample::rounded(Some(value)),
         Ok(Some(_)) | Ok(None) | Err(_) => SurfaceMaterialSample::UNKNOWN,
     }
@@ -12776,6 +12871,15 @@ fn precompute_open_ocean_companion_materials(
     let Some(material_sampler) = material_sampler else {
         return Ok(None);
     };
+    if let Some(earth_data) = material_sampler.as_earth_data_surface_material_sampler() {
+        return earth_data.precompute_open_ocean_companion_materials_with_row_cache(
+            longitudes,
+            latitudes,
+            longitude_span_degrees,
+            latitude_span_degrees,
+            smoothed_center_elevations,
+        );
+    }
     if !material_sampler.samples_open_water()
         || !material_sampler.samples_open_ocean_water_by_material_cell()
     {
