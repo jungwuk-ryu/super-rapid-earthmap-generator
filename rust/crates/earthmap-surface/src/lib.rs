@@ -420,6 +420,8 @@ pub struct SurfaceRegionSamplePhaseNanos {
     pub smooth_precompute: u128,
     pub relief_precompute: u128,
     pub open_ocean_fast_path: u128,
+    pub coordinate_precompute: u128,
+    pub photo_land_precompute: u128,
     pub column_build: u128,
     pub photo_profile: u128,
     pub photo_apply: u128,
@@ -12225,6 +12227,7 @@ where
         surface_region_local_relief_center_meters(&elevations, &valid, parallel_column_sampling)
     });
     phase_nanos.relief_precompute = phase_start.elapsed().as_nanos();
+    let column_build_phase_start = Instant::now();
     let phase_start = Instant::now();
     let longitudes = (0..SURFACE_REGION_WIDTH)
         .map(|local_x| {
@@ -12248,6 +12251,8 @@ where
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    phase_nanos.coordinate_precompute = phase_start.elapsed().as_nanos();
+    let phase_start = Instant::now();
     let precomputed_photo_land_materials = if texture_mode == SurfaceTextureMode::Photo {
         match material_sampler {
             Some(material_sampler) => material_sampler.precompute_photo_land_region_materials(
@@ -12263,6 +12268,7 @@ where
     } else {
         None
     };
+    phase_nanos.photo_land_precompute = phase_start.elapsed().as_nanos();
 
     struct SurfaceColumnSampleBuild {
         column: EarthSurfaceColumn,
@@ -12381,7 +12387,7 @@ where
         }
         column_builds
     };
-    phase_nanos.column_build = phase_start.elapsed().as_nanos();
+    phase_nanos.column_build = column_build_phase_start.elapsed().as_nanos();
     phase_nanos.sampled_material_columns = column_builds
         .iter()
         .filter(|build| build.material.is_some())

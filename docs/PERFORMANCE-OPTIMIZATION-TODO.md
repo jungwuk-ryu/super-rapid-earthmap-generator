@@ -118,6 +118,8 @@
 - [x] Test and reject widening the prefetch consumer/output Rayon pool: it helped small ocean smoke but badly hurt land/photo regions.
 - [x] Re-test `prefetchWorkers=2` after the larger material caches; reject it again for the current land row because it increased land region times and reduced average CPU versus `prefetchWorkers=1`.
 - [x] Rebalance prefetch split from `12 sample / 4 output` to `13 sample / 3 output` for 16-thread photo generation, because current land rows are sample-bound while pure-ocean rows still need enough output/NBT capacity.
+- [x] Split broad `surfacePhase.columnBuildMillis` telemetry into coordinate and photo-land precompute subfields while keeping the existing field backwards-compatible.
+- [ ] Use the new subphase telemetry to decide whether the next optimization should target photo-land precompute, column material application, open-ocean elevation/fill, or consumer/NBT output.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
 - [x] Reduce startup worker tuning cost so long runs do not spend many minutes generating benchmark regions before the real batch.
 
@@ -228,3 +230,6 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [ ] Design a locality-aware resume scheduler so incomplete regions are grouped by nearby runs instead of starting far-apart holes concurrently.
 - [x] Add a conservative uniform deep-open-ocean surface sample path for regions whose smoothed source elevations are all deep enough to clamp to the world floor and whose water biome is constant.
 - [x] Verify the uniform deep-open-ocean unit test passes; real `r.88.27` and `r.-120.27` did not trigger the conservative guard, so their remaining ocean cost is still in the normal open-ocean path.
+- [x] Added subphase telemetry and verified it in release smoke runs:
+  - Land smoke `agent-runs/smoke-phase-telemetry-land--63-31-20260609-120756`: `r.-63.31` elapsed `12522ms`, `surfaceSampleMillis=10370`, `elevationFillMillis=931`, `photoLandPrecomputeMillis=2421`, broad `columnBuildMillis=6330`, `photoApplyMillis=1922`, `postProcessMillis=1030`, `consumerElapsedMillis=2151`.
+  - Ocean smoke `agent-runs/smoke-phase-telemetry-ocean-107-31-20260609-120833`: `r.107.31` elapsed `3760ms`, `surfaceSampleMillis=1788`, `elevationFillMillis=919`, `openOceanFastPathMillis=752`, `consumerElapsedMillis=1971`.
