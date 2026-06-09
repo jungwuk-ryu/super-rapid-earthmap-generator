@@ -7299,7 +7299,7 @@ pub trait SurfaceMaterialSampler: Send + Sync {
         _water_mask: &[bool],
         _longitude_span_degrees: f64,
         _latitude_span_degrees: f64,
-    ) -> Result<Option<Vec<Option<SurfaceMaterialSample>>>> {
+    ) -> Result<Option<Vec<Option<Arc<SurfaceMaterialSample>>>>> {
         Ok(None)
     }
 
@@ -8242,7 +8242,7 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
         water_mask: &[bool],
         longitude_span_degrees: f64,
         latitude_span_degrees: f64,
-    ) -> Result<Option<Vec<Option<SurfaceMaterialSample>>>> {
+    ) -> Result<Option<Vec<Option<Arc<SurfaceMaterialSample>>>>> {
         let photo_cell_degrees = photo_cell_degrees(longitude_span_degrees, latitude_span_degrees);
         let evidence_cell_degrees =
             photo_evidence_cell_degrees(longitude_span_degrees, latitude_span_degrees);
@@ -8321,14 +8321,25 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let mut sample_indices = HashMap::<(usize, usize), usize>::new();
+        let mut samples = Vec::<Arc<SurfaceMaterialSample>>::new();
         let by_column = column_cells
             .into_iter()
             .map(|indices| {
                 indices.map(|(color_index, evidence_index)| {
-                    with_surface_terrain_token(
-                        &evidences[evidence_index].with_color(colors[color_index]),
-                        terrain_token_colors[color_index],
-                    )
+                    let key = (color_index, evidence_index);
+                    let sample_index = if let Some(&index) = sample_indices.get(&key) {
+                        index
+                    } else {
+                        let index = samples.len();
+                        sample_indices.insert(key, index);
+                        samples.push(Arc::new(with_surface_terrain_token(
+                            &evidences[evidence_index].with_color(colors[color_index]),
+                            terrain_token_colors[color_index],
+                        )));
+                        index
+                    };
+                    Arc::clone(&samples[sample_index])
                 })
             })
             .collect::<Vec<_>>();
@@ -12273,7 +12284,7 @@ where
     struct SurfaceColumnSampleBuild {
         column: EarthSurfaceColumn,
         coast_factor: f64,
-        material: Option<SurfaceMaterialSample>,
+        material: Option<Arc<SurfaceMaterialSample>>,
         sampled_water: bool,
         smoothed_elevation: f64,
         longitude: f64,
@@ -12310,7 +12321,7 @@ where
             .as_ref()
             .and_then(|materials| materials[column_index].as_ref())
         {
-            let sampled_material = precomputed_material.clone();
+            let sampled_material = Arc::clone(precomputed_material);
             local_relief_meters = local_relief_center_meters
                 .as_ref()
                 .map(|relief| relief[column_index])
@@ -12334,7 +12345,7 @@ where
                 coast_factor,
                 smoothed_elevation,
             ) {
-                let sampled_material = sample_surface_region_material(
+                let sampled_material = Arc::new(sample_surface_region_material(
                     material_sampler,
                     texture_mode,
                     water,
@@ -12343,7 +12354,7 @@ where
                     latitude,
                     longitude_span_degrees,
                     latitude_span_degrees,
-                )?;
+                )?);
                 local_relief_meters = local_relief_center_meters
                     .as_ref()
                     .map(|relief| relief[column_index])
@@ -12427,7 +12438,7 @@ where
                     }
                     return apply_surface_region_photo_material_sample(
                         build.column,
-                        material,
+                        (*material).clone(),
                         build.smoothed_elevation,
                         build.longitude,
                         build.latitude,
