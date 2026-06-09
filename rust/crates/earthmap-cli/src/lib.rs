@@ -84,11 +84,9 @@ const PREFETCH_SEND_RETRY_MILLIS: u64 = 10;
 const SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
 const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
-const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 3;
+const SURFACE_PHOTO_AUTOTUNE_SAMPLES_PER_MAX_WORKER: usize = 2;
+const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLE_LIMIT: usize = 32;
 const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
-const SURFACE_PHOTO_AUTOTUNE_LAND_TARGET: usize = 1;
-const SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET: usize = 1;
-const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 1;
 const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
@@ -416,6 +414,22 @@ fn surface_photo_worker_candidate_configs(
     configs
 }
 
+fn surface_photo_worker_tune_sample_target(
+    candidates: &[SurfacePhotoWorkerCandidateConfig],
+    submitted_regions: usize,
+) -> usize {
+    let max_worker_count = candidates
+        .iter()
+        .map(|candidate| candidate.worker_count)
+        .max()
+        .unwrap_or(1);
+    max_worker_count
+        .saturating_mul(SURFACE_PHOTO_AUTOTUNE_SAMPLES_PER_MAX_WORKER)
+        .max(3)
+        .min(SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLE_LIMIT)
+        .min(submitted_regions.max(1))
+}
+
 fn surface_photo_worker_candidate_config_json(config: SurfacePhotoWorkerCandidateConfig) -> Value {
     json!({
         "workerThreads": config.worker_count,
@@ -568,26 +582,32 @@ fn tune_surface_photo_workers_from_regions(
             "only one worker candidate is available",
         );
     }
-    let samples =
-        match select_surface_photo_tune_samples(heightmap, scale, cache_rows, probe_regions) {
-            Ok(samples) if !samples.is_empty() => samples,
-            Ok(_) => {
-                return SurfacePhotoWorkerTuning::fallback(
-                    "fallback-no-samples",
-                    requested_threads,
-                    submitted_regions,
-                    "no valid land/ocean tuning samples were found",
-                )
-            }
-            Err(error) => {
-                return SurfacePhotoWorkerTuning::fallback(
-                    "fallback-sample-error",
-                    requested_threads,
-                    submitted_regions,
-                    error,
-                )
-            }
-        };
+    let target_samples = surface_photo_worker_tune_sample_target(&candidates, submitted_regions);
+    let samples = match select_surface_photo_tune_samples(
+        heightmap,
+        scale,
+        cache_rows,
+        probe_regions,
+        target_samples,
+    ) {
+        Ok(samples) if !samples.is_empty() => samples,
+        Ok(_) => {
+            return SurfacePhotoWorkerTuning::fallback(
+                "fallback-no-samples",
+                requested_threads,
+                submitted_regions,
+                "no valid land/ocean tuning samples were found",
+            )
+        }
+        Err(error) => {
+            return SurfacePhotoWorkerTuning::fallback(
+                "fallback-sample-error",
+                requested_threads,
+                submitted_regions,
+                error,
+            )
+        }
+    };
     let sample_count = samples.len();
     let land_samples = samples
         .iter()
@@ -972,7 +992,9 @@ fn select_surface_photo_tune_samples(
     scale: i32,
     cache_rows: usize,
     probe_regions: &[(i32, i32)],
+    target_samples: usize,
 ) -> std::result::Result<Vec<SurfacePhotoWorkerTuneSample>, String> {
+    let target_samples = target_samples.max(1);
     let reader = GeoTiffHeightmapReader::open(heightmap).map_err(|error| error.to_string())?;
     let mapping = mapping_for(reader.metadata(), scale).map_err(|error| error.to_string())?;
     let cache = GeoTiffRowCache::new(&reader, cache_rows).map_err(|error| error.to_string())?;
@@ -992,39 +1014,22 @@ fn select_surface_photo_tune_samples(
             SurfacePhotoWorkerTuneSampleKind::Ocean => ocean.push(sample),
             SurfacePhotoWorkerTuneSampleKind::Mixed => mixed.push(sample),
         }
-        if land.len() >= SURFACE_PHOTO_AUTOTUNE_LAND_TARGET
-            && mixed.len() >= SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET
-            && ocean.len() >= SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET
-        {
+    }
+    let mut samples = Vec::with_capacity(target_samples);
+    while samples.len() < target_samples {
+        let before = samples.len();
+        surface_photo_take_samples(&mut samples, &mut mixed, 1);
+        if samples.len() >= target_samples {
             break;
         }
-    }
-    let mut samples = Vec::with_capacity(SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES);
-    surface_photo_take_samples(
-        &mut samples,
-        &mut mixed,
-        SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET,
-    );
-    surface_photo_take_samples(&mut samples, &mut land, SURFACE_PHOTO_AUTOTUNE_LAND_TARGET);
-    surface_photo_take_samples(
-        &mut samples,
-        &mut ocean,
-        SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET,
-    );
-    while samples.len() < SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES {
-        if let Some(sample) = mixed.pop() {
-            samples.push(sample);
-            continue;
+        surface_photo_take_samples(&mut samples, &mut land, 1);
+        if samples.len() >= target_samples {
+            break;
         }
-        if let Some(sample) = ocean.pop() {
-            samples.push(sample);
-            continue;
+        surface_photo_take_samples(&mut samples, &mut ocean, 1);
+        if samples.len() == before {
+            break;
         }
-        if let Some(sample) = land.pop() {
-            samples.push(sample);
-            continue;
-        }
-        break;
     }
     Ok(samples)
 }
@@ -9670,6 +9675,9 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     );
 
     configure_surface_photo_rayon_threads(threads);
+    let worker_candidate_configs = surface_photo_worker_candidate_configs(threads, region_count);
+    let worker_tune_sample_target =
+        surface_photo_worker_tune_sample_target(&worker_candidate_configs, region_count);
     write_progress_event(
         out,
         json!({
@@ -9678,12 +9686,12 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "requestedThreads": threads,
             "submittedRegions": region_count,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, region_count),
-            "candidateWorkerConfigs": surface_photo_worker_candidate_configs(threads, region_count)
+            "candidateWorkerConfigs": worker_candidate_configs
                 .into_iter()
                 .map(surface_photo_worker_candidate_config_json)
                 .collect::<Vec<_>>(),
             "minRegions": SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS,
-            "maxSamples": SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES,
+            "maxSamples": worker_tune_sample_target,
         }),
     )?;
     let worker_tuning = tune_surface_photo_workers_for_grid(
@@ -10618,6 +10626,10 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         runtime_options.vertical_scale.label(),
     );
     configure_surface_photo_rayon_threads(threads);
+    let worker_candidate_configs =
+        surface_photo_worker_candidate_configs(threads, submitted_regions);
+    let worker_tune_sample_target =
+        surface_photo_worker_tune_sample_target(&worker_candidate_configs, submitted_regions);
     write_progress_event(
         out,
         json!({
@@ -10627,12 +10639,12 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "requestedThreads": threads,
             "submittedRegions": submitted_regions,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, submitted_regions),
-            "candidateWorkerConfigs": surface_photo_worker_candidate_configs(threads, submitted_regions)
+            "candidateWorkerConfigs": worker_candidate_configs
                 .into_iter()
                 .map(surface_photo_worker_candidate_config_json)
                 .collect::<Vec<_>>(),
             "minRegions": SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS,
-            "maxSamples": SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES,
+            "maxSamples": worker_tune_sample_target,
         }),
     )?;
     let worker_tuning = tune_surface_photo_workers_for_plan(
@@ -18644,6 +18656,13 @@ mod tests {
             surface_photo_parallel_column_sampling(10, tuned_rayon)
         )));
         assert_eq!(configs.len(), 7);
+    }
+
+    #[test]
+    fn surface_photo_worker_tune_sample_target_scales_with_max_worker_candidate() {
+        let configs = surface_photo_worker_candidate_configs(8, 100);
+        assert_eq!(surface_photo_worker_tune_sample_target(&configs, 100), 16);
+        assert_eq!(surface_photo_worker_tune_sample_target(&configs, 8), 8);
     }
 
     #[test]
