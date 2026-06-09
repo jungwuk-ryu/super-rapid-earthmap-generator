@@ -7284,6 +7284,10 @@ pub trait SurfaceMaterialSampler: Send + Sync {
         false
     }
 
+    fn samples_open_ocean_water_by_material_cell(&self) -> bool {
+        false
+    }
+
     fn sample_water(
         &self,
         longitude: f64,
@@ -8209,6 +8213,10 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
 
     fn samples_open_water(&self) -> bool {
         self.bathymetry.is_some() || self.ocean_temperature.is_some()
+    }
+
+    fn samples_open_ocean_water_by_material_cell(&self) -> bool {
+        true
     }
 
     fn sample_water(
@@ -12391,6 +12399,16 @@ fn try_sample_open_ocean_surface_region(
     )? {
         return Ok(Some(uniform));
     }
+    if let Some(uniform) = try_sample_uniform_open_ocean_surface_region(
+        region_block_x,
+        region_block_z,
+        mapping,
+        vertical_scale,
+        material_sampler,
+        smoothed_center_elevations,
+    )? {
+        return Ok(Some(uniform));
+    }
 
     struct OpenOceanColumnBuild {
         column: EarthSurfaceColumn,
@@ -12418,19 +12436,33 @@ fn try_sample_open_ocean_surface_region(
             }
         })
         .collect::<Result<Vec<_>>>()?;
+    let companion_materials: Option<Vec<Option<SurfaceMaterialSample>>> =
+        precompute_open_ocean_companion_materials(
+            material_sampler,
+            &longitudes,
+            &latitudes,
+            longitude_span_degrees,
+            latitude_span_degrees,
+            smoothed_center_elevations,
+        )?;
 
-    let build_column = |column_index| -> Result<OpenOceanColumnBuild> {
+    let build_column = |column_index: usize| -> Result<OpenOceanColumnBuild> {
         let local_z = column_index / SURFACE_REGION_WIDTH;
         let local_x = column_index % SURFACE_REGION_WIDTH;
         let longitude = longitudes[local_x];
         let latitude = latitudes[local_z];
         let smoothed_elevation = smoothed_center_elevations[column_index];
-        let needs_companion_material = material_sampler
-            .map(|sampler| {
-                sampler.samples_open_water()
-                    && should_sample_open_ocean_companion_material(smoothed_elevation)
-            })
-            .unwrap_or(false);
+        let companion_material = companion_materials
+            .as_ref()
+            .and_then(|materials| materials[column_index].as_ref());
+        let needs_companion_material = companion_material.is_some()
+            || material_sampler
+                .map(|sampler| {
+                    !sampler.samples_open_ocean_water_by_material_cell()
+                        && sampler.samples_open_water()
+                        && should_sample_open_ocean_companion_material(smoothed_elevation)
+                })
+                .unwrap_or(false);
         let column = if needs_companion_material {
             let mut column = classify_shaped_surface_scaled(
                 smoothed_elevation,
@@ -12440,7 +12472,18 @@ fn try_sample_open_ocean_surface_region(
                 0.0,
                 vertical_scale,
             )?;
-            if let Some(material_sampler) = material_sampler {
+            if let Some(material) = companion_material {
+                column = apply_surface_region_semantic_material_sample(
+                    column,
+                    material,
+                    smoothed_elevation,
+                    longitude,
+                    latitude,
+                    0.0,
+                    0.0,
+                    vertical_scale,
+                )?;
+            } else if let Some(material_sampler) = material_sampler {
                 let material = material_sampler.sample_open_ocean_water(
                     longitude,
                     latitude,
@@ -12488,8 +12531,154 @@ fn try_sample_open_ocean_surface_region(
     SurfaceRegionSample::new(builds.into_iter().map(|build| build.column).collect()).map(Some)
 }
 
+fn precompute_open_ocean_companion_materials(
+    material_sampler: Option<&dyn SurfaceMaterialSampler>,
+    longitudes: &[f64],
+    latitudes: &[f64],
+    longitude_span_degrees: f64,
+    latitude_span_degrees: f64,
+    smoothed_center_elevations: &[f64],
+) -> Result<Option<Vec<Option<SurfaceMaterialSample>>>> {
+    let Some(material_sampler) = material_sampler else {
+        return Ok(None);
+    };
+    if !material_sampler.samples_open_water()
+        || !material_sampler.samples_open_ocean_water_by_material_cell()
+    {
+        return Ok(None);
+    }
+    let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+    let mut cache = HashMap::<i64, SurfaceMaterialSample>::new();
+    let mut by_column = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+    for local_z in 0..SURFACE_REGION_WIDTH {
+        let latitude = latitudes[local_z];
+        for local_x in 0..SURFACE_REGION_WIDTH {
+            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+            if !should_sample_open_ocean_companion_material(
+                smoothed_center_elevations[column_index],
+            ) {
+                continue;
+            }
+            let longitude = longitudes[local_x];
+            let cell = quantized_cell(longitude, latitude, cell_degrees);
+            let sample = if let Some(sample) = cache.get(&cell.key) {
+                sample.clone()
+            } else {
+                let sample = material_sampler.sample_open_ocean_water(
+                    cell.center_longitude,
+                    cell.center_latitude,
+                    longitude_span_degrees,
+                    latitude_span_degrees,
+                )?;
+                cache.insert(cell.key, sample.clone());
+                sample
+            };
+            by_column[column_index] = Some(sample);
+        }
+    }
+    if cache.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(by_column))
+    }
+}
+
 const OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS: f64 = SHAPED_ELEVATION_METERS_PER_BLOCK;
-const UNIFORM_DEEP_OPEN_OCEAN_SOURCE_DEPTH_BLOCKS: f64 = 128.0;
+// `ocean_depth_blocks` can subtract up to two blocks of roughness before clamping.
+// A source depth of 125 therefore still guarantees the final 123-block floor.
+const UNIFORM_DEEP_OPEN_OCEAN_SOURCE_DEPTH_BLOCKS: f64 = 125.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UniformOpenOceanSignature {
+    ground_y: i32,
+    top: i32,
+    biome: &'static str,
+    decision_source: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_sample_uniform_open_ocean_surface_region(
+    region_block_x: i32,
+    region_block_z: i32,
+    mapping: &EarthScaleMapping,
+    vertical_scale: f64,
+    material_sampler: Option<&dyn SurfaceMaterialSampler>,
+    smoothed_center_elevations: &[f64],
+) -> Result<Option<SurfaceRegionSample>> {
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    if material_sampler
+        .map(|sampler| sampler.samples_open_water())
+        .unwrap_or(false)
+        && smoothed_center_elevations
+            .iter()
+            .any(|&elevation| should_sample_open_ocean_companion_material(elevation))
+    {
+        return Ok(None);
+    }
+
+    let mut first_signature = None::<UniformOpenOceanSignature>;
+    for local_z in 0..SURFACE_REGION_WIDTH {
+        let global_block_z = region_block_z.wrapping_add(local_z as i32);
+        let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+        let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
+            0.0
+        } else {
+            mapping.latitude_for_block_z(map_z)?
+        };
+        for local_x in 0..SURFACE_REGION_WIDTH {
+            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+            let global_block_x = region_block_x.wrapping_add(local_x as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
+                0.0
+            } else {
+                mapping.longitude_for_block_x(map_x)?
+            };
+            let elevation = smoothed_center_elevations[column_index];
+            let ground_y =
+                shaped_ground_surface_y(elevation, longitude, latitude, true, 0.0, vertical_scale);
+            let biome = water_biome_id(latitude, ground_y);
+            let depth = 1.max(SEA_LEVEL_Y - ground_y);
+            let top = if depth <= 6 {
+                block_state_ids::CLAY
+            } else if depth <= 18 {
+                block_state_ids::GRAVEL
+            } else {
+                block_state_ids::STONE
+            };
+            let decision_source = if top == block_state_ids::GRAVEL {
+                "height-rule"
+            } else {
+                "height-rule+natural-surface"
+            };
+            let signature = UniformOpenOceanSignature {
+                ground_y,
+                top,
+                biome,
+                decision_source,
+            };
+            match first_signature {
+                Some(first) if first != signature => return Ok(None),
+                Some(_) => {}
+                None => first_signature = Some(signature),
+            }
+        }
+    }
+
+    let Some(signature) = first_signature else {
+        return Ok(None);
+    };
+    let column = EarthSurfaceColumn::new(
+        true,
+        signature.ground_y,
+        SEA_LEVEL_Y,
+        signature.top,
+        signature.top,
+        signature.biome,
+        signature.decision_source,
+    );
+    SurfaceRegionSample::new(vec![column; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH]).map(Some)
+}
 
 fn try_sample_uniform_deep_open_ocean_surface_region(
     region_block_z: i32,
@@ -17008,6 +17197,66 @@ mod tests {
     }
 
     #[test]
+    fn open_ocean_companion_material_precompute_reuses_material_cells() {
+        struct CellSampler {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl SurfaceMaterialSampler for CellSampler {
+            fn sample(
+                &self,
+                _longitude: f64,
+                _latitude: f64,
+                _longitude_span_degrees: f64,
+                _latitude_span_degrees: f64,
+            ) -> Result<SurfaceMaterialSample> {
+                Ok(SurfaceMaterialSample::color_only(RgbColor::unavailable()))
+            }
+
+            fn samples_open_water(&self) -> bool {
+                true
+            }
+
+            fn samples_open_ocean_water_by_material_cell(&self) -> bool {
+                true
+            }
+
+            fn sample_open_ocean_water(
+                &self,
+                _longitude: f64,
+                _latitude: f64,
+                _longitude_span_degrees: f64,
+                _latitude_span_degrees: f64,
+            ) -> Result<SurfaceMaterialSample> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(SurfaceMaterialSample::color_only(RgbColor::unavailable()))
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler = CellSampler {
+            calls: Arc::clone(&calls),
+        };
+        let longitudes = vec![0.001; SURFACE_REGION_WIDTH];
+        let latitudes = vec![0.001; SURFACE_REGION_WIDTH];
+        let elevations = vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        let materials = precompute_open_ocean_companion_materials(
+            Some(&sampler),
+            &longitudes,
+            &latitudes,
+            0.001,
+            0.001,
+            &elevations,
+        )
+        .unwrap()
+        .expect("all shallow open-ocean columns should use companion material");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(materials.iter().all(Option::is_some));
+    }
+
+    #[test]
     fn uniform_deep_open_ocean_fast_path_reuses_one_floor_column() {
         let mapping = EarthScaleMapping::for_denominator(250, -90.0, 90.0).unwrap();
         let elevations = vec![-2_000.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
@@ -17023,6 +17272,28 @@ mod tests {
         assert!(first.water);
         assert_eq!(first.ground_surface_y, MIN_SURFACE_Y);
         assert!(sample.columns().iter().all(|column| column == first));
+    }
+
+    #[test]
+    fn uniform_open_ocean_fast_path_matches_direct_classifier_when_all_columns_equal() {
+        let mapping = EarthScaleMapping::for_denominator(250, -90.0, 90.0).unwrap();
+        let elevations = vec![-2_000.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        let sample =
+            try_sample_uniform_open_ocean_surface_region(0, 0, &mapping, 4.0, None, &elevations)
+                .unwrap()
+                .expect("equatorial open ocean should collapse to one repeated column");
+        let first = &sample.columns()[0];
+        assert!(sample.columns().iter().all(|column| column == first));
+
+        let longitude = mapping
+            .longitude_for_block_x(mapping.width_blocks / 2)
+            .unwrap();
+        let latitude = mapping
+            .latitude_for_block_z(mapping.height_blocks / 2)
+            .unwrap();
+        let direct =
+            classify_open_ocean_surface_scaled(-2_000.0, longitude, latitude, 4.0).unwrap();
+        assert_eq!(first, &direct);
     }
 
     #[test]
