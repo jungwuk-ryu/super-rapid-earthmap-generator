@@ -802,7 +802,7 @@ fn split_prefetch_rayon_threads(
         return (1, 1);
     }
     let consumer_threads = if total >= 8 {
-        consumer_workers.min((total / 4).max(2)).max(1)
+        consumer_workers.min(2).max(1)
     } else {
         consumer_workers.min((total / 4).max(1)).max(1)
     };
@@ -979,23 +979,24 @@ fn classify_surface_photo_tune_region(
     region_x: i32,
     region_z: i32,
 ) -> std::result::Result<SurfacePhotoWorkerTuneSampleKind, String> {
-    let local_points = [
-        (REGION_SIZE_BLOCKS / 2, REGION_SIZE_BLOCKS / 2),
-        (REGION_SIZE_BLOCKS / 4, REGION_SIZE_BLOCKS / 4),
-        ((REGION_SIZE_BLOCKS * 3) / 4, REGION_SIZE_BLOCKS / 4),
-        (REGION_SIZE_BLOCKS / 4, (REGION_SIZE_BLOCKS * 3) / 4),
-        ((REGION_SIZE_BLOCKS * 3) / 4, (REGION_SIZE_BLOCKS * 3) / 4),
-    ];
+    const CLASSIFICATION_GRID: i32 = 9;
     let mut land = 0;
     let mut water = 0;
-    for (local_x, local_z) in local_points {
-        if let Some(elevation) =
-            sample_tune_region_elevation(mapping, sampler, region_x, region_z, local_x, local_z)?
-        {
-            if elevation <= 0.0 {
-                water += 1;
-            } else {
-                land += 1;
+    for grid_z in 0..CLASSIFICATION_GRID {
+        let local_z = ((grid_z + 1) * REGION_SIZE_BLOCKS) / (CLASSIFICATION_GRID + 1);
+        for grid_x in 0..CLASSIFICATION_GRID {
+            let local_x = ((grid_x + 1) * REGION_SIZE_BLOCKS) / (CLASSIFICATION_GRID + 1);
+            if let Some(elevation) = sample_tune_region_elevation(
+                mapping, sampler, region_x, region_z, local_x, local_z,
+            )? {
+                if elevation <= 0.0 {
+                    water += 1;
+                } else {
+                    land += 1;
+                }
+                if land > 0 && water > 0 {
+                    return Ok(SurfacePhotoWorkerTuneSampleKind::Mixed);
+                }
             }
         }
     }
@@ -18505,7 +18506,7 @@ mod tests {
 
     #[test]
     fn prefetch_rayon_split_keeps_sample_pool_wide_for_photo_regions() {
-        assert_eq!(split_prefetch_rayon_threads(16, 2, 4), (12, 4));
+        assert_eq!(split_prefetch_rayon_threads(16, 2, 4), (14, 2));
         assert_eq!(split_prefetch_rayon_threads(8, 2, 4), (6, 2));
         assert_eq!(split_prefetch_rayon_threads(2, 1, 4), (1, 1));
     }
