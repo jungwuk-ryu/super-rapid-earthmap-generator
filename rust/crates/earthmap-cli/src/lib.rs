@@ -801,7 +801,9 @@ fn split_prefetch_rayon_threads(
     if total == 1 {
         return (1, 1);
     }
-    let consumer_threads = if total >= 8 {
+    let consumer_threads = if total >= 16 {
+        consumer_workers.min(3).max(1)
+    } else if total >= 8 {
         consumer_workers.min(2).max(1)
     } else {
         consumer_workers.min((total / 4).max(1)).max(1)
@@ -18506,7 +18508,7 @@ mod tests {
 
     #[test]
     fn prefetch_rayon_split_keeps_sample_pool_wide_for_photo_regions() {
-        assert_eq!(split_prefetch_rayon_threads(16, 2, 4), (14, 2));
+        assert_eq!(split_prefetch_rayon_threads(16, 2, 4), (13, 3));
         assert_eq!(split_prefetch_rayon_threads(8, 2, 4), (6, 2));
         assert_eq!(split_prefetch_rayon_threads(2, 1, 4), (1, 1));
     }
