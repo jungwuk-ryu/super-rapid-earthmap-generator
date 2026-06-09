@@ -7288,6 +7288,19 @@ pub trait SurfaceMaterialSampler: Send + Sync {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn precompute_photo_land_region_materials(
+        &self,
+        _longitudes: &[f64],
+        _latitudes: &[f64],
+        _valid: &[bool],
+        _water_mask: &[bool],
+        _longitude_span_degrees: f64,
+        _latitude_span_degrees: f64,
+    ) -> Result<Option<Vec<Option<SurfaceMaterialSample>>>> {
+        Ok(None)
+    }
+
     fn sample_water(
         &self,
         longitude: f64,
@@ -8217,6 +8230,82 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
 
     fn samples_open_ocean_water_by_material_cell(&self) -> bool {
         true
+    }
+
+    fn precompute_photo_land_region_materials(
+        &self,
+        longitudes: &[f64],
+        latitudes: &[f64],
+        valid: &[bool],
+        water_mask: &[bool],
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<Option<Vec<Option<SurfaceMaterialSample>>>> {
+        let photo_cell_degrees = photo_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let evidence_cell_degrees =
+            photo_evidence_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let mut color_cache = HashMap::<i64, RgbColor>::new();
+        let mut evidence_cache = HashMap::<i64, SurfaceMaterialSample>::new();
+        let mut terrain_token_cache = HashMap::<i64, RgbColor>::new();
+        let mut by_column = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        for local_z in 0..SURFACE_REGION_WIDTH {
+            let latitude = latitudes[local_z];
+            for local_x in 0..SURFACE_REGION_WIDTH {
+                let sample_index = surface_region_extent_index(
+                    local_x + SURFACE_REGION_COAST_RADIUS,
+                    local_z + SURFACE_REGION_COAST_RADIUS,
+                );
+                if !valid[sample_index] || water_mask[sample_index] {
+                    continue;
+                }
+                let longitude = longitudes[local_x];
+                let color_cell = quantized_cell(longitude, latitude, photo_cell_degrees);
+                let color = if let Some(color) = color_cache.get(&color_cell.key) {
+                    *color
+                } else {
+                    let color = self.sample_primary_photo_color(
+                        color_cell.center_longitude,
+                        color_cell.center_latitude,
+                        longitude_span_degrees,
+                        latitude_span_degrees,
+                    )?;
+                    color_cache.insert(color_cell.key, color);
+                    color
+                };
+                let evidence_cell = quantized_cell(longitude, latitude, evidence_cell_degrees);
+                let evidence = if let Some(evidence) = evidence_cache.get(&evidence_cell.key) {
+                    evidence.clone()
+                } else {
+                    let evidence = self.sample_photo_evidence_uncached(
+                        evidence_cell.center_longitude,
+                        evidence_cell.center_latitude,
+                        evidence_cell_degrees,
+                        evidence_cell_degrees,
+                    )?;
+                    evidence_cache.insert(evidence_cell.key, evidence.clone());
+                    evidence
+                };
+                let terrain_token_color =
+                    if let Some(color) = terrain_token_cache.get(&color_cell.key) {
+                        *color
+                    } else {
+                        let color = self.sample_terrain_token_color_uncached(
+                            color_cell.center_longitude,
+                            color_cell.center_latitude,
+                        );
+                        terrain_token_cache.insert(color_cell.key, color);
+                        color
+                    };
+                let material =
+                    with_surface_terrain_token(&evidence.with_color(color), terrain_token_color);
+                by_column[(local_z * SURFACE_REGION_WIDTH) + local_x] = Some(material);
+            }
+        }
+        if color_cache.is_empty() && evidence_cache.is_empty() && terrain_token_cache.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(by_column))
+        }
     }
 
     fn sample_water(
@@ -12107,6 +12196,44 @@ where
         surface_region_local_relief_center_meters(&elevations, &valid, parallel_column_sampling)
     });
     phase_nanos.relief_precompute = phase_start.elapsed().as_nanos();
+    let phase_start = Instant::now();
+    let longitudes = (0..SURFACE_REGION_WIDTH)
+        .map(|local_x| {
+            let global_block_x = region_block_x.wrapping_add(local_x as i32);
+            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+            if map_x < 0 || map_x >= mapping.width_blocks {
+                Ok(0.0)
+            } else {
+                mapping.longitude_for_block_x(map_x).map_err(Into::into)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let latitudes = (0..SURFACE_REGION_WIDTH)
+        .map(|local_z| {
+            let global_block_z = region_block_z.wrapping_add(local_z as i32);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            if map_z < 0 || map_z >= mapping.height_blocks {
+                Ok(0.0)
+            } else {
+                mapping.latitude_for_block_z(map_z).map_err(Into::into)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let precomputed_photo_land_materials = if texture_mode == SurfaceTextureMode::Photo {
+        match material_sampler {
+            Some(material_sampler) => material_sampler.precompute_photo_land_region_materials(
+                &longitudes,
+                &latitudes,
+                &valid,
+                &water_mask,
+                longitude_span_degrees,
+                latitude_span_degrees,
+            )?,
+            None => None,
+        }
+    } else {
+        None
+    };
 
     struct SurfaceColumnSampleBuild {
         column: EarthSurfaceColumn,
@@ -12121,25 +12248,15 @@ where
         global_block_z: i32,
     }
 
-    let build_column = |column_index| -> Result<SurfaceColumnSampleBuild> {
+    let build_column = |column_index: usize| -> Result<SurfaceColumnSampleBuild> {
         let local_z = column_index / SURFACE_REGION_WIDTH;
         let local_x = column_index % SURFACE_REGION_WIDTH;
         let center_x = local_x + SURFACE_REGION_COAST_RADIUS;
         let center_z = local_z + SURFACE_REGION_COAST_RADIUS;
         let global_block_x = region_block_x.wrapping_add(local_x as i32);
         let global_block_z = region_block_z.wrapping_add(local_z as i32);
-        let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
-        let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
-        let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
-            0.0
-        } else {
-            mapping.longitude_for_block_x(map_x)?
-        };
-        let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
-            0.0
-        } else {
-            mapping.latitude_for_block_z(map_z)?
-        };
+        let longitude = longitudes[local_x];
+        let latitude = latitudes[local_z];
         let sample_index = surface_region_extent_index(center_x, center_z);
         let smoothed_elevation = smoothed_center_elevations[column_index];
         let water = water_mask[sample_index];
@@ -12154,7 +12271,27 @@ where
         )?;
         let mut material = None;
         let mut local_relief_meters = 0.0;
-        if let Some(material_sampler) = material_sampler {
+        if let Some(precomputed_material) = precomputed_photo_land_materials
+            .as_ref()
+            .and_then(|materials| materials[column_index].as_ref())
+        {
+            let sampled_material = precomputed_material.clone();
+            local_relief_meters = local_relief_center_meters
+                .as_ref()
+                .map(|relief| relief[column_index])
+                .unwrap_or(0.0);
+            column = apply_surface_region_semantic_material_sample(
+                column,
+                &sampled_material,
+                smoothed_elevation,
+                longitude,
+                latitude,
+                coast_factor,
+                local_relief_meters,
+                vertical_scale,
+            )?;
+            material = Some(sampled_material);
+        } else if let Some(material_sampler) = material_sampler {
             if should_sample_surface_material(
                 material_sampler,
                 valid[sample_index],
@@ -12203,7 +12340,6 @@ where
             global_block_z,
         })
     };
-    let phase_start = Instant::now();
     let column_builds = if parallel_column_sampling {
         (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
             .into_par_iter()
