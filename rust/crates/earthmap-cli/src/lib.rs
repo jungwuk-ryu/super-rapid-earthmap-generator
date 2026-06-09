@@ -82,11 +82,11 @@ const PREFETCH_SEND_RETRY_MILLIS: u64 = 10;
 const SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
 const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
-const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 2;
+const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLES: usize = 3;
 const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
 const SURFACE_PHOTO_AUTOTUNE_LAND_TARGET: usize = 1;
 const SURFACE_PHOTO_AUTOTUNE_MIXED_TARGET: usize = 1;
-const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 0;
+const SURFACE_PHOTO_AUTOTUNE_OCEAN_TARGET: usize = 1;
 const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
@@ -369,10 +369,15 @@ fn surface_photo_worker_candidates(
         .min(submitted_regions.max(1))
         .min(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
         .max(1);
-    if max_workers <= legacy {
-        return vec![max_workers];
+    let mut candidates = Vec::new();
+    for worker_count in [1, 2, legacy, max_workers] {
+        let worker_count = worker_count.min(max_workers).max(1);
+        if !candidates.contains(&worker_count) {
+            candidates.push(worker_count);
+        }
     }
-    vec![legacy]
+    candidates.sort_unstable();
+    candidates
 }
 
 fn surface_photo_worker_candidate_configs(
@@ -18536,9 +18541,9 @@ mod tests {
 
     #[test]
     fn surface_photo_worker_candidates_keep_legacy_and_requested_options() {
-        assert_eq!(surface_photo_worker_candidates(10, 100), vec![4]);
-        assert_eq!(surface_photo_worker_candidates(3, 100), vec![3]);
-        assert_eq!(surface_photo_worker_candidates(10, 2), vec![2]);
+        assert_eq!(surface_photo_worker_candidates(10, 100), vec![1, 2, 4, 10]);
+        assert_eq!(surface_photo_worker_candidates(3, 100), vec![1, 2, 3]);
+        assert_eq!(surface_photo_worker_candidates(10, 2), vec![1, 2]);
     }
 
     fn surface_photo_candidate_result(
@@ -18565,7 +18570,12 @@ mod tests {
             tuned_rayon,
             surface_photo_parallel_column_sampling(4, tuned_rayon)
         )));
-        assert_eq!(configs.len(), 1);
+        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
+            10,
+            tuned_rayon,
+            surface_photo_parallel_column_sampling(10, tuned_rayon)
+        )));
+        assert_eq!(configs.len(), 4);
     }
 
     #[test]
