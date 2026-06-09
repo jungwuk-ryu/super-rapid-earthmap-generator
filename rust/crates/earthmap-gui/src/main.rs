@@ -238,6 +238,12 @@ struct GenerationOptions {
     cache_rows: String,
     surface_tile_cache_entries: String,
     rayon_threads: String,
+    #[serde(default = "default_worker_tuning_enabled")]
+    worker_tuning_enabled: bool,
+}
+
+fn default_worker_tuning_enabled() -> bool {
+    true
 }
 
 impl Default for GenerationOptions {
@@ -268,6 +274,7 @@ impl Default for GenerationOptions {
             cache_rows: DEFAULT_CACHE_ROWS.to_string(),
             surface_tile_cache_entries: DEFAULT_SURFACE_TILE_CACHE_ENTRIES.to_string(),
             rayon_threads: String::new(),
+            worker_tuning_enabled: default_worker_tuning_enabled(),
         }
     }
 }
@@ -371,6 +378,7 @@ fn build_generation_args(options: &GenerationOptions) -> Vec<String> {
         options.normalized_surface_raster(),
         options.vertical_scale_option(),
         options.compression_option(),
+        format!("workerAutotune={}", options.worker_tuning_enabled),
     ]
 }
 
@@ -1148,6 +1156,15 @@ fn world_map_background_image() -> egui::ColorImage {
 
 #[derive(Debug)]
 enum GeneratorProgressEvent {
+    WorkerTuningStarted {
+        enabled: bool,
+        requested_threads: Option<usize>,
+        submitted_regions: Option<usize>,
+        max_samples: Option<usize>,
+    },
+    WorkerTuningFinished {
+        result: WorkerTuningResult,
+    },
     BatchStarted {
         grid: RegionGrid,
         total_regions: usize,
@@ -1177,6 +1194,19 @@ enum GeneratorProgressEvent {
         elapsed_millis: Option<u64>,
         regions_per_hour: Option<f64>,
     },
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct WorkerTuningResult {
+    mode: String,
+    selected_worker_threads: Option<usize>,
+    selected_rayon_threads: Option<usize>,
+    parallel_column_sampling: Option<bool>,
+    sample_count: Option<usize>,
+    land_samples: Option<usize>,
+    ocean_samples: Option<usize>,
+    mixed_samples: Option<usize>,
+    message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1240,6 +1270,11 @@ struct ProgressState {
     recent_completions: VecDeque<Instant>,
     resume_fingerprint_matched: Option<bool>,
     resume_journal_regions: usize,
+    worker_tuning_enabled: Option<bool>,
+    worker_tuning_requested_threads: Option<usize>,
+    worker_tuning_submitted_regions: Option<usize>,
+    worker_tuning_max_samples: Option<usize>,
+    worker_tuning_result: Option<WorkerTuningResult>,
 }
 
 struct MapOverlayState {
@@ -1542,6 +1577,38 @@ impl EarthMapGuiApp {
 
     fn apply_progress_event(&mut self, event: GeneratorProgressEvent) {
         match event {
+            GeneratorProgressEvent::WorkerTuningStarted {
+                enabled,
+                requested_threads,
+                submitted_regions,
+                max_samples,
+            } => {
+                self.progress.worker_tuning_enabled = Some(enabled);
+                self.progress.worker_tuning_requested_threads = requested_threads;
+                self.progress.worker_tuning_submitted_regions = submitted_regions;
+                self.progress.worker_tuning_max_samples = max_samples;
+                self.progress.worker_tuning_result = None;
+                if enabled {
+                    self.push_log_line(format!(
+                        "worker tuning started: requested={} regions={} maxSamples={}",
+                        requested_threads
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        submitted_regions
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "?".to_string()),
+                        max_samples
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    ));
+                } else {
+                    self.push_log_line("worker tuning disabled".to_string());
+                }
+            }
+            GeneratorProgressEvent::WorkerTuningFinished { result } => {
+                self.push_log_line(worker_tuning_log_line(&result));
+                self.progress.worker_tuning_result = Some(result);
+            }
             GeneratorProgressEvent::BatchStarted {
                 grid,
                 total_regions,
@@ -1646,6 +1713,43 @@ impl EarthMapGuiApp {
             0.0
         } else {
             self.progress.completed_regions as f64 / elapsed_hours
+        }
+    }
+
+    fn remaining_regions(&self) -> usize {
+        self.progress
+            .total_regions
+            .saturating_sub(self.progress.completed_regions)
+    }
+
+    fn remaining_for_display(&self) -> Option<Duration> {
+        let remaining_regions = self.remaining_regions();
+        if remaining_regions == 0 {
+            return Some(Duration::ZERO);
+        }
+        let regions_per_hour = self.live_regions_per_hour();
+        if !regions_per_hour.is_finite() || regions_per_hour <= 0.0 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(
+            remaining_regions as f64 * 3600.0 / regions_per_hour,
+        ))
+    }
+
+    fn worker_tuning_text(&self) -> Option<String> {
+        if let Some(result) = &self.progress.worker_tuning_result {
+            return Some(worker_tuning_display_text(result));
+        }
+        match self.progress.worker_tuning_enabled {
+            Some(true) => Some(format!(
+                "Tuning: running (up to {} samples)",
+                self.progress
+                    .worker_tuning_max_samples
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            )),
+            Some(false) => Some("Tuning: disabled".to_string()),
+            None => None,
         }
     }
 
@@ -2039,6 +2143,8 @@ impl eframe::App for EarthMapGuiApp {
                     ui.text_edit_singleline(&mut self.options.rayon_threads);
                 });
                 ui.small("Leave Rayon threads empty to use the tuned default.");
+                ui.checkbox(&mut self.options.worker_tuning_enabled, "Worker autotune");
+                ui.small("When disabled, Threads is used directly for region workers within safe system limits.");
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -2059,7 +2165,16 @@ impl eframe::App for EarthMapGuiApp {
                     "Speed: {:.2} regions/hour",
                     self.live_regions_per_hour()
                 ));
+                ui.separator();
+                let remaining = self
+                    .remaining_for_display()
+                    .map(format_duration_compact)
+                    .unwrap_or_else(|| "calculating".to_string());
+                ui.label(format!("Remaining: {remaining}"));
             });
+            if let Some(tuning_text) = self.worker_tuning_text() {
+                ui.label(tuning_text);
+            }
             if !self.progress.last_region.is_empty() {
                 ui.label(format!("Last region: {}", self.progress.last_region));
             }
@@ -2100,6 +2215,61 @@ impl eframe::App for EarthMapGuiApp {
                     }
                 });
         });
+    }
+}
+
+fn worker_tuning_display_text(result: &WorkerTuningResult) -> String {
+    let worker_threads = result
+        .selected_worker_threads
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let rayon_threads = result
+        .selected_rayon_threads
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let samples = result
+        .sample_count
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let mut text = format!(
+        "Tuning: {} -> {} region workers / {} Rayon threads, {} samples",
+        result.mode, worker_threads, rayon_threads, samples
+    );
+    if let (Some(land), Some(mixed), Some(ocean)) = (
+        result.land_samples,
+        result.mixed_samples,
+        result.ocean_samples,
+    ) {
+        text.push_str(&format!(" ({land} land, {mixed} mixed, {ocean} ocean)"));
+    }
+    if let Some(message) = &result.message {
+        if !message.is_empty() {
+            text.push_str(&format!("; {message}"));
+        }
+    }
+    text
+}
+
+fn worker_tuning_log_line(result: &WorkerTuningResult) -> String {
+    worker_tuning_display_text(result)
+}
+
+fn format_duration_compact(duration: Duration) -> String {
+    let mut seconds = duration.as_secs();
+    let days = seconds / 86_400;
+    seconds %= 86_400;
+    let hours = seconds / 3_600;
+    seconds %= 3_600;
+    let minutes = seconds / 60;
+    seconds %= 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -2237,6 +2407,18 @@ fn parse_progress_event_line(line: &str) -> Option<GeneratorProgressEvent> {
     let json = line.strip_prefix("event\t")?;
     let value = serde_json::from_str::<Value>(json).ok()?;
     match value.get("type").and_then(Value::as_str)? {
+        "workerTuningStarted" => Some(GeneratorProgressEvent::WorkerTuningStarted {
+            enabled: value
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            requested_threads: json_usize(&value, "requestedThreads"),
+            submitted_regions: json_usize(&value, "submittedRegions"),
+            max_samples: json_usize(&value, "maxSamples"),
+        }),
+        "workerTuningFinished" => Some(GeneratorProgressEvent::WorkerTuningFinished {
+            result: parse_worker_tuning_result(value.get("workerTuning")?)?,
+        }),
         "batchStarted" => {
             let start_region_x = json_i32(&value, "regionStartX")?;
             let start_region_z = json_i32(&value, "regionStartZ")?;
@@ -2300,6 +2482,42 @@ fn parse_progress_event_line(line: &str) -> Option<GeneratorProgressEvent> {
     }
 }
 
+fn parse_worker_tuning_result(value: &Value) -> Option<WorkerTuningResult> {
+    Some(WorkerTuningResult {
+        mode: value.get("mode").and_then(Value::as_str)?.to_string(),
+        selected_worker_threads: value
+            .get("selectedRegionWorkerThreads")
+            .or_else(|| value.get("selectedWorkerThreads"))
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        selected_rayon_threads: value
+            .get("selectedRayonThreads")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        parallel_column_sampling: value.get("parallelColumnSampling").and_then(Value::as_bool),
+        sample_count: value
+            .get("sampleCount")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        land_samples: value
+            .get("landSamples")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        ocean_samples: value
+            .get("oceanSamples")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        mixed_samples: value
+            .get("mixedSamples")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        message: value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
 fn json_i32(value: &Value, key: &str) -> Option<i32> {
     value
         .get(key)
@@ -2309,6 +2527,13 @@ fn json_i32(value: &Value, key: &str) -> Option<i32> {
 
 fn json_u64(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64)
+}
+
+fn json_usize(value: &Value, key: &str) -> Option<usize> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn parse_region_line(line: &str) -> Option<(LegacyRegionStatus, i32, i32, Option<u64>)> {
@@ -2410,6 +2635,16 @@ mod tests {
         let args = build_generation_args(&options);
         assert_eq!(args[11], "surfaceRaster=fixtures/TrueMarble.vrt");
         assert_eq!(args[12], "verticalScale=auto");
+    }
+
+    #[test]
+    fn generation_args_include_worker_tuning_toggle() {
+        let options = GenerationOptions {
+            worker_tuning_enabled: false,
+            ..GenerationOptions::default()
+        };
+        let args = build_generation_args(&options);
+        assert_eq!(args[14], "workerAutotune=false");
     }
 
     #[test]
@@ -2580,6 +2815,7 @@ generation.verticalScaleMode=auto\n",
             cache_rows: "auto".to_string(),
             surface_tile_cache_entries: "auto".to_string(),
             rayon_threads: "12".to_string(),
+            worker_tuning_enabled: false,
         };
 
         let encoded = serde_json::to_string(&options).unwrap();
@@ -2590,6 +2826,38 @@ generation.verticalScaleMode=auto\n",
         assert_eq!(decoded.linear_compression_level, 6);
         assert_eq!(decoded.threads, 10);
         assert_eq!(decoded.rayon_threads, "12");
+        assert!(!decoded.worker_tuning_enabled);
+    }
+
+    #[test]
+    fn generation_options_default_worker_tuning_when_loading_old_storage() {
+        let json = r#"{
+            "heightmap_path":"heightmap.tif",
+            "tif_root":"TifFiles",
+            "true_marble_path":"TifFiles/terrain/TrueMarble.vrt",
+            "world_dir":"world",
+            "scale":1000,
+            "extent_mode":"Preset",
+            "preset":"Australia",
+            "bounds":{"west_longitude":112.0,"east_longitude":154.0,"north_latitude":-10.0,"south_latitude":-44.0},
+            "start_region_x":26,
+            "start_region_z":-10,
+            "cols":3,
+            "rows":3,
+            "format":"Linear",
+            "linear_compression_level":4,
+            "mca_compression_level":6,
+            "threads":8,
+            "status":"Surface",
+            "vertical_scale":"auto",
+            "cache_rows":"auto",
+            "surface_tile_cache_entries":"auto",
+            "rayon_threads":""
+        }"#;
+
+        let decoded: GenerationOptions = serde_json::from_str(json).unwrap();
+
+        assert!(decoded.worker_tuning_enabled);
     }
 
     #[test]
@@ -2806,6 +3074,37 @@ generation.verticalScaleMode=auto\n",
 
     #[test]
     fn parse_json_progress_event_extracts_batch_and_region_updates() {
+        let tuning_started = parse_progress_event_line(
+            r#"event	{"schemaVersion":1,"type":"workerTuningStarted","enabled":true,"requestedThreads":8,"submittedRegions":100,"maxSamples":16}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            tuning_started,
+            GeneratorProgressEvent::WorkerTuningStarted {
+                enabled: true,
+                requested_threads: Some(8),
+                submitted_regions: Some(100),
+                max_samples: Some(16)
+            }
+        ));
+
+        let tuning_finished = parse_progress_event_line(
+            r#"event	{"schemaVersion":1,"type":"workerTuningFinished","workerTuning":{"mode":"autotuned","selectedRegionWorkerThreads":4,"selectedRayonThreads":12,"parallelColumnSampling":true,"sampleCount":16,"landSamples":5,"mixedSamples":6,"oceanSamples":5,"message":null}}"#,
+        )
+        .unwrap();
+        match tuning_finished {
+            GeneratorProgressEvent::WorkerTuningFinished { result } => {
+                assert_eq!(result.mode, "autotuned");
+                assert_eq!(result.selected_worker_threads, Some(4));
+                assert_eq!(result.selected_rayon_threads, Some(12));
+                assert_eq!(result.sample_count, Some(16));
+                assert_eq!(result.land_samples, Some(5));
+                assert_eq!(result.mixed_samples, Some(6));
+                assert_eq!(result.ocean_samples, Some(5));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
         let batch = parse_progress_event_line(
             r#"event	{"schemaVersion":1,"type":"batchStarted","regionStartX":-40,"regionStartZ":-20,"regionCols":80,"regionRows":40,"regionCount":3200,"resumeFingerprintMatched":true,"resumeJournalRegions":12}"#,
         )
@@ -2840,5 +3139,30 @@ generation.verticalScaleMode=auto\n",
                 elapsed_millis: Some(10977)
             }
         ));
+    }
+
+    #[test]
+    fn remaining_time_uses_live_regions_per_hour() {
+        let mut app = EarthMapGuiApp::default();
+        app.progress.total_regions = 100;
+        app.progress.completed_regions = 25;
+        app.progress.regions_per_hour = Some(75.0);
+
+        assert_eq!(app.remaining_regions(), 75);
+        assert_eq!(
+            app.remaining_for_display().map(format_duration_compact),
+            Some("1h 0m".to_string())
+        );
+    }
+
+    #[test]
+    fn duration_format_is_compact() {
+        assert_eq!(format_duration_compact(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration_compact(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(format_duration_compact(Duration::from_secs(3_900)), "1h 5m");
+        assert_eq!(
+            format_duration_compact(Duration::from_secs(90_000)),
+            "1d 1h"
+        );
     }
 }

@@ -289,6 +289,35 @@ impl SurfacePhotoWorkerTuning {
         }
     }
 
+    fn manual(
+        mode: &'static str,
+        requested_threads: usize,
+        submitted_regions: usize,
+        message: impl Into<String>,
+    ) -> Self {
+        let selected_worker_count =
+            manual_surface_photo_worker_count(requested_threads, submitted_regions);
+        let selected_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads)
+            .max(selected_worker_count);
+        Self {
+            mode,
+            requested_threads,
+            selected_worker_count,
+            selected_rayon_threads,
+            parallel_column_sampling: surface_photo_parallel_column_sampling(
+                selected_worker_count,
+                selected_rayon_threads,
+            ),
+            sample_count: 0,
+            land_samples: 0,
+            ocean_samples: 0,
+            mixed_samples: 0,
+            candidates: Vec::new(),
+            confirmation_candidates: Vec::new(),
+            message: Some(message.into()),
+        }
+    }
+
     fn to_progress_json(&self) -> Value {
         json!({
             "mode": self.mode,
@@ -349,7 +378,21 @@ fn fallback_surface_photo_worker_count(
         .max(1)
 }
 
-fn surface_photo_worker_autotune_enabled() -> bool {
+fn manual_surface_photo_worker_count(requested_threads: usize, submitted_regions: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(requested_threads.max(1));
+    requested_threads
+        .min(submitted_regions.max(1))
+        .min(available.max(1))
+        .max(1)
+}
+
+fn surface_photo_worker_autotune_enabled(explicit: Option<bool>) -> bool {
+    explicit.unwrap_or_else(surface_photo_worker_autotune_env_enabled)
+}
+
+fn surface_photo_worker_autotune_env_enabled() -> bool {
     std::env::var(SURFACE_PHOTO_AUTOTUNE_ENV)
         .map(|value| {
             !matches!(
@@ -471,22 +514,23 @@ fn tune_surface_photo_workers_for_grid(
     cache_rows: usize,
     surface_tile_cache_entries: usize,
     compression_options: RegionCompressionOptions,
+    worker_autotune: Option<bool>,
 ) -> SurfacePhotoWorkerTuning {
     let submitted_regions = usize::try_from(cols.saturating_mul(rows)).unwrap_or(usize::MAX);
     if submitted_regions < SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS || requested_threads <= 1 {
-        return SurfacePhotoWorkerTuning::fallback(
+        return SurfacePhotoWorkerTuning::manual(
             "fallback-small-batch",
             requested_threads,
             submitted_regions,
             "batch is too small for startup worker tuning",
         );
     }
-    if !surface_photo_worker_autotune_enabled() {
-        return SurfacePhotoWorkerTuning::fallback(
+    if !surface_photo_worker_autotune_enabled(worker_autotune) {
+        return SurfacePhotoWorkerTuning::manual(
             "fallback-disabled",
             requested_threads,
             submitted_regions,
-            format!("{SURFACE_PHOTO_AUTOTUNE_ENV} disabled worker tuning"),
+            "worker tuning disabled",
         );
     }
     let positions = surface_photo_grid_probe_regions(start_region_x, start_region_z, cols, rows);
@@ -522,21 +566,22 @@ fn tune_surface_photo_workers_for_plan(
     cache_rows: usize,
     surface_tile_cache_entries: usize,
     compression_options: RegionCompressionOptions,
+    worker_autotune: Option<bool>,
 ) -> SurfacePhotoWorkerTuning {
     if submitted_regions < SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS || requested_threads <= 1 {
-        return SurfacePhotoWorkerTuning::fallback(
+        return SurfacePhotoWorkerTuning::manual(
             "fallback-small-batch",
             requested_threads,
             submitted_regions,
             "batch is too small for startup worker tuning",
         );
     }
-    if !surface_photo_worker_autotune_enabled() {
-        return SurfacePhotoWorkerTuning::fallback(
+    if !surface_photo_worker_autotune_enabled(worker_autotune) {
+        return SurfacePhotoWorkerTuning::manual(
             "fallback-disabled",
             requested_threads,
             submitted_regions,
-            format!("{SURFACE_PHOTO_AUTOTUNE_ENV} disabled worker tuning"),
+            "worker tuning disabled",
         );
     }
     let positions = surface_photo_plan_probe_regions(plan_regions, submitted_regions);
@@ -3576,6 +3621,7 @@ struct GenerationRuntimeOptions {
     compression: RegionCompressionOptions,
     vertical_scale: VerticalScaleOption,
     prefetch: GenerationPrefetchOptions,
+    worker_autotune: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3759,6 +3805,17 @@ fn parse_generation_runtime_options(
         {
             parsed.prefetch.enabled = true;
             parsed.prefetch.workers = parse_positive_usize_string("prefetchWorkers", value)?;
+            continue;
+        }
+        if key.eq_ignore_ascii_case("workerAutotune")
+            || key.eq_ignore_ascii_case("workerAutoTune")
+            || key.eq_ignore_ascii_case("surfaceWorkerAutotune")
+            || key.eq_ignore_ascii_case("surfaceWorkerTuning")
+            || key.eq_ignore_ascii_case("workerTuning")
+            || key.eq_ignore_ascii_case("autotune")
+            || key.eq_ignore_ascii_case("autoTune")
+        {
+            parsed.worker_autotune = Some(parse_bool_option("workerAutotune", value)?);
             continue;
         }
         return Err(format!("unknown generation option: {key}"));
@@ -4121,7 +4178,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [prefetchMemoryGB=N]"
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N]"
     )?;
     writeln!(
         out,
@@ -4157,15 +4214,15 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [prefetchMemoryGB=N]"
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N]"
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate-vanilla-delegated-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false]"
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N]"
+        "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false]"
     )?;
     writeln!(
         out,
@@ -9675,14 +9732,20 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     );
 
     configure_surface_photo_rayon_threads(threads);
+    let worker_autotune_enabled =
+        surface_photo_worker_autotune_enabled(runtime_options.worker_autotune);
     let worker_candidate_configs = surface_photo_worker_candidate_configs(threads, region_count);
-    let worker_tune_sample_target =
-        surface_photo_worker_tune_sample_target(&worker_candidate_configs, region_count);
+    let worker_tune_sample_target = if worker_autotune_enabled {
+        surface_photo_worker_tune_sample_target(&worker_candidate_configs, region_count)
+    } else {
+        0
+    };
     write_progress_event(
         out,
         json!({
             "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
             "type": "workerTuningStarted",
+            "enabled": worker_autotune_enabled,
             "requestedThreads": threads,
             "submittedRegions": region_count,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, region_count),
@@ -9710,6 +9773,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         cache_rows,
         surface_tile_cache_entries,
         runtime_options.compression,
+        runtime_options.worker_autotune,
     );
     write_progress_event(
         out,
@@ -9816,6 +9880,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "regionWorkerThreads": worker_count,
             "rayonThreads": rayon_threads,
             "parallelColumnSampling": parallel_column_sampling,
+            "workerAutotuneEnabled": worker_autotune_enabled,
             "prefetchEnabled": prefetch_config.enabled,
             "prefetchWorkers": prefetch_config.workers,
             "prefetchConsumerWorkers": prefetch_consumer_workers,
@@ -10444,6 +10509,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("regionWorkerThreads={worker_count}"),
         format!("rayonThreads={rayon_threads}"),
         format!("parallelColumnSampling={parallel_column_sampling}"),
+        format!("workerAutotuneEnabled={worker_autotune_enabled}"),
         format!("prefetchEnabled={}", prefetch_config.enabled),
         format!("prefetchWorkers={}", prefetch_config.workers),
         format!("prefetchConsumerWorkers={prefetch_consumer_workers}"),
@@ -10626,16 +10692,22 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         runtime_options.vertical_scale.label(),
     );
     configure_surface_photo_rayon_threads(threads);
+    let worker_autotune_enabled =
+        surface_photo_worker_autotune_enabled(runtime_options.worker_autotune);
     let worker_candidate_configs =
         surface_photo_worker_candidate_configs(threads, submitted_regions);
-    let worker_tune_sample_target =
-        surface_photo_worker_tune_sample_target(&worker_candidate_configs, submitted_regions);
+    let worker_tune_sample_target = if worker_autotune_enabled {
+        surface_photo_worker_tune_sample_target(&worker_candidate_configs, submitted_regions)
+    } else {
+        0
+    };
     write_progress_event(
         out,
         json!({
             "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
             "type": "workerTuningStarted",
             "mode": "plan",
+            "enabled": worker_autotune_enabled,
             "requestedThreads": threads,
             "submittedRegions": submitted_regions,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, submitted_regions),
@@ -10661,6 +10733,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         cache_rows,
         surface_tile_cache_entries,
         runtime_options.compression,
+        runtime_options.worker_autotune,
     );
     write_progress_event(
         out,
@@ -10742,6 +10815,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "regionWorkerThreads": worker_count,
             "rayonThreads": rayon_threads,
             "parallelColumnSampling": parallel_column_sampling,
+            "workerAutotuneEnabled": worker_autotune_enabled,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
             "resumeJournalRegions": resume.completed_regions.len(),
@@ -10980,6 +11054,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         format!("regionWorkerThreads={worker_count}"),
         format!("rayonThreads={rayon_threads}"),
         format!("parallelColumnSampling={parallel_column_sampling}"),
+        format!("workerAutotuneEnabled={worker_autotune_enabled}"),
         format!("workerTuningMode={}", worker_tuning.mode),
         format!("workerTuningSamples={}", worker_tuning.sample_count),
         format!("workerTuningLandSamples={}", worker_tuning.land_samples),
@@ -20770,6 +20845,32 @@ mod tests {
     }
 
     #[test]
+    fn vanilla_delegated_parallel_args_keep_worker_autotune_option() {
+        let args = [
+            "generate-vanilla-delegated-regions-parallel",
+            "E:\\HQheightmap.tif",
+            "D:\\world",
+            "1000",
+            "26",
+            "-10",
+            "3",
+            "3",
+            "linear",
+            "8",
+            "surface",
+            "surfaceRaster=D:\\surface.vrt",
+            "workerAutotune=false",
+        ]
+        .map(String::from);
+
+        let parsed = vanilla_delegated_regions_parallel_args(&args).unwrap();
+
+        assert_eq!(parsed.status, "surface");
+        assert_eq!(parsed.surface_raster, "surfaceRaster=D:\\surface.vrt");
+        assert_eq!(parsed.extra_options, ["workerAutotune=false".to_string()]);
+    }
+
+    #[test]
     fn region_compression_options_apply_generic_key_to_selected_format() {
         let linear = parse_region_compression_options(
             OutputFormat::LinearV2,
@@ -20842,6 +20943,38 @@ mod tests {
         assert_eq!(parsed.prefetch.memory_cap_bytes, Some(25 * BYTES_PER_GIB));
         assert_eq!(parsed.prefetch.queue_regions, Some(3));
         assert_eq!(parsed.prefetch.workers, 2);
+    }
+
+    #[test]
+    fn generation_runtime_options_parse_worker_autotune() {
+        let disabled = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &["workerAutotune=false".to_string()],
+        )
+        .unwrap();
+        let enabled = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &["surfaceWorkerTuning=on".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(disabled.worker_autotune, Some(false));
+        assert_eq!(enabled.worker_autotune, Some(true));
+    }
+
+    #[test]
+    fn manual_worker_tuning_uses_requested_threads_without_legacy_cap() {
+        let available = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(8);
+        let requested_threads = available.max(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT + 1);
+        let expected = requested_threads.min(available).min(100).max(1);
+
+        let tuning =
+            SurfacePhotoWorkerTuning::manual("fallback-disabled", requested_threads, 100, "manual");
+
+        assert_eq!(tuning.selected_worker_count, expected);
+        assert_eq!(tuning.mode, "fallback-disabled");
     }
 
     #[test]
