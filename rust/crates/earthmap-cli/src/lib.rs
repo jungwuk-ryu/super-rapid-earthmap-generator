@@ -391,6 +391,10 @@ fn surface_photo_worker_candidate_configs(
     let mut configs = Vec::new();
     for worker_count in region_workers {
         let mut rayon_candidates = vec![default_rayon_threads.max(worker_count)];
+        if worker_count > 1 {
+            let balanced_rayon_threads = worker_count.min(default_rayon_threads.max(worker_count));
+            rayon_candidates.push(balanced_rayon_threads);
+        }
         rayon_candidates.sort_unstable();
         rayon_candidates.dedup();
         for rayon_threads in rayon_candidates {
@@ -18621,15 +18625,25 @@ mod tests {
         let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(4);
         assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
             4,
+            4,
+            surface_photo_parallel_column_sampling(4, 4)
+        )));
+        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
+            4,
             tuned_rayon,
             surface_photo_parallel_column_sampling(4, tuned_rayon)
+        )));
+        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
+            10,
+            10,
+            surface_photo_parallel_column_sampling(10, 10)
         )));
         assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
             10,
             tuned_rayon,
             surface_photo_parallel_column_sampling(10, tuned_rayon)
         )));
-        assert_eq!(configs.len(), 4);
+        assert_eq!(configs.len(), 7);
     }
 
     #[test]

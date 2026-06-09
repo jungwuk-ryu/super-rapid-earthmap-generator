@@ -12501,6 +12501,22 @@ where
     phase_nanos.coast_factor = phase_start.elapsed().as_nanos();
     let collect_photo_materials =
         texture_mode == SurfaceTextureMode::Photo && material_sampler.is_some();
+    if surface_region_open_ocean_fast_path_eligible(&valid, &water_mask, &coast_factor_extent) {
+        let phase_start = Instant::now();
+        if let Some(open_ocean) = try_sample_uniform_deep_open_ocean_surface_region_from_raw(
+            region_block_z,
+            mapping,
+            vertical_scale,
+            &elevations,
+            &valid,
+            parallel_column_sampling,
+            &mut phase_nanos,
+        )? {
+            phase_nanos.open_ocean_fast_path += phase_start.elapsed().as_nanos();
+            return Ok(open_ocean.with_phase_nanos(phase_nanos));
+        }
+        phase_nanos.open_ocean_fast_path += phase_start.elapsed().as_nanos();
+    }
     let phase_start = Instant::now();
     let smoothed_center_elevations =
         surface_region_smoothed_center_elevations(&elevations, &valid, parallel_column_sampling);
@@ -12521,10 +12537,10 @@ where
         parallel_column_sampling,
         &mut phase_nanos,
     )? {
-        phase_nanos.open_ocean_fast_path = phase_start.elapsed().as_nanos();
+        phase_nanos.open_ocean_fast_path += phase_start.elapsed().as_nanos();
         return Ok(open_ocean.with_phase_nanos(phase_nanos));
     }
-    phase_nanos.open_ocean_fast_path = phase_start.elapsed().as_nanos();
+    phase_nanos.open_ocean_fast_path += phase_start.elapsed().as_nanos();
     let phase_start = Instant::now();
     let local_relief_center_meters = material_sampler.map(|_| {
         surface_region_local_relief_center_meters(&elevations, &valid, parallel_column_sampling)
@@ -13312,10 +13328,8 @@ fn try_sample_uniform_deep_open_ocean_surface_region(
     parallel_column_sampling: bool,
     phase_nanos: &mut SurfaceRegionSamplePhaseNanos,
 ) -> Result<Option<SurfaceRegionSample>> {
-    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
-    let deep_floor_threshold_meters = -((UNIFORM_DEEP_OPEN_OCEAN_SOURCE_DEPTH_BLOCKS
-        * ELEVATION_METERS_PER_BLOCK)
-        / vertical_scale);
+    let deep_floor_threshold_meters =
+        uniform_deep_open_ocean_source_threshold_meters(vertical_scale)?;
     let phase_start = Instant::now();
     let all_deep = if parallel_column_sampling {
         smoothed_center_elevations
@@ -13331,6 +13345,61 @@ fn try_sample_uniform_deep_open_ocean_surface_region(
         return Ok(None);
     }
 
+    try_build_uniform_deep_open_ocean_surface_region(
+        region_block_z,
+        mapping,
+        parallel_column_sampling,
+        phase_nanos,
+        phase_start,
+    )
+}
+
+fn try_sample_uniform_deep_open_ocean_surface_region_from_raw(
+    region_block_z: i32,
+    mapping: &EarthScaleMapping,
+    vertical_scale: f64,
+    elevations: &[f64],
+    valid: &[bool],
+    parallel_column_sampling: bool,
+    phase_nanos: &mut SurfaceRegionSamplePhaseNanos,
+) -> Result<Option<SurfaceRegionSample>> {
+    let deep_floor_threshold_meters =
+        uniform_deep_open_ocean_source_threshold_meters(vertical_scale)?;
+    let phase_start = Instant::now();
+    let all_deep = surface_region_all_valid_elevations_at_or_below(
+        elevations,
+        valid,
+        deep_floor_threshold_meters,
+    );
+    if !all_deep {
+        phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
+        return Ok(None);
+    }
+
+    try_build_uniform_deep_open_ocean_surface_region(
+        region_block_z,
+        mapping,
+        parallel_column_sampling,
+        phase_nanos,
+        phase_start,
+    )
+}
+
+fn uniform_deep_open_ocean_source_threshold_meters(vertical_scale: f64) -> Result<f64> {
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    Ok(
+        -((UNIFORM_DEEP_OPEN_OCEAN_SOURCE_DEPTH_BLOCKS * ELEVATION_METERS_PER_BLOCK)
+            / vertical_scale),
+    )
+}
+
+fn try_build_uniform_deep_open_ocean_surface_region(
+    region_block_z: i32,
+    mapping: &EarthScaleMapping,
+    parallel_column_sampling: bool,
+    phase_nanos: &mut SurfaceRegionSamplePhaseNanos,
+    phase_start: Instant,
+) -> Result<Option<SurfaceRegionSample>> {
     let mut biome = None::<String>;
     for local_z in 0..SURFACE_REGION_WIDTH {
         let global_block_z = region_block_z.wrapping_add(local_z as i32);
@@ -18043,6 +18112,28 @@ mod tests {
             sample.columns().len(),
             SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH
         );
+        let first = &sample.columns()[0];
+        assert!(first.water);
+        assert_eq!(first.ground_surface_y, MIN_SURFACE_Y);
+        assert!(sample.columns().iter().all(|column| column == first));
+    }
+
+    #[test]
+    fn raw_deep_open_ocean_region_skips_smoothing() {
+        let mapping = EarthScaleMapping::for_denominator(250, -90.0, 90.0).unwrap();
+        let sample = sample_surface_region_with_elevation_fn(
+            0,
+            0,
+            &mapping,
+            4.0,
+            |_longitude, _latitude| Ok(-2_000.0),
+            SurfaceTextureMode::Photo,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(sample.phase_nanos().smooth_precompute, 0);
         let first = &sample.columns()[0];
         assert!(first.water);
         assert_eq!(first.ground_surface_y, MIN_SURFACE_Y);
