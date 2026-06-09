@@ -4938,7 +4938,7 @@ fn clamp_surface_material_color(value: i32) -> u8 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhotoSurfaceInput {
     pub semantic_column: EarthSurfaceColumn,
-    pub sample: SurfaceMaterialSample,
+    pub sample: Arc<SurfaceMaterialSample>,
     pub elevation_meters: f64,
     pub longitude: f64,
     pub latitude: f64,
@@ -4954,6 +4954,31 @@ impl PhotoSurfaceInput {
     pub fn new(
         semantic_column: EarthSurfaceColumn,
         sample: SurfaceMaterialSample,
+        elevation_meters: f64,
+        longitude: f64,
+        latitude: f64,
+        coast_factor: f64,
+        local_relief_meters: f64,
+        global_block_x: i32,
+        global_block_z: i32,
+    ) -> Self {
+        Self::new_shared(
+            semantic_column,
+            Arc::new(sample),
+            elevation_meters,
+            longitude,
+            latitude,
+            coast_factor,
+            local_relief_meters,
+            global_block_x,
+            global_block_z,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_shared(
+        semantic_column: EarthSurfaceColumn,
+        sample: Arc<SurfaceMaterialSample>,
         elevation_meters: f64,
         longitude: f64,
         latitude: f64,
@@ -11419,13 +11444,22 @@ fn generate_surface_region_with_prepared_sample_inner(
                 .region_z
                 .wrapping_mul(REGION_CHUNKS)
                 .wrapping_add(local_chunk_z);
-            let sample = region_surface.chunk_sample(local_chunk_x, local_chunk_z)?;
-
             let phase_start = Instant::now();
-            let build = build_surface_chunk_with_osm_overlay(
+            let origin_x = local_chunk_x as usize * CHUNK_WIDTH;
+            let origin_z = local_chunk_z as usize * CHUNK_WIDTH;
+            let build = build_surface_chunk_with_osm_overlay_from_columns(
                 chunk_x,
                 chunk_z,
-                sample.columns(),
+                |column_index| {
+                    let local_z = column_index / CHUNK_WIDTH;
+                    let local_x = column_index % CHUNK_WIDTH;
+                    let region_index = surface_class_index(
+                        origin_x + local_x,
+                        origin_z + local_z,
+                        SURFACE_REGION_WIDTH,
+                    );
+                    &region_surface.columns()[region_index]
+                },
                 settings.osm_region_feature_mask.as_ref(),
                 local_chunk_x * CHUNK_WIDTH as i32,
                 local_chunk_z * CHUNK_WIDTH as i32,
@@ -11795,7 +11829,7 @@ pub fn trace_surface_region_columns(
             if let Some(material) = material {
                 columns[column_index] = apply_surface_region_photo_material_sample(
                     columns[column_index].clone(),
-                    material,
+                    Arc::new(material),
                     photo_smoothed_elevations[column_index],
                     photo_longitudes[column_index],
                     photo_latitudes[column_index],
@@ -12113,6 +12147,28 @@ pub fn build_surface_chunk_with_osm_overlay(
             "surface chunk sample must contain one entry per chunk column",
         ));
     }
+    build_surface_chunk_with_osm_overlay_from_columns(
+        chunk_x,
+        chunk_z,
+        |column_index| &columns[column_index],
+        osm_mask,
+        region_local_origin_x,
+        region_local_origin_z,
+    )
+}
+
+fn build_surface_chunk_with_osm_overlay_from_columns<'a, F>(
+    chunk_x: i32,
+    chunk_z: i32,
+    column_at: F,
+    osm_mask: Option<&OsmRegionFeatureMask>,
+    region_local_origin_x: i32,
+    region_local_origin_z: i32,
+) -> Result<SurfaceChunkBuild>
+where
+    F: Fn(usize) -> &'a EarthSurfaceColumn,
+{
+    let expected_columns = CHUNK_WIDTH * CHUNK_WIDTH;
     let mut chunk = ChunkModel::overworld(chunk_x, chunk_z);
     let mut land_columns = 0;
     let mut water_columns = 0;
@@ -12127,7 +12183,7 @@ pub fn build_surface_chunk_with_osm_overlay(
     for local_z in 0..CHUNK_WIDTH {
         for local_x in 0..CHUNK_WIDTH {
             let column_index = (local_z * CHUNK_WIDTH) + local_x;
-            let column = normalize_surface_column_for_chunk(&columns[column_index]);
+            let column = normalize_surface_column_for_chunk(column_at(column_index));
             if column.water {
                 water_columns += 1;
             } else {
@@ -12563,7 +12619,7 @@ where
                     }
                     return apply_surface_region_photo_material_sample(
                         build.column,
-                        (*material).clone(),
+                        material,
                         build.smoothed_elevation,
                         build.longitude,
                         build.latitude,
@@ -13303,7 +13359,7 @@ fn apply_surface_region_semantic_material_sample(
 #[allow(clippy::too_many_arguments)]
 fn apply_surface_region_photo_material_sample(
     semantic_column: EarthSurfaceColumn,
-    sample: SurfaceMaterialSample,
+    sample: Arc<SurfaceMaterialSample>,
     elevation_meters: f64,
     longitude: f64,
     latitude: f64,
@@ -13314,7 +13370,7 @@ fn apply_surface_region_photo_material_sample(
     vertical_scale: f64,
     token_luma_profile: Option<&Arc<PhotoSurfaceTokenLumaProfile>>,
 ) -> Result<EarthSurfaceColumn> {
-    let mut input = PhotoSurfaceInput::new(
+    let mut input = PhotoSurfaceInput::new_shared(
         semantic_column,
         sample,
         elevation_meters,
@@ -13359,7 +13415,7 @@ fn apply_surface_region_material_sample(
     match texture_mode {
         SurfaceTextureMode::Photo => apply_surface_region_photo_material_sample(
             semantic_column,
-            sample,
+            Arc::new(sample),
             elevation_meters,
             longitude,
             latitude,
@@ -20669,7 +20725,7 @@ mod tests {
         .unwrap();
         let photo_pass = apply_surface_region_photo_material_sample(
             semantic_only.clone(),
-            material.clone(),
+            Arc::new(material.clone()),
             240.0,
             13.0,
             24.0,
