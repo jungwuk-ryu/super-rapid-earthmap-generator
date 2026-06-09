@@ -14033,8 +14033,9 @@ fn temperate_rock_replacement(biome: &str) -> i32 {
     if is_wet_surface_biome(biome) {
         return block_state_ids::MOSS_BLOCK;
     }
-    let lower = lower_surface_biome(biome);
-    if lower.contains("taiga") || lower.contains("old_growth") {
+    if contains_ascii_case_insensitive(biome, "taiga")
+        || contains_ascii_case_insensitive(biome, "old_growth")
+    {
         return block_state_ids::PODZOL;
     }
     block_state_ids::GRASS_BLOCK
@@ -14078,75 +14079,75 @@ fn is_drab_temperate_earth(block: i32) -> bool {
 }
 
 fn is_temperate_vegetated_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("forest")
-        || lower.contains("taiga")
-        || lower.contains("jungle")
-        || lower.contains("plains")
-        || lower.contains("meadow")
-        || lower.contains("grove")
-        || lower.contains("windswept")
-        || lower.contains("mountain")
-        || lower.contains("hill")
+    contains_ascii_case_insensitive(biome, "forest")
+        || contains_ascii_case_insensitive(biome, "taiga")
+        || contains_ascii_case_insensitive(biome, "jungle")
+        || contains_ascii_case_insensitive(biome, "plains")
+        || contains_ascii_case_insensitive(biome, "meadow")
+        || contains_ascii_case_insensitive(biome, "grove")
+        || contains_ascii_case_insensitive(biome, "windswept")
+        || contains_ascii_case_insensitive(biome, "mountain")
+        || contains_ascii_case_insensitive(biome, "hill")
 }
 
 fn is_hard_alpine_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("stony") || lower.contains("peak") || lower.contains("jagged")
+    contains_ascii_case_insensitive(biome, "stony")
+        || contains_ascii_case_insensitive(biome, "peak")
+        || contains_ascii_case_insensitive(biome, "jagged")
 }
 
 fn is_coast_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("beach")
-        || lower.contains("ocean")
-        || lower.contains("river")
-        || lower.contains("shore")
+    contains_ascii_case_insensitive(biome, "beach")
+        || contains_ascii_case_insensitive(biome, "ocean")
+        || contains_ascii_case_insensitive(biome, "river")
+        || contains_ascii_case_insensitive(biome, "shore")
 }
 
 fn is_dry_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("desert")
-        || lower.contains("badlands")
-        || lower.contains("savanna")
-        || lower.contains("steppe")
-        || lower.contains("grassland")
+    contains_ascii_case_insensitive(biome, "desert")
+        || contains_ascii_case_insensitive(biome, "badlands")
+        || contains_ascii_case_insensitive(biome, "savanna")
+        || contains_ascii_case_insensitive(biome, "steppe")
+        || contains_ascii_case_insensitive(biome, "grassland")
 }
 
 fn is_arid_bare_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("desert") || lower.contains("badlands") || lower.contains("steppe")
+    contains_ascii_case_insensitive(biome, "desert")
+        || contains_ascii_case_insensitive(biome, "badlands")
+        || contains_ascii_case_insensitive(biome, "steppe")
 }
 
 fn is_true_sandy_land_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("desert") || lower.contains("badlands")
+    contains_ascii_case_insensitive(biome, "desert")
+        || contains_ascii_case_insensitive(biome, "badlands")
 }
 
 fn is_wet_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("swamp") || lower.contains("mangrove") || lower.contains("wetland")
+    contains_ascii_case_insensitive(biome, "swamp")
+        || contains_ascii_case_insensitive(biome, "mangrove")
+        || contains_ascii_case_insensitive(biome, "wetland")
 }
 
 fn is_snowy_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("snow") || lower.contains("frozen") || lower.contains("ice")
+    contains_ascii_case_insensitive(biome, "snow")
+        || contains_ascii_case_insensitive(biome, "frozen")
+        || contains_ascii_case_insensitive(biome, "ice")
 }
 
 fn is_rocky_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("mountain")
-        || lower.contains("peak")
-        || lower.contains("stony")
-        || lower.contains("windswept")
+    contains_ascii_case_insensitive(biome, "mountain")
+        || contains_ascii_case_insensitive(biome, "peak")
+        || contains_ascii_case_insensitive(biome, "stony")
+        || contains_ascii_case_insensitive(biome, "windswept")
 }
 
 fn is_forest_surface_biome(biome: &str) -> bool {
-    let lower = lower_surface_biome(biome);
-    lower.contains("forest") || lower.contains("taiga")
+    contains_ascii_case_insensitive(biome, "forest")
+        || contains_ascii_case_insensitive(biome, "taiga")
 }
 
 fn is_jungle_surface_biome(biome: &str) -> bool {
-    lower_surface_biome(biome).contains("jungle")
+    contains_ascii_case_insensitive(biome, "jungle")
 }
 
 const IMMEDIATE_COAST_FACTOR: f64 = 0.985;
@@ -14213,14 +14214,18 @@ fn clean_water_surface_column(
 }
 
 fn land_shore_top(biome: &str) -> i32 {
-    let lower = lower_surface_biome(biome);
-    if lower.contains("swamp") || lower.contains("mangrove") || lower.contains("wetland") {
+    if contains_ascii_case_insensitive(biome, "swamp")
+        || contains_ascii_case_insensitive(biome, "mangrove")
+        || contains_ascii_case_insensitive(biome, "wetland")
+    {
         return block_state_ids::MUD;
     }
-    if lower.contains("badlands") || lower.contains("savanna") {
+    if contains_ascii_case_insensitive(biome, "badlands")
+        || contains_ascii_case_insensitive(biome, "savanna")
+    {
         return block_state_ids::COARSE_DIRT;
     }
-    if lower.contains("desert") {
+    if contains_ascii_case_insensitive(biome, "desert") {
         return block_state_ids::GRASS_BLOCK;
     }
     block_state_ids::GRASS_BLOCK
@@ -14243,8 +14248,10 @@ fn land_shore_filler(top: i32) -> i32 {
 }
 
 fn water_floor_top(biome: &str, depth: i32) -> i32 {
-    let lower = lower_surface_biome(biome);
-    if lower.contains("swamp") || lower.contains("mangrove") || lower.contains("wetland") {
+    if contains_ascii_case_insensitive(biome, "swamp")
+        || contains_ascii_case_insensitive(biome, "mangrove")
+        || contains_ascii_case_insensitive(biome, "wetland")
+    {
         return block_state_ids::CLAY;
     }
     if depth <= 6 {
@@ -14298,10 +14305,6 @@ fn replace_surface_blocks(
     replaced.terrain_token_source = column.terrain_token_source;
     replaced.data_evidence_flags = column.data_evidence_flags;
     replaced
-}
-
-fn lower_surface_biome(biome: &str) -> String {
-    biome.to_ascii_lowercase()
 }
 
 const SURFACE_BIOME_BELOW_PADDING: i32 = 4;
