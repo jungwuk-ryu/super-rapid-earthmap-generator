@@ -15429,6 +15429,12 @@ fn surface_region_smoothed_elevation(
 }
 
 fn surface_region_water_decision_mask(elevations: &[f64], valid: &[bool]) -> Vec<bool> {
+    if surface_region_all_valid_elevations_at_or_below(elevations, valid, 0.0) {
+        return vec![true; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    }
+    if surface_region_all_valid_elevations_at_or_above(elevations, valid, 8.0) {
+        return vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    }
     let mut water_mask = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     for z in 0..SURFACE_REGION_EXTENT {
         for x in 0..SURFACE_REGION_EXTENT {
@@ -15449,6 +15455,28 @@ fn surface_region_water_decision_mask(elevations: &[f64], valid: &[bool]) -> Vec
     water_mask
 }
 
+fn surface_region_all_valid_elevations_at_or_below(
+    elevations: &[f64],
+    valid: &[bool],
+    threshold: f64,
+) -> bool {
+    valid
+        .iter()
+        .zip(elevations.iter())
+        .all(|(&valid, &elevation)| valid && elevation <= threshold)
+}
+
+fn surface_region_all_valid_elevations_at_or_above(
+    elevations: &[f64],
+    valid: &[bool],
+    threshold: f64,
+) -> bool {
+    valid
+        .iter()
+        .zip(elevations.iter())
+        .all(|(&valid, &elevation)| valid && elevation >= threshold)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn surface_region_water_decision_mask_with_coverage<F>(
     elevations: &[f64],
@@ -15465,6 +15493,9 @@ where
 {
     let water_mask = surface_region_water_decision_mask(elevations, valid);
     if !surface_region_uses_subblock_water_coverage(longitude_span_degrees, latitude_span_degrees) {
+        return Ok(water_mask);
+    }
+    if surface_region_mask_uniform_on_valid(valid, &water_mask) {
         return Ok(water_mask);
     }
     let mut refined = water_mask.clone();
@@ -15499,6 +15530,21 @@ where
         }
     }
     Ok(refined)
+}
+
+fn surface_region_mask_uniform_on_valid(valid: &[bool], mask: &[bool]) -> bool {
+    let mut first = None;
+    for (&valid, &value) in valid.iter().zip(mask.iter()) {
+        if !valid {
+            continue;
+        }
+        match first {
+            Some(first) if first != value => return false,
+            Some(_) => {}
+            None => first = Some(value),
+        }
+    }
+    first.is_some()
 }
 
 fn surface_region_uses_subblock_water_coverage(
@@ -15585,6 +15631,9 @@ fn surface_subblock_sample_valid(
 const SURFACE_REGION_DISTANCE_INFINITY: i32 = 1_000_000_000;
 
 fn surface_region_coast_factors(valid: &[bool], water_mask: &[bool]) -> Vec<f64> {
+    if surface_region_mask_uniform_on_valid(valid, water_mask) {
+        return vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+    }
     let distance_to_water = surface_region_squared_distance_to_mask(valid, water_mask, true);
     let distance_to_land = surface_region_squared_distance_to_mask(valid, water_mask, false);
     let mut factors = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
@@ -21850,6 +21899,25 @@ mod tests {
             surface_chunk_coast_factor(&valid, &water_mask, 64, 64, false),
             0.0
         );
+    }
+
+    #[test]
+    fn surface_region_water_mask_fast_paths_uniform_valid_extents() {
+        let valid = vec![true; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+        let shallow_water_elevations = vec![0.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+        let water_mask = surface_region_water_decision_mask(&shallow_water_elevations, &valid);
+        assert!(water_mask.iter().all(|&water| water));
+
+        let land_elevations = vec![8.0; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
+        let land_mask = surface_region_water_decision_mask(&land_elevations, &valid);
+        assert!(land_mask.iter().all(|&water| !water));
+
+        let mut invalid = valid.clone();
+        invalid[0] = false;
+        let mixed_validity =
+            surface_region_water_decision_mask(&shallow_water_elevations, &invalid);
+        assert!(!mixed_validity[0]);
+        assert!(mixed_validity[1]);
     }
 
     #[test]
