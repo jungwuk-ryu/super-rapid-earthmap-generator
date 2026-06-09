@@ -1399,6 +1399,17 @@ pub fn apply_surface_material(
     Ok(with_surface_material_metadata(classified, sample))
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn classify_surface_material_water(
     base: &EarthSurfaceColumn,
     sample: &SurfaceMaterialSample,
@@ -2744,14 +2755,13 @@ fn classify_surface_material_by_ecoregion(
     }
 
     let biome = sample.ecoregion_biome_id.as_str();
-    let key_source = biome.strip_prefix("minecraft:").unwrap_or(biome);
-    let key = key_source.to_ascii_lowercase();
+    let key = biome.strip_prefix("minecraft:").unwrap_or(biome);
     let green_like = is_green_like(metrics);
     let olive_dry_grass = is_olive_dry_grass(metrics);
     let desert_sand_like = is_desert_sand_like(metrics);
     let vegetation_evidence = has_vegetation_evidence(sample, metrics);
     let vegetation_strength = sample.vegetation_cover();
-    let eco_name = sample.ecoregion_name.to_ascii_lowercase();
+    let eco_name = sample.ecoregion_name.as_str();
 
     if should_defer_ecoregion_at_transition(
         sample,
@@ -2770,7 +2780,7 @@ fn classify_surface_material_by_ecoregion(
         return None;
     }
 
-    if key.contains("beach") {
+    if contains_ascii_case_insensitive(key, "beach") {
         if is_immediate_beach(base, coast_factor)
             && should_use_beach_sand(metrics, longitude, latitude)
         {
@@ -2783,7 +2793,10 @@ fn classify_surface_material_by_ecoregion(
         }
         return None;
     }
-    if key.contains("snow") || key.contains("frozen") || key.contains("grove") {
+    if contains_ascii_case_insensitive(key, "snow")
+        || contains_ascii_case_insensitive(key, "frozen")
+        || contains_ascii_case_insensitive(key, "grove")
+    {
         let top = if base.ground_surface_y >= 145 || sample.snow_cover_ratio() >= 0.18 {
             block_state_ids::SNOW_BLOCK
         } else {
@@ -2796,10 +2809,10 @@ fn classify_surface_material_by_ecoregion(
             biome,
         ));
     }
-    if key.contains("peak")
-        || key.contains("stony")
-        || key.contains("jagged")
-        || key.contains("gravelly")
+    if contains_ascii_case_insensitive(key, "peak")
+        || contains_ascii_case_insensitive(key, "stony")
+        || contains_ascii_case_insensitive(key, "jagged")
+        || contains_ascii_case_insensitive(key, "gravelly")
     {
         let top = if base.ground_surface_y >= 150 || local_relief_meters >= 180.0 {
             block_state_ids::STONE
@@ -2813,7 +2826,7 @@ fn classify_surface_material_by_ecoregion(
         };
         return Some(surface_material_with_surface(base, top, filler, biome));
     }
-    if key.contains("swamp") || sample.swamp_cover_ratio() >= 0.35 {
+    if contains_ascii_case_insensitive(key, "swamp") || sample.swamp_cover_ratio() >= 0.35 {
         if sample.swamp_cover_ratio() < 0.25
             && !is_immediate_beach(base, coast_factor)
             && base.ground_surface_y > SEA_LEVEL_Y + 3
@@ -2834,21 +2847,22 @@ fn classify_surface_material_by_ecoregion(
             base,
             top,
             filler,
-            if key.contains("mangrove") {
+            if contains_ascii_case_insensitive(key, "mangrove") {
                 "minecraft:mangrove_swamp"
             } else {
                 "minecraft:swamp"
             },
         ));
     }
-    if key.contains("jungle") {
+    if contains_ascii_case_insensitive(key, "jungle") {
         if !vegetation_evidence
             && rainforest_score < 0.25
             && !is_tropical_rain_climate(sample.climate_class)
         {
             return None;
         }
-        let mosaic = eco_name.contains("mosaic") || eco_name.contains("savanna");
+        let mosaic = contains_ascii_case_insensitive(eco_name, "mosaic")
+            || contains_ascii_case_insensitive(eco_name, "savanna");
         if mosaic || rainforest_score < 0.42 || (vegetation_strength < 0.12 && !green_like) {
             if (olive_dry_grass || dry_savanna_score >= 0.25) && patch_noise < 0.46 {
                 let top = dry_grass_surface_conservative(
@@ -2925,7 +2939,7 @@ fn classify_surface_material_by_ecoregion(
                 },
             ));
         }
-        let jungle_biome = if key.contains("sparse") {
+        let jungle_biome = if contains_ascii_case_insensitive(key, "sparse") {
             "minecraft:sparse_jungle"
         } else if sample.tree_cover() >= 0.55 && patch_noise >= 0.64 {
             "minecraft:bamboo_jungle"
@@ -2949,7 +2963,7 @@ fn classify_surface_material_by_ecoregion(
             jungle_biome,
         ));
     }
-    if key.contains("savanna") {
+    if contains_ascii_case_insensitive(key, "savanna") {
         if !vegetation_evidence
             && desert_sand_like
             && sahara_score >= 0.35
@@ -2977,11 +2991,12 @@ fn classify_surface_material_by_ecoregion(
             semantic_terrain,
             local_relief_meters,
         );
-        let savanna_biome = if key.contains("windswept") || elevation_meters >= 900.0 {
-            "minecraft:windswept_savanna"
-        } else {
-            "minecraft:savanna"
-        };
+        let savanna_biome =
+            if contains_ascii_case_insensitive(key, "windswept") || elevation_meters >= 900.0 {
+                "minecraft:windswept_savanna"
+            } else {
+                "minecraft:savanna"
+            };
         return Some(surface_material_with_surface(
             base,
             top,
@@ -2989,10 +3004,10 @@ fn classify_surface_material_by_ecoregion(
             savanna_biome,
         ));
     }
-    if key.contains("desert") {
+    if contains_ascii_case_insensitive(key, "desert") {
         if vegetation_evidence
             && (sahel_score >= 0.18 || dry_savanna_score >= 0.18)
-            && (!eco_name.contains("sahara desert")
+            && (!contains_ascii_case_insensitive(eco_name, "sahara desert")
                 || sahel_score >= 0.28
                 || dry_savanna_score >= 0.28
                 || is_sahel_latitude(latitude))
@@ -3014,7 +3029,7 @@ fn classify_surface_material_by_ecoregion(
                 "minecraft:savanna",
             ));
         }
-        if eco_name.contains("sahara desert")
+        if contains_ascii_case_insensitive(eco_name, "sahara desert")
             && (olive_dry_grass || green_like)
             && (sahel_score >= 0.18 || latitude <= 20.0)
             && patch_noise >= 0.42
@@ -3052,7 +3067,7 @@ fn classify_surface_material_by_ecoregion(
             "minecraft:desert",
         ));
     }
-    if key.contains("badlands") {
+    if contains_ascii_case_insensitive(key, "badlands") {
         let exposed = is_exposed_dry_rock(
             metrics,
             elevation_meters,
@@ -3072,7 +3087,9 @@ fn classify_surface_material_by_ecoregion(
                 fine_noise,
             ));
         }
-        if eco_name.contains("desert") && !has_vegetation_evidence(sample, metrics) {
+        if contains_ascii_case_insensitive(eco_name, "desert")
+            && !has_vegetation_evidence(sample, metrics)
+        {
             let mut top = if metrics.red > metrics.green * 1.18 && metrics.hue <= 45.0 {
                 block_state_ids::RED_SAND
             } else {
@@ -3103,14 +3120,16 @@ fn classify_surface_material_by_ecoregion(
             biome,
         ));
     }
-    if key.contains("forest") || key.contains("taiga") {
+    if contains_ascii_case_insensitive(key, "forest")
+        || contains_ascii_case_insensitive(key, "taiga")
+    {
         if !vegetation_evidence
             && !is_temperate_climate(sample.climate_class)
             && !is_cold_climate(sample.climate_class)
         {
             return None;
         }
-        if eco_name.contains("mosaic")
+        if contains_ascii_case_insensitive(eco_name, "mosaic")
             && vegetation_strength < 0.16
             && (olive_dry_grass || dry_savanna_score >= 0.25)
             && patch_noise < 0.50
@@ -3132,7 +3151,7 @@ fn classify_surface_material_by_ecoregion(
                 "minecraft:savanna",
             ));
         }
-        let forest_biome = if key.contains("forest")
+        let forest_biome = if contains_ascii_case_insensitive(key, "forest")
             && sample.tree_cover() < 0.08
             && !green_like
             && olive_dry_grass
@@ -3149,7 +3168,9 @@ fn classify_surface_material_by_ecoregion(
             forest_biome,
         ));
     }
-    if key.contains("meadow") || key.contains("plains") {
+    if contains_ascii_case_insensitive(key, "meadow")
+        || contains_ascii_case_insensitive(key, "plains")
+    {
         let top = if fine_noise >= 0.92 && !green_like && !olive_dry_grass {
             block_state_ids::COARSE_DIRT
         } else {
@@ -3184,25 +3205,25 @@ fn should_defer_ecoregion_at_transition(
     if sample.ecoregion_confidence >= 0.84 {
         return false;
     }
-    if !(key.contains("desert")
-        || key.contains("savanna")
-        || key.contains("jungle")
-        || key.contains("forest")
-        || key.contains("badlands")
-        || key.contains("plains"))
+    if !(contains_ascii_case_insensitive(key, "desert")
+        || contains_ascii_case_insensitive(key, "savanna")
+        || contains_ascii_case_insensitive(key, "jungle")
+        || contains_ascii_case_insensitive(key, "forest")
+        || contains_ascii_case_insensitive(key, "badlands")
+        || contains_ascii_case_insensitive(key, "plains"))
     {
         return false;
     }
     let green_like = is_green_like(metrics);
     let desert_sand_like = is_desert_sand_like(metrics);
-    if eco_name.contains("sahara desert")
+    if contains_ascii_case_insensitive(eco_name, "sahara desert")
         && latitude >= 18.0
         && !vegetation_evidence
         && (desert_sand_like || sahara_score >= 0.55)
     {
         return false;
     }
-    if key.contains("jungle")
+    if contains_ascii_case_insensitive(key, "jungle")
         && (sample.tree_cover() >= 0.22
             || rainforest_score >= 0.62
             || (is_tropical_rain_climate(sample.climate_class) && green_like))
@@ -3210,13 +3231,14 @@ fn should_defer_ecoregion_at_transition(
     {
         return false;
     }
-    if key.contains("savanna")
+    if contains_ascii_case_insensitive(key, "savanna")
         && (dry_savanna_score >= 0.55 || is_tropical_savanna_climate(sample.climate_class))
         && sample.ecoregion_confidence >= 0.62
     {
         return false;
     }
-    if (key.contains("badlands") || key.contains("desert"))
+    if (contains_ascii_case_insensitive(key, "badlands")
+        || contains_ascii_case_insensitive(key, "desert"))
         && elevation_meters >= 700.0
         && sample.slope_ratio() >= 0.20
         && !vegetation_evidence
@@ -3964,12 +3986,13 @@ fn temperate_biome(
     patch_noise: f64,
     fine_noise: f64,
 ) -> String {
-    let eco_name = sample.ecoregion_name.to_ascii_lowercase();
-    let broadleaf = eco_name.contains("broadleaf")
-        || eco_name.contains("mixed")
-        || eco_name.contains("temperate");
-    let boreal =
-        eco_name.contains("boreal") || eco_name.contains("conifer") || eco_name.contains("taiga");
+    let eco_name = sample.ecoregion_name.as_str();
+    let broadleaf = contains_ascii_case_insensitive(eco_name, "broadleaf")
+        || contains_ascii_case_insensitive(eco_name, "mixed")
+        || contains_ascii_case_insensitive(eco_name, "temperate");
+    let boreal = contains_ascii_case_insensitive(eco_name, "boreal")
+        || contains_ascii_case_insensitive(eco_name, "conifer")
+        || contains_ascii_case_insensitive(eco_name, "taiga");
     if is_forest_like_ecoregion(sample) && sample.ecoregion_confidence >= 0.55 {
         if boreal || (latitude.abs() >= 55.0 && !broadleaf) {
             return if patch_noise >= 0.42 {
@@ -4043,10 +4066,10 @@ fn temperate_grassland_biome(
     fine_noise: f64,
 ) -> String {
     let abs_lat = latitude.abs();
-    let eco_name = sample.ecoregion_name.to_ascii_lowercase();
+    let eco_name = sample.ecoregion_name.as_str();
     let forest_edge = is_forest_like_ecoregion(sample)
-        || eco_name.contains("woodland")
-        || eco_name.contains("mosaic");
+        || contains_ascii_case_insensitive(eco_name, "woodland")
+        || contains_ascii_case_insensitive(eco_name, "mosaic");
     let tree_patch =
         sample.tree_cover() >= 0.10 || (sample.tree_cover() >= 0.06 && patch_noise >= 0.64);
     if abs_lat >= 56.0 && (tree_patch || patch_noise >= 0.76) {
@@ -4293,10 +4316,7 @@ fn mediterranean_biome(
     patch_noise: f64,
 ) -> String {
     if sample.has_ecoregion()
-        && sample
-            .ecoregion_name
-            .to_ascii_lowercase()
-            .contains("mediterranean")
+        && contains_ascii_case_insensitive(&sample.ecoregion_name, "mediterranean")
         && patch_noise < 0.34
         && !is_green_like(metrics)
     {
@@ -4370,40 +4390,42 @@ fn is_forest_like_ecoregion(sample: &SurfaceMaterialSample) -> bool {
     if !sample.has_ecoregion() {
         return false;
     }
-    let name = sample.ecoregion_name.to_ascii_lowercase();
-    let biome = sample.ecoregion_biome_id.to_ascii_lowercase();
-    biome.contains("forest")
-        || biome.contains("jungle")
-        || biome.contains("taiga")
-        || name.contains("forest")
-        || name.contains("woodland")
-        || name.contains("broadleaf")
-        || name.contains("conifer")
+    let name = sample.ecoregion_name.as_str();
+    let biome = sample.ecoregion_biome_id.as_str();
+    contains_ascii_case_insensitive(biome, "forest")
+        || contains_ascii_case_insensitive(biome, "jungle")
+        || contains_ascii_case_insensitive(biome, "taiga")
+        || contains_ascii_case_insensitive(name, "forest")
+        || contains_ascii_case_insensitive(name, "woodland")
+        || contains_ascii_case_insensitive(name, "broadleaf")
+        || contains_ascii_case_insensitive(name, "conifer")
 }
 
 fn is_savanna_like_ecoregion(sample: &SurfaceMaterialSample) -> bool {
     if !sample.has_ecoregion() {
         return false;
     }
-    let name = sample.ecoregion_name.to_ascii_lowercase();
-    let biome = sample.ecoregion_biome_id.to_ascii_lowercase();
-    biome.contains("savanna")
-        || biome.contains("plains")
-        || name.contains("savanna")
-        || name.contains("grassland")
-        || name.contains("steppe")
-        || name.contains("xeric")
+    let name = sample.ecoregion_name.as_str();
+    let biome = sample.ecoregion_biome_id.as_str();
+    contains_ascii_case_insensitive(biome, "savanna")
+        || contains_ascii_case_insensitive(biome, "plains")
+        || contains_ascii_case_insensitive(name, "savanna")
+        || contains_ascii_case_insensitive(name, "grassland")
+        || contains_ascii_case_insensitive(name, "steppe")
+        || contains_ascii_case_insensitive(name, "xeric")
 }
 
 fn is_named_forest_savanna_mosaic(sample: &SurfaceMaterialSample) -> bool {
     if !sample.has_ecoregion() {
         return false;
     }
-    let name = sample.ecoregion_name.to_ascii_lowercase();
-    name.contains("forest-savanna")
-        || name.contains("forest savanna")
-        || (name.contains("mosaic")
-            && (name.contains("forest") || name.contains("woodland") || name.contains("savanna")))
+    let name = sample.ecoregion_name.as_str();
+    contains_ascii_case_insensitive(name, "forest-savanna")
+        || contains_ascii_case_insensitive(name, "forest savanna")
+        || (contains_ascii_case_insensitive(name, "mosaic")
+            && (contains_ascii_case_insensitive(name, "forest")
+                || contains_ascii_case_insensitive(name, "woodland")
+                || contains_ascii_case_insensitive(name, "savanna")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4419,8 +4441,8 @@ fn is_forest_savanna_mosaic_intent(
     patch_noise: f64,
     fine_noise: f64,
 ) -> bool {
-    let biome_id = sample.ecoregion_biome_id.to_ascii_lowercase();
-    let sparse_jungle_savanna_edge = biome_id.contains("sparse_jungle")
+    let biome_id = sample.ecoregion_biome_id.as_str();
+    let sparse_jungle_savanna_edge = contains_ascii_case_insensitive(biome_id, "sparse_jungle")
         && (is_tropical_savanna_climate(sample.climate_class) || dry_savanna_score >= 0.18);
     let climate_ecotone = is_humid_dry_tropical_ecotone(
         sample,
@@ -4463,12 +4485,12 @@ fn is_humid_forest_core(
     sahel_score: f64,
     dry_savanna_score: f64,
 ) -> bool {
-    let biome = sample.ecoregion_biome_id.to_ascii_lowercase();
-    let name = sample.ecoregion_name.to_ascii_lowercase();
-    let forest_named = biome.contains("jungle")
-        || biome.contains("forest")
-        || name.contains("rainforest")
-        || name.contains("lowland forest");
+    let biome = sample.ecoregion_biome_id.as_str();
+    let name = sample.ecoregion_name.as_str();
+    let forest_named = contains_ascii_case_insensitive(biome, "jungle")
+        || contains_ascii_case_insensitive(biome, "forest")
+        || contains_ascii_case_insensitive(name, "rainforest")
+        || contains_ascii_case_insensitive(name, "lowland forest");
     let humid_climate = sample.climate_class == 1 || sample.climate_class == 2;
     forest_named
         && humid_climate
@@ -4525,8 +4547,8 @@ fn is_dry_ecoregion_biome(sample: &SurfaceMaterialSample) -> bool {
     if let Some(stripped) = key.strip_prefix("minecraft:") {
         key = stripped;
     }
-    let key = key.to_ascii_lowercase();
-    key.contains("desert") || key.contains("badlands")
+    contains_ascii_case_insensitive(key, "desert")
+        || contains_ascii_case_insensitive(key, "badlands")
 }
 
 fn has_vegetation_evidence(sample: &SurfaceMaterialSample, metrics: SurfaceColorMetrics) -> bool {
@@ -5983,17 +6005,17 @@ fn java_standard_tan_carrier_top(
 }
 
 fn photo_solver_dry_context(input: &PhotoSurfaceInput, source: RgbColor) -> bool {
-    let biome = input.semantic_column.biome_id.to_ascii_lowercase();
-    let eco_biome = input.sample.ecoregion_biome_id.to_ascii_lowercase();
-    let eco_name = input.sample.ecoregion_name.to_ascii_lowercase();
-    biome.contains("desert")
-        || biome.contains("savanna")
-        || biome.contains("badlands")
-        || eco_biome.contains("desert")
-        || eco_biome.contains("savanna")
-        || eco_name.contains("desert")
-        || eco_name.contains("savanna")
-        || eco_name.contains("sahel")
+    let biome = input.semantic_column.biome_id.as_str();
+    let eco_biome = input.sample.ecoregion_biome_id.as_str();
+    let eco_name = input.sample.ecoregion_name.as_str();
+    contains_ascii_case_insensitive(biome, "desert")
+        || contains_ascii_case_insensitive(biome, "savanna")
+        || contains_ascii_case_insensitive(biome, "badlands")
+        || contains_ascii_case_insensitive(eco_biome, "desert")
+        || contains_ascii_case_insensitive(eco_biome, "savanna")
+        || contains_ascii_case_insensitive(eco_name, "desert")
+        || contains_ascii_case_insensitive(eco_name, "savanna")
+        || contains_ascii_case_insensitive(eco_name, "sahel")
         || photo_color_saturation(source) >= 0.16
             && (28.0..=66.0).contains(&photo_color_hue_degrees(source))
 }
@@ -6590,8 +6612,8 @@ fn is_photo_solver_coastal_sand_halo_candidate(top: i32, input: &PhotoSurfaceInp
 }
 
 fn is_photo_solver_naturally_sandy_biome(biome: &str) -> bool {
-    let lower = biome.to_ascii_lowercase();
-    lower.contains("desert") || lower.contains("badlands")
+    contains_ascii_case_insensitive(biome, "desert")
+        || contains_ascii_case_insensitive(biome, "badlands")
 }
 
 fn is_photo_solver_sand_like_carrier(top: i32) -> bool {
@@ -6859,8 +6881,10 @@ fn photo_solver_snow_evidence(input: &PhotoSurfaceInput, source: RgbColor) -> bo
     if input.sample.snow_cover_ratio() >= 0.10 {
         return true;
     }
-    let biome = input.semantic_column.biome_id.to_ascii_lowercase();
-    if biome.contains("snow") || biome.contains("frozen") {
+    let biome = input.semantic_column.biome_id.as_str();
+    if contains_ascii_case_insensitive(biome, "snow")
+        || contains_ascii_case_insensitive(biome, "frozen")
+    {
         return true;
     }
     let value = f64::from(photo_color_value(source)) / 255.0;
@@ -14785,8 +14809,8 @@ fn is_naturally_sandy_biome(biome: &str) -> bool {
     if biome.trim().is_empty() {
         return false;
     }
-    let lower = biome.to_ascii_lowercase();
-    lower.contains("desert") || lower.contains("badlands")
+    contains_ascii_case_insensitive(biome, "desert")
+        || contains_ascii_case_insensitive(biome, "badlands")
 }
 
 fn is_gray_olive_tint_target(color: i32) -> bool {
@@ -16027,12 +16051,11 @@ fn can_absorb_dry_vegetation_sand_patch(
 }
 
 fn is_dry_vegetation_biome(biome: &str) -> bool {
-    let lower = biome.to_ascii_lowercase();
-    lower.contains("savanna")
-        || lower.contains("plains")
-        || lower.contains("meadow")
-        || lower.contains("grassland")
-        || lower.contains("steppe")
+    contains_ascii_case_insensitive(biome, "savanna")
+        || contains_ascii_case_insensitive(biome, "plains")
+        || contains_ascii_case_insensitive(biome, "meadow")
+        || contains_ascii_case_insensitive(biome, "grassland")
+        || contains_ascii_case_insensitive(biome, "steppe")
 }
 
 fn is_photo_vegetation_biome(biome: &str) -> bool {
@@ -16040,13 +16063,14 @@ fn is_photo_vegetation_biome(biome: &str) -> bool {
 }
 
 fn is_lush_vegetation_biome(biome: &str) -> bool {
-    let lower = biome.to_ascii_lowercase();
-    lower.contains("jungle") || lower.contains("forest") || lower.contains("taiga")
+    contains_ascii_case_insensitive(biome, "jungle")
+        || contains_ascii_case_insensitive(biome, "forest")
+        || contains_ascii_case_insensitive(biome, "taiga")
 }
 
 fn is_desert_like_biome(biome: &str) -> bool {
-    let lower = biome.to_ascii_lowercase();
-    lower.contains("desert") || lower.contains("badlands")
+    contains_ascii_case_insensitive(biome, "desert")
+        || contains_ascii_case_insensitive(biome, "badlands")
 }
 
 fn photo_texture_family(top: i32) -> i32 {
