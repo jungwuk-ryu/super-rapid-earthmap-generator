@@ -288,4 +288,5 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [ ] Reduce open-ocean `EarthSurfaceColumn` allocation/clone overhead without changing bathymetry, biome, or output hashes.
 - [x] Test whether avoiding per-chunk column clone copies in `generate_surface_region_with_prepared_sample_inner` improves consumer time without changing output.
 - [ ] Re-run representative land and ocean smoke tests after the next open-ocean data-structure optimization.
-- [ ] Resume the 1:250 full Earth Linear run again with the requested 25GB prefetch cap and confirm whether sustained CPU improves beyond the current ~6.34-core sample.
+- [x] Resume the 1:250 full Earth Linear run again with the requested 25GB prefetch cap: PID `29728`, log `agent-runs/full-earth-resume-answercrash-25w1-20260609-152749`, `prefetchWorkers=1`, `prefetchMemoryGB=25`; early log shows `validResume` region skips against `D:\earthmap\1-250-earth-linear`.
+- [ ] Confirm whether sustained CPU improves beyond the current ~6.34-core sample on the resumed run.
