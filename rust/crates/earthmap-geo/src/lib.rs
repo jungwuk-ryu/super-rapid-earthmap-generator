@@ -2104,14 +2104,20 @@ impl<'a> GeoTiffFloat32RowCache<'a> {
         let tx = clamp_unit(pixel_x - floor_x);
         let ty = clamp_unit(pixel_y - floor_y);
 
+        let row0 = self.row_arc(y0)?;
+        let row1 = if y1 == y0 {
+            Arc::clone(&row0)
+        } else {
+            self.row_arc(y1)?
+        };
         let samples = [
             (
-                self.sample_optional_at_pixel(x0, y0)?,
+                self.sample_optional_from_row(&row0, x0)?,
                 (1.0 - tx) * (1.0 - ty),
             ),
-            (self.sample_optional_at_pixel(x1, y0)?, tx * (1.0 - ty)),
-            (self.sample_optional_at_pixel(x0, y1)?, (1.0 - tx) * ty),
-            (self.sample_optional_at_pixel(x1, y1)?, tx * ty),
+            (self.sample_optional_from_row(&row0, x1)?, tx * (1.0 - ty)),
+            (self.sample_optional_from_row(&row1, x0)?, (1.0 - tx) * ty),
+            (self.sample_optional_from_row(&row1, x1)?, tx * ty),
         ];
         let mut weighted = 0.0;
         let mut weight_sum = 0.0;
@@ -2174,8 +2180,14 @@ impl<'a> GeoTiffFloat32RowCache<'a> {
         Ok(Arc::from(row.into_boxed_slice()))
     }
 
-    fn sample_optional_at_pixel(&self, x: i32, y: i32) -> Result<Option<f64>> {
-        let value = f64::from(self.sample_at_pixel(x, y)?);
+    fn sample_optional_from_row(&self, row: &[f32], x: i32) -> Result<Option<f64>> {
+        let x =
+            usize::try_from(x).map_err(|_| GeoError::invalid(format!("x outside raster: {x}")))?;
+        let value = f64::from(
+            row.get(x)
+                .copied()
+                .ok_or_else(|| GeoError::invalid(format!("x outside raster: {x}")))?,
+        );
         if !value.is_finite()
             || self
                 .reader

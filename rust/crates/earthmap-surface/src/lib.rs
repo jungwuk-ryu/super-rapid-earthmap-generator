@@ -8261,17 +8261,29 @@ impl EarthDataSurfaceMaterialSampler {
         if !self.samples_open_water() || !self.samples_open_ocean_water_by_material_cell() {
             return Ok(None);
         }
+        if !open_ocean_companion_material_needed(smoothed_center_elevations) {
+            return Ok(None);
+        }
         let bathymetry_cache = self
             .bathymetry
             .as_ref()
             .map(|reader| GeoTiffFloat32RowCache::new(reader, OPEN_OCEAN_BATHYMETRY_ROW_CACHE_ROWS))
             .transpose()?;
         let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+        let longitude_cells = longitudes
+            .iter()
+            .map(|&longitude| quantized_longitude_axis(longitude, cell_degrees))
+            .collect::<Vec<_>>();
+        let latitude_cells = latitudes
+            .iter()
+            .map(|&latitude| quantized_latitude_axis(latitude, cell_degrees))
+            .collect::<Vec<_>>();
+        let cell_code = quantized_cell_code(cell_degrees);
         let mut cell_indices = HashMap::<i64, usize>::new();
         let mut samples = Vec::<SurfaceMaterialSample>::new();
         let mut column_samples = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
         for local_z in 0..SURFACE_REGION_WIDTH {
-            let latitude = latitudes[local_z];
+            let latitude_cell = latitude_cells[local_z];
             for local_x in 0..SURFACE_REGION_WIDTH {
                 let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
                 if !should_sample_open_ocean_companion_material(
@@ -8279,18 +8291,22 @@ impl EarthDataSurfaceMaterialSampler {
                 ) {
                     continue;
                 }
-                let longitude = longitudes[local_x];
-                let cell = quantized_cell(longitude, latitude, cell_degrees);
-                let sample_index = if let Some(&index) = cell_indices.get(&cell.key) {
+                let longitude_cell = longitude_cells[local_x];
+                let cell_key = quantized_cell_key_with_code(
+                    cell_code,
+                    longitude_cell.cell,
+                    latitude_cell.cell,
+                );
+                let sample_index = if let Some(&index) = cell_indices.get(&cell_key) {
                     index
                 } else {
                     let sample = self.sample_open_ocean_water_uncached_with_bathymetry_cache(
-                        cell.center_longitude,
-                        cell.center_latitude,
+                        longitude_cell.center,
+                        latitude_cell.center,
                         bathymetry_cache.as_ref(),
                     );
                     let index = samples.len();
-                    cell_indices.insert(cell.key, index);
+                    cell_indices.insert(cell_key, index);
                     samples.push(sample);
                     index
                 };
@@ -10347,21 +10363,51 @@ pub fn ecoregion_cell_degrees(longitude_span_degrees: f64, latitude_span_degrees
 }
 
 pub fn quantized_cell(longitude: f64, latitude: f64, cell_degrees: f64) -> SurfaceQuantizedCell {
-    let lon = normalize_longitude(longitude);
-    let lat = java_max(-90.0, java_min(90.0, latitude));
-    let lon_cell = ((lon + 180.0) / cell_degrees).floor() as i32;
-    let lat_cell = ((lat + 90.0) / cell_degrees).floor() as i32;
-    let cell_code = java_math_round_double_to_narrowed_i32(cell_degrees * 10_000.0);
-    let key = (i64::from(cell_code) << 48)
-        ^ ((i64::from(lon_cell) & 0x00ff_ffff) << 24)
-        ^ (i64::from(lat_cell) & 0x00ff_ffff);
-    let center_longitude = -180.0 + ((f64::from(lon_cell) + 0.5) * cell_degrees);
-    let center_latitude = -90.0 + ((f64::from(lat_cell) + 0.5) * cell_degrees);
+    let lon_axis = quantized_longitude_axis(longitude, cell_degrees);
+    let lat_axis = quantized_latitude_axis(latitude, cell_degrees);
     SurfaceQuantizedCell {
-        key,
-        center_longitude,
-        center_latitude,
+        key: quantized_cell_key(cell_degrees, lon_axis.cell, lat_axis.cell),
+        center_longitude: lon_axis.center,
+        center_latitude: lat_axis.center,
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QuantizedAxisCell {
+    cell: i32,
+    center: f64,
+}
+
+fn quantized_longitude_axis(longitude: f64, cell_degrees: f64) -> QuantizedAxisCell {
+    let lon = normalize_longitude(longitude);
+    let cell = ((lon + 180.0) / cell_degrees).floor() as i32;
+    QuantizedAxisCell {
+        cell,
+        center: -180.0 + ((f64::from(cell) + 0.5) * cell_degrees),
+    }
+}
+
+fn quantized_latitude_axis(latitude: f64, cell_degrees: f64) -> QuantizedAxisCell {
+    let lat = java_max(-90.0, java_min(90.0, latitude));
+    let cell = ((lat + 90.0) / cell_degrees).floor() as i32;
+    QuantizedAxisCell {
+        cell,
+        center: -90.0 + ((f64::from(cell) + 0.5) * cell_degrees),
+    }
+}
+
+fn quantized_cell_key(cell_degrees: f64, lon_cell: i32, lat_cell: i32) -> i64 {
+    quantized_cell_key_with_code(quantized_cell_code(cell_degrees), lon_cell, lat_cell)
+}
+
+fn quantized_cell_code(cell_degrees: f64) -> i32 {
+    java_math_round_double_to_narrowed_i32(cell_degrees * 10_000.0)
+}
+
+fn quantized_cell_key_with_code(cell_code: i32, lon_cell: i32, lat_cell: i32) -> i64 {
+    (i64::from(cell_code) << 48)
+        ^ ((i64::from(lon_cell) & 0x00ff_ffff) << 24)
+        ^ (i64::from(lat_cell) & 0x00ff_ffff)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13047,12 +13093,24 @@ fn precompute_open_ocean_companion_materials(
     {
         return Ok(None);
     }
+    if !open_ocean_companion_material_needed(smoothed_center_elevations) {
+        return Ok(None);
+    }
     let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
+    let longitude_cells = longitudes
+        .iter()
+        .map(|&longitude| quantized_longitude_axis(longitude, cell_degrees))
+        .collect::<Vec<_>>();
+    let latitude_cells = latitudes
+        .iter()
+        .map(|&latitude| quantized_latitude_axis(latitude, cell_degrees))
+        .collect::<Vec<_>>();
+    let cell_code = quantized_cell_code(cell_degrees);
     let mut cell_indices = HashMap::<i64, usize>::new();
     let mut samples = Vec::<SurfaceMaterialSample>::new();
     let mut column_samples = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
     for local_z in 0..SURFACE_REGION_WIDTH {
-        let latitude = latitudes[local_z];
+        let latitude_cell = latitude_cells[local_z];
         for local_x in 0..SURFACE_REGION_WIDTH {
             let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
             if !should_sample_open_ocean_companion_material(
@@ -13060,19 +13118,20 @@ fn precompute_open_ocean_companion_materials(
             ) {
                 continue;
             }
-            let longitude = longitudes[local_x];
-            let cell = quantized_cell(longitude, latitude, cell_degrees);
-            let sample_index = if let Some(&index) = cell_indices.get(&cell.key) {
+            let longitude_cell = longitude_cells[local_x];
+            let cell_key =
+                quantized_cell_key_with_code(cell_code, longitude_cell.cell, latitude_cell.cell);
+            let sample_index = if let Some(&index) = cell_indices.get(&cell_key) {
                 index
             } else {
                 let sample = material_sampler.sample_open_ocean_water_material_cell(
-                    cell.center_longitude,
-                    cell.center_latitude,
+                    longitude_cell.center,
+                    latitude_cell.center,
                     longitude_span_degrees,
                     latitude_span_degrees,
                 )?;
                 let index = samples.len();
-                cell_indices.insert(cell.key, index);
+                cell_indices.insert(cell_key, index);
                 samples.push(sample);
                 index
             };
@@ -13118,9 +13177,7 @@ fn try_sample_uniform_open_ocean_surface_region(
     if material_sampler
         .map(|sampler| sampler.samples_open_water())
         .unwrap_or(false)
-        && smoothed_center_elevations
-            .iter()
-            .any(|&elevation| should_sample_open_ocean_companion_material(elevation))
+        && open_ocean_companion_material_needed(smoothed_center_elevations)
     {
         phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
         return Ok(None);
@@ -13371,6 +13428,12 @@ fn classify_open_ocean_surface_scaled(
 fn should_sample_open_ocean_companion_material(smoothed_elevation_meters: f64) -> bool {
     !smoothed_elevation_meters.is_finite()
         || smoothed_elevation_meters > -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS
+}
+
+fn open_ocean_companion_material_needed(smoothed_center_elevations: &[f64]) -> bool {
+    smoothed_center_elevations
+        .iter()
+        .any(|&elevation| should_sample_open_ocean_companion_material(elevation))
 }
 
 fn surface_region_open_ocean_fast_path_eligible(
@@ -17845,6 +17908,59 @@ mod tests {
             -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS + 0.01
         ));
         assert!(should_sample_open_ocean_companion_material(f64::NAN));
+    }
+
+    #[test]
+    fn open_ocean_companion_precompute_skips_deep_regions() {
+        struct CellSampler {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl SurfaceMaterialSampler for CellSampler {
+            fn sample(
+                &self,
+                _longitude: f64,
+                _latitude: f64,
+                _longitude_span_degrees: f64,
+                _latitude_span_degrees: f64,
+            ) -> Result<SurfaceMaterialSample> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(SurfaceMaterialSample::color_only(RgbColor::unavailable()))
+            }
+
+            fn samples_open_water(&self) -> bool {
+                true
+            }
+
+            fn samples_open_ocean_water_by_material_cell(&self) -> bool {
+                true
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sampler = CellSampler {
+            calls: Arc::clone(&calls),
+        };
+        let longitudes = vec![0.001; SURFACE_REGION_WIDTH];
+        let latitudes = vec![0.001; SURFACE_REGION_WIDTH];
+        let elevations = vec![
+            -OPEN_OCEAN_COMPANION_SAMPLE_MAX_TRUSTED_DEPTH_METERS - 1.0;
+            SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH
+        ];
+        let materials = precompute_open_ocean_companion_materials(
+            Some(&sampler),
+            &longitudes,
+            &latitudes,
+            0.001,
+            0.001,
+            &elevations,
+        )
+        .unwrap();
+
+        assert!(materials.is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!open_ocean_companion_material_needed(&elevations));
     }
 
     #[test]
