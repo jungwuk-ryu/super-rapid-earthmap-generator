@@ -138,6 +138,8 @@
 - [x] Feature-gate the CLI `mimalloc` global allocator so the default binary avoids that native crash candidate.
 - [ ] Confirm the resumed long run no longer hits `0xC0000005`.
 - [x] Local dump target: `D:\earthmap\super-rapid-earthmap-generator\agent-runs\crash-dumps`
+- [x] Code audit after the crash question: `earthmap-surface` forbids `unsafe_code`, and `sanitize_surface_column_for_production` plus `replace_surface_blocks` only clone/construct safe Rust values. Treat the symbol as the observed fault site, not proof that this pure function directly caused memory corruption.
+- [ ] If `0xC0000005` recurs on the default non-`mimalloc` CLI binary, collect the local dump and separate Rust logic from native dependency/process-shutdown fault candidates before further performance tuning.
 
 ### Prefetch/Evidence Queue Design Checklist
 
@@ -154,6 +156,8 @@
 - [x] Smoke test prefetch path on a 1-region Linear run.
 - [x] Split pure open-ocean water evidence from coastal/photo water sampling so open ocean keeps bathymetry and ocean temperature without per-cell RGB/terrain-token raster work.
 - [x] Skip companion water sampling for deep open-ocean columns when the primary heightmap already supplies trusted bathymetry; keep companion sampling for shallow or unknown depths.
+- [x] Clarify the prefetch model: the queue is a bounded `sync_channel` of prepared regions, not a raw byte buffer. It does free a slot after the owning region is consumed, but it cannot eliminate GDAL/GeoTIFF decode, row/tile cache locking, surface material calculation, or output serialization costs.
+- [x] Clarify disk interpretation: low disk MB/s does not rule out tiny random-read or `Mutex<File>` latency in raster readers, but the latest telemetry does not support raw disk bandwidth as the dominant remaining bottleneck. Continue separating read/decode/lock waits from surface and consumer CPU work with per-region telemetry.
 
 ### Restart Command
 
