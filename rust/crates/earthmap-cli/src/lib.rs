@@ -78,6 +78,8 @@ const SURFACE_TILE_CACHE_MAX_ENTRIES: usize = 32_768;
 const PREPARED_SURFACE_REGION_ESTIMATED_BYTES: u64 = 128 * BYTES_PER_MIB;
 const PREFETCH_MEMORY_PERCENT: u64 = 20;
 const PREFETCH_MAX_MEMORY_BYTES: u64 = 32 * BYTES_PER_GIB;
+const PREFETCH_DEFAULT_QUEUE_MULTIPLIER: usize = 2;
+const PREFETCH_DEFAULT_QUEUE_MAX_REGIONS: usize = 8;
 const PREFETCH_SEND_RETRY_MILLIS: u64 = 10;
 const SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT: usize = 4;
 const SURFACE_PHOTO_AUTOTUNE_ENV: &str = "EARTHMAP_SURFACE_WORKER_AUTOTUNE";
@@ -12818,7 +12820,14 @@ fn effective_prefetch_config(
         .map(|bytes| (bytes / estimated_region_bytes).max(1))
         .and_then(|regions| usize::try_from(regions).ok())
         .unwrap_or(usize::MAX);
-    let default_queue_regions = memory_limited_regions.min(region_count).max(1);
+    let default_queue_regions = options
+        .workers
+        .max(1)
+        .saturating_mul(PREFETCH_DEFAULT_QUEUE_MULTIPLIER)
+        .clamp(1, PREFETCH_DEFAULT_QUEUE_MAX_REGIONS)
+        .min(memory_limited_regions)
+        .min(region_count)
+        .max(1);
     let requested_queue_regions = options
         .queue_regions
         .unwrap_or(default_queue_regions)
@@ -20822,7 +20831,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_prefetch_config_defaults_to_memory_bounded_queue() {
+    fn effective_prefetch_config_defaults_to_small_memory_bounded_queue() {
         let options = GenerationPrefetchOptions {
             enabled: true,
             memory_cap_bytes: Some(25 * BYTES_PER_GIB),
@@ -20832,7 +20841,7 @@ mod tests {
         let config = effective_prefetch_config(options, 8, 100);
 
         assert!(config.enabled);
-        assert_eq!(config.queue_regions, 100);
+        assert_eq!(config.queue_regions, 2);
         assert_eq!(config.workers, 1);
 
         let options = GenerationPrefetchOptions {
@@ -20843,8 +20852,23 @@ mod tests {
         };
         let config = effective_prefetch_config(options, 8, 100);
 
-        assert_eq!(config.queue_regions, 100);
+        assert_eq!(config.queue_regions, 6);
         assert_eq!(config.workers, 3);
+    }
+
+    #[test]
+    fn effective_prefetch_config_keeps_memory_cap_as_hard_limit() {
+        let options = GenerationPrefetchOptions {
+            enabled: true,
+            memory_cap_bytes: Some(PREPARED_SURFACE_REGION_ESTIMATED_BYTES),
+            queue_regions: None,
+            workers: 4,
+        };
+        let config = effective_prefetch_config(options, 8, 100);
+
+        assert!(config.enabled);
+        assert_eq!(config.queue_regions, 1);
+        assert_eq!(config.workers, 1);
     }
 
     #[test]

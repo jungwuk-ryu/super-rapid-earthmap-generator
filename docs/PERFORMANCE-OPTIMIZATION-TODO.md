@@ -131,11 +131,12 @@
 - [x] WER event type: `APPCRASH`
 - [x] Faulting module: `earthmap-rs.exe`
 - [x] Fault offset: `0x0000000000322de3`
-- [x] Symbolized function: `earthmap_surface::sanitize_surface_column_for_production`
+- [x] Earlier same-build symbolization pointed at `earthmap_surface::sanitize_surface_column_for_production`; later re-symbolization against a newer binary pointed at `earthmap_surface::trace_surface_region_columns`, so old WER offsets must be treated as build-specific and rechecked only with the matching PDB/dump.
 - [x] WER archive: `C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_earthmap-rs.exe_e0d3b81434ca9f1ce1ea57a6e01b41381e37bcfa_5a4a99de_c63f15f4-4db7-4228-9ceb-1f9fd480a53a`
 - [x] Check whether the archive contains a usable dump or only `Report.wer`.
 - [x] If no dump exists, enable a local dump or add targeted diagnostics before the next long run.
 - [x] Feature-gate the CLI `mimalloc` global allocator so the default binary avoids that native crash candidate.
+- [x] Short crash-repro run at `agent-runs/crash-repro-q2-row53-3r-20260609-continue` generated `r.-157.53..r.-155.53` with exit code `0`, so the q2 interruption is not a deterministic failure of those three regions.
 - [ ] Confirm the resumed long run no longer hits `0xC0000005`.
 - [x] Local dump target: `D:\earthmap\super-rapid-earthmap-generator\agent-runs\crash-dumps`
 - [x] Code audit after the crash question: `earthmap-surface` forbids `unsafe_code`, and `sanitize_surface_column_for_production` plus `replace_surface_blocks` only clone/construct safe Rust values. Treat the symbol as the observed fault site, not proof that this pure function directly caused memory corruption.
@@ -158,6 +159,11 @@
 - [x] Skip companion water sampling for deep open-ocean columns when the primary heightmap already supplies trusted bathymetry; keep companion sampling for shallow or unknown depths.
 - [x] Clarify the prefetch model: the queue is a bounded `sync_channel` of prepared regions, not a raw byte buffer. It does free a slot after the owning region is consumed, but it cannot eliminate GDAL/GeoTIFF decode, row/tile cache locking, surface material calculation, or output serialization costs.
 - [x] Clarify disk interpretation: low disk MB/s does not rule out tiny random-read or `Mutex<File>` latency in raster readers, but the latest telemetry does not support raw disk bandwidth as the dominant remaining bottleneck. Continue separating read/decode/lock waits from surface and consumer CPU work with per-region telemetry.
+- [x] Change the default queue policy so `prefetchMemoryGB=N` is a hard cap, not a target to fill. The default queue now stays small and backpressure-oriented while explicit `prefetchRegions=N` remains available and memory-clamped.
+- [x] Verification after small default queue policy:
+  - `cargo test --manifest-path rust\Cargo.toml -p earthmap-cli --lib --locked prefetch`
+  - Release build: `cargo build --manifest-path rust\Cargo.toml -p earthmap-cli --release --target-dir rust\target-latest --locked`
+  - Smoke `agent-runs/smoke-prefetch-default-small-queue-146-52-4r-20260609-continue`: `prefetchMemoryGB=25 prefetchWorkers=1` defaulted to `prefetchQueueRegions=2`, generated 4/4 regions with 0 failures, and all 4 SHA-256 hashes matched the existing `D:\earthmap\1-250-earth-linear` regions.
 
 ### Restart Command
 
