@@ -12768,7 +12768,7 @@ fn effective_prefetch_config(
         .map(|bytes| (bytes / estimated_region_bytes).max(1))
         .and_then(|regions| usize::try_from(regions).ok())
         .unwrap_or(usize::MAX);
-    let default_queue_regions = options.workers.max(1);
+    let default_queue_regions = memory_limited_regions.min(region_count).max(1);
     let requested_queue_regions = options
         .queue_regions
         .unwrap_or(default_queue_regions)
@@ -20737,7 +20737,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_prefetch_config_defaults_to_worker_depth_queue() {
+    fn effective_prefetch_config_defaults_to_memory_bounded_queue() {
         let options = GenerationPrefetchOptions {
             enabled: true,
             memory_cap_bytes: Some(25 * BYTES_PER_GIB),
@@ -20747,7 +20747,7 @@ mod tests {
         let config = effective_prefetch_config(options, 8, 100);
 
         assert!(config.enabled);
-        assert_eq!(config.queue_regions, 1);
+        assert_eq!(config.queue_regions, 100);
         assert_eq!(config.workers, 1);
 
         let options = GenerationPrefetchOptions {
@@ -20758,7 +20758,7 @@ mod tests {
         };
         let config = effective_prefetch_config(options, 8, 100);
 
-        assert_eq!(config.queue_regions, 3);
+        assert_eq!(config.queue_regions, 100);
         assert_eq!(config.workers, 3);
     }
 

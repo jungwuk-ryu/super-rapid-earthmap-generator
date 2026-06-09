@@ -7328,6 +7328,31 @@ pub mod surface_data_evidence {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PrecomputedPhotoLandMaterials {
+    column_samples: Vec<Option<usize>>,
+    samples: Vec<SurfaceMaterialSample>,
+}
+
+impl PrecomputedPhotoLandMaterials {
+    fn new(column_samples: Vec<Option<usize>>, samples: Vec<SurfaceMaterialSample>) -> Self {
+        Self {
+            column_samples,
+            samples,
+        }
+    }
+
+    fn sample(&self, column_index: usize) -> Option<&SurfaceMaterialSample> {
+        self.column_samples
+            .get(column_index)
+            .and_then(|sample_index| sample_index.map(|index| &self.samples[index]))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.column_samples.iter().all(Option::is_none)
+    }
+}
+
 pub trait SurfaceMaterialSampler: Send + Sync {
     fn as_earth_data_surface_material_sampler(&self) -> Option<&EarthDataSurfaceMaterialSampler> {
         None
@@ -7373,7 +7398,7 @@ pub trait SurfaceMaterialSampler: Send + Sync {
         _water_mask: &[bool],
         _longitude_span_degrees: f64,
         _latitude_span_degrees: f64,
-    ) -> Result<Option<Vec<Option<Arc<SurfaceMaterialSample>>>>> {
+    ) -> Result<Option<PrecomputedPhotoLandMaterials>> {
         Ok(None)
     }
 
@@ -8406,7 +8431,7 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
         water_mask: &[bool],
         longitude_span_degrees: f64,
         latitude_span_degrees: f64,
-    ) -> Result<Option<Vec<Option<Arc<SurfaceMaterialSample>>>>> {
+    ) -> Result<Option<PrecomputedPhotoLandMaterials>> {
         let photo_cell_degrees = photo_cell_degrees(longitude_span_degrees, latitude_span_degrees);
         let evidence_cell_degrees =
             photo_evidence_cell_degrees(longitude_span_degrees, latitude_span_degrees);
@@ -8486,7 +8511,7 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
             .collect::<Result<Vec<_>>>()?;
 
         let mut sample_indices = HashMap::<(usize, usize), usize>::new();
-        let mut samples = Vec::<Arc<SurfaceMaterialSample>>::new();
+        let mut samples = Vec::<SurfaceMaterialSample>::new();
         let by_column = column_cells
             .into_iter()
             .map(|indices| {
@@ -8497,20 +8522,21 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
                     } else {
                         let index = samples.len();
                         sample_indices.insert(key, index);
-                        samples.push(Arc::new(with_surface_terrain_token(
+                        samples.push(with_surface_terrain_token(
                             &evidences[evidence_index].with_color(colors[color_index]),
                             terrain_token_colors[color_index],
-                        )));
+                        ));
                         index
                     };
-                    Arc::clone(&samples[sample_index])
+                    sample_index
                 })
             })
             .collect::<Vec<_>>();
-        if by_column.iter().all(Option::is_none) {
+        let materials = PrecomputedPhotoLandMaterials::new(by_column, samples);
+        if materials.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(by_column))
+            Ok(Some(materials))
         }
     }
 
@@ -11868,7 +11894,7 @@ pub fn trace_surface_region_columns(
             if let Some(material) = material {
                 columns[column_index] = apply_surface_region_photo_material_sample(
                     columns[column_index].clone(),
-                    Arc::new(material),
+                    &material,
                     photo_smoothed_elevations[column_index],
                     photo_longitudes[column_index],
                     photo_latitudes[column_index],
@@ -12501,10 +12527,24 @@ where
     };
     phase_nanos.photo_land_precompute = phase_start.elapsed().as_nanos();
 
-    struct SurfaceColumnSampleBuild {
+    enum SurfaceColumnMaterial<'a> {
+        Borrowed(&'a SurfaceMaterialSample),
+        Owned(SurfaceMaterialSample),
+    }
+
+    impl SurfaceColumnMaterial<'_> {
+        fn as_sample(&self) -> &SurfaceMaterialSample {
+            match self {
+                SurfaceColumnMaterial::Borrowed(sample) => sample,
+                SurfaceColumnMaterial::Owned(sample) => sample,
+            }
+        }
+    }
+
+    struct SurfaceColumnSampleBuild<'a> {
         column: EarthSurfaceColumn,
         coast_factor: f64,
-        material: Option<Arc<SurfaceMaterialSample>>,
+        material: Option<SurfaceColumnMaterial<'a>>,
         sampled_water: bool,
         classify_nanos: u128,
         semantic_apply_nanos: u128,
@@ -12547,9 +12587,8 @@ where
         let mut semantic_apply_nanos = 0;
         if let Some(precomputed_material) = precomputed_photo_land_materials
             .as_ref()
-            .and_then(|materials| materials[column_index].as_ref())
+            .and_then(|materials| materials.sample(column_index))
         {
-            let sampled_material = Arc::clone(precomputed_material);
             local_relief_meters = local_relief_center_meters
                 .as_ref()
                 .map(|relief| relief[column_index])
@@ -12557,7 +12596,7 @@ where
             let semantic_start = detailed_column_phase_timing.then(Instant::now);
             column = apply_surface_region_semantic_material_sample(
                 column,
-                &sampled_material,
+                precomputed_material,
                 smoothed_elevation,
                 longitude,
                 latitude,
@@ -12568,7 +12607,7 @@ where
             semantic_apply_nanos += semantic_start
                 .map(|started_at| started_at.elapsed().as_nanos())
                 .unwrap_or(0);
-            material = Some(sampled_material);
+            material = Some(SurfaceColumnMaterial::Borrowed(precomputed_material));
         } else if let Some(material_sampler) = material_sampler {
             if should_sample_surface_material(
                 material_sampler,
@@ -12577,7 +12616,7 @@ where
                 coast_factor,
                 smoothed_elevation,
             ) {
-                let sampled_material = Arc::new(sample_surface_region_material(
+                let sampled_material = sample_surface_region_material(
                     material_sampler,
                     texture_mode,
                     water,
@@ -12586,7 +12625,7 @@ where
                     latitude,
                     longitude_span_degrees,
                     latitude_span_degrees,
-                )?);
+                )?;
                 local_relief_meters = local_relief_center_meters
                     .as_ref()
                     .map(|relief| relief[column_index])
@@ -12605,7 +12644,7 @@ where
                 semantic_apply_nanos += semantic_start
                     .map(|started_at| started_at.elapsed().as_nanos())
                     .unwrap_or(0);
-                material = Some(sampled_material);
+                material = Some(SurfaceColumnMaterial::Owned(sampled_material));
             }
         }
 
@@ -12670,7 +12709,7 @@ where
         for build in &column_builds {
             if let Some(material) = build.material.as_ref() {
                 if !build.column.water {
-                    photo_token_luma_profile.add(material);
+                    photo_token_luma_profile.add(material.as_sample());
                 }
             }
         }
@@ -12686,7 +12725,7 @@ where
                     }
                     return apply_surface_region_photo_material_sample(
                         build.column,
-                        material,
+                        material.as_sample(),
                         build.smoothed_elevation,
                         build.longitude,
                         build.latitude,
@@ -13426,7 +13465,7 @@ fn apply_surface_region_semantic_material_sample(
 #[allow(clippy::too_many_arguments)]
 fn apply_surface_region_photo_material_sample(
     semantic_column: EarthSurfaceColumn,
-    sample: Arc<SurfaceMaterialSample>,
+    sample: &SurfaceMaterialSample,
     elevation_meters: f64,
     longitude: f64,
     latitude: f64,
@@ -13439,7 +13478,7 @@ fn apply_surface_region_photo_material_sample(
 ) -> Result<EarthSurfaceColumn> {
     let mut input = PhotoSurfaceInput::new_shared(
         semantic_column,
-        sample,
+        Arc::new(sample.clone()),
         elevation_meters,
         longitude,
         latitude,
@@ -13482,7 +13521,7 @@ fn apply_surface_region_material_sample(
     match texture_mode {
         SurfaceTextureMode::Photo => apply_surface_region_photo_material_sample(
             semantic_column,
-            Arc::new(sample),
+            &sample,
             elevation_meters,
             longitude,
             latitude,
@@ -20844,7 +20883,7 @@ mod tests {
         .unwrap();
         let photo_pass = apply_surface_region_photo_material_sample(
             semantic_only.clone(),
-            Arc::new(material.clone()),
+            &material,
             240.0,
             13.0,
             24.0,
