@@ -843,6 +843,38 @@ fn open_ocean_prefetch_output_rayon_threads(
     base
 }
 
+fn prefetch_consumer_worker_count(
+    requested_threads: usize,
+    tuned_worker_count: usize,
+    region_count: usize,
+) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(requested_threads.max(1));
+    prefetch_consumer_worker_count_with_available(
+        requested_threads,
+        tuned_worker_count,
+        region_count,
+        available,
+    )
+}
+
+fn prefetch_consumer_worker_count_with_available(
+    requested_threads: usize,
+    tuned_worker_count: usize,
+    region_count: usize,
+    available_threads: usize,
+) -> usize {
+    let cap = requested_threads
+        .max(1)
+        .min(region_count.max(1))
+        .min(available_threads.max(1));
+    if cap <= 1 {
+        return 1;
+    }
+    tuned_worker_count.max(2).min(cap)
+}
+
 fn surface_photo_worker_tune_root(world: &Path) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -9681,6 +9713,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         surface_tile_cache_entries.div_ceil(worker_count).max(1);
     let prefetch_config =
         effective_prefetch_config(runtime_options.prefetch, worker_count, region_count);
+    let prefetch_consumer_workers = if prefetch_config.enabled {
+        prefetch_consumer_worker_count(threads, worker_count, region_count)
+    } else {
+        worker_count
+    };
     let prefetch_heightmap_cache_rows_per_worker =
         cache_rows.div_ceil(prefetch_config.workers.max(1)).max(1);
     let prefetch_surface_tile_cache_entries_per_worker = surface_tile_cache_entries
@@ -9688,7 +9725,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         .max(1);
     let (prefetch_sample_rayon_threads, prefetch_output_rayon_threads) = if prefetch_config.enabled
     {
-        split_prefetch_rayon_threads(rayon_threads, prefetch_config.workers, worker_count)
+        split_prefetch_rayon_threads(
+            rayon_threads,
+            prefetch_config.workers,
+            prefetch_consumer_workers,
+        )
     } else {
         (0, 0)
     };
@@ -9696,7 +9737,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         open_ocean_prefetch_output_rayon_threads(
             rayon_threads,
             prefetch_output_rayon_threads,
-            worker_count,
+            prefetch_consumer_workers,
         )
     } else {
         0
@@ -9763,6 +9804,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "parallelColumnSampling": parallel_column_sampling,
             "prefetchEnabled": prefetch_config.enabled,
             "prefetchWorkers": prefetch_config.workers,
+            "prefetchConsumerWorkers": prefetch_consumer_workers,
             "prefetchQueueRegions": prefetch_config.queue_regions,
             "prefetchMemoryCapBytes": prefetch_config.memory_cap_bytes,
             "prefetchEstimatedRegionBytes": prefetch_config.estimated_region_bytes,
@@ -9985,7 +10027,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                 });
             }
             drop(prepared_sender);
-            for _ in 0..worker_count {
+            for _ in 0..prefetch_consumer_workers {
                 let receiver = Arc::clone(&prepared_receiver);
                 let sender = event_sender.clone();
                 let prefetch_output_pool = &prefetch_output_pool;
@@ -10390,6 +10432,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("parallelColumnSampling={parallel_column_sampling}"),
         format!("prefetchEnabled={}", prefetch_config.enabled),
         format!("prefetchWorkers={}", prefetch_config.workers),
+        format!("prefetchConsumerWorkers={prefetch_consumer_workers}"),
         format!("prefetchQueueRegions={}", prefetch_config.queue_regions),
         format!(
             "prefetchMemoryCapBytes={}",
@@ -18606,6 +18649,30 @@ mod tests {
         assert_eq!(open_ocean_prefetch_output_rayon_threads(8, 2, 2), 6);
         assert_eq!(open_ocean_prefetch_output_rayon_threads(8, 2, 4), 7);
         assert_eq!(open_ocean_prefetch_output_rayon_threads(2, 1, 4), 1);
+    }
+
+    #[test]
+    fn prefetch_consumer_workers_do_not_collapse_to_one_when_capacity_exists() {
+        assert_eq!(
+            prefetch_consumer_worker_count_with_available(8, 1, 100, 16),
+            2
+        );
+        assert_eq!(
+            prefetch_consumer_worker_count_with_available(8, 2, 100, 16),
+            2
+        );
+        assert_eq!(
+            prefetch_consumer_worker_count_with_available(8, 4, 100, 16),
+            4
+        );
+        assert_eq!(
+            prefetch_consumer_worker_count_with_available(1, 1, 100, 16),
+            1
+        );
+        assert_eq!(
+            prefetch_consumer_worker_count_with_available(8, 1, 1, 16),
+            1
+        );
     }
 
     #[test]
