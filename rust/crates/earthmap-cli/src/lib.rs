@@ -822,12 +822,16 @@ fn open_ocean_prefetch_output_rayon_threads(
     let total = rayon_threads.max(1);
     let base = base_output_threads.max(1);
     if total >= 16 {
-        return (consumer_workers.saturating_add(2))
-            .min(total.saturating_sub(1).max(1))
+        return consumer_workers
+            .saturating_mul(3)
+            .min(total.saturating_sub(2).max(1))
             .max(base);
     }
     if total >= 8 {
-        return consumer_workers.min(3).max(base);
+        return consumer_workers
+            .saturating_mul(2)
+            .min(total.saturating_sub(1).max(1))
+            .max(base);
     }
     base
 }
@@ -9998,7 +10002,13 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                     let region_file = prepared.region_file.clone();
                     let started_at = prepared.started_at;
                     let use_open_ocean_output_pool =
-                        prepared.sample.sample.phase_nanos().open_ocean_fast_path > 0;
+                        prepared.sample.sample.phase_nanos().open_ocean_fast_path > 0
+                            && prepared
+                                .sample
+                                .sample
+                                .columns()
+                                .iter()
+                                .all(|column| column.water);
                     let ready_queue_wait_millis = prepared.prepared_at.elapsed().as_millis();
                     let prefetch_send_wait_millis = prepared.prefetch_send_wait_millis;
                     let consumer_started_at = Instant::now();
@@ -18559,8 +18569,8 @@ mod tests {
 
     #[test]
     fn open_ocean_prefetch_output_pool_can_use_more_threads_than_land_output() {
-        assert_eq!(open_ocean_prefetch_output_rayon_threads(16, 3, 4), 6);
-        assert_eq!(open_ocean_prefetch_output_rayon_threads(8, 2, 4), 3);
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(16, 3, 4), 12);
+        assert_eq!(open_ocean_prefetch_output_rayon_threads(8, 2, 4), 7);
         assert_eq!(open_ocean_prefetch_output_rayon_threads(2, 1, 4), 1);
     }
 
