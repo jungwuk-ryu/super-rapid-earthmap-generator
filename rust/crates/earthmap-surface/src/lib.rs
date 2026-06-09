@@ -12588,6 +12588,7 @@ fn try_sample_open_ocean_surface_region(
         vertical_scale,
         material_sampler,
         smoothed_center_elevations,
+        parallel_column_sampling,
     )? {
         return Ok(Some(uniform));
     }
@@ -12786,6 +12787,7 @@ fn try_sample_uniform_open_ocean_surface_region(
     vertical_scale: f64,
     material_sampler: Option<&dyn SurfaceMaterialSampler>,
     smoothed_center_elevations: &[f64],
+    parallel_column_sampling: bool,
 ) -> Result<Option<SurfaceRegionSample>> {
     let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
     if material_sampler
@@ -12798,68 +12800,118 @@ fn try_sample_uniform_open_ocean_surface_region(
         return Ok(None);
     }
 
-    let mut first_signature = None::<UniformOpenOceanSignature>;
-    for local_z in 0..SURFACE_REGION_WIDTH {
-        let global_block_z = region_block_z.wrapping_add(local_z as i32);
-        let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
-        let latitude = if map_z < 0 || map_z >= mapping.height_blocks {
-            0.0
-        } else {
-            mapping.latitude_for_block_z(map_z)?
-        };
-        for local_x in 0..SURFACE_REGION_WIDTH {
-            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+    let longitudes = (0..SURFACE_REGION_WIDTH)
+        .map(|local_x| {
             let global_block_x = region_block_x.wrapping_add(local_x as i32);
             let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
-            let longitude = if map_x < 0 || map_x >= mapping.width_blocks {
-                0.0
+            if map_x < 0 || map_x >= mapping.width_blocks {
+                Ok(0.0)
             } else {
-                mapping.longitude_for_block_x(map_x)?
-            };
-            let elevation = smoothed_center_elevations[column_index];
-            let ground_y =
-                shaped_ground_surface_y(elevation, longitude, latitude, true, 0.0, vertical_scale);
-            let biome = water_biome_id(latitude, ground_y);
-            let depth = 1.max(SEA_LEVEL_Y - ground_y);
-            let top = if depth <= 6 {
-                block_state_ids::CLAY
-            } else if depth <= 18 {
-                block_state_ids::GRAVEL
+                mapping.longitude_for_block_x(map_x).map_err(Into::into)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let latitudes = (0..SURFACE_REGION_WIDTH)
+        .map(|local_z| {
+            let global_block_z = region_block_z.wrapping_add(local_z as i32);
+            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+            if map_z < 0 || map_z >= mapping.height_blocks {
+                Ok(0.0)
             } else {
-                block_state_ids::STONE
-            };
-            let decision_source = if top == block_state_ids::GRAVEL {
-                "height-rule"
-            } else {
-                "height-rule+natural-surface"
-            };
-            let signature = UniformOpenOceanSignature {
-                ground_y,
-                top,
-                biome,
-                decision_source,
-            };
-            match first_signature {
-                Some(first) if first != signature => return Ok(None),
-                Some(_) => {}
-                None => first_signature = Some(signature),
+                mapping.latitude_for_block_z(map_z).map_err(Into::into)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let signature_at = |column_index: usize| -> UniformOpenOceanSignature {
+        let local_z = column_index / SURFACE_REGION_WIDTH;
+        let local_x = column_index % SURFACE_REGION_WIDTH;
+        let longitude = longitudes[local_x];
+        let latitude = latitudes[local_z];
+        let elevation = smoothed_center_elevations[column_index];
+        uniform_open_ocean_signature(elevation, longitude, latitude, vertical_scale)
+    };
+    let first_signature = signature_at(0);
+    for &local_z in uniform_open_ocean_probe_indices() {
+        for &local_x in uniform_open_ocean_probe_indices() {
+            let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
+            if signature_at(column_index) != first_signature {
+                return Ok(None);
             }
         }
     }
 
-    let Some(signature) = first_signature else {
-        return Ok(None);
-    };
+    if parallel_column_sampling {
+        let uniform = (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+            .into_par_iter()
+            .all(|column_index| signature_at(column_index) == first_signature);
+        if !uniform {
+            return Ok(None);
+        }
+    } else {
+        for column_index in 0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH) {
+            if signature_at(column_index) != first_signature {
+                return Ok(None);
+            }
+        }
+    }
+
     let column = EarthSurfaceColumn::new(
         true,
-        signature.ground_y,
+        first_signature.ground_y,
         SEA_LEVEL_Y,
-        signature.top,
-        signature.top,
-        signature.biome,
-        signature.decision_source,
+        first_signature.top,
+        first_signature.top,
+        first_signature.biome,
+        first_signature.decision_source,
     );
     SurfaceRegionSample::new(vec![column; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH]).map(Some)
+}
+
+fn uniform_open_ocean_probe_indices() -> &'static [usize] {
+    static INDICES: OnceLock<Vec<usize>> = OnceLock::new();
+    INDICES.get_or_init(|| {
+        let last = SURFACE_REGION_WIDTH - 1;
+        let mut indices = vec![
+            0,
+            SURFACE_REGION_WIDTH / 4,
+            SURFACE_REGION_WIDTH / 2,
+            (SURFACE_REGION_WIDTH * 3) / 4,
+            last,
+        ];
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    })
+}
+
+fn uniform_open_ocean_signature(
+    elevation: f64,
+    longitude: f64,
+    latitude: f64,
+    vertical_scale: f64,
+) -> UniformOpenOceanSignature {
+    let ground_y =
+        shaped_ground_surface_y(elevation, longitude, latitude, true, 0.0, vertical_scale);
+    let biome = water_biome_id(latitude, ground_y);
+    let depth = 1.max(SEA_LEVEL_Y - ground_y);
+    let top = if depth <= 6 {
+        block_state_ids::CLAY
+    } else if depth <= 18 {
+        block_state_ids::GRAVEL
+    } else {
+        block_state_ids::STONE
+    };
+    let decision_source = if top == block_state_ids::GRAVEL {
+        "height-rule"
+    } else {
+        "height-rule+natural-surface"
+    };
+    UniformOpenOceanSignature {
+        ground_y,
+        top,
+        biome,
+        decision_source,
+    }
 }
 
 fn try_sample_uniform_deep_open_ocean_surface_region(
@@ -17460,10 +17512,17 @@ mod tests {
     fn uniform_open_ocean_fast_path_matches_direct_classifier_when_all_columns_equal() {
         let mapping = EarthScaleMapping::for_denominator(250, -90.0, 90.0).unwrap();
         let elevations = vec![-2_000.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
-        let sample =
-            try_sample_uniform_open_ocean_surface_region(0, 0, &mapping, 4.0, None, &elevations)
-                .unwrap()
-                .expect("equatorial open ocean should collapse to one repeated column");
+        let sample = try_sample_uniform_open_ocean_surface_region(
+            0,
+            0,
+            &mapping,
+            4.0,
+            None,
+            &elevations,
+            true,
+        )
+        .unwrap()
+        .expect("equatorial open ocean should collapse to one repeated column");
         let first = &sample.columns()[0];
         assert!(sample.columns().iter().all(|column| column == first));
 

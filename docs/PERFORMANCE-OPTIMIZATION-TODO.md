@@ -240,3 +240,5 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Added an open-ocean-only prefetch output pool so pure open-ocean regions can use 6 output threads while land/photo regions keep the safer 3-thread output pool.
 - [x] Open-ocean output pool smoke `agent-runs/smoke-ocean-output-pool-8r-100-32-20260609-124705`: 8 pure-ocean regions used `13 sample / 3 land-output / 6 open-ocean-output` threads; average `consumerElapsedMillis` dropped from about `970.6ms` to `578.6ms`, with average elapsed `1748ms`.
 - [x] Land regression check `agent-runs/smoke-ocean-output-pool-land-4r--62-32-20260609-124742`: regions `r.-62.32` through `r.-59.32` all matched existing SHA-256 outputs.
+- [x] Added a probe-then-parallel uniform open-ocean verification path so uniform ocean candidates do not spend the whole 512x512 signature check serially.
+- [x] Uniform ocean probe smoke `agent-runs/smoke-uniform-ocean-probe-8r--90-33-20260609-125912`: 8 pure-ocean regions `r.-90.33` through `r.-83.33` all matched existing SHA-256 outputs; average `openOceanFastPathMillis=851.4`, average elapsed `1752.4ms`.
