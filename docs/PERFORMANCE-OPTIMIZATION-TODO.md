@@ -154,17 +154,17 @@
 
 ### Restart Command
 
-- [ ] Stop or confirm inactive any stale `earthmap-rs.exe` process targeting the same output directory before restart.
-- [ ] Restart only after crash diagnostics and prefetch changes are verified.
+- [x] Stop or confirm inactive any stale `earthmap-rs.exe` process targeting the same output directory before restart.
+- [x] Restart only after crash diagnostics and prefetch changes are verified.
 - [ ] Use command:
 
 ```powershell
 earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\HQheightmap.tif D:\earthmap\1-250-earth-linear 250 -157 -74 314 148 linear 8 surface surfaceRaster=D:\earthmap\TifFiles\terrain\TrueMarble.vrt verticalScale=auto linearCompression=6
 ```
 
-- [ ] Set prefetch/evidence memory cap to about `25GB`.
-- [ ] Confirm resume mode uses existing `D:\earthmap\1-250-earth-linear` progress instead of starting fresh.
-- [ ] Record sustained CPU usage, read throughput, write throughput, completed regions/hour, and peak memory.
+- [x] Set prefetch/evidence memory cap to about `25GB`.
+- [x] Confirm resume mode uses existing `D:\earthmap\1-250-earth-linear` progress instead of starting fresh.
+- [x] Record sustained CPU usage, read throughput, write throughput, completed regions/hour, and peak memory.
 
 ### Verification Notes
 
@@ -219,6 +219,7 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Cap surface photo region workers at the legacy 4-worker limit while column-parallel sampling uses the Rayon pool internally.
 - [x] Check 1 worker versus 4 worker land throughput: 1 worker / 16 Rayon generated 4 land regions in `69200ms` (~208 regions/hour), while the 4-worker full run completed comparable land regions in about `45s` (~320 regions/hour), so the 4-worker cap remains the better current default.
 - [x] For the current scattered resume holes, restart with `workerThreads=1` and `RAYON_NUM_THREADS=16`: regions `r.20.27`, `r.21.27`, and `r.22.27` completed in `8489ms`, `14420ms`, and `14958ms`; this avoids the far-apart tile-cache thrash seen when 4 workers started isolated holes concurrently.
+- [x] Stable full resume after rejecting the prefetch gate: PID `16100`, log `agent-runs/full-earth-resume-stable-25w1-20260609-101805`, `prefetchMemoryGB=25`, `prefetchWorkers=1`, `resumeFingerprintMatched=true`; region `r.127.30` regenerated after the earlier crash point in `11053ms`, and a 30s sample averaged `3.81` CPU cores with about `2.06GB` private memory. Pure-ocean regions in that sample completed around `1.94-2.05s`; this confirms resume/crash recovery but still does not satisfy the sustained high-CPU target.
 - [ ] Design a locality-aware resume scheduler so incomplete regions are grouped by nearby runs instead of starting far-apart holes concurrently.
 - [x] Add a conservative uniform deep-open-ocean surface sample path for regions whose smoothed source elevations are all deep enough to clamp to the world floor and whose water biome is constant.
 - [x] Verify the uniform deep-open-ocean unit test passes; real `r.88.27` and `r.-120.27` did not trigger the conservative guard, so their remaining ocean cost is still in the normal open-ocean path.
