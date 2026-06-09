@@ -8244,10 +8244,11 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
         let photo_cell_degrees = photo_cell_degrees(longitude_span_degrees, latitude_span_degrees);
         let evidence_cell_degrees =
             photo_evidence_cell_degrees(longitude_span_degrees, latitude_span_degrees);
-        let mut color_cache = HashMap::<i64, RgbColor>::new();
-        let mut evidence_cache = HashMap::<i64, SurfaceMaterialSample>::new();
-        let mut terrain_token_cache = HashMap::<i64, RgbColor>::new();
-        let mut by_column = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        let mut color_cell_indices = HashMap::<i64, usize>::new();
+        let mut evidence_cell_indices = HashMap::<i64, usize>::new();
+        let mut color_cells = Vec::<SurfaceQuantizedCell>::new();
+        let mut evidence_cells = Vec::<SurfaceQuantizedCell>::new();
+        let mut column_cells = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
         for local_z in 0..SURFACE_REGION_WIDTH {
             let latitude = latitudes[local_z];
             for local_x in 0..SURFACE_REGION_WIDTH {
@@ -8260,48 +8261,76 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
                 }
                 let longitude = longitudes[local_x];
                 let color_cell = quantized_cell(longitude, latitude, photo_cell_degrees);
-                let color = if let Some(color) = color_cache.get(&color_cell.key) {
-                    *color
+                let color_index = if let Some(&index) = color_cell_indices.get(&color_cell.key) {
+                    index
                 } else {
-                    let color = self.sample_primary_photo_color(
-                        color_cell.center_longitude,
-                        color_cell.center_latitude,
-                        longitude_span_degrees,
-                        latitude_span_degrees,
-                    )?;
-                    color_cache.insert(color_cell.key, color);
-                    color
+                    let index = color_cells.len();
+                    color_cell_indices.insert(color_cell.key, index);
+                    color_cells.push(color_cell);
+                    index
                 };
                 let evidence_cell = quantized_cell(longitude, latitude, evidence_cell_degrees);
-                let evidence = if let Some(evidence) = evidence_cache.get(&evidence_cell.key) {
-                    evidence.clone()
-                } else {
-                    let evidence = self.sample_photo_evidence_uncached(
-                        evidence_cell.center_longitude,
-                        evidence_cell.center_latitude,
-                        evidence_cell_degrees,
-                        evidence_cell_degrees,
-                    )?;
-                    evidence_cache.insert(evidence_cell.key, evidence.clone());
-                    evidence
-                };
-                let terrain_token_color =
-                    if let Some(color) = terrain_token_cache.get(&color_cell.key) {
-                        *color
+                let evidence_index =
+                    if let Some(&index) = evidence_cell_indices.get(&evidence_cell.key) {
+                        index
                     } else {
-                        let color = self.sample_terrain_token_color_uncached(
-                            color_cell.center_longitude,
-                            color_cell.center_latitude,
-                        );
-                        terrain_token_cache.insert(color_cell.key, color);
-                        color
+                        let index = evidence_cells.len();
+                        evidence_cell_indices.insert(evidence_cell.key, index);
+                        evidence_cells.push(evidence_cell);
+                        index
                     };
-                let material =
-                    with_surface_terrain_token(&evidence.with_color(color), terrain_token_color);
-                by_column[(local_z * SURFACE_REGION_WIDTH) + local_x] = Some(material);
+                column_cells[(local_z * SURFACE_REGION_WIDTH) + local_x] =
+                    Some((color_index, evidence_index));
             }
         }
-        if color_cache.is_empty() && evidence_cache.is_empty() && terrain_token_cache.is_empty() {
+        if color_cells.is_empty() && evidence_cells.is_empty() {
+            return Ok(None);
+        }
+
+        let colors = color_cells
+            .par_iter()
+            .map(|cell| {
+                self.sample_primary_photo_color(
+                    cell.center_longitude,
+                    cell.center_latitude,
+                    longitude_span_degrees,
+                    latitude_span_degrees,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let terrain_token_colors = color_cells
+            .par_iter()
+            .map(|cell| {
+                self.sample_terrain_token_color_uncached(
+                    cell.center_longitude,
+                    cell.center_latitude,
+                )
+            })
+            .collect::<Vec<_>>();
+        let evidences = evidence_cells
+            .par_iter()
+            .map(|cell| {
+                self.sample_photo_evidence_uncached(
+                    cell.center_longitude,
+                    cell.center_latitude,
+                    evidence_cell_degrees,
+                    evidence_cell_degrees,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let by_column = column_cells
+            .into_iter()
+            .map(|indices| {
+                indices.map(|(color_index, evidence_index)| {
+                    with_surface_terrain_token(
+                        &evidences[evidence_index].with_color(colors[color_index]),
+                        terrain_token_colors[color_index],
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if by_column.iter().all(Option::is_none) {
             Ok(None)
         } else {
             Ok(Some(by_column))
