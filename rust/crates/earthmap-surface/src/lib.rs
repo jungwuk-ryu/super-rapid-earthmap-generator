@@ -420,6 +420,10 @@ pub struct SurfaceRegionSamplePhaseNanos {
     pub smooth_precompute: u128,
     pub relief_precompute: u128,
     pub open_ocean_fast_path: u128,
+    pub open_ocean_uniform_check: u128,
+    pub open_ocean_companion_precompute: u128,
+    pub open_ocean_column_build: u128,
+    pub open_ocean_repeated_expand: u128,
     pub coordinate_precompute: u128,
     pub photo_land_precompute: u128,
     pub column_build: u128,
@@ -7332,6 +7336,21 @@ pub trait SurfaceMaterialSampler: Send + Sync {
             latitude_span_degrees,
         )
     }
+
+    fn sample_open_ocean_water_material_cell(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        longitude_span_degrees: f64,
+        latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        self.sample_open_ocean_water(
+            longitude,
+            latitude,
+            longitude_span_degrees,
+            latitude_span_degrees,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -8378,6 +8397,16 @@ impl SurfaceMaterialSampler for EarthDataSurfaceMaterialSampler {
             longitude_span_degrees,
             latitude_span_degrees,
         )
+    }
+
+    fn sample_open_ocean_water_material_cell(
+        &self,
+        longitude: f64,
+        latitude: f64,
+        _longitude_span_degrees: f64,
+        _latitude_span_degrees: f64,
+    ) -> Result<SurfaceMaterialSample> {
+        Ok(self.sample_open_ocean_water_uncached(longitude, latitude))
     }
 }
 
@@ -12228,6 +12257,7 @@ where
         &coast_factor_extent,
         &smoothed_center_elevations,
         parallel_column_sampling,
+        &mut phase_nanos,
     )? {
         phase_nanos.open_ocean_fast_path = phase_start.elapsed().as_nanos();
         return Ok(open_ocean.with_phase_nanos(phase_nanos));
@@ -12569,6 +12599,7 @@ fn try_sample_open_ocean_surface_region(
     coast_factor_extent: &[f64],
     smoothed_center_elevations: &[f64],
     parallel_column_sampling: bool,
+    phase_nanos: &mut SurfaceRegionSamplePhaseNanos,
 ) -> Result<Option<SurfaceRegionSample>> {
     if !surface_region_open_ocean_fast_path_eligible(valid, water_mask, coast_factor_extent) {
         return Ok(None);
@@ -12578,6 +12609,8 @@ fn try_sample_open_ocean_surface_region(
         mapping,
         vertical_scale,
         smoothed_center_elevations,
+        parallel_column_sampling,
+        phase_nanos,
     )? {
         return Ok(Some(uniform));
     }
@@ -12589,6 +12622,7 @@ fn try_sample_open_ocean_surface_region(
         material_sampler,
         smoothed_center_elevations,
         parallel_column_sampling,
+        phase_nanos,
     )? {
         return Ok(Some(uniform));
     }
@@ -12619,15 +12653,16 @@ fn try_sample_open_ocean_surface_region(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let companion_materials: Option<Vec<Option<SurfaceMaterialSample>>> =
-        precompute_open_ocean_companion_materials(
-            material_sampler,
-            &longitudes,
-            &latitudes,
-            longitude_span_degrees,
-            latitude_span_degrees,
-            smoothed_center_elevations,
-        )?;
+    let phase_start = Instant::now();
+    let companion_materials = precompute_open_ocean_companion_materials(
+        material_sampler,
+        &longitudes,
+        &latitudes,
+        longitude_span_degrees,
+        latitude_span_degrees,
+        smoothed_center_elevations,
+    )?;
+    phase_nanos.open_ocean_companion_precompute += phase_start.elapsed().as_nanos();
 
     let build_column = |column_index: usize| -> Result<OpenOceanColumnBuild> {
         let local_z = column_index / SURFACE_REGION_WIDTH;
@@ -12637,7 +12672,7 @@ fn try_sample_open_ocean_surface_region(
         let smoothed_elevation = smoothed_center_elevations[column_index];
         let companion_material = companion_materials
             .as_ref()
-            .and_then(|materials| materials[column_index].as_ref());
+            .and_then(|materials| materials.sample(column_index));
         let needs_companion_material = companion_material.is_some()
             || material_sampler
                 .map(|sampler| {
@@ -12696,6 +12731,7 @@ fn try_sample_open_ocean_surface_region(
         Ok(OpenOceanColumnBuild { column })
     };
 
+    let phase_start = Instant::now();
     let builds = if parallel_column_sampling {
         (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
             .into_par_iter()
@@ -12708,10 +12744,25 @@ fn try_sample_open_ocean_surface_region(
         }
         builds
     };
+    phase_nanos.open_ocean_column_build += phase_start.elapsed().as_nanos();
     if !builds.iter().all(|build| build.column.water) {
         return Ok(None);
     }
     SurfaceRegionSample::new(builds.into_iter().map(|build| build.column).collect()).map(Some)
+}
+
+#[derive(Debug)]
+struct OpenOceanCompanionMaterials {
+    column_samples: Vec<Option<usize>>,
+    samples: Vec<SurfaceMaterialSample>,
+}
+
+impl OpenOceanCompanionMaterials {
+    fn sample(&self, column_index: usize) -> Option<&SurfaceMaterialSample> {
+        self.column_samples
+            .get(column_index)
+            .and_then(|sample_index| sample_index.map(|index| &self.samples[index]))
+    }
 }
 
 fn precompute_open_ocean_companion_materials(
@@ -12721,7 +12772,7 @@ fn precompute_open_ocean_companion_materials(
     longitude_span_degrees: f64,
     latitude_span_degrees: f64,
     smoothed_center_elevations: &[f64],
-) -> Result<Option<Vec<Option<SurfaceMaterialSample>>>> {
+) -> Result<Option<OpenOceanCompanionMaterials>> {
     let Some(material_sampler) = material_sampler else {
         return Ok(None);
     };
@@ -12731,8 +12782,9 @@ fn precompute_open_ocean_companion_materials(
         return Ok(None);
     }
     let cell_degrees = material_cell_degrees(longitude_span_degrees, latitude_span_degrees);
-    let mut cache = HashMap::<i64, SurfaceMaterialSample>::new();
-    let mut by_column = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+    let mut cell_indices = HashMap::<i64, usize>::new();
+    let mut samples = Vec::<SurfaceMaterialSample>::new();
+    let mut column_samples = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
     for local_z in 0..SURFACE_REGION_WIDTH {
         let latitude = latitudes[local_z];
         for local_x in 0..SURFACE_REGION_WIDTH {
@@ -12744,25 +12796,30 @@ fn precompute_open_ocean_companion_materials(
             }
             let longitude = longitudes[local_x];
             let cell = quantized_cell(longitude, latitude, cell_degrees);
-            let sample = if let Some(sample) = cache.get(&cell.key) {
-                sample.clone()
+            let sample_index = if let Some(&index) = cell_indices.get(&cell.key) {
+                index
             } else {
-                let sample = material_sampler.sample_open_ocean_water(
+                let sample = material_sampler.sample_open_ocean_water_material_cell(
                     cell.center_longitude,
                     cell.center_latitude,
                     longitude_span_degrees,
                     latitude_span_degrees,
                 )?;
-                cache.insert(cell.key, sample.clone());
-                sample
+                let index = samples.len();
+                cell_indices.insert(cell.key, index);
+                samples.push(sample);
+                index
             };
-            by_column[column_index] = Some(sample);
+            column_samples[column_index] = Some(sample_index);
         }
     }
-    if cache.is_empty() {
+    if samples.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(by_column))
+        Ok(Some(OpenOceanCompanionMaterials {
+            column_samples,
+            samples,
+        }))
     }
 }
 
@@ -12788,8 +12845,10 @@ fn try_sample_uniform_open_ocean_surface_region(
     material_sampler: Option<&dyn SurfaceMaterialSampler>,
     smoothed_center_elevations: &[f64],
     parallel_column_sampling: bool,
+    phase_nanos: &mut SurfaceRegionSamplePhaseNanos,
 ) -> Result<Option<SurfaceRegionSample>> {
     let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let phase_start = Instant::now();
     if material_sampler
         .map(|sampler| sampler.samples_open_water())
         .unwrap_or(false)
@@ -12797,6 +12856,7 @@ fn try_sample_uniform_open_ocean_surface_region(
             .iter()
             .any(|&elevation| should_sample_open_ocean_companion_material(elevation))
     {
+        phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
         return Ok(None);
     }
 
@@ -12835,6 +12895,7 @@ fn try_sample_uniform_open_ocean_surface_region(
         for &local_x in uniform_open_ocean_probe_indices() {
             let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
             if signature_at(column_index) != first_signature {
+                phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
                 return Ok(None);
             }
         }
@@ -12845,15 +12906,18 @@ fn try_sample_uniform_open_ocean_surface_region(
             .into_par_iter()
             .all(|column_index| signature_at(column_index) == first_signature);
         if !uniform {
+            phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
             return Ok(None);
         }
     } else {
         for column_index in 0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH) {
             if signature_at(column_index) != first_signature {
+                phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
                 return Ok(None);
             }
         }
     }
+    phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
 
     let column = EarthSurfaceColumn::new(
         true,
@@ -12864,7 +12928,10 @@ fn try_sample_uniform_open_ocean_surface_region(
         first_signature.biome,
         first_signature.decision_source,
     );
-    SurfaceRegionSample::new(vec![column; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH]).map(Some)
+    let phase_start = Instant::now();
+    let sample = repeated_surface_region_sample(column, parallel_column_sampling)?;
+    phase_nanos.open_ocean_repeated_expand += phase_start.elapsed().as_nanos();
+    Ok(Some(sample))
 }
 
 fn uniform_open_ocean_probe_indices() -> &'static [usize] {
@@ -12919,15 +12986,25 @@ fn try_sample_uniform_deep_open_ocean_surface_region(
     mapping: &EarthScaleMapping,
     vertical_scale: f64,
     smoothed_center_elevations: &[f64],
+    parallel_column_sampling: bool,
+    phase_nanos: &mut SurfaceRegionSamplePhaseNanos,
 ) -> Result<Option<SurfaceRegionSample>> {
     let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
     let deep_floor_threshold_meters = -((UNIFORM_DEEP_OPEN_OCEAN_SOURCE_DEPTH_BLOCKS
         * ELEVATION_METERS_PER_BLOCK)
         / vertical_scale);
-    if !smoothed_center_elevations
-        .iter()
-        .all(|&elevation| elevation.is_finite() && elevation <= deep_floor_threshold_meters)
-    {
+    let phase_start = Instant::now();
+    let all_deep = if parallel_column_sampling {
+        smoothed_center_elevations
+            .par_iter()
+            .all(|&elevation| elevation.is_finite() && elevation <= deep_floor_threshold_meters)
+    } else {
+        smoothed_center_elevations
+            .iter()
+            .all(|&elevation| elevation.is_finite() && elevation <= deep_floor_threshold_meters)
+    };
+    if !all_deep {
+        phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
         return Ok(None);
     }
 
@@ -12942,11 +13019,15 @@ fn try_sample_uniform_deep_open_ocean_surface_region(
         };
         let row_biome = biome_id(-10_000.0, 0.0, latitude, true, MIN_SURFACE_Y, 0.0);
         match biome.as_ref() {
-            Some(existing) if existing != &row_biome => return Ok(None),
+            Some(existing) if existing != &row_biome => {
+                phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
+                return Ok(None);
+            }
             Some(_) => {}
             None => biome = Some(row_biome),
         }
     }
+    phase_nanos.open_ocean_uniform_check += phase_start.elapsed().as_nanos();
 
     let column = clean_coastal_surface_column(
         &EarthSurfaceColumn::new(
@@ -12960,7 +13041,25 @@ fn try_sample_uniform_deep_open_ocean_surface_region(
         ),
         0.0,
     );
-    SurfaceRegionSample::new(vec![column; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH]).map(Some)
+    let phase_start = Instant::now();
+    let sample = repeated_surface_region_sample(column, parallel_column_sampling)?;
+    phase_nanos.open_ocean_repeated_expand += phase_start.elapsed().as_nanos();
+    Ok(Some(sample))
+}
+
+fn repeated_surface_region_sample(
+    column: EarthSurfaceColumn,
+    parallel_column_sampling: bool,
+) -> Result<SurfaceRegionSample> {
+    let columns = if parallel_column_sampling {
+        (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+            .into_par_iter()
+            .map(|_| column.clone())
+            .collect()
+    } else {
+        vec![column; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH]
+    };
+    SurfaceRegionSample::new(columns)
 }
 
 fn classify_open_ocean_surface_scaled(
@@ -17487,17 +17586,25 @@ mod tests {
         .expect("all shallow open-ocean columns should use companion material");
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(materials.iter().all(Option::is_some));
+        assert!(materials.column_samples.iter().all(Option::is_some));
+        assert_eq!(materials.samples.len(), 1);
     }
 
     #[test]
     fn uniform_deep_open_ocean_fast_path_reuses_one_floor_column() {
         let mapping = EarthScaleMapping::for_denominator(250, -90.0, 90.0).unwrap();
         let elevations = vec![-2_000.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
-        let sample =
-            try_sample_uniform_deep_open_ocean_surface_region(0, &mapping, 4.0, &elevations)
-                .unwrap()
-                .expect("deep equatorial ocean should be uniform");
+        let mut phase_nanos = SurfaceRegionSamplePhaseNanos::default();
+        let sample = try_sample_uniform_deep_open_ocean_surface_region(
+            0,
+            &mapping,
+            4.0,
+            &elevations,
+            true,
+            &mut phase_nanos,
+        )
+        .unwrap()
+        .expect("deep equatorial ocean should be uniform");
         assert_eq!(
             sample.columns().len(),
             SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH
@@ -17512,6 +17619,7 @@ mod tests {
     fn uniform_open_ocean_fast_path_matches_direct_classifier_when_all_columns_equal() {
         let mapping = EarthScaleMapping::for_denominator(250, -90.0, 90.0).unwrap();
         let elevations = vec![-2_000.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        let mut phase_nanos = SurfaceRegionSamplePhaseNanos::default();
         let sample = try_sample_uniform_open_ocean_surface_region(
             0,
             0,
@@ -17520,6 +17628,7 @@ mod tests {
             None,
             &elevations,
             true,
+            &mut phase_nanos,
         )
         .unwrap()
         .expect("equatorial open ocean should collapse to one repeated column");

@@ -11256,6 +11256,10 @@ fn handle_vanilla_delegated_parallel_event(
                 "surfacePhase.smoothPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.smooth_precompute)),
                 "surfacePhase.reliefPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.relief_precompute)),
                 "surfacePhase.openOceanFastPathMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_fast_path)),
+                "surfacePhase.openOceanUniformCheckMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_uniform_check)),
+                "surfacePhase.openOceanCompanionPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_companion_precompute)),
+                "surfacePhase.openOceanColumnBuildMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_column_build)),
+                "surfacePhase.openOceanRepeatedExpandMillis": u128_to_u64(millis(report.sample_phase_nanos.open_ocean_repeated_expand)),
                 "surfacePhase.coordinatePrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.coordinate_precompute)),
                 "surfacePhase.photoLandPrecomputeMillis": u128_to_u64(millis(report.sample_phase_nanos.photo_land_precompute)),
                 "surfacePhase.columnBuildMillis": u128_to_u64(millis(report.sample_phase_nanos.column_build)),
@@ -19083,6 +19087,10 @@ mod tests {
                 smooth_precompute: 40_000_000,
                 relief_precompute: 50_000_000,
                 open_ocean_fast_path: 60_000_000,
+                open_ocean_uniform_check: 61_000_000,
+                open_ocean_companion_precompute: 62_000_000,
+                open_ocean_column_build: 63_000_000,
+                open_ocean_repeated_expand: 64_000_000,
                 coordinate_precompute: 70_000_000,
                 photo_land_precompute: 75_000_000,
                 column_build: 700_000_000,
@@ -19125,6 +19133,10 @@ mod tests {
         assert_eq!(event["surfacePhase.smoothPrecomputeMillis"], 40);
         assert_eq!(event["surfacePhase.reliefPrecomputeMillis"], 50);
         assert_eq!(event["surfacePhase.openOceanFastPathMillis"], 60);
+        assert_eq!(event["surfacePhase.openOceanUniformCheckMillis"], 61);
+        assert_eq!(event["surfacePhase.openOceanCompanionPrecomputeMillis"], 62);
+        assert_eq!(event["surfacePhase.openOceanColumnBuildMillis"], 63);
+        assert_eq!(event["surfacePhase.openOceanRepeatedExpandMillis"], 64);
         assert_eq!(event["surfacePhase.coordinatePrecomputeMillis"], 70);
         assert_eq!(event["surfacePhase.photoLandPrecomputeMillis"], 75);
         assert_eq!(event["surfacePhase.columnBuildMillis"], 700);
