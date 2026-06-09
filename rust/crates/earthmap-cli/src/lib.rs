@@ -12756,7 +12756,7 @@ fn auto_surface_tile_cache_entries_for_memory(
 
 fn effective_prefetch_config(
     options: GenerationPrefetchOptions,
-    worker_count: usize,
+    _worker_count: usize,
     region_count: usize,
 ) -> EffectivePrefetchConfig {
     if !options.enabled || region_count == 0 {
@@ -12788,7 +12788,7 @@ fn effective_prefetch_config(
         .workers
         .max(1)
         .min(queue_regions)
-        .min(worker_count.max(1));
+        .min(region_count.max(1));
     EffectivePrefetchConfig {
         enabled: queue_regions > 0 && workers > 0,
         memory_cap_bytes,
@@ -20778,6 +20778,21 @@ mod tests {
 
         assert_eq!(config.queue_regions, 100);
         assert_eq!(config.workers, 3);
+    }
+
+    #[test]
+    fn effective_prefetch_config_keeps_requested_producers_independent_from_consumers() {
+        let options = GenerationPrefetchOptions {
+            enabled: true,
+            memory_cap_bytes: Some(25 * BYTES_PER_GIB),
+            queue_regions: Some(16),
+            workers: 4,
+        };
+        let config = effective_prefetch_config(options, 1, 100);
+
+        assert!(config.enabled);
+        assert_eq!(config.queue_regions, 16);
+        assert_eq!(config.workers, 4);
     }
 
     #[test]
