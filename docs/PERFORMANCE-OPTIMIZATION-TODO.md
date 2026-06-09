@@ -119,6 +119,8 @@
 - [x] Re-test `prefetchWorkers=2` after the larger material caches; reject it again for the current land row because it increased land region times and reduced average CPU versus `prefetchWorkers=1`.
 - [x] Rebalance prefetch split from `12 sample / 4 output` to `13 sample / 3 output` for 16-thread photo generation, because current land rows are sample-bound while pure-ocean rows still need enough output/NBT capacity.
 - [x] Split broad `surfacePhase.columnBuildMillis` telemetry into coordinate and photo-land precompute subfields while keeping the existing field backwards-compatible.
+- [x] Scale startup worker-tuning samples from the maximum candidate worker count, so 8-worker candidates are judged from enough completed sample regions instead of a 3-region under-sample.
+- [x] Persist GUI generation options through eframe storage and reload them at startup, then apply existing project settings so a reopened project is resume-ready.
 - [ ] Use the new subphase telemetry to decide whether the next optimization should target photo-land precompute, column material application, open-ocean elevation/fill, or consumer/NBT output.
 - [ ] Iterate until `earthmap-rs` sustains high CPU utilization across the long generation path, not only during short region-start bursts.
 - [x] Reduce startup worker tuning cost so long runs do not spend many minutes generating benchmark regions before the real batch.
@@ -211,6 +213,8 @@ earthmap-rs generate-vanilla-delegated-regions-parallel C:\earth_map_resources\H
 - [x] Rejected producer-partitioned `prefetchWorkers=2` and ocean-lookahead scheduling experiments: partitioned sample pools improved some `w2` tail cases but still regressed land (`r.-60.31` reached `29746-52079ms` column build in tested variants) and did not improve ocean wall time. The experimental scheduler code was removed instead of committed.
 - [x] Accepted balanced sample-heavy split smoke: final `prefetchWorkers=1`, `13 sample / 3 output` land smoke for `r.-63.31` through `r.-60.31` completed in `11697-14729ms` per region with no long tail; final ocean smoke for `r.-77.31` through `r.-74.31` returned to about `1.9-2.7s` per pure-ocean region.
 - [x] Startup tuning follow-up: reduced candidate samples to land/mixed/ocean coverage with fewer Rayon candidates.
+- [x] Startup tuning sample-scaling follow-up: maximum sample count now scales as `maxCandidateWorkers * 2`, capped at 32 and clamped to submitted region count, so a candidate that can process 8 regions concurrently is not judged from only 3 completed regions.
+- [x] GUI persistence follow-up: `GenerationOptions` now serializes through eframe native persistence, and the app re-applies existing world project settings after loading stored options.
 - [x] Resume sample with `prefetchWorkers=4`: PID 24980 averaged 3.5 CPU cores over 30s, generated no additional completed regions during the sample, and showed pure-ocean `openOceanFastPathMillis` up to 57.7s.
 - [x] Open-ocean fast-path smoke after RGB/terrain-token split: region `r.-112.27` dropped from the long-run log's `openOceanFastPathMillis=57724` to `2575`; total one-region smoke completed in 5.6s. This is smoke evidence only because OS cache can bias single-run timings.
 - [x] Deep open-ocean companion-skip smoke: region `r.-120.27` dropped from the long-run log's `openOceanFastPathMillis=9968` to `2481`; total one-region smoke completed in 5.4s. This is smoke evidence only because OS cache can bias single-run timings.
