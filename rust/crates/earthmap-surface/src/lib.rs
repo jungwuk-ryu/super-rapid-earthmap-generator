@@ -42,6 +42,7 @@ const TIF_ROOT_ENV: &str = "EARTHMAP_TIF_ROOT";
 const OPEN_OCEAN_BATHYMETRY_ROW_CACHE_ROWS: usize = 256;
 
 static PHOTO_SURFACE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+static SURFACE_PHASE_DETAIL_ENABLED: OnceLock<bool> = OnceLock::new();
 const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 262_144;
 
 fn photo_surface_trace_enabled() -> bool {
@@ -56,6 +57,17 @@ fn photo_surface_trace_enabled() -> bool {
                 })
                 .unwrap_or(false)
         })
+}
+
+fn surface_phase_detail_enabled() -> bool {
+    *SURFACE_PHASE_DETAIL_ENABLED.get_or_init(|| {
+        std::env::var("EARTHMAP_SURFACE_PHASE_DETAIL")
+            .ok()
+            .is_some_and(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+            })
+    })
 }
 
 thread_local! {
@@ -429,6 +441,9 @@ pub struct SurfaceRegionSamplePhaseNanos {
     pub coordinate_precompute: u128,
     pub photo_land_precompute: u128,
     pub column_build: u128,
+    pub column_loop: u128,
+    pub column_classify: u128,
+    pub column_semantic_apply: u128,
     pub photo_profile: u128,
     pub photo_apply: u128,
     pub post_process: u128,
@@ -12467,6 +12482,8 @@ where
         coast_factor: f64,
         material: Option<Arc<SurfaceMaterialSample>>,
         sampled_water: bool,
+        classify_nanos: u128,
+        semantic_apply_nanos: u128,
         smoothed_elevation: f64,
         longitude: f64,
         latitude: f64,
@@ -12475,6 +12492,7 @@ where
         global_block_z: i32,
     }
 
+    let detailed_column_phase_timing = surface_phase_detail_enabled();
     let build_column = |column_index: usize| -> Result<SurfaceColumnSampleBuild> {
         let local_z = column_index / SURFACE_REGION_WIDTH;
         let local_x = column_index % SURFACE_REGION_WIDTH;
@@ -12488,6 +12506,7 @@ where
         let smoothed_elevation = smoothed_center_elevations[column_index];
         let water = water_mask[sample_index];
         let coast_factor = coast_factor_extent[sample_index];
+        let classify_start = detailed_column_phase_timing.then(Instant::now);
         let mut column = classify_shaped_surface_scaled(
             smoothed_elevation,
             longitude,
@@ -12496,8 +12515,12 @@ where
             coast_factor,
             vertical_scale,
         )?;
+        let classify_nanos = classify_start
+            .map(|started_at| started_at.elapsed().as_nanos())
+            .unwrap_or(0);
         let mut material = None;
         let mut local_relief_meters = 0.0;
+        let mut semantic_apply_nanos = 0;
         if let Some(precomputed_material) = precomputed_photo_land_materials
             .as_ref()
             .and_then(|materials| materials[column_index].as_ref())
@@ -12507,6 +12530,7 @@ where
                 .as_ref()
                 .map(|relief| relief[column_index])
                 .unwrap_or(0.0);
+            let semantic_start = detailed_column_phase_timing.then(Instant::now);
             column = apply_surface_region_semantic_material_sample(
                 column,
                 &sampled_material,
@@ -12517,6 +12541,9 @@ where
                 local_relief_meters,
                 vertical_scale,
             )?;
+            semantic_apply_nanos += semantic_start
+                .map(|started_at| started_at.elapsed().as_nanos())
+                .unwrap_or(0);
             material = Some(sampled_material);
         } else if let Some(material_sampler) = material_sampler {
             if should_sample_surface_material(
@@ -12540,6 +12567,7 @@ where
                     .as_ref()
                     .map(|relief| relief[column_index])
                     .unwrap_or(0.0);
+                let semantic_start = detailed_column_phase_timing.then(Instant::now);
                 column = apply_surface_region_semantic_material_sample(
                     column,
                     &sampled_material,
@@ -12550,6 +12578,9 @@ where
                     local_relief_meters,
                     vertical_scale,
                 )?;
+                semantic_apply_nanos += semantic_start
+                    .map(|started_at| started_at.elapsed().as_nanos())
+                    .unwrap_or(0);
                 material = Some(sampled_material);
             }
         }
@@ -12559,6 +12590,8 @@ where
             coast_factor,
             material,
             sampled_water: water,
+            classify_nanos,
+            semantic_apply_nanos,
             smoothed_elevation,
             longitude,
             latitude,
@@ -12567,6 +12600,7 @@ where
             global_block_z,
         })
     };
+    let column_loop_phase_start = Instant::now();
     let column_builds = if parallel_column_sampling {
         (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
             .into_par_iter()
@@ -12579,6 +12613,15 @@ where
         }
         column_builds
     };
+    phase_nanos.column_loop = column_loop_phase_start.elapsed().as_nanos();
+    phase_nanos.column_classify = column_builds
+        .iter()
+        .map(|build| build.classify_nanos)
+        .sum::<u128>();
+    phase_nanos.column_semantic_apply = column_builds
+        .iter()
+        .map(|build| build.semantic_apply_nanos)
+        .sum::<u128>();
     phase_nanos.column_build = column_build_phase_start.elapsed().as_nanos();
     phase_nanos.sampled_material_columns = column_builds
         .iter()

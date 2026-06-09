@@ -11293,6 +11293,22 @@ fn handle_vanilla_delegated_parallel_event(
             });
             if let Some(object) = event.as_object_mut() {
                 object.insert(
+                    "surfacePhase.columnLoopMillis".to_string(),
+                    json!(u128_to_u64(millis(report.sample_phase_nanos.column_loop))),
+                );
+                object.insert(
+                    "surfacePhase.columnClassifyMillis".to_string(),
+                    json!(u128_to_u64(millis(
+                        report.sample_phase_nanos.column_classify
+                    ))),
+                );
+                object.insert(
+                    "surfacePhase.columnSemanticApplyMillis".to_string(),
+                    json!(u128_to_u64(millis(
+                        report.sample_phase_nanos.column_semantic_apply
+                    ))),
+                );
+                object.insert(
                     "surfaceMaterialRaster.sourceCount".to_string(),
                     json!(report.surface_material_raster_stats.source_count),
                 );
@@ -19104,6 +19120,9 @@ mod tests {
                 coordinate_precompute: 70_000_000,
                 photo_land_precompute: 75_000_000,
                 column_build: 700_000_000,
+                column_loop: 650_000_000,
+                column_classify: 120_000_000,
+                column_semantic_apply: 220_000_000,
                 photo_profile: 80_000_000,
                 photo_apply: 900_000_000,
                 post_process: 100_000_000,
@@ -19150,6 +19169,9 @@ mod tests {
         assert_eq!(event["surfacePhase.coordinatePrecomputeMillis"], 70);
         assert_eq!(event["surfacePhase.photoLandPrecomputeMillis"], 75);
         assert_eq!(event["surfacePhase.columnBuildMillis"], 700);
+        assert_eq!(event["surfacePhase.columnLoopMillis"], 650);
+        assert_eq!(event["surfacePhase.columnClassifyMillis"], 120);
+        assert_eq!(event["surfacePhase.columnSemanticApplyMillis"], 220);
         assert_eq!(event["surfacePhase.photoProfileMillis"], 80);
         assert_eq!(event["surfacePhase.photoApplyMillis"], 900);
         assert_eq!(event["surfacePhase.postProcessMillis"], 100);
