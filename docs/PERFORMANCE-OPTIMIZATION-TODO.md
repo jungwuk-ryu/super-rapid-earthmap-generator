@@ -137,6 +137,7 @@
 - [x] If no dump exists, enable a local dump or add targeted diagnostics before the next long run.
 - [x] Feature-gate the CLI `mimalloc` global allocator so the default binary avoids that native crash candidate.
 - [x] Short crash-repro run at `agent-runs/crash-repro-q2-row53-3r-20260609-continue` generated `r.-157.53..r.-155.53` with exit code `0`, so the q2 interruption is not a deterministic failure of those three regions.
+- [x] Repaired the real `D:\earthmap\1-250-earth-linear` resume journal after the short crash-repro run overwrote it with a 3-region fingerprint. Current journal was rebuilt from the current full-command fingerprint captured in `agent-runs/fingerprint-current-full-valid-20260609-continue` plus 39,881 existing Linear region files in the full `-157,-74 314x148` area; first 20 lines parse as valid JSON.
 - [ ] Confirm the resumed long run no longer hits `0xC0000005`.
 - [x] Local dump target: `D:\earthmap\super-rapid-earthmap-generator\agent-runs\crash-dumps`
 - [x] Code audit after the crash question: `earthmap-surface` forbids `unsafe_code`, and `sanitize_surface_column_for_production` plus `replace_surface_blocks` only clone/construct safe Rust values. Treat the symbol as the observed fault site, not proof that this pure function directly caused memory corruption.
