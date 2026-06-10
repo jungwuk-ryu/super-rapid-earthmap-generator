@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -233,6 +233,8 @@ struct GenerationOptions {
     linear_compression_level: i32,
     mca_compression_level: u32,
     threads: usize,
+    #[serde(default = "default_shard_processes")]
+    shard_processes: usize,
     status: ChunkStatusChoice,
     vertical_scale: String,
     cache_rows: String,
@@ -252,6 +254,10 @@ struct GenerationOptions {
 
 fn default_worker_tuning_enabled() -> bool {
     true
+}
+
+fn default_shard_processes() -> usize {
+    1
 }
 
 fn default_auto_text() -> String {
@@ -281,6 +287,7 @@ impl Default for GenerationOptions {
             linear_compression_level: 4,
             mca_compression_level: 6,
             threads: 8,
+            shard_processes: default_shard_processes(),
             status: ChunkStatusChoice::Surface,
             vertical_scale: DEFAULT_VERTICAL_SCALE.to_string(),
             cache_rows: DEFAULT_CACHE_ROWS.to_string(),
@@ -397,8 +404,24 @@ impl GenerationOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessTag {
+    index: usize,
+    total: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenerationCommand {
+    tag: Option<ProcessTag>,
+    grid: RegionGrid,
+    args: Vec<String>,
+}
+
 fn build_generation_args(options: &GenerationOptions) -> Vec<String> {
-    let grid = options.resolved_region_grid();
+    build_generation_args_for_grid(options, options.resolved_region_grid())
+}
+
+fn build_generation_args_for_grid(options: &GenerationOptions, grid: RegionGrid) -> Vec<String> {
     let mut args = vec![
         "generate-vanilla-delegated-regions-parallel".to_string(),
         options.heightmap_path.clone(),
@@ -418,6 +441,65 @@ fn build_generation_args(options: &GenerationOptions) -> Vec<String> {
     ];
     args.extend(options.prefetch_options());
     args
+}
+
+fn effective_shard_processes(options: &GenerationOptions) -> usize {
+    let grid = options.resolved_region_grid();
+    effective_shard_processes_for_grid(options.shard_processes, grid)
+}
+
+fn effective_shard_processes_for_grid(requested_shards: usize, grid: RegionGrid) -> usize {
+    requested_shards.max(1).min(grid.cols.max(1) as usize)
+}
+
+fn build_shard_region_grids(grid: RegionGrid, requested_shards: usize) -> Vec<RegionGrid> {
+    let shard_count = effective_shard_processes_for_grid(requested_shards, grid);
+    if shard_count <= 1 {
+        return vec![grid];
+    }
+    let total_cols = grid.cols.max(1) as usize;
+    let base_cols = total_cols / shard_count;
+    let extra_cols = total_cols % shard_count;
+    let mut grids = Vec::with_capacity(shard_count);
+    let mut start_region_x = grid.start_region_x;
+    for shard_index in 0..shard_count {
+        let cols = base_cols + usize::from(shard_index < extra_cols);
+        if cols == 0 {
+            continue;
+        }
+        grids.push(RegionGrid {
+            start_region_x,
+            start_region_z: grid.start_region_z,
+            cols: i32::try_from(cols).unwrap_or(i32::MAX),
+            rows: grid.rows.max(1),
+        });
+        start_region_x = start_region_x.saturating_add(i32::try_from(cols).unwrap_or(i32::MAX));
+    }
+    grids
+}
+
+fn build_generation_commands(options: &GenerationOptions) -> Vec<GenerationCommand> {
+    let grid = options.resolved_region_grid();
+    let shards = build_shard_region_grids(grid, options.shard_processes);
+    let total = shards.len();
+    shards
+        .into_iter()
+        .enumerate()
+        .map(|(index, shard_grid)| GenerationCommand {
+            tag: (total > 1).then_some(ProcessTag { index, total }),
+            grid: shard_grid,
+            args: {
+                let mut args = build_generation_args_for_grid(options, shard_grid);
+                if total > 1 {
+                    args.push(format!(
+                        "projectGrid={},{},{},{}",
+                        grid.start_region_x, grid.start_region_z, grid.cols, grid.rows
+                    ));
+                }
+                args
+            },
+        })
+        .collect()
 }
 
 fn manual_region_grid(options: &GenerationOptions) -> RegionGrid {
@@ -1256,7 +1338,10 @@ enum LegacyRegionStatus {
 #[derive(Debug)]
 enum WorkerEvent {
     Line(String),
-    Progress(GeneratorProgressEvent),
+    Progress {
+        tag: Option<ProcessTag>,
+        event: GeneratorProgressEvent,
+    },
     RegionFinished {
         status: LegacyRegionStatus,
         region_x: i32,
@@ -1277,19 +1362,28 @@ enum WorkerEvent {
 struct GenerationRun {
     receiver: Receiver<WorkerEvent>,
     cancel: Arc<AtomicBool>,
-    child: Arc<Mutex<Option<std::process::Child>>>,
+    children: Arc<Mutex<Vec<RunningChild>>>,
     started_at: Instant,
 }
 
 impl GenerationRun {
     fn request_stop(&self) {
         self.cancel.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(child) = guard.as_mut() {
-                let _ = child.kill();
+        if let Ok(mut guard) = self.children.lock() {
+            for child in guard.iter_mut() {
+                if !child.finished {
+                    let _ = child.child.kill();
+                }
             }
         }
     }
+}
+
+struct RunningChild {
+    tag: Option<ProcessTag>,
+    child: Child,
+    finished: bool,
+    exit_code: Option<i32>,
 }
 
 #[derive(Default)]
@@ -1535,18 +1629,24 @@ impl EarthMapGuiApp {
         self.log_lines.clear();
         let (sender, receiver) = bounded(WORKER_EVENT_CHANNEL_CAPACITY);
         let cancel = Arc::new(AtomicBool::new(false));
-        let child = Arc::new(Mutex::new(None));
-        let args = build_generation_args(&self.options);
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let commands = build_generation_commands(&self.options);
         let options = self.options.clone();
         let cancel_for_thread = Arc::clone(&cancel);
-        let child_for_thread = Arc::clone(&child);
+        let children_for_thread = Arc::clone(&children);
         thread::spawn(move || {
-            run_generation_process(args, options, sender, cancel_for_thread, child_for_thread);
+            run_generation_processes(
+                commands,
+                options,
+                sender,
+                cancel_for_thread,
+                children_for_thread,
+            );
         });
         self.run = Some(GenerationRun {
             receiver,
             cancel,
-            child,
+            children,
             started_at: Instant::now(),
         });
     }
@@ -1567,7 +1667,7 @@ impl EarthMapGuiApp {
         for event in events {
             match event {
                 WorkerEvent::Line(line) => self.push_log_line(line),
-                WorkerEvent::Progress(event) => self.apply_progress_event(event),
+                WorkerEvent::Progress { tag, event } => self.apply_progress_event(tag, event),
                 WorkerEvent::RegionFinished {
                     status,
                     region_x,
@@ -1620,7 +1720,7 @@ impl EarthMapGuiApp {
         }
     }
 
-    fn apply_progress_event(&mut self, event: GeneratorProgressEvent) {
+    fn apply_progress_event(&mut self, tag: Option<ProcessTag>, event: GeneratorProgressEvent) {
         match event {
             GeneratorProgressEvent::WorkerTuningStarted {
                 enabled,
@@ -1633,9 +1733,10 @@ impl EarthMapGuiApp {
                 self.progress.worker_tuning_submitted_regions = submitted_regions;
                 self.progress.worker_tuning_max_samples = max_samples;
                 self.progress.worker_tuning_result = None;
+                let prefix = process_log_prefix(tag);
                 if enabled {
                     self.push_log_line(format!(
-                        "worker tuning started: requested={} regions={} maxSamples={}",
+                        "{prefix}worker tuning started: requested={} regions={} maxSamples={}",
                         requested_threads
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "?".to_string()),
@@ -1647,11 +1748,15 @@ impl EarthMapGuiApp {
                             .unwrap_or_else(|| "?".to_string())
                     ));
                 } else {
-                    self.push_log_line("worker tuning disabled".to_string());
+                    self.push_log_line(format!("{prefix}worker tuning disabled"));
                 }
             }
             GeneratorProgressEvent::WorkerTuningFinished { result } => {
-                self.push_log_line(worker_tuning_log_line(&result));
+                self.push_log_line(format!(
+                    "{}{}",
+                    process_log_prefix(tag),
+                    worker_tuning_log_line(&result)
+                ));
                 self.progress.worker_tuning_result = Some(result);
             }
             GeneratorProgressEvent::BatchStarted {
@@ -1660,13 +1765,22 @@ impl EarthMapGuiApp {
                 resume_fingerprint_matched,
                 resume_journal_regions,
             } => {
-                self.progress.reset_from_batch(grid, total_regions);
-                self.progress.resume_fingerprint_matched = Some(resume_fingerprint_matched);
-                self.progress.resume_journal_regions = resume_journal_regions;
-                self.map_overlay.status_dirty = true;
+                if tag.is_none() {
+                    self.progress.reset_from_batch(grid, total_regions);
+                    self.progress.resume_fingerprint_matched = Some(resume_fingerprint_matched);
+                    self.progress.resume_journal_regions = resume_journal_regions;
+                    self.map_overlay.status_dirty = true;
+                }
                 self.push_log_line(format!(
-                    "batch started: {} regions, resume match={}, journal regions={}",
-                    total_regions, resume_fingerprint_matched, resume_journal_regions
+                    "{}batch started: {} regions, start=({}, {}), size={}x{}, resume match={}, journal regions={}",
+                    process_log_prefix(tag),
+                    total_regions,
+                    grid.start_region_x,
+                    grid.start_region_z,
+                    grid.cols,
+                    grid.rows,
+                    resume_fingerprint_matched,
+                    resume_journal_regions
                 ));
             }
             GeneratorProgressEvent::RegionStarted { region_x, region_z } => {
@@ -1719,8 +1833,19 @@ impl EarthMapGuiApp {
                 elapsed_millis,
                 regions_per_hour,
             } => {
-                self.progress.elapsed_millis = elapsed_millis;
-                self.progress.regions_per_hour = regions_per_hour;
+                if tag.is_none() {
+                    self.progress.elapsed_millis = elapsed_millis;
+                    self.progress.regions_per_hour = regions_per_hour;
+                }
+                if let Some(tag) = tag {
+                    let speed = regions_per_hour
+                        .map(|value| format!("{value:.2} regions/hour"))
+                        .unwrap_or_else(|| "unknown speed".to_string());
+                    self.push_log_line(format!(
+                        "{}batch summary: {speed}",
+                        process_log_prefix(Some(tag))
+                    ));
+                }
             }
         }
     }
@@ -2126,6 +2251,20 @@ impl eframe::App for EarthMapGuiApp {
                     ui.label("Threads");
                     ui.add(egui::DragValue::new(&mut self.options.threads).range(1..=256));
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Shard processes");
+                    ui.add(
+                        egui::DragValue::new(&mut self.options.shard_processes).range(1..=64),
+                    );
+                });
+                let effective_shards = effective_shard_processes(&self.options);
+                if effective_shards > 1 {
+                    ui.small(format!(
+                        "Runs {effective_shards} earthmap-rs processes over column shards. Each shard uses the same Threads, Rayon, and prefetch settings."
+                    ));
+                } else {
+                    ui.small("1 keeps the normal single-process generator path.");
+                }
                 egui::ComboBox::from_label("Format")
                     .selected_text(self.options.format.as_cli_arg())
                     .show_ui(ui, |ui| {
@@ -2267,8 +2406,26 @@ impl eframe::App for EarthMapGuiApp {
                 ui.separator();
             }
             ui.heading("Resolved Command");
-            let args = build_generation_args(&self.options);
-            ui.monospace(format!("earthmap-rs {}", args.join(" ")));
+            let commands = build_generation_commands(&self.options);
+            if commands.len() <= 1 {
+                let args = commands
+                    .first()
+                    .map(|command| command.args.clone())
+                    .unwrap_or_else(|| build_generation_args(&self.options));
+                ui.monospace(format!("earthmap-rs {}", args.join(" ")));
+            } else {
+                ui.monospace(format!("{} shard processes", commands.len()));
+                for command in commands.iter().take(8) {
+                    ui.monospace(format!(
+                        "{}earthmap-rs {}",
+                        process_log_prefix(command.tag),
+                        command.args.join(" ")
+                    ));
+                }
+                if commands.len() > 8 {
+                    ui.monospace(format!("... {} more shards", commands.len() - 8));
+                }
+            }
             let env_preview = generation_env_preview(&self.options);
             if !env_preview.is_empty() {
                 ui.heading("Resolved Environment");
@@ -2344,66 +2501,120 @@ fn format_duration_compact(duration: Duration) -> String {
     }
 }
 
-fn run_generation_process(
-    args: Vec<String>,
+fn process_log_prefix(tag: Option<ProcessTag>) -> String {
+    tag.map(|tag| format!("shard {}/{}: ", tag.index + 1, tag.total))
+        .unwrap_or_default()
+}
+
+fn run_generation_processes(
+    commands: Vec<GenerationCommand>,
     options: GenerationOptions,
     sender: Sender<WorkerEvent>,
     cancel: Arc<AtomicBool>,
-    child_slot: Arc<Mutex<Option<std::process::Child>>>,
+    children_slot: Arc<Mutex<Vec<RunningChild>>>,
 ) {
     let started_at = Instant::now();
     let executable = earthmap_cli_executable();
-    let mut command = Command::new(&executable);
-    command
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    apply_generation_env(&mut command, &options);
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = sender.send(WorkerEvent::Failed(format!(
-                "failed to start {}: {error}",
-                executable.display()
-            )));
+    let command_count = commands.len().max(1);
+    for command_spec in commands {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = sender.send(WorkerEvent::Finished {
+                code: None,
+                elapsed: started_at.elapsed(),
+            });
             return;
         }
-    };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    if let Ok(mut guard) = child_slot.lock() {
-        *guard = Some(child);
-    }
+        let mut command = Command::new(&executable);
+        command
+            .args(&command_spec.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_generation_env(&mut command, &options);
 
-    if let Some(stdout) = stdout {
-        spawn_output_reader(stdout, sender.clone(), false);
-    }
-    if let Some(stderr) = stderr {
-        spawn_output_reader(stderr, sender.clone(), true);
+        let _ = sender.send(WorkerEvent::Line(format!(
+            "{}starting earthmap-rs {}",
+            process_log_prefix(command_spec.tag),
+            command_spec.args.join(" ")
+        )));
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                kill_running_children(&children_slot);
+                let _ = sender.send(WorkerEvent::Failed(format!(
+                    "failed to start {}: {error}",
+                    executable.display()
+                )));
+                return;
+            }
+        };
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        if let Ok(mut guard) = children_slot.lock() {
+            guard.push(RunningChild {
+                tag: command_spec.tag,
+                child,
+                finished: false,
+                exit_code: None,
+            });
+        }
+
+        if let Some(stdout) = stdout {
+            spawn_output_reader(stdout, sender.clone(), false, command_spec.tag);
+        }
+        if let Some(stderr) = stderr {
+            spawn_output_reader(stderr, sender.clone(), true, command_spec.tag);
+        }
     }
 
     loop {
         if cancel.load(Ordering::SeqCst) {
-            if let Ok(mut guard) = child_slot.lock() {
-                if let Some(child) = guard.as_mut() {
-                    let _ = child.kill();
-                }
-            }
+            kill_running_children(&children_slot);
         }
-        let status = match child_slot.lock() {
-            Ok(mut guard) => match guard.as_mut() {
-                Some(child) => match child.try_wait() {
-                    Ok(status) => status,
-                    Err(error) => {
-                        let _ = sender.send(WorkerEvent::Failed(format!(
-                            "failed to wait for generator: {error}"
-                        )));
-                        return;
+        let mut finished_events = Vec::new();
+        let wait_result = match children_slot.lock() {
+            Ok(mut guard) => {
+                let mut all_finished = guard.len() >= command_count;
+                for child in guard.iter_mut() {
+                    if child.finished {
+                        continue;
                     }
-                },
-                None => None,
-            },
+                    match child.child.try_wait() {
+                        Ok(Some(status)) => {
+                            child.finished = true;
+                            child.exit_code = status.code();
+                            finished_events.push((child.tag, status.code()));
+                        }
+                        Ok(None) => {
+                            all_finished = false;
+                        }
+                        Err(error) => {
+                            let _ = sender.send(WorkerEvent::Failed(format!(
+                                "{}failed to wait for generator: {error}",
+                                process_log_prefix(child.tag)
+                            )));
+                            return;
+                        }
+                    }
+                }
+                if guard.len() < command_count {
+                    all_finished = false;
+                }
+                let exit_code = if all_finished {
+                    guard
+                        .iter()
+                        .filter_map(|child| child.exit_code)
+                        .find(|code| *code != 0)
+                        .or(Some(0))
+                } else {
+                    None
+                };
+                Ok((all_finished, exit_code))
+            }
+            Err(_) => Err(()),
+        };
+        let (all_finished, exit_code) = match wait_result {
+            Ok(value) => value,
             Err(_) => {
                 let _ = sender.send(WorkerEvent::Failed(
                     "generator process state was poisoned".to_string(),
@@ -2411,13 +2622,20 @@ fn run_generation_process(
                 return;
             }
         };
-        if let Some(status) = status {
+        for (tag, code) in finished_events {
+            let _ = sender.send(WorkerEvent::Line(format!(
+                "{}process finished with code {}",
+                process_log_prefix(tag),
+                code.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+            )));
+        }
+        if all_finished {
             let _ = sender.send(WorkerEvent::Finished {
-                code: status.code(),
+                code: exit_code,
                 elapsed: started_at.elapsed(),
             });
-            if let Ok(mut guard) = child_slot.lock() {
-                *guard = None;
+            if let Ok(mut guard) = children_slot.lock() {
+                guard.clear();
             }
             return;
         }
@@ -2425,8 +2643,22 @@ fn run_generation_process(
     }
 }
 
-fn spawn_output_reader<R>(reader: R, sender: Sender<WorkerEvent>, is_stderr: bool)
-where
+fn kill_running_children(children_slot: &Arc<Mutex<Vec<RunningChild>>>) {
+    if let Ok(mut guard) = children_slot.lock() {
+        for child in guard.iter_mut() {
+            if !child.finished {
+                let _ = child.child.kill();
+            }
+        }
+    }
+}
+
+fn spawn_output_reader<R>(
+    reader: R,
+    sender: Sender<WorkerEvent>,
+    is_stderr: bool,
+    tag: Option<ProcessTag>,
+) where
     R: std::io::Read + Send + 'static,
 {
     thread::spawn(move || {
@@ -2435,19 +2667,21 @@ where
             let Ok(line) = line_result else {
                 break;
             };
-            let line = if is_stderr {
-                format!("stderr: {line}")
+            if is_stderr {
+                let _ = sender.send(WorkerEvent::Line(format!(
+                    "{}stderr: {line}",
+                    process_log_prefix(tag)
+                )));
             } else {
-                line
-            };
-            send_progress_events(&sender, &line);
+                send_progress_events(&sender, &line, tag);
+            }
         }
     });
 }
 
-fn send_progress_events(sender: &Sender<WorkerEvent>, line: &str) {
+fn send_progress_events(sender: &Sender<WorkerEvent>, line: &str, tag: Option<ProcessTag>) {
     if let Some(event) = parse_progress_event_line(line) {
-        let _ = sender.send(WorkerEvent::Progress(event));
+        let _ = sender.send(WorkerEvent::Progress { tag, event });
         return;
     }
     if let Some((status, region_x, region_z, elapsed_millis)) = parse_region_line(line) {
@@ -2459,7 +2693,10 @@ fn send_progress_events(sender: &Sender<WorkerEvent>, line: &str) {
         });
         return;
     }
-    let _ = sender.send(WorkerEvent::Line(line.to_string()));
+    let _ = sender.send(WorkerEvent::Line(format!(
+        "{}{line}",
+        process_log_prefix(tag)
+    )));
     if line.starts_with("elapsedMillis=") || line.starts_with("generatedRegionsPerHour=") {
         let elapsed_millis = line
             .strip_prefix("elapsedMillis=")
@@ -2772,6 +3009,84 @@ mod tests {
     }
 
     #[test]
+    fn generation_commands_split_region_grid_into_column_shards() {
+        let options = GenerationOptions {
+            extent_mode: ExtentMode::RegionGrid,
+            start_region_x: -10,
+            start_region_z: 5,
+            cols: 10,
+            rows: 3,
+            shard_processes: 4,
+            ..GenerationOptions::default()
+        };
+
+        let commands = build_generation_commands(&options);
+
+        assert_eq!(commands.len(), 4);
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.grid)
+                .collect::<Vec<_>>(),
+            vec![
+                RegionGrid {
+                    start_region_x: -10,
+                    start_region_z: 5,
+                    cols: 3,
+                    rows: 3
+                },
+                RegionGrid {
+                    start_region_x: -7,
+                    start_region_z: 5,
+                    cols: 3,
+                    rows: 3
+                },
+                RegionGrid {
+                    start_region_x: -4,
+                    start_region_z: 5,
+                    cols: 2,
+                    rows: 3
+                },
+                RegionGrid {
+                    start_region_x: -2,
+                    start_region_z: 5,
+                    cols: 2,
+                    rows: 3
+                },
+            ]
+        );
+        assert_eq!(commands[0].args[4], "-10");
+        assert_eq!(commands[0].args[6], "3");
+        assert_eq!(commands[3].args[4], "-2");
+        assert_eq!(commands[3].args[6], "2");
+        assert!(commands[0]
+            .args
+            .contains(&"projectGrid=-10,5,10,3".to_string()));
+        assert!(commands[3]
+            .args
+            .contains(&"projectGrid=-10,5,10,3".to_string()));
+    }
+
+    #[test]
+    fn generation_commands_cap_shards_to_region_columns() {
+        let options = GenerationOptions {
+            extent_mode: ExtentMode::RegionGrid,
+            start_region_x: 3,
+            start_region_z: 4,
+            cols: 2,
+            rows: 8,
+            shard_processes: 8,
+            ..GenerationOptions::default()
+        };
+
+        let commands = build_generation_commands(&options);
+
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].grid.cols, 1);
+        assert_eq!(commands[1].grid.cols, 1);
+    }
+
+    #[test]
     fn generation_env_preview_includes_rayon_threads() {
         let options = GenerationOptions {
             rayon_threads: "13".to_string(),
@@ -2944,6 +3259,7 @@ generation.verticalScaleMode=auto\n",
             linear_compression_level: 6,
             mca_compression_level: 5,
             threads: 10,
+            shard_processes: 4,
             status: ChunkStatusChoice::Surface,
             vertical_scale: "auto".to_string(),
             cache_rows: "auto".to_string(),
@@ -2963,6 +3279,7 @@ generation.verticalScaleMode=auto\n",
         assert_eq!(decoded.extent_mode, ExtentMode::WholeEarth);
         assert_eq!(decoded.linear_compression_level, 6);
         assert_eq!(decoded.threads, 10);
+        assert_eq!(decoded.shard_processes, 4);
         assert_eq!(decoded.rayon_threads, "12");
         assert!(!decoded.worker_tuning_enabled);
         assert!(decoded.prefetch_enabled);
@@ -3000,6 +3317,7 @@ generation.verticalScaleMode=auto\n",
         let decoded: GenerationOptions = serde_json::from_str(json).unwrap();
 
         assert!(decoded.worker_tuning_enabled);
+        assert_eq!(decoded.shard_processes, 1);
         assert!(!decoded.prefetch_enabled);
         assert_eq!(decoded.prefetch_memory_gb, "auto");
         assert_eq!(decoded.prefetch_queue_regions, "auto");

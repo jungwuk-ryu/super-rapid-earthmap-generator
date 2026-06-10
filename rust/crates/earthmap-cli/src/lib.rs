@@ -94,6 +94,10 @@ const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 const SURFACE_SAMPLING_PROFILE_VERSION: &str = "bilinear-bathymetry-detail-coast-v1";
 const VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME: &str = "earthmap-vanilla-delegated-resume.ndjson";
+const VANILLA_DELEGATED_RESUME_LOCK_FILE_NAME: &str = "earthmap-vanilla-delegated-resume.lock";
+const VANILLA_DELEGATED_RESUME_LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
+const VANILLA_DELEGATED_RESUME_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
+const VANILLA_DELEGATED_RESUME_LOCK_ATTEMPTS: usize = 600;
 const PARALLEL_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const TOPDOWN_REGION_SIZE_BLOCKS: usize = 512;
 const TOPDOWN_AIR_BLOCK: &str = "minecraft:air";
@@ -3608,6 +3612,15 @@ struct GenerationRuntimeOptions {
     vertical_scale: VerticalScaleOption,
     prefetch: GenerationPrefetchOptions,
     worker_autotune: Option<bool>,
+    project_grid: Option<GenerationProjectGrid>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenerationProjectGrid {
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3751,6 +3764,13 @@ fn parse_generation_runtime_options(
             parsed.vertical_scale = parse_generation_vertical_scale_option(value)?;
             continue;
         }
+        if key.eq_ignore_ascii_case("projectGrid")
+            || key.eq_ignore_ascii_case("resumeGrid")
+            || key.eq_ignore_ascii_case("metadataGrid")
+        {
+            parsed.project_grid = Some(parse_generation_project_grid_option(value)?);
+            continue;
+        }
         if key.eq_ignore_ascii_case("prefetch")
             || key.eq_ignore_ascii_case("surfacePrefetch")
             || key.eq_ignore_ascii_case("evidencePrefetch")
@@ -3807,6 +3827,65 @@ fn parse_generation_runtime_options(
         return Err(format!("unknown generation option: {key}"));
     }
     Ok(parsed)
+}
+
+fn parse_generation_project_grid_option(
+    value: &str,
+) -> std::result::Result<GenerationProjectGrid, String> {
+    let parts = value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != 4 {
+        return Err("projectGrid must be startRegionX,startRegionZ,cols,rows".to_string());
+    }
+    Ok(GenerationProjectGrid {
+        start_region_x: parse_i32_string(parts[0])?,
+        start_region_z: parse_i32_string(parts[1])?,
+        cols: parse_positive_i32_string("projectGrid cols", parts[2])?,
+        rows: parse_positive_i32_string("projectGrid rows", parts[3])?,
+    })
+}
+
+fn validate_project_grid_contains_generation_grid(
+    project: GenerationProjectGrid,
+    generation: GenerationProjectGrid,
+) -> std::result::Result<(), String> {
+    let project_end_x = project
+        .start_region_x
+        .checked_add(project.cols)
+        .ok_or_else(|| "projectGrid X range overflow".to_string())?;
+    let project_end_z = project
+        .start_region_z
+        .checked_add(project.rows)
+        .ok_or_else(|| "projectGrid Z range overflow".to_string())?;
+    let generation_end_x = generation
+        .start_region_x
+        .checked_add(generation.cols)
+        .ok_or_else(|| "generation X range overflow".to_string())?;
+    let generation_end_z = generation
+        .start_region_z
+        .checked_add(generation.rows)
+        .ok_or_else(|| "generation Z range overflow".to_string())?;
+    if generation.start_region_x < project.start_region_x
+        || generation.start_region_z < project.start_region_z
+        || generation_end_x > project_end_x
+        || generation_end_z > project_end_z
+    {
+        return Err(format!(
+            "projectGrid {},{},{},{} must contain generation grid {},{},{},{}",
+            project.start_region_x,
+            project.start_region_z,
+            project.cols,
+            project.rows,
+            generation.start_region_x,
+            generation.start_region_z,
+            generation.cols,
+            generation.rows
+        ));
+    }
+    Ok(())
 }
 
 fn parse_bool_option(name: &str, value: &str) -> std::result::Result<bool, String> {
@@ -4164,7 +4243,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N]"
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows]"
     )?;
     writeln!(
         out,
@@ -4200,7 +4279,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N]"
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows]"
     )?;
     writeln!(
         out,
@@ -9685,6 +9764,14 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let start_region_z = parse_i32_string(start_region_z_text)?;
     let cols = parse_positive_i32_string("cols", cols_text)?;
     let rows = parse_positive_i32_string("rows", rows_text)?;
+    let generation_grid = GenerationProjectGrid {
+        start_region_x,
+        start_region_z,
+        cols,
+        rows,
+    };
+    let project_grid = runtime_options.project_grid.unwrap_or(generation_grid);
+    validate_project_grid_contains_generation_grid(project_grid, generation_grid)?;
     let threads = parse_positive_usize_string("threads", threads_text)?;
     let region_count = usize::try_from(
         cols.checked_mul(rows)
@@ -9706,10 +9793,10 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         heightmap,
         format,
         scale,
-        start_region_x,
-        start_region_z,
-        cols,
-        rows,
+        project_grid.start_region_x,
+        project_grid.start_region_z,
+        project_grid.cols,
+        project_grid.rows,
         status,
         &surface_material_path,
         runtime_options.compression,
@@ -9808,39 +9895,45 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     };
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
-    let spawn_x = start_region_x
-        .wrapping_mul(REGION_SIZE_BLOCKS)
-        .wrapping_add(cols.wrapping_mul(REGION_SIZE_BLOCKS) / 2);
-    let spawn_z = start_region_z
-        .wrapping_mul(REGION_SIZE_BLOCKS)
-        .wrapping_add(rows.wrapping_mul(REGION_SIZE_BLOCKS) / 2);
-    let level_settings = level_dat_template::Settings::new(
-        "SR EarthMap Vanilla Delegated",
-        0,
-        spawn_x,
-        SEA_LEVEL_Y + 10,
-        spawn_z,
-    )
-    .map_err(|error| error.to_string())?;
-    level_dat_template::write(world.join("level.dat"), &level_settings)
+    let manifest_file = {
+        let _metadata_lock =
+            acquire_resume_journal_lock_path(&world.join(VANILLA_DELEGATED_RESUME_LOCK_FILE_NAME))?;
+        let spawn_x = project_grid
+            .start_region_x
+            .wrapping_mul(REGION_SIZE_BLOCKS)
+            .wrapping_add(project_grid.cols.wrapping_mul(REGION_SIZE_BLOCKS) / 2);
+        let spawn_z = project_grid
+            .start_region_z
+            .wrapping_mul(REGION_SIZE_BLOCKS)
+            .wrapping_add(project_grid.rows.wrapping_mul(REGION_SIZE_BLOCKS) / 2);
+        let level_settings = level_dat_template::Settings::new(
+            "SR EarthMap Vanilla Delegated",
+            0,
+            spawn_x,
+            SEA_LEVEL_Y + 10,
+            spawn_z,
+        )
         .map_err(|error| error.to_string())?;
-    let manifest_file = write_vanilla_delegated_parallel_manifest(
-        world,
-        heightmap,
-        format,
-        scale,
-        start_region_x,
-        start_region_z,
-        cols,
-        rows,
-        threads,
-        status,
-        &surface_material_path,
-        runtime_options.compression,
-        vertical_scale,
-        runtime_options.vertical_scale.label(),
-    )
-    .map_err(|error| error.to_string())?;
+        level_dat_template::write(world.join("level.dat"), &level_settings)
+            .map_err(|error| error.to_string())?;
+        write_vanilla_delegated_parallel_manifest(
+            world,
+            heightmap,
+            format,
+            scale,
+            project_grid.start_region_x,
+            project_grid.start_region_z,
+            project_grid.cols,
+            project_grid.rows,
+            threads,
+            status,
+            &surface_material_path,
+            runtime_options.compression,
+            vertical_scale,
+            runtime_options.vertical_scale.label(),
+        )
+        .map_err(|error| error.to_string())?
+    };
     let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
     let stale_temp_files = cleanup_stale_region_temp_files(&world.join("region"));
     let setup_millis = setup_start.elapsed().as_millis();
@@ -11536,6 +11629,7 @@ struct PreparedVanillaDelegatedResume {
 
 struct VanillaDelegatedResumeJournal {
     file: File,
+    lock_path: PathBuf,
 }
 
 impl VanillaDelegatedResumeJournal {
@@ -11556,10 +11650,12 @@ impl VanillaDelegatedResumeJournal {
             "chunks": chunks,
             "outputBytes": output_bytes,
         });
+        let _lock = acquire_resume_journal_lock_path(&self.lock_path)?;
         writeln!(self.file, "{line}").map_err(|error| error.to_string())
     }
 
     fn sync(&self) -> std::result::Result<(), String> {
+        let _lock = acquire_resume_journal_lock_path(&self.lock_path)?;
         self.file.sync_data().map_err(|error| error.to_string())
     }
 }
@@ -11569,6 +11665,8 @@ fn prepare_vanilla_delegated_resume_journal(
     fingerprint: &Value,
 ) -> std::result::Result<PreparedVanillaDelegatedResume, String> {
     let path = world.join(VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME);
+    let lock_path = world.join(VANILLA_DELEGATED_RESUME_LOCK_FILE_NAME);
+    let _lock = acquire_resume_journal_lock_path(&lock_path)?;
     let mut warnings = Vec::new();
     let loaded = match load_vanilla_delegated_resume_journal(&path, fingerprint) {
         Ok(loaded) => loaded,
@@ -11596,10 +11694,67 @@ fn prepare_vanilla_delegated_resume_journal(
     Ok(PreparedVanillaDelegatedResume {
         fingerprint_matched,
         completed_regions,
-        journal: Arc::new(Mutex::new(VanillaDelegatedResumeJournal { file })),
+        journal: Arc::new(Mutex::new(VanillaDelegatedResumeJournal {
+            file,
+            lock_path,
+        })),
         path,
         warnings,
     })
+}
+
+struct ResumeJournalLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl Drop for ResumeJournalLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_resume_journal_lock_path(path: &Path) -> std::result::Result<ResumeJournalLock, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    for _ in 0..VANILLA_DELEGATED_RESUME_LOCK_ATTEMPTS {
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                writeln!(
+                    file,
+                    "pid={} acquiredAt={:?}",
+                    std::process::id(),
+                    SystemTime::now()
+                )
+                .map_err(|error| error.to_string())?;
+                return Ok(ResumeJournalLock {
+                    path: path.to_path_buf(),
+                    _file: file,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if resume_journal_lock_is_stale(path) {
+                    let _ = fs::remove_file(path);
+                    continue;
+                }
+                std::thread::sleep(VANILLA_DELEGATED_RESUME_LOCK_RETRY_DELAY);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err(format!(
+        "timed out waiting for resume journal lock {}",
+        path.display()
+    ))
+}
+
+fn resume_journal_lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > VANILLA_DELEGATED_RESUME_LOCK_STALE_AFTER)
 }
 
 fn load_vanilla_delegated_resume_journal(
@@ -20950,6 +21105,50 @@ mod tests {
 
         assert_eq!(disabled.worker_autotune, Some(false));
         assert_eq!(enabled.worker_autotune, Some(true));
+    }
+
+    #[test]
+    fn generation_runtime_options_parse_project_grid() {
+        let parsed = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &["projectGrid=-157,-74,314,148".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.project_grid,
+            Some(GenerationProjectGrid {
+                start_region_x: -157,
+                start_region_z: -74,
+                cols: 314,
+                rows: 148
+            })
+        );
+    }
+
+    #[test]
+    fn project_grid_must_contain_generation_grid() {
+        let project = GenerationProjectGrid {
+            start_region_x: -10,
+            start_region_z: 5,
+            cols: 10,
+            rows: 3,
+        };
+        let inside = GenerationProjectGrid {
+            start_region_x: -7,
+            start_region_z: 5,
+            cols: 3,
+            rows: 3,
+        };
+        let outside = GenerationProjectGrid {
+            start_region_x: -11,
+            start_region_z: 5,
+            cols: 3,
+            rows: 3,
+        };
+
+        assert!(validate_project_grid_contains_generation_grid(project, inside).is_ok());
+        assert!(validate_project_grid_contains_generation_grid(project, outside).is_err());
     }
 
     #[test]
