@@ -379,13 +379,7 @@ fn fallback_surface_photo_worker_count(
 }
 
 fn manual_surface_photo_worker_count(requested_threads: usize, submitted_regions: usize) -> usize {
-    let available = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(requested_threads.max(1));
-    requested_threads
-        .min(submitted_regions.max(1))
-        .min(available.max(1))
-        .max(1)
+    requested_threads.min(submitted_regions.max(1)).max(1)
 }
 
 fn surface_photo_worker_autotune_enabled(explicit: Option<bool>) -> bool {
@@ -919,27 +913,19 @@ fn prefetch_consumer_worker_count(
     tuned_worker_count: usize,
     region_count: usize,
 ) -> usize {
-    let available = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(requested_threads.max(1));
-    prefetch_consumer_worker_count_with_available(
+    prefetch_consumer_worker_count_with_requested_cap(
         requested_threads,
         tuned_worker_count,
         region_count,
-        available,
     )
 }
 
-fn prefetch_consumer_worker_count_with_available(
+fn prefetch_consumer_worker_count_with_requested_cap(
     requested_threads: usize,
     tuned_worker_count: usize,
     region_count: usize,
-    available_threads: usize,
 ) -> usize {
-    let cap = requested_threads
-        .max(1)
-        .min(region_count.max(1))
-        .min(available_threads.max(1));
+    let cap = requested_threads.max(1).min(region_count.max(1));
     if cap <= 1 {
         return 1;
     }
@@ -18771,23 +18757,27 @@ mod tests {
     #[test]
     fn prefetch_consumer_workers_do_not_collapse_to_one_when_capacity_exists() {
         assert_eq!(
-            prefetch_consumer_worker_count_with_available(8, 1, 100, 16),
+            prefetch_consumer_worker_count_with_requested_cap(8, 1, 100),
             2
         );
         assert_eq!(
-            prefetch_consumer_worker_count_with_available(8, 2, 100, 16),
+            prefetch_consumer_worker_count_with_requested_cap(8, 2, 100),
             2
         );
         assert_eq!(
-            prefetch_consumer_worker_count_with_available(8, 4, 100, 16),
+            prefetch_consumer_worker_count_with_requested_cap(8, 4, 100),
             4
         );
         assert_eq!(
-            prefetch_consumer_worker_count_with_available(1, 1, 100, 16),
+            prefetch_consumer_worker_count_with_requested_cap(16, 16, 100),
+            16
+        );
+        assert_eq!(
+            prefetch_consumer_worker_count_with_requested_cap(1, 1, 100),
             1
         );
         assert_eq!(
-            prefetch_consumer_worker_count_with_available(8, 1, 1, 16),
+            prefetch_consumer_worker_count_with_requested_cap(8, 1, 1),
             1
         );
     }
@@ -20967,13 +20957,16 @@ mod tests {
         let available = std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(8);
-        let requested_threads = available.max(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT + 1);
-        let expected = requested_threads.min(available).min(100).max(1);
+        let requested_threads = available.max(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT) + 4;
 
-        let tuning =
-            SurfacePhotoWorkerTuning::manual("fallback-disabled", requested_threads, 100, "manual");
+        let tuning = SurfacePhotoWorkerTuning::manual(
+            "fallback-disabled",
+            requested_threads,
+            requested_threads + 10,
+            "manual",
+        );
 
-        assert_eq!(tuning.selected_worker_count, expected);
+        assert_eq!(tuning.selected_worker_count, requested_threads);
         assert_eq!(tuning.mode, "fallback-disabled");
     }
 
