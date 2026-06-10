@@ -240,10 +240,22 @@ struct GenerationOptions {
     rayon_threads: String,
     #[serde(default = "default_worker_tuning_enabled")]
     worker_tuning_enabled: bool,
+    #[serde(default)]
+    prefetch_enabled: bool,
+    #[serde(default = "default_auto_text")]
+    prefetch_memory_gb: String,
+    #[serde(default = "default_auto_text")]
+    prefetch_queue_regions: String,
+    #[serde(default = "default_auto_text")]
+    prefetch_workers: String,
 }
 
 fn default_worker_tuning_enabled() -> bool {
     true
+}
+
+fn default_auto_text() -> String {
+    "auto".to_string()
 }
 
 impl Default for GenerationOptions {
@@ -275,6 +287,10 @@ impl Default for GenerationOptions {
             surface_tile_cache_entries: DEFAULT_SURFACE_TILE_CACHE_ENTRIES.to_string(),
             rayon_threads: String::new(),
             worker_tuning_enabled: default_worker_tuning_enabled(),
+            prefetch_enabled: false,
+            prefetch_memory_gb: default_auto_text(),
+            prefetch_queue_regions: default_auto_text(),
+            prefetch_workers: default_auto_text(),
         }
     }
 }
@@ -321,6 +337,26 @@ impl GenerationOptions {
         }
     }
 
+    fn prefetch_options(&self) -> Vec<String> {
+        if !self.prefetch_enabled {
+            return Vec::new();
+        }
+        let mut options = vec!["prefetch=true".to_string()];
+        let memory = self.prefetch_memory_gb.trim();
+        if !memory.is_empty() && !memory.eq_ignore_ascii_case("auto") {
+            options.push(format!("prefetchMemoryGB={memory}"));
+        }
+        let queue_regions = self.prefetch_queue_regions.trim();
+        if !queue_regions.is_empty() && !queue_regions.eq_ignore_ascii_case("auto") {
+            options.push(format!("prefetchRegions={queue_regions}"));
+        }
+        let workers = self.prefetch_workers.trim();
+        if !workers.is_empty() && !workers.eq_ignore_ascii_case("auto") {
+            options.push(format!("prefetchWorkers={workers}"));
+        }
+        options
+    }
+
     fn resolved_region_grid(&self) -> RegionGrid {
         match self.extent_mode {
             ExtentMode::WholeEarth => {
@@ -363,7 +399,7 @@ impl GenerationOptions {
 
 fn build_generation_args(options: &GenerationOptions) -> Vec<String> {
     let grid = options.resolved_region_grid();
-    vec![
+    let mut args = vec![
         "generate-vanilla-delegated-regions-parallel".to_string(),
         options.heightmap_path.clone(),
         options.world_dir.clone(),
@@ -379,7 +415,9 @@ fn build_generation_args(options: &GenerationOptions) -> Vec<String> {
         options.vertical_scale_option(),
         options.compression_option(),
         format!("workerAutotune={}", options.worker_tuning_enabled),
-    ]
+    ];
+    args.extend(options.prefetch_options());
+    args
 }
 
 fn manual_region_grid(options: &GenerationOptions) -> RegionGrid {
@@ -1259,6 +1297,7 @@ struct ProgressState {
     completed_regions: usize,
     total_regions: usize,
     failed_regions: usize,
+    completed_events: usize,
     last_region: String,
     elapsed_millis: Option<u64>,
     regions_per_hour: Option<f64>,
@@ -1350,7 +1389,12 @@ impl ProgressState {
 
     fn record_completion(&mut self) {
         let now = Instant::now();
+        self.completed_events = self.completed_events.saturating_add(1);
         self.recent_completions.push_back(now);
+        self.refresh_rolling_speed(now);
+    }
+
+    fn refresh_rolling_speed(&mut self, now: Instant) {
         while self
             .recent_completions
             .front()
@@ -1358,13 +1402,14 @@ impl ProgressState {
         {
             self.recent_completions.pop_front();
         }
-        let window_secs = self
-            .recent_completions
-            .front()
-            .map(|instant| now.duration_since(*instant).as_secs_f64().max(1.0))
-            .unwrap_or(1.0);
-        self.rolling_regions_per_hour =
-            Some((self.recent_completions.len() as f64) * 3600.0 / window_secs);
+        if self.recent_completions.is_empty() {
+            self.rolling_regions_per_hour = None;
+        } else {
+            self.rolling_regions_per_hour = Some(
+                (self.recent_completions.len() as f64) * 3600.0
+                    / ROLLING_SPEED_WINDOW.as_secs_f64().max(1.0),
+            );
+        }
     }
 
     fn progress_fraction(&self) -> f32 {
@@ -1699,11 +1744,17 @@ impl EarthMapGuiApp {
         }
     }
 
-    fn live_regions_per_hour(&self) -> f64 {
-        if self.run.is_some() {
+    fn live_regions_per_hour(&mut self) -> f64 {
+        if let Some(run) = &self.run {
+            self.progress.refresh_rolling_speed(Instant::now());
             if let Some(rolling_regions_per_hour) = self.progress.rolling_regions_per_hour {
                 return rolling_regions_per_hour;
             }
+            let elapsed_hours = run.started_at.elapsed().as_secs_f64() / 3600.0;
+            if elapsed_hours > 0.0 && self.progress.completed_events > 0 {
+                return self.progress.completed_events as f64 / elapsed_hours;
+            }
+            return 0.0;
         }
         if let Some(regions_per_hour) = self.progress.regions_per_hour {
             return regions_per_hour;
@@ -1712,7 +1763,7 @@ impl EarthMapGuiApp {
         if elapsed_hours <= 0.0 {
             0.0
         } else {
-            self.progress.completed_regions as f64 / elapsed_hours
+            self.progress.completed_events as f64 / elapsed_hours
         }
     }
 
@@ -1722,12 +1773,11 @@ impl EarthMapGuiApp {
             .saturating_sub(self.progress.completed_regions)
     }
 
-    fn remaining_for_display(&self) -> Option<Duration> {
+    fn remaining_for_display(&self, regions_per_hour: f64) -> Option<Duration> {
         let remaining_regions = self.remaining_regions();
         if remaining_regions == 0 {
             return Some(Duration::ZERO);
         }
-        let regions_per_hour = self.live_regions_per_hour();
         if !regions_per_hour.is_finite() || regions_per_hour <= 0.0 {
             return None;
         }
@@ -2145,6 +2195,22 @@ impl eframe::App for EarthMapGuiApp {
                 ui.small("Leave Rayon threads empty to use the tuned default.");
                 ui.checkbox(&mut self.options.worker_tuning_enabled, "Worker autotune");
                 ui.small("When disabled, Threads is used directly for region workers within safe system limits.");
+                ui.checkbox(&mut self.options.prefetch_enabled, "Surface prefetch");
+                if self.options.prefetch_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Prefetch memory GB");
+                        ui.text_edit_singleline(&mut self.options.prefetch_memory_gb);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Prefetch queue regions");
+                        ui.text_edit_singleline(&mut self.options.prefetch_queue_regions);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Prefetch workers");
+                        ui.text_edit_singleline(&mut self.options.prefetch_workers);
+                    });
+                    ui.small("Use auto for adaptive memory and queue sizing. Whole-Earth runs usually benefit from prefetch.");
+                }
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -2155,19 +2221,17 @@ impl eframe::App for EarthMapGuiApp {
                     self.progress.completed_regions, self.progress.total_regions
                 )),
             );
+            let live_regions_per_hour = self.live_regions_per_hour();
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "Elapsed: {:.1}s",
                     self.elapsed_for_display().as_secs_f64()
                 ));
                 ui.separator();
-                ui.label(format!(
-                    "Speed: {:.2} regions/hour",
-                    self.live_regions_per_hour()
-                ));
+                ui.label(format!("Speed: {:.2} regions/hour", live_regions_per_hour));
                 ui.separator();
                 let remaining = self
-                    .remaining_for_display()
+                    .remaining_for_display(live_regions_per_hour)
                     .map(format_duration_compact)
                     .unwrap_or_else(|| "calculating".to_string());
                 ui.label(format!("Remaining: {remaining}"));
@@ -2205,6 +2269,13 @@ impl eframe::App for EarthMapGuiApp {
             ui.heading("Resolved Command");
             let args = build_generation_args(&self.options);
             ui.monospace(format!("earthmap-rs {}", args.join(" ")));
+            let env_preview = generation_env_preview(&self.options);
+            if !env_preview.is_empty() {
+                ui.heading("Resolved Environment");
+                for (name, value) in env_preview {
+                    ui.monospace(format!("{name}={value}"));
+                }
+            }
             ui.separator();
             ui.heading("Log");
             egui::ScrollArea::vertical()
@@ -2600,6 +2671,29 @@ fn apply_generation_env(command: &mut Command, options: &GenerationOptions) {
     }
 }
 
+fn generation_env_preview(options: &GenerationOptions) -> Vec<(String, String)> {
+    let mut values = Vec::new();
+    if !options.cache_rows.trim().is_empty() {
+        values.push((
+            "EARTHMAP_HEIGHTMAP_CACHE_ROWS".to_string(),
+            options.cache_rows.trim().to_string(),
+        ));
+    }
+    if !options.surface_tile_cache_entries.trim().is_empty() {
+        values.push((
+            "EARTHMAP_SURFACE_TILE_CACHE_ENTRIES".to_string(),
+            options.surface_tile_cache_entries.trim().to_string(),
+        ));
+    }
+    if !options.rayon_threads.trim().is_empty() {
+        values.push((
+            "RAYON_NUM_THREADS".to_string(),
+            options.rayon_threads.trim().to_string(),
+        ));
+    }
+    values
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2645,6 +2739,46 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[14], "workerAutotune=false");
+    }
+
+    #[test]
+    fn generation_args_include_prefetch_options_when_enabled() {
+        let options = GenerationOptions {
+            prefetch_enabled: true,
+            prefetch_memory_gb: "25".to_string(),
+            prefetch_queue_regions: "2".to_string(),
+            prefetch_workers: "1".to_string(),
+            ..GenerationOptions::default()
+        };
+        let args = build_generation_args(&options);
+        assert_eq!(args[15], "prefetch=true");
+        assert_eq!(args[16], "prefetchMemoryGB=25");
+        assert_eq!(args[17], "prefetchRegions=2");
+        assert_eq!(args[18], "prefetchWorkers=1");
+    }
+
+    #[test]
+    fn generation_args_allow_auto_prefetch_without_memory_argument() {
+        let options = GenerationOptions {
+            prefetch_enabled: true,
+            prefetch_memory_gb: "auto".to_string(),
+            prefetch_queue_regions: "auto".to_string(),
+            prefetch_workers: "auto".to_string(),
+            ..GenerationOptions::default()
+        };
+        let args = build_generation_args(&options);
+        assert_eq!(args[15], "prefetch=true");
+        assert_eq!(args.len(), 16);
+    }
+
+    #[test]
+    fn generation_env_preview_includes_rayon_threads() {
+        let options = GenerationOptions {
+            rayon_threads: "13".to_string(),
+            ..GenerationOptions::default()
+        };
+        let env = generation_env_preview(&options);
+        assert!(env.contains(&("RAYON_NUM_THREADS".to_string(), "13".to_string())));
     }
 
     #[test]
@@ -2816,6 +2950,10 @@ generation.verticalScaleMode=auto\n",
             surface_tile_cache_entries: "auto".to_string(),
             rayon_threads: "12".to_string(),
             worker_tuning_enabled: false,
+            prefetch_enabled: true,
+            prefetch_memory_gb: "25".to_string(),
+            prefetch_queue_regions: "2".to_string(),
+            prefetch_workers: "1".to_string(),
         };
 
         let encoded = serde_json::to_string(&options).unwrap();
@@ -2827,6 +2965,10 @@ generation.verticalScaleMode=auto\n",
         assert_eq!(decoded.threads, 10);
         assert_eq!(decoded.rayon_threads, "12");
         assert!(!decoded.worker_tuning_enabled);
+        assert!(decoded.prefetch_enabled);
+        assert_eq!(decoded.prefetch_memory_gb, "25");
+        assert_eq!(decoded.prefetch_queue_regions, "2");
+        assert_eq!(decoded.prefetch_workers, "1");
     }
 
     #[test]
@@ -2858,6 +3000,10 @@ generation.verticalScaleMode=auto\n",
         let decoded: GenerationOptions = serde_json::from_str(json).unwrap();
 
         assert!(decoded.worker_tuning_enabled);
+        assert!(!decoded.prefetch_enabled);
+        assert_eq!(decoded.prefetch_memory_gb, "auto");
+        assert_eq!(decoded.prefetch_queue_regions, "auto");
+        assert_eq!(decoded.prefetch_workers, "auto");
     }
 
     #[test]
@@ -3146,11 +3292,12 @@ generation.verticalScaleMode=auto\n",
         let mut app = EarthMapGuiApp::default();
         app.progress.total_regions = 100;
         app.progress.completed_regions = 25;
+        app.progress.completed_events = 25;
         app.progress.regions_per_hour = Some(75.0);
 
         assert_eq!(app.remaining_regions(), 75);
         assert_eq!(
-            app.remaining_for_display().map(format_duration_compact),
+            app.remaining_for_display(75.0).map(format_duration_compact),
             Some("1h 0m".to_string())
         );
     }
