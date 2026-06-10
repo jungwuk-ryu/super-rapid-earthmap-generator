@@ -3613,6 +3613,7 @@ struct GenerationRuntimeOptions {
     prefetch: GenerationPrefetchOptions,
     worker_autotune: Option<bool>,
     project_grid: Option<GenerationProjectGrid>,
+    remaining_shard: Option<GenerationRemainingShard>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3621,6 +3622,12 @@ struct GenerationProjectGrid {
     start_region_z: i32,
     cols: i32,
     rows: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenerationRemainingShard {
+    index: usize,
+    total: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3771,6 +3778,13 @@ fn parse_generation_runtime_options(
             parsed.project_grid = Some(parse_generation_project_grid_option(value)?);
             continue;
         }
+        if key.eq_ignore_ascii_case("remainingShard")
+            || key.eq_ignore_ascii_case("remainingRegionShard")
+            || key.eq_ignore_ascii_case("missingRegionShard")
+        {
+            parsed.remaining_shard = Some(parse_generation_remaining_shard_option(value)?);
+            continue;
+        }
         if key.eq_ignore_ascii_case("prefetch")
             || key.eq_ignore_ascii_case("surfacePrefetch")
             || key.eq_ignore_ascii_case("evidencePrefetch")
@@ -3848,6 +3862,29 @@ fn parse_generation_project_grid_option(
     })
 }
 
+fn parse_generation_remaining_shard_option(
+    value: &str,
+) -> std::result::Result<GenerationRemainingShard, String> {
+    let separator = if value.contains('/') { '/' } else { ',' };
+    let parts = value
+        .split(separator)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if parts.len() != 2 {
+        return Err("remainingShard must be index/total, for example 1/4".to_string());
+    }
+    let one_based_index = parse_positive_usize_string("remainingShard index", parts[0])?;
+    let total = parse_positive_usize_string("remainingShard total", parts[1])?;
+    if one_based_index > total {
+        return Err("remainingShard index must be <= total".to_string());
+    }
+    Ok(GenerationRemainingShard {
+        index: one_based_index - 1,
+        total,
+    })
+}
+
 fn validate_project_grid_contains_generation_grid(
     project: GenerationProjectGrid,
     generation: GenerationProjectGrid,
@@ -3886,6 +3923,44 @@ fn validate_project_grid_contains_generation_grid(
         ));
     }
     Ok(())
+}
+
+fn build_grid_region_queue(
+    start_region_x: i32,
+    start_region_z: i32,
+    cols: i32,
+    rows: i32,
+) -> VecDeque<(i32, i32)> {
+    let region_count = usize::try_from(cols.saturating_mul(rows)).unwrap_or(0);
+    let mut regions = VecDeque::with_capacity(region_count);
+    for row in 0..rows {
+        for col in 0..cols {
+            regions.push_back((
+                start_region_x.wrapping_add(col),
+                start_region_z.wrapping_add(row),
+            ));
+        }
+    }
+    regions
+}
+
+fn filter_remaining_region_shard(
+    regions: VecDeque<(i32, i32)>,
+    world: &Path,
+    format: OutputFormat,
+    shard: GenerationRemainingShard,
+) -> VecDeque<(i32, i32)> {
+    regions
+        .into_iter()
+        .enumerate()
+        .filter_map(|(grid_index, (region_x, region_z))| {
+            if grid_index % shard.total != shard.index {
+                return None;
+            }
+            (!vanilla_delegated_region_file(world, format, region_x, region_z).is_file())
+                .then_some((region_x, region_z))
+        })
+        .collect()
 }
 
 fn parse_bool_option(name: &str, value: &str) -> std::result::Result<bool, String> {
@@ -4243,7 +4318,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows]"
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N]"
     )?;
     writeln!(
         out,
@@ -4279,7 +4354,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows]"
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N]"
     )?;
     writeln!(
         out,
@@ -9789,6 +9864,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let cache_rows = configured_heightmap_cache_rows(heightmap)?;
     let surface_tile_cache_entries =
         configured_surface_tile_cache_entries(Some(&surface_material_path))?;
+    let mut scheduled_regions = build_grid_region_queue(start_region_x, start_region_z, cols, rows);
+    if let Some(shard) = runtime_options.remaining_shard {
+        scheduled_regions = filter_remaining_region_shard(scheduled_regions, world, format, shard);
+    }
+    let submitted_region_count = scheduled_regions.len();
     let resume_fingerprint = vanilla_delegated_parallel_resume_fingerprint(
         heightmap,
         format,
@@ -9807,9 +9887,10 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     configure_surface_photo_rayon_threads(threads);
     let worker_autotune_enabled =
         surface_photo_worker_autotune_enabled(runtime_options.worker_autotune);
-    let worker_candidate_configs = surface_photo_worker_candidate_configs(threads, region_count);
+    let worker_candidate_configs =
+        surface_photo_worker_candidate_configs(threads, submitted_region_count);
     let worker_tune_sample_target = if worker_autotune_enabled {
-        surface_photo_worker_tune_sample_target(&worker_candidate_configs, region_count)
+        surface_photo_worker_tune_sample_target(&worker_candidate_configs, submitted_region_count)
     } else {
         0
     };
@@ -9820,8 +9901,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "type": "workerTuningStarted",
             "enabled": worker_autotune_enabled,
             "requestedThreads": threads,
-            "submittedRegions": region_count,
-            "candidateWorkerThreads": surface_photo_worker_candidates(threads, region_count),
+            "submittedRegions": submitted_region_count,
+            "candidateWorkerThreads": surface_photo_worker_candidates(threads, submitted_region_count),
             "candidateWorkerConfigs": worker_candidate_configs
                 .into_iter()
                 .map(surface_photo_worker_candidate_config_json)
@@ -9830,24 +9911,44 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "maxSamples": worker_tune_sample_target,
         }),
     )?;
-    let worker_tuning = tune_surface_photo_workers_for_grid(
-        heightmap,
-        world,
-        format,
-        scale,
-        start_region_x,
-        start_region_z,
-        cols,
-        rows,
-        threads,
-        status,
-        vertical_scale,
-        &surface_material_path,
-        cache_rows,
-        surface_tile_cache_entries,
-        runtime_options.compression,
-        runtime_options.worker_autotune,
-    );
+    let scheduled_region_vec = scheduled_regions.iter().copied().collect::<Vec<_>>();
+    let worker_tuning = if runtime_options.remaining_shard.is_some() {
+        tune_surface_photo_workers_for_plan(
+            heightmap,
+            world,
+            format,
+            scale,
+            &scheduled_region_vec,
+            submitted_region_count,
+            threads,
+            status,
+            vertical_scale,
+            &surface_material_path,
+            cache_rows,
+            surface_tile_cache_entries,
+            runtime_options.compression,
+            runtime_options.worker_autotune,
+        )
+    } else {
+        tune_surface_photo_workers_for_grid(
+            heightmap,
+            world,
+            format,
+            scale,
+            start_region_x,
+            start_region_z,
+            cols,
+            rows,
+            threads,
+            status,
+            vertical_scale,
+            &surface_material_path,
+            cache_rows,
+            surface_tile_cache_entries,
+            runtime_options.compression,
+            runtime_options.worker_autotune,
+        )
+    };
     write_progress_event(
         out,
         json!({
@@ -9856,16 +9957,22 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "workerTuning": worker_tuning.to_progress_json(),
         }),
     )?;
-    let worker_count = worker_tuning.selected_worker_count.min(region_count).max(1);
+    let worker_count = worker_tuning
+        .selected_worker_count
+        .min(submitted_region_count)
+        .max(1);
     let rayon_threads = worker_tuning.selected_rayon_threads.max(worker_count);
     let parallel_column_sampling = worker_tuning.parallel_column_sampling;
     let heightmap_cache_rows_per_worker = cache_rows.div_ceil(worker_count).max(1);
     let surface_tile_cache_entries_per_worker =
         surface_tile_cache_entries.div_ceil(worker_count).max(1);
-    let prefetch_config =
-        effective_prefetch_config(runtime_options.prefetch, worker_count, region_count);
+    let prefetch_config = effective_prefetch_config(
+        runtime_options.prefetch,
+        worker_count,
+        submitted_region_count,
+    );
     let prefetch_consumer_workers = if prefetch_config.enabled {
-        prefetch_consumer_worker_count(threads, worker_count, region_count)
+        prefetch_consumer_worker_count(threads, worker_count, submitted_region_count)
     } else {
         worker_count
     };
@@ -9953,7 +10060,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "regionStartZ": start_region_z,
             "regionCols": cols,
             "regionRows": rows,
-            "regionCount": region_count,
+            "regionCount": submitted_region_count,
+            "projectRegionCount": region_count,
             "requestedThreads": threads,
             "workerThreads": worker_count,
             "regionWorkerThreads": worker_count,
@@ -9973,6 +10081,10 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "resumeFingerprintMatched": resume.fingerprint_matched,
             "resumeJournalRegions": resume.completed_regions.len(),
             "resumeJournal": normalized_path_display(&resume.path),
+            "remainingShard": runtime_options.remaining_shard.map(|shard| json!({
+                "index": shard.index + 1,
+                "total": shard.total,
+            })),
         }),
     )?;
     for warning in &resume.warnings {
@@ -9985,17 +10097,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     )
     .map_err(|error| error.to_string())?;
 
-    let mut regions = VecDeque::with_capacity(region_count);
-    for row in 0..rows {
-        for col in 0..cols {
-            regions.push_back((
-                start_region_x.wrapping_add(col),
-                start_region_z.wrapping_add(row),
-            ));
-        }
-    }
-
-    let region_queue = Mutex::new(regions);
+    let region_queue = Mutex::new(scheduled_regions);
     let stop_queueing = AtomicBool::new(false);
     let resume_completed_regions = Arc::new(resume.completed_regions);
     let resume_journal = resume.journal;
@@ -21124,6 +21226,50 @@ mod tests {
                 rows: 148
             })
         );
+    }
+
+    #[test]
+    fn generation_runtime_options_parse_remaining_shard() {
+        let parsed = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &["remainingShard=3/4".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.remaining_shard,
+            Some(GenerationRemainingShard { index: 2, total: 4 })
+        );
+    }
+
+    #[test]
+    fn remaining_region_shard_uses_missing_region_files() {
+        let temp = tempdir().unwrap();
+        let region_dir = temp.path().join("region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        std::fs::write(region_dir.join("r.0.0.linear"), b"done").unwrap();
+        std::fs::write(region_dir.join("r.3.0.linear"), b"done").unwrap();
+        std::fs::write(region_dir.join("r.1.1.linear"), b"done").unwrap();
+        std::fs::write(region_dir.join("r.3.1.linear"), b"done").unwrap();
+
+        let first = filter_remaining_region_shard(
+            build_grid_region_queue(0, 0, 4, 2),
+            temp.path(),
+            OutputFormat::LinearV2,
+            GenerationRemainingShard { index: 0, total: 2 },
+        );
+        let second = filter_remaining_region_shard(
+            build_grid_region_queue(0, 0, 4, 2),
+            temp.path(),
+            OutputFormat::LinearV2,
+            GenerationRemainingShard { index: 1, total: 2 },
+        );
+
+        assert_eq!(
+            first.into_iter().collect::<Vec<_>>(),
+            vec![(2, 0), (0, 1), (2, 1)]
+        );
+        assert_eq!(second.into_iter().collect::<Vec<_>>(), vec![(1, 0)]);
     }
 
     #[test]

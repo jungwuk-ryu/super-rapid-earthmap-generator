@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -449,53 +449,62 @@ fn effective_shard_processes(options: &GenerationOptions) -> usize {
 }
 
 fn effective_shard_processes_for_grid(requested_shards: usize, grid: RegionGrid) -> usize {
-    requested_shards.max(1).min(grid.cols.max(1) as usize)
-}
-
-fn build_shard_region_grids(grid: RegionGrid, requested_shards: usize) -> Vec<RegionGrid> {
-    let shard_count = effective_shard_processes_for_grid(requested_shards, grid);
-    if shard_count <= 1 {
-        return vec![grid];
-    }
-    let total_cols = grid.cols.max(1) as usize;
-    let base_cols = total_cols / shard_count;
-    let extra_cols = total_cols % shard_count;
-    let mut grids = Vec::with_capacity(shard_count);
-    let mut start_region_x = grid.start_region_x;
-    for shard_index in 0..shard_count {
-        let cols = base_cols + usize::from(shard_index < extra_cols);
-        if cols == 0 {
-            continue;
-        }
-        grids.push(RegionGrid {
-            start_region_x,
-            start_region_z: grid.start_region_z,
-            cols: i32::try_from(cols).unwrap_or(i32::MAX),
-            rows: grid.rows.max(1),
-        });
-        start_region_x = start_region_x.saturating_add(i32::try_from(cols).unwrap_or(i32::MAX));
-    }
-    grids
+    let region_count = (grid.cols.max(1) as usize).saturating_mul(grid.rows.max(1) as usize);
+    requested_shards.max(1).min(region_count.max(1))
 }
 
 fn build_generation_commands(options: &GenerationOptions) -> Vec<GenerationCommand> {
     let grid = options.resolved_region_grid();
-    let shards = build_shard_region_grids(grid, options.shard_processes);
-    let total = shards.len();
-    shards
-        .into_iter()
-        .enumerate()
-        .map(|(index, shard_grid)| GenerationCommand {
-            tag: (total > 1).then_some(ProcessTag { index, total }),
-            grid: shard_grid,
+    let remaining_regions = missing_region_files_for_grid(
+        Path::new(options.world_dir.trim()),
+        options.format.region_extension(),
+        grid,
+    );
+    if remaining_regions.is_empty() {
+        return Vec::new();
+    }
+    let total_regions = (grid.cols.max(1) as usize).saturating_mul(grid.rows.max(1) as usize);
+    let requested_shards = effective_shard_processes_for_grid(options.shard_processes, grid);
+    let total = requested_shards.min(remaining_regions.len()).max(1);
+    if total <= 1 && remaining_regions.len() == total_regions {
+        return vec![GenerationCommand {
+            tag: None,
+            grid,
+            args: build_generation_args_for_grid(options, grid),
+        }];
+    }
+    build_remaining_shard_generation_commands(options, grid, total)
+}
+
+fn build_generation_command_preview(options: &GenerationOptions) -> Vec<GenerationCommand> {
+    let grid = options.resolved_region_grid();
+    let requested_shards = effective_shard_processes_for_grid(options.shard_processes, grid);
+    if requested_shards <= 1 {
+        return vec![GenerationCommand {
+            tag: None,
+            grid,
+            args: build_generation_args_for_grid(options, grid),
+        }];
+    }
+    build_remaining_shard_generation_commands(options, grid, requested_shards)
+}
+
+fn build_remaining_shard_generation_commands(
+    options: &GenerationOptions,
+    grid: RegionGrid,
+    total: usize,
+) -> Vec<GenerationCommand> {
+    (0..total)
+        .map(|index| GenerationCommand {
+            tag: Some(ProcessTag { index, total }),
+            grid,
             args: {
-                let mut args = build_generation_args_for_grid(options, shard_grid);
-                if total > 1 {
-                    args.push(format!(
-                        "projectGrid={},{},{},{}",
-                        grid.start_region_x, grid.start_region_z, grid.cols, grid.rows
-                    ));
-                }
+                let mut args = build_generation_args_for_grid(options, grid);
+                args.push(format!(
+                    "projectGrid={},{},{},{}",
+                    grid.start_region_x, grid.start_region_z, grid.cols, grid.rows
+                ));
+                args.push(format!("remainingShard={}/{}", index + 1, total));
                 args
             },
         })
@@ -1081,6 +1090,29 @@ fn scan_existing_region_files(
         .collect()
 }
 
+fn missing_region_files_for_grid(
+    world_dir: &Path,
+    extension: &str,
+    grid: RegionGrid,
+) -> Vec<(i32, i32)> {
+    let existing = scan_existing_region_files(world_dir, extension, grid)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut missing = Vec::new();
+    for row in 0..grid.rows.max(1) {
+        for col in 0..grid.cols.max(1) {
+            let region = (
+                grid.start_region_x.wrapping_add(col),
+                grid.start_region_z.wrapping_add(row),
+            );
+            if !existing.contains(&region) {
+                missing.push(region);
+            }
+        }
+    }
+    missing
+}
+
 fn parse_region_file_name(file_name: &str, extension: &str) -> Option<(i32, i32)> {
     let parts = file_name.split('.').collect::<Vec<_>>();
     if parts.len() != 4 || parts[0] != "r" || !parts[3].eq_ignore_ascii_case(extension) {
@@ -1627,10 +1659,16 @@ impl EarthMapGuiApp {
         self.progress.mark_existing_regions(existing_regions);
         self.map_overlay.status_dirty = true;
         self.log_lines.clear();
+        let commands = build_generation_commands(&self.options);
+        if commands.is_empty() {
+            self.progress.running = false;
+            self.progress.exit_code = Some(0);
+            self.push_log_line("No remaining region files to generate.".to_string());
+            return;
+        }
         let (sender, receiver) = bounded(WORKER_EVENT_CHANNEL_CAPACITY);
         let cancel = Arc::new(AtomicBool::new(false));
         let children = Arc::new(Mutex::new(Vec::new()));
-        let commands = build_generation_commands(&self.options);
         let options = self.options.clone();
         let cancel_for_thread = Arc::clone(&cancel);
         let children_for_thread = Arc::clone(&children);
@@ -2406,7 +2444,7 @@ impl eframe::App for EarthMapGuiApp {
                 ui.separator();
             }
             ui.heading("Resolved Command");
-            let commands = build_generation_commands(&self.options);
+            let commands = build_generation_command_preview(&self.options);
             if commands.len() <= 1 {
                 let args = commands
                     .first()
@@ -3009,8 +3047,10 @@ mod tests {
     }
 
     #[test]
-    fn generation_commands_split_region_grid_into_column_shards() {
+    fn generation_commands_split_missing_regions_into_remaining_shards() {
+        let temp = tempfile::tempdir().unwrap();
         let options = GenerationOptions {
+            world_dir: temp.path().display().to_string(),
             extent_mode: ExtentMode::RegionGrid,
             start_region_x: -10,
             start_region_z: 5,
@@ -3023,67 +3063,71 @@ mod tests {
         let commands = build_generation_commands(&options);
 
         assert_eq!(commands.len(), 4);
-        assert_eq!(
-            commands
-                .iter()
-                .map(|command| command.grid)
-                .collect::<Vec<_>>(),
-            vec![
-                RegionGrid {
-                    start_region_x: -10,
-                    start_region_z: 5,
-                    cols: 3,
-                    rows: 3
-                },
-                RegionGrid {
-                    start_region_x: -7,
-                    start_region_z: 5,
-                    cols: 3,
-                    rows: 3
-                },
-                RegionGrid {
-                    start_region_x: -4,
-                    start_region_z: 5,
-                    cols: 2,
-                    rows: 3
-                },
-                RegionGrid {
-                    start_region_x: -2,
-                    start_region_z: 5,
-                    cols: 2,
-                    rows: 3
-                },
-            ]
-        );
+        assert!(commands.iter().all(|command| command.grid
+            == RegionGrid {
+                start_region_x: -10,
+                start_region_z: 5,
+                cols: 10,
+                rows: 3
+            }));
         assert_eq!(commands[0].args[4], "-10");
-        assert_eq!(commands[0].args[6], "3");
-        assert_eq!(commands[3].args[4], "-2");
-        assert_eq!(commands[3].args[6], "2");
+        assert_eq!(commands[0].args[6], "10");
+        assert_eq!(commands[3].args[4], "-10");
+        assert_eq!(commands[3].args[6], "10");
         assert!(commands[0]
             .args
             .contains(&"projectGrid=-10,5,10,3".to_string()));
+        assert!(commands[0].args.contains(&"remainingShard=1/4".to_string()));
         assert!(commands[3]
             .args
             .contains(&"projectGrid=-10,5,10,3".to_string()));
+        assert!(commands[3].args.contains(&"remainingShard=4/4".to_string()));
     }
 
     #[test]
-    fn generation_commands_cap_shards_to_region_columns() {
+    fn generation_commands_cap_shards_to_remaining_regions() {
+        let temp = tempfile::tempdir().unwrap();
+        let region_dir = temp.path().join("region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        std::fs::write(region_dir.join("r.3.4.linear"), b"done").unwrap();
         let options = GenerationOptions {
+            world_dir: temp.path().display().to_string(),
             extent_mode: ExtentMode::RegionGrid,
             start_region_x: 3,
             start_region_z: 4,
             cols: 2,
-            rows: 8,
+            rows: 1,
             shard_processes: 8,
             ..GenerationOptions::default()
         };
 
         let commands = build_generation_commands(&options);
 
-        assert_eq!(commands.len(), 2);
-        assert_eq!(commands[0].grid.cols, 1);
-        assert_eq!(commands[1].grid.cols, 1);
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].args.contains(&"remainingShard=1/1".to_string()));
+    }
+
+    #[test]
+    fn generation_commands_return_empty_when_all_regions_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let region_dir = temp.path().join("region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        std::fs::write(region_dir.join("r.3.4.linear"), b"done").unwrap();
+        std::fs::write(region_dir.join("r.4.4.linear"), b"done").unwrap();
+        let options = GenerationOptions {
+            world_dir: temp.path().display().to_string(),
+            extent_mode: ExtentMode::RegionGrid,
+            start_region_x: 3,
+            start_region_z: 4,
+            cols: 2,
+            rows: 1,
+            shard_processes: 8,
+            ..GenerationOptions::default()
+        };
+
+        let commands = build_generation_commands(&options);
+
+        assert!(commands.is_empty());
     }
 
     #[test]
