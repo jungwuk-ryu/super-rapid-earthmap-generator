@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::too_many_arguments)]
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -52,6 +53,8 @@ use earthmap_surface::{
 };
 use serde_json::{json, Value};
 
+mod usage;
+
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const HEIGHTMAP_PATH_ENV: &str = "EARTHMAP_HEIGHTMAP";
@@ -87,9 +90,11 @@ const SURFACE_PHOTO_AUTOTUNE_MIN_REGIONS: usize = 8;
 const SURFACE_PHOTO_AUTOTUNE_SAMPLES_PER_MAX_WORKER: usize = 2;
 const SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLE_LIMIT: usize = 32;
 const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
+const SURFACE_PHOTO_AUTOTUNE_CONFIRMATION_CANDIDATES: usize = 3;
 const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
 const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
+const DEFAULT_MAX_SUBMITTED_REGIONS: usize = 100_000;
 const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
 const SURFACE_SAMPLING_PROFILE_VERSION: &str = "bilinear-bathymetry-detail-coast-v1";
@@ -98,6 +103,7 @@ const VANILLA_DELEGATED_RESUME_LOCK_FILE_NAME: &str = "earthmap-vanilla-delegate
 const VANILLA_DELEGATED_RESUME_LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
 const VANILLA_DELEGATED_RESUME_LOCK_RETRY_DELAY: Duration = Duration::from_millis(50);
 const VANILLA_DELEGATED_RESUME_LOCK_ATTEMPTS: usize = 600;
+const RESUME_JOURNAL_SYNC_INTERVAL_REGIONS: usize = 16;
 const PARALLEL_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const TOPDOWN_REGION_SIZE_BLOCKS: usize = 512;
 const TOPDOWN_AIR_BLOCK: &str = "minecraft:air";
@@ -378,8 +384,7 @@ fn fallback_surface_photo_worker_count(
     requested_threads
         .min(submitted_regions.max(1))
         .min(available.max(1))
-        .min(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
-        .max(1)
+        .clamp(1, SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
 }
 
 fn manual_surface_photo_worker_count(requested_threads: usize, submitted_regions: usize) -> usize {
@@ -408,8 +413,7 @@ fn surface_photo_worker_candidates(
     let max_workers = requested_threads.min(submitted_regions.max(1)).max(1);
     let legacy = requested_threads
         .min(submitted_regions.max(1))
-        .min(SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT)
-        .max(1);
+        .clamp(1, SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT);
     let mut candidates = Vec::new();
     for worker_count in [1, 2, legacy, max_workers] {
         let worker_count = worker_count.min(max_workers).max(1);
@@ -466,8 +470,7 @@ fn surface_photo_worker_tune_sample_target(
         .unwrap_or(1);
     max_worker_count
         .saturating_mul(SURFACE_PHOTO_AUTOTUNE_SAMPLES_PER_MAX_WORKER)
-        .max(3)
-        .min(SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLE_LIMIT)
+        .clamp(3, SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLE_LIMIT)
         .min(submitted_regions.max(1))
 }
 
@@ -494,6 +497,38 @@ fn select_surface_photo_worker_candidate(
         .filter(|candidate| candidate.millis_per_region() <= best_score * noise_ratio)
         .map(SurfacePhotoWorkerCandidateResult::config)
         .min_by_key(|config| config.resource_rank())
+}
+
+fn surface_photo_worker_confirmation_candidates(
+    initial_results: &[SurfacePhotoWorkerCandidateResult],
+    initial_selected: SurfacePhotoWorkerCandidateConfig,
+) -> Vec<SurfacePhotoWorkerCandidateConfig> {
+    let mut ranked = initial_results
+        .iter()
+        .filter(|candidate| candidate.millis_per_region().is_finite())
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.millis_per_region()
+            .partial_cmp(&right.millis_per_region())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.config()
+                    .resource_rank()
+                    .cmp(&right.config().resource_rank())
+            })
+    });
+    let mut configs = vec![initial_selected];
+    for result in ranked {
+        let config = result.config();
+        if !configs.contains(&config) {
+            configs.push(config);
+        }
+        if configs.len() >= SURFACE_PHOTO_AUTOTUNE_CONFIRMATION_CANDIDATES {
+            break;
+        }
+    }
+    configs.reverse();
+    configs
 }
 
 fn tune_surface_photo_workers_for_grid(
@@ -726,7 +761,6 @@ fn tune_surface_photo_workers_from_regions(
             }
         }
     }
-    let _ = fs::remove_dir_all(&tune_root);
     let initial_selected =
         select_surface_photo_worker_candidate(&results, SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO)
             .unwrap_or_else(|| {
@@ -736,8 +770,52 @@ fn tune_surface_photo_workers_from_regions(
                     true,
                 )
             });
-    let selected_config = initial_selected;
-    let confirmation_candidates = Vec::new();
+    let confirmation_configs =
+        surface_photo_worker_confirmation_candidates(&results, initial_selected);
+    let mut confirmation_candidates = Vec::with_capacity(confirmation_configs.len());
+    for candidate in confirmation_configs {
+        let candidate_dir = tune_root.join(format!(
+            "confirm-workers-{}-rayon-{}-columns-{}",
+            candidate.worker_count,
+            candidate.rayon_threads,
+            if candidate.parallel_column_sampling {
+                "parallel"
+            } else {
+                "serial"
+            }
+        ));
+        match benchmark_surface_photo_worker_candidate(
+            heightmap,
+            &candidate_dir,
+            format,
+            scale,
+            &samples,
+            candidate,
+            status,
+            vertical_scale,
+            surface_material_path,
+            cache_rows,
+            surface_tile_cache_entries,
+            compression_options,
+        ) {
+            Ok(result) => confirmation_candidates.push(result),
+            Err(error) => {
+                let _ = fs::remove_dir_all(&tune_root);
+                return SurfacePhotoWorkerTuning::fallback(
+                    "fallback-confirmation-error",
+                    requested_threads,
+                    submitted_regions,
+                    error,
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&tune_root);
+    let selected_config = select_surface_photo_worker_candidate(
+        &confirmation_candidates,
+        SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO,
+    )
+    .unwrap_or(initial_selected);
     SurfacePhotoWorkerTuning {
         mode: "autotuned",
         requested_threads,
@@ -1907,6 +1985,9 @@ where
             write_region_writer_parity_fixtures(stdout, stderr, &args[1]),
         ),
         command => {
+            if let Some(message) = usage::known_command_usage_error(command, args.len()) {
+                return write_result(print_usage_error(stderr, message));
+            }
             if let Some(spec) = commands::find_initial_command(command) {
                 if spec.status == CommandStatus::NotPortedYet {
                     return write_result(print_not_implemented(stderr, spec.name));
@@ -3575,17 +3656,12 @@ struct RegionCompressionOptions {
     linear_compression_level: Option<i32>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum VerticalScaleOption {
+    #[default]
     Auto,
     Legacy,
     Explicit(f64),
-}
-
-impl Default for VerticalScaleOption {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 impl VerticalScaleOption {
@@ -3614,6 +3690,7 @@ struct GenerationRuntimeOptions {
     worker_autotune: Option<bool>,
     project_grid: Option<GenerationProjectGrid>,
     remaining_shard: Option<GenerationRemainingShard>,
+    max_submitted_regions: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3838,6 +3915,14 @@ fn parse_generation_runtime_options(
             parsed.worker_autotune = Some(parse_bool_option("workerAutotune", value)?);
             continue;
         }
+        if key.eq_ignore_ascii_case("maxSubmittedRegions")
+            || key.eq_ignore_ascii_case("maxRegions")
+            || key.eq_ignore_ascii_case("regionLimit")
+        {
+            parsed.max_submitted_regions =
+                Some(parse_positive_usize_string("maxSubmittedRegions", value)?);
+            continue;
+        }
         return Err(format!("unknown generation option: {key}"));
     }
     Ok(parsed)
@@ -3930,18 +4015,40 @@ fn build_grid_region_queue(
     start_region_z: i32,
     cols: i32,
     rows: i32,
-) -> VecDeque<(i32, i32)> {
-    let region_count = usize::try_from(cols.saturating_mul(rows)).unwrap_or(0);
+) -> std::result::Result<VecDeque<(i32, i32)>, String> {
+    let region_count = checked_grid_region_count(cols, rows)?;
     let mut regions = VecDeque::with_capacity(region_count);
     for row in 0..rows {
+        let region_z = start_region_z
+            .checked_add(row)
+            .ok_or_else(|| "region grid Z coordinate overflow".to_string())?;
         for col in 0..cols {
-            regions.push_back((
-                start_region_x.wrapping_add(col),
-                start_region_z.wrapping_add(row),
-            ));
+            let region_x = start_region_x
+                .checked_add(col)
+                .ok_or_else(|| "region grid X coordinate overflow".to_string())?;
+            regions.push_back((region_x, region_z));
         }
     }
-    regions
+    Ok(regions)
+}
+
+fn checked_grid_region_count(cols: i32, rows: i32) -> std::result::Result<usize, String> {
+    let count = cols
+        .checked_mul(rows)
+        .ok_or_else(|| "region grid size overflow".to_string())?;
+    usize::try_from(count).map_err(|_| "region grid size overflow".to_string())
+}
+
+fn validate_submitted_region_limit(
+    region_count: usize,
+    max_submitted_regions: usize,
+) -> std::result::Result<(), String> {
+    if region_count > max_submitted_regions {
+        return Err(format!(
+            "region grid submits {region_count} regions, which exceeds maxSubmittedRegions={max_submitted_regions}; pass maxSubmittedRegions=N explicitly to raise this limit"
+        ));
+    }
+    Ok(())
 }
 
 fn filter_remaining_region_shard(
@@ -4318,7 +4425,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N]"
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N] [maxSubmittedRegions=N]"
     )?;
     writeln!(
         out,
@@ -4354,7 +4461,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N]"
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N] [maxSubmittedRegions=N]"
     )?;
     writeln!(
         out,
@@ -7797,11 +7904,8 @@ fn raster_smoke_impl(
             .any(|needle| column.biome_id.contains(needle));
         let top_ok = case
             .expected_top_blocks
-            .iter()
-            .any(|&top| top == column.top_block_state_id);
-        let elevation_ok = case
-            .min_elevation_meters
-            .map_or(true, |min| elevation >= min);
+            .contains(&column.top_block_state_id);
+        let elevation_ok = case.min_elevation_meters.is_none_or(|min| elevation >= min);
         let valid = column.water == case.expected_water
             && biome_ok
             && top_ok
@@ -9848,11 +9952,13 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let project_grid = runtime_options.project_grid.unwrap_or(generation_grid);
     validate_project_grid_contains_generation_grid(project_grid, generation_grid)?;
     let threads = parse_positive_usize_string("threads", threads_text)?;
-    let region_count = usize::try_from(
-        cols.checked_mul(rows)
-            .ok_or_else(|| "region grid size overflow".to_string())?,
-    )
-    .map_err(|_| "region grid size overflow".to_string())?;
+    let region_count = checked_grid_region_count(cols, rows)?;
+    validate_submitted_region_limit(
+        region_count,
+        runtime_options
+            .max_submitted_regions
+            .unwrap_or(DEFAULT_MAX_SUBMITTED_REGIONS),
+    )?;
 
     let heightmap = Path::new(heightmap_path);
     let world = Path::new(world_dir);
@@ -9864,7 +9970,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     let cache_rows = configured_heightmap_cache_rows(heightmap)?;
     let surface_tile_cache_entries =
         configured_surface_tile_cache_entries(Some(&surface_material_path))?;
-    let mut scheduled_regions = build_grid_region_queue(start_region_x, start_region_z, cols, rows);
+    let mut scheduled_regions =
+        build_grid_region_queue(start_region_x, start_region_z, cols, rows)?;
     if let Some(shard) = runtime_options.remaining_shard {
         scheduled_regions = filter_remaining_region_shard(scheduled_regions, world, format, shard);
     }
@@ -10043,6 +10150,18 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     };
     let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
     let stale_temp_files = cleanup_stale_region_temp_files(&world.join("region"));
+    let mut resume_completed_region_set = resume.completed_regions;
+    let resume_reconciled_regions = if resume.fingerprint_matched {
+        reconcile_resume_completed_regions_with_valid_files(
+            world,
+            format,
+            scheduled_regions.iter().copied(),
+            &mut resume_completed_region_set,
+            &resume.journal,
+        )?
+    } else {
+        0
+    };
     let setup_millis = setup_start.elapsed().as_millis();
 
     write_progress_event(
@@ -10079,7 +10198,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "prefetchOpenOceanOutputRayonThreads": prefetch_open_ocean_output_rayon_threads,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
-            "resumeJournalRegions": resume.completed_regions.len(),
+            "resumeJournalRegions": resume_completed_region_set.len(),
+            "resumeReconciledRegions": resume_reconciled_regions,
             "resumeJournal": normalized_path_display(&resume.path),
             "remainingShard": runtime_options.remaining_shard.map(|shard| json!({
                 "index": shard.index + 1,
@@ -10099,7 +10219,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
 
     let region_queue = Mutex::new(scheduled_regions);
     let stop_queueing = AtomicBool::new(false);
-    let resume_completed_regions = Arc::new(resume.completed_regions);
+    let resume_completed_regions = Arc::new(resume_completed_region_set);
     let resume_journal = resume.journal;
     let (event_sender, event_receiver) =
         mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
@@ -10125,16 +10245,26 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                     let producer_heightmap_reader =
                         match GeoTiffHeightmapReader::open(heightmap_path) {
                             Ok(reader) => reader,
-                            Err(_) => {
-                                stop_queueing.store(true, Ordering::SeqCst);
+                            Err(error) => {
+                                send_worker_setup_failed(
+                                    &sender,
+                                    stop_queueing,
+                                    "prefetchProducer",
+                                    format!("failed to open heightmap: {error}"),
+                                );
                                 return;
                             }
                         };
                     let producer_heightmap_mapping =
                         match mapping_for(producer_heightmap_reader.metadata(), scale) {
                             Ok(mapping) => mapping,
-                            Err(_) => {
-                                stop_queueing.store(true, Ordering::SeqCst);
+                            Err(error) => {
+                                send_worker_setup_failed(
+                                    &sender,
+                                    stop_queueing,
+                                    "prefetchProducer",
+                                    format!("failed to create heightmap mapping: {error}"),
+                                );
                                 return;
                             }
                         };
@@ -10143,8 +10273,13 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                         prefetch_heightmap_cache_rows_per_worker,
                     ) {
                         Ok(cache) => cache,
-                        Err(_) => {
-                            stop_queueing.store(true, Ordering::SeqCst);
+                        Err(error) => {
+                            send_worker_setup_failed(
+                                &sender,
+                                stop_queueing,
+                                "prefetchProducer",
+                                format!("failed to create heightmap cache: {error}"),
+                            );
                             return;
                         }
                     };
@@ -10154,8 +10289,13 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                             prefetch_surface_tile_cache_entries_per_worker,
                         ) {
                             Ok(sampler) => sampler,
-                            Err(_) => {
-                                stop_queueing.store(true, Ordering::SeqCst);
+                            Err(error) => {
+                                send_worker_setup_failed(
+                                    &sender,
+                                    stop_queueing,
+                                    "prefetchProducer",
+                                    format!("failed to open surface material sampler: {error}"),
+                                );
                                 return;
                             }
                         };
@@ -10393,7 +10533,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                 .send(VanillaDelegatedParallelEvent::RegionGenerated {
                                     elapsed_millis: started_at.elapsed().as_millis(),
                                     output_bytes,
-                                    report,
+                                    report: Box::new(report),
                                     prefetch_timing: Some(prefetch_timing),
                                 })
                                 .is_err()
@@ -10435,9 +10575,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                 generation_pool.scope(|rayon_scope| {
                     for _ in 0..worker_count {
                         let queue = region_queue;
-                        let stop_queueing = stop_queueing;
-                        let surface_material_path = surface_material_path;
-                        let completed_regions = Arc::clone(&resume_completed_regions);
+                        let completed_regions = Arc::clone(resume_completed_regions);
                         let journal = Arc::clone(resume_journal);
                         let sender = coordinator_sender.clone();
                         let fingerprint_matched = resume.fingerprint_matched;
@@ -10445,16 +10583,26 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                             let worker_heightmap_reader =
                                 match GeoTiffHeightmapReader::open(heightmap_path) {
                                     Ok(reader) => reader,
-                                    Err(_) => {
-                                        stop_queueing.store(true, Ordering::SeqCst);
+                                    Err(error) => {
+                                        send_worker_setup_failed(
+                                            &sender,
+                                            stop_queueing,
+                                            "regionWorker",
+                                            format!("failed to open heightmap: {error}"),
+                                        );
                                         return;
                                     }
                                 };
                             let worker_heightmap_mapping =
                                 match mapping_for(worker_heightmap_reader.metadata(), scale) {
                                     Ok(mapping) => mapping,
-                                    Err(_) => {
-                                        stop_queueing.store(true, Ordering::SeqCst);
+                                    Err(error) => {
+                                        send_worker_setup_failed(
+                                            &sender,
+                                            stop_queueing,
+                                            "regionWorker",
+                                            format!("failed to create heightmap mapping: {error}"),
+                                        );
                                         return;
                                     }
                                 };
@@ -10463,8 +10611,13 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                 heightmap_cache_rows_per_worker,
                             ) {
                                 Ok(cache) => cache,
-                                Err(_) => {
-                                    stop_queueing.store(true, Ordering::SeqCst);
+                                Err(error) => {
+                                    send_worker_setup_failed(
+                                        &sender,
+                                        stop_queueing,
+                                        "regionWorker",
+                                        format!("failed to create heightmap cache: {error}"),
+                                    );
                                     return;
                                 }
                             };
@@ -10474,8 +10627,15 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                     surface_tile_cache_entries_per_worker,
                                 ) {
                                     Ok(sampler) => sampler,
-                                    Err(_) => {
-                                        stop_queueing.store(true, Ordering::SeqCst);
+                                    Err(error) => {
+                                        send_worker_setup_failed(
+                                            &sender,
+                                            stop_queueing,
+                                            "regionWorker",
+                                            format!(
+                                                "failed to open surface material sampler: {error}"
+                                            ),
+                                        );
                                         return;
                                     }
                                 };
@@ -10608,7 +10768,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
                                             .send(VanillaDelegatedParallelEvent::RegionGenerated {
                                                 elapsed_millis: region_start.elapsed().as_millis(),
                                                 output_bytes,
-                                                report,
+                                                report: Box::new(report),
                                                 prefetch_timing: None,
                                             })
                                             .is_err()
@@ -10645,9 +10805,11 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             Ok::<(), String>(())
         })?;
     }
-    if let Ok(journal) = resume_journal.lock() {
+    if let Ok(mut journal) = resume_journal.lock() {
         journal.sync()?;
     }
+    let unaccounted_regions =
+        record_vanilla_delegated_unaccounted_regions(&mut stats, submitted_region_count);
     let elapsed_millis = total_start.elapsed().as_millis();
     let generated_regions_per_hour = if elapsed_millis == 0 {
         0.0
@@ -10660,17 +10822,25 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     } else {
         (completed_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
     };
+    let accounted_regions = stats.accounted_regions();
+    let all_done = stats.failed_regions == 0
+        && stats.batch_failures == 0
+        && accounted_regions == submitted_region_count;
     write_progress_event(
         out,
         json!({
             "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
             "type": "batchSummary",
             "elapsedMillis": u128_to_u64(elapsed_millis),
+            "submittedRegions": submitted_region_count,
             "generatedRegions": stats.generated_regions,
             "skippedRegions": stats.skipped_regions,
             "completedRegions": completed_regions,
             "failedRegions": stats.failed_regions,
-            "allDone": stats.failed_regions == 0,
+            "batchFailures": stats.batch_failures,
+            "accountedRegions": accounted_regions,
+            "unaccountedRegions": unaccounted_regions,
+            "allDone": all_done,
             "generatedRegionsPerHour": generated_regions_per_hour,
             "completedRegionsPerHour": completed_regions_per_hour,
         }),
@@ -10736,6 +10906,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("resumeJournal={}", resume.path.display()),
         format!("resumeFingerprintMatched={}", resume.fingerprint_matched),
         format!("resumeJournalRegions={}", resume_completed_regions.len()),
+        format!("resumeReconciledRegions={resume_reconciled_regions}"),
         format!("staleTempRegionFilesRemoved={stale_temp_files}"),
         format!("setupMillis={setup_millis}"),
         format!(
@@ -10767,9 +10938,12 @@ fn generate_vanilla_delegated_regions_parallel_impl(
         format!("skippedRegions={}", stats.skipped_regions),
         format!("completedRegions={completed_regions}"),
         format!("failedRegions={}", stats.failed_regions),
+        format!("batchFailures={}", stats.batch_failures),
+        format!("accountedRegions={accounted_regions}"),
+        format!("unaccountedRegions={unaccounted_regions}"),
         format!("generatedRegionsPerHour={generated_regions_per_hour:.2}"),
         format!("completedRegionsPerHour={completed_regions_per_hour:.2}"),
-        format!("allDone={}", stats.failed_regions == 0),
+        format!("allDone={all_done}"),
         format!("manifestFile={}", manifest_file.display()),
     ];
     for line in lines {
@@ -10931,6 +11105,9 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         .max(1);
     let rayon_threads = worker_tuning.selected_rayon_threads.max(worker_count);
     let parallel_column_sampling = worker_tuning.parallel_column_sampling;
+    let heightmap_cache_rows_per_worker = cache_rows.div_ceil(worker_count).max(1);
+    let surface_tile_cache_entries_per_worker =
+        surface_tile_cache_entries.div_ceil(worker_count).max(1);
 
     let setup_start = Instant::now();
     std::fs::create_dir_all(world.join("region")).map_err(|error| error.to_string())?;
@@ -10969,11 +11146,23 @@ fn generate_vanilla_delegated_plan_parallel_impl(
     .map_err(|error| error.to_string())?;
     let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
     let stale_temp_files = cleanup_stale_region_temp_files(&world.join("region"));
-    let surface_material_sampler = EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
-        &surface_material_path,
-        surface_tile_cache_entries,
-    )
-    .map_err(|error| error.to_string())?;
+    let submitted_plan_regions = plan_regions
+        .iter()
+        .take(submitted_regions)
+        .copied()
+        .collect::<VecDeque<_>>();
+    let mut resume_completed_region_set = resume.completed_regions;
+    let resume_reconciled_regions = if resume.fingerprint_matched {
+        reconcile_resume_completed_regions_with_valid_files(
+            world,
+            format,
+            submitted_plan_regions.iter().copied(),
+            &mut resume_completed_region_set,
+            &resume.journal,
+        )?
+    } else {
+        0
+    };
     let setup_millis = setup_start.elapsed().as_millis();
 
     write_progress_event(
@@ -10996,10 +11185,13 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "regionWorkerThreads": worker_count,
             "rayonThreads": rayon_threads,
             "parallelColumnSampling": parallel_column_sampling,
+            "heightmapCacheRowsPerWorker": heightmap_cache_rows_per_worker,
+            "surfaceTileCacheEntriesPerWorker": surface_tile_cache_entries_per_worker,
             "workerAutotuneEnabled": worker_autotune_enabled,
             "workerTuning": worker_tuning.to_progress_json(),
             "resumeFingerprintMatched": resume.fingerprint_matched,
-            "resumeJournalRegions": resume.completed_regions.len(),
+            "resumeJournalRegions": resume_completed_region_set.len(),
+            "resumeReconciledRegions": resume_reconciled_regions,
             "resumeJournal": normalized_path_display(&resume.path),
         }),
     )?;
@@ -11013,14 +11205,9 @@ fn generate_vanilla_delegated_plan_parallel_impl(
     )
     .map_err(|error| error.to_string())?;
 
-    let regions = plan_regions
-        .iter()
-        .take(submitted_regions)
-        .copied()
-        .collect::<VecDeque<_>>();
-    let region_queue = Mutex::new(regions);
+    let region_queue = Mutex::new(submitted_plan_regions);
     let stop_queueing = AtomicBool::new(false);
-    let resume_completed_regions = Arc::new(resume.completed_regions);
+    let resume_completed_regions = Arc::new(resume_completed_region_set);
     let resume_journal = resume.journal;
     let (event_sender, event_receiver) =
         mpsc::sync_channel::<VanillaDelegatedParallelEvent>(PARALLEL_EVENT_CHANNEL_CAPACITY);
@@ -11031,7 +11218,6 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         let generation_pool = &generation_pool;
         let region_queue = &region_queue;
         let stop_queueing = &stop_queueing;
-        let surface_material_sampler = &surface_material_sampler;
         let surface_material_path = &surface_material_path;
         let resume_completed_regions = &resume_completed_regions;
         let resume_journal = &resume_journal;
@@ -11039,138 +11225,213 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             generation_pool.scope(|rayon_scope| {
                 for _ in 0..worker_count {
                     let queue = region_queue;
-                    let stop_queueing = stop_queueing;
-                    let surface_material_sampler = surface_material_sampler;
-                    let surface_material_path = surface_material_path;
-                    let completed_regions = Arc::clone(&resume_completed_regions);
+                    let completed_regions = Arc::clone(resume_completed_regions);
                     let journal = Arc::clone(resume_journal);
                     let sender = coordinator_sender.clone();
                     let fingerprint_matched = resume.fingerprint_matched;
-                    rayon_scope.spawn(move |_| loop {
-                        if stop_queueing.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let next_region = {
-                            let mut queue = queue.lock().expect("queue lock");
-                            if stop_queueing.load(Ordering::SeqCst) {
-                                None
-                            } else {
-                                queue.pop_front()
+                    rayon_scope.spawn(move |_| {
+                        let worker_heightmap_reader =
+                            match GeoTiffHeightmapReader::open(heightmap_path) {
+                                Ok(reader) => reader,
+                                Err(error) => {
+                                    send_worker_setup_failed(
+                                        &sender,
+                                        stop_queueing,
+                                        "planWorker",
+                                        format!("failed to open heightmap: {error}"),
+                                    );
+                                    return;
+                                }
+                            };
+                        let worker_heightmap_mapping =
+                            match mapping_for(worker_heightmap_reader.metadata(), scale) {
+                                Ok(mapping) => mapping,
+                                Err(error) => {
+                                    send_worker_setup_failed(
+                                        &sender,
+                                        stop_queueing,
+                                        "planWorker",
+                                        format!("failed to create heightmap mapping: {error}"),
+                                    );
+                                    return;
+                                }
+                            };
+                        let worker_heightmap_cache = match GeoTiffRowCache::new(
+                            &worker_heightmap_reader,
+                            heightmap_cache_rows_per_worker,
+                        ) {
+                            Ok(cache) => cache,
+                            Err(error) => {
+                                send_worker_setup_failed(
+                                    &sender,
+                                    stop_queueing,
+                                    "planWorker",
+                                    format!("failed to create heightmap cache: {error}"),
+                                );
+                                return;
                             }
                         };
-                        let Some((region_x, region_z)) = next_region else {
-                            break;
-                        };
-                        let region_file =
-                            vanilla_delegated_region_file(world, format, region_x, region_z);
-                        if fingerprint_matched && completed_regions.contains(&(region_x, region_z))
-                        {
-                            let skip_start = Instant::now();
-                            if let Ok(validation) = validate_region_file_for_resume(
-                                &region_file,
-                                region_format_for_output(format),
-                                region_x,
-                                region_z,
-                                REGION_CHUNKS_PER_REGION,
+                        let worker_surface_material_sampler =
+                            match EarthDataSurfaceMaterialSampler::open_with_tile_cache_entries(
+                                surface_material_path,
+                                surface_tile_cache_entries_per_worker,
                             ) {
-                                if sender
-                                    .send(VanillaDelegatedParallelEvent::RegionSkipped {
-                                        region_x,
-                                        region_z,
-                                        elapsed_millis: skip_start.elapsed().as_millis(),
-                                        chunks: validation.chunk_count,
-                                        output_bytes: validation.file_bytes,
-                                        region_file,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
+                                Ok(sampler) => sampler,
+                                Err(error) => {
+                                    send_worker_setup_failed(
+                                        &sender,
+                                        stop_queueing,
+                                        "planWorker",
+                                        format!("failed to open surface material sampler: {error}"),
+                                    );
+                                    return;
                                 }
-                                continue;
+                            };
+                        let heightmap_sampler = HeightmapScalarSampler::with_row_cache(
+                            &worker_heightmap_reader,
+                            &worker_heightmap_cache,
+                        );
+                        loop {
+                            if stop_queueing.load(Ordering::SeqCst) {
+                                break;
                             }
-                        }
-                        if sender
-                            .send(VanillaDelegatedParallelEvent::RegionStarted {
-                                region_x,
-                                region_z,
-                                region_file: region_file.clone(),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        };
-                        let region_start = Instant::now();
-                        let result = (|| -> std::result::Result<SurfaceRegionReport, String> {
-                            let mut settings = SurfaceRegionSettings::new_with_texture_options(
-                                heightmap_path,
-                                world_dir,
-                                "SR EarthMap Vanilla Delegated Plan",
-                                0,
-                                scale,
-                                region_x,
-                                region_z,
-                                format,
-                                cache_rows,
-                                false,
-                                status,
-                                vertical_scale,
-                                SurfaceTextureMode::Photo,
-                            )
-                            .map_err(|error| error.to_string())?;
-                            settings.surface_material_path = Some((*surface_material_path).clone());
-                            settings.surface_tile_cache_entries = surface_tile_cache_entries;
-                            settings.parallel_column_sampling = parallel_column_sampling;
-                            apply_region_compression_options(
-                                &mut settings,
-                                runtime_options.compression,
-                            );
-                            let report = generate_surface_region_with_open_material_sampler(
-                                &settings,
-                                Some(surface_material_sampler),
-                            )
-                            .map_err(|error| error.to_string())?;
-                            let output_bytes = std::fs::metadata(&report.region_file)
-                                .map(|metadata| metadata.len())
-                                .unwrap_or(0);
-                            journal
-                                .lock()
-                                .map_err(|_| "resume journal lock poisoned".to_string())?
-                                .append_region_complete(
-                                    report.region_x,
-                                    report.region_z,
-                                    format,
-                                    report.chunk_count,
-                                    output_bytes,
-                                )?;
-                            Ok(report)
-                        })();
-                        match result {
-                            Ok(report) => {
-                                let output_bytes = std::fs::metadata(&report.region_file)
-                                    .map(|metadata| metadata.len())
-                                    .unwrap_or(0);
-                                if sender
-                                    .send(VanillaDelegatedParallelEvent::RegionGenerated {
-                                        elapsed_millis: region_start.elapsed().as_millis(),
-                                        output_bytes,
-                                        report,
-                                        prefetch_timing: None,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
+                            let next_region = {
+                                let mut queue = queue.lock().expect("queue lock");
+                                if stop_queueing.load(Ordering::SeqCst) {
+                                    None
+                                } else {
+                                    queue.pop_front()
                                 }
-                            }
-                            Err(message) => {
-                                stop_queueing.store(true, Ordering::SeqCst);
-                                let _ = sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                            };
+                            let Some((region_x, region_z)) = next_region else {
+                                break;
+                            };
+                            let region_file =
+                                vanilla_delegated_region_file(world, format, region_x, region_z);
+                            if fingerprint_matched
+                                && completed_regions.contains(&(region_x, region_z))
+                            {
+                                let skip_start = Instant::now();
+                                if let Ok(validation) = validate_region_file_for_resume(
+                                    &region_file,
+                                    region_format_for_output(format),
                                     region_x,
                                     region_z,
-                                    elapsed_millis: region_start.elapsed().as_millis(),
-                                    region_file,
-                                    message,
-                                });
+                                    REGION_CHUNKS_PER_REGION,
+                                ) {
+                                    if sender
+                                        .send(VanillaDelegatedParallelEvent::RegionSkipped {
+                                            region_x,
+                                            region_z,
+                                            elapsed_millis: skip_start.elapsed().as_millis(),
+                                            chunks: validation.chunk_count,
+                                            output_bytes: validation.file_bytes,
+                                            region_file,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                            if sender
+                                .send(VanillaDelegatedParallelEvent::RegionStarted {
+                                    region_x,
+                                    region_z,
+                                    region_file: region_file.clone(),
+                                })
+                                .is_err()
+                            {
                                 break;
+                            };
+                            let region_start = Instant::now();
+                            let result =
+                                (|| -> std::result::Result<SurfaceRegionReport, String> {
+                                    let mut settings =
+                                        SurfaceRegionSettings::new_with_texture_options(
+                                            heightmap_path,
+                                            world_dir,
+                                            "SR EarthMap Vanilla Delegated Plan",
+                                            0,
+                                            scale,
+                                            region_x,
+                                            region_z,
+                                            format,
+                                            heightmap_cache_rows_per_worker,
+                                            false,
+                                            status,
+                                            vertical_scale,
+                                            SurfaceTextureMode::Photo,
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    settings.surface_material_path =
+                                        Some((*surface_material_path).clone());
+                                    settings.surface_tile_cache_entries =
+                                        surface_tile_cache_entries_per_worker;
+                                    settings.parallel_column_sampling = parallel_column_sampling;
+                                    apply_region_compression_options(
+                                        &mut settings,
+                                        runtime_options.compression,
+                                    );
+                                    let mut prepared =
+                                        prepare_surface_region_sample_with_heightmap_sampler(
+                                            &settings,
+                                            &worker_heightmap_mapping,
+                                            &heightmap_sampler,
+                                            worker_heightmap_cache.stats(),
+                                            Some(&worker_surface_material_sampler),
+                                        )
+                                        .map_err(|error| error.to_string())?;
+                                    prepared.cache_stats = worker_heightmap_cache.stats();
+                                    let report = generate_surface_region_with_prepared_sample(
+                                        &settings, prepared,
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                    let output_bytes = std::fs::metadata(&report.region_file)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0);
+                                    journal
+                                        .lock()
+                                        .map_err(|_| "resume journal lock poisoned".to_string())?
+                                        .append_region_complete(
+                                            report.region_x,
+                                            report.region_z,
+                                            format,
+                                            report.chunk_count,
+                                            output_bytes,
+                                        )?;
+                                    Ok(report)
+                                })();
+                            match result {
+                                Ok(report) => {
+                                    let output_bytes = std::fs::metadata(&report.region_file)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0);
+                                    if sender
+                                        .send(VanillaDelegatedParallelEvent::RegionGenerated {
+                                            elapsed_millis: region_start.elapsed().as_millis(),
+                                            output_bytes,
+                                            report: Box::new(report),
+                                            prefetch_timing: None,
+                                        })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(message) => {
+                                    stop_queueing.store(true, Ordering::SeqCst);
+                                    let _ =
+                                        sender.send(VanillaDelegatedParallelEvent::RegionFailed {
+                                            region_x,
+                                            region_z,
+                                            elapsed_millis: region_start.elapsed().as_millis(),
+                                            region_file,
+                                            message,
+                                        });
+                                    break;
+                                }
                             }
                         }
                     });
@@ -11186,9 +11447,11 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             .map_err(|_| "parallel plan worker coordinator panicked".to_string())?;
         Ok::<(), String>(())
     })?;
-    if let Ok(journal) = resume_journal.lock() {
+    if let Ok(mut journal) = resume_journal.lock() {
         journal.sync()?;
     }
+    let unaccounted_regions =
+        record_vanilla_delegated_unaccounted_regions(&mut stats, submitted_regions);
     let elapsed_millis = total_start.elapsed().as_millis();
     let generated_regions_per_hour = if elapsed_millis == 0 {
         0.0
@@ -11201,7 +11464,12 @@ fn generate_vanilla_delegated_plan_parallel_impl(
     } else {
         (completed_regions as f64) * 3_600_000.0 / (elapsed_millis as f64)
     };
+    let accounted_regions = stats.accounted_regions();
     let remaining_regions = plan_regions.len().saturating_sub(completed_regions);
+    let all_done = stats.failed_regions == 0
+        && stats.batch_failures == 0
+        && accounted_regions == submitted_regions
+        && remaining_regions == 0;
     write_progress_event(
         out,
         json!({
@@ -11215,8 +11483,11 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "skippedRegions": stats.skipped_regions,
             "completedRegions": completed_regions,
             "failedRegions": stats.failed_regions,
+            "batchFailures": stats.batch_failures,
+            "accountedRegions": accounted_regions,
+            "unaccountedRegions": unaccounted_regions,
             "remainingRegions": remaining_regions,
-            "allDone": stats.failed_regions == 0 && remaining_regions == 0,
+            "allDone": all_done,
             "generatedRegionsPerHour": generated_regions_per_hour,
             "completedRegionsPerHour": completed_regions_per_hour,
         }),
@@ -11241,8 +11512,10 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         format!("workerTuningLandSamples={}", worker_tuning.land_samples),
         format!("workerTuningOceanSamples={}", worker_tuning.ocean_samples),
         format!("workerTuningMixedSamples={}", worker_tuning.mixed_samples),
-        format!("surfaceSamplerStrategy=shared"),
+        "surfaceSamplerStrategy=per-worker-heightmap-material".to_string(),
         format!("sharedCacheRows={cache_rows}"),
+        format!("heightmapCacheRowsPerWorker={heightmap_cache_rows_per_worker}"),
+        format!("surfaceTileCacheEntriesPerWorker={surface_tile_cache_entries_per_worker}"),
         format!("surfaceTileCacheEntries={surface_tile_cache_entries}"),
         format!("verticalScale={vertical_scale}"),
         format!(
@@ -11257,6 +11530,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         format!("resumeJournal={}", resume.path.display()),
         format!("resumeFingerprintMatched={}", resume.fingerprint_matched),
         format!("resumeJournalRegions={}", resume_completed_regions.len()),
+        format!("resumeReconciledRegions={resume_reconciled_regions}"),
         format!("staleTempRegionFilesRemoved={stale_temp_files}"),
         format!("setupMillis={setup_millis}"),
         format!(
@@ -11288,13 +11562,13 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         format!("skippedRegions={}", stats.skipped_regions),
         format!("completedRegions={completed_regions}"),
         format!("failedRegions={}", stats.failed_regions),
+        format!("batchFailures={}", stats.batch_failures),
+        format!("accountedRegions={accounted_regions}"),
+        format!("unaccountedRegions={unaccounted_regions}"),
         format!("remainingRegions={remaining_regions}"),
         format!("generatedRegionsPerHour={generated_regions_per_hour:.2}"),
         format!("completedRegionsPerHour={completed_regions_per_hour:.2}"),
-        format!(
-            "allDone={}",
-            stats.failed_regions == 0 && remaining_regions == 0
-        ),
+        format!("allDone={all_done}"),
         format!("manifestFile={}", manifest_file.display()),
     ];
     for line in lines {
@@ -11440,7 +11714,7 @@ enum VanillaDelegatedParallelEvent {
     RegionGenerated {
         elapsed_millis: u128,
         output_bytes: u64,
-        report: SurfaceRegionReport,
+        report: Box<SurfaceRegionReport>,
         prefetch_timing: Option<PrefetchTimingMillis>,
     },
     RegionFailed {
@@ -11448,6 +11722,10 @@ enum VanillaDelegatedParallelEvent {
         region_z: i32,
         elapsed_millis: u128,
         region_file: std::path::PathBuf,
+        message: String,
+    },
+    WorkerSetupFailed {
+        worker_role: &'static str,
         message: String,
     },
 }
@@ -11476,6 +11754,7 @@ struct VanillaDelegatedParallelBatchStats {
     generated_regions: usize,
     skipped_regions: usize,
     failed_regions: usize,
+    batch_failures: usize,
     phase_surface_sample_millis: u128,
     phase_chunk_build_millis: u128,
     phase_nbt_encode_millis: u128,
@@ -11483,6 +11762,50 @@ struct VanillaDelegatedParallelBatchStats {
     phase_metadata_millis: u128,
     phase_total_internal_millis: u128,
     errors: Vec<String>,
+}
+
+impl VanillaDelegatedParallelBatchStats {
+    fn accounted_regions(&self) -> usize {
+        self.generated_regions
+            .saturating_add(self.skipped_regions)
+            .saturating_add(self.failed_regions)
+    }
+}
+
+fn record_vanilla_delegated_unaccounted_regions(
+    stats: &mut VanillaDelegatedParallelBatchStats,
+    submitted_regions: usize,
+) -> usize {
+    let accounted_regions = stats.accounted_regions();
+    if accounted_regions == submitted_regions {
+        return 0;
+    }
+    let unaccounted_regions = submitted_regions.saturating_sub(accounted_regions);
+    let message = if accounted_regions > submitted_regions {
+        format!(
+            "parallel generation emitted {accounted_regions} terminal region events for {submitted_regions} submitted regions"
+        )
+    } else {
+        format!(
+            "parallel generation left {unaccounted_regions} of {submitted_regions} submitted regions without generated, skipped, or failed events"
+        )
+    };
+    stats.batch_failures += 1;
+    stats.errors.push(message);
+    unaccounted_regions
+}
+
+fn send_worker_setup_failed(
+    sender: &mpsc::SyncSender<VanillaDelegatedParallelEvent>,
+    stop_queueing: &AtomicBool,
+    worker_role: &'static str,
+    message: String,
+) {
+    stop_queueing.store(true, Ordering::SeqCst);
+    let _ = sender.send(VanillaDelegatedParallelEvent::WorkerSetupFailed {
+        worker_role,
+        message,
+    });
 }
 
 fn send_prepared_vanilla_region(
@@ -11713,6 +12036,25 @@ fn handle_vanilla_delegated_parallel_event(
             )
             .map_err(|error| error.to_string())?;
         }
+        VanillaDelegatedParallelEvent::WorkerSetupFailed {
+            worker_role,
+            message,
+        } => {
+            let combined_message = format!("{worker_role}: {message}");
+            stats.batch_failures += 1;
+            stats.errors.push(combined_message.clone());
+            write_progress_event(
+                out,
+                json!({
+                    "schemaVersion": PROGRESS_EVENT_SCHEMA_VERSION,
+                    "type": "workerSetupFailed",
+                    "workerRole": worker_role,
+                    "message": message,
+                }),
+            )?;
+            writeln!(out, "batch,failed,,,,,,,{}", csv_cell(&combined_message))
+                .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }
@@ -11732,6 +12074,7 @@ struct PreparedVanillaDelegatedResume {
 struct VanillaDelegatedResumeJournal {
     file: File,
     lock_path: PathBuf,
+    unsynced_appends: usize,
 }
 
 impl VanillaDelegatedResumeJournal {
@@ -11753,13 +12096,68 @@ impl VanillaDelegatedResumeJournal {
             "outputBytes": output_bytes,
         });
         let _lock = acquire_resume_journal_lock_path(&self.lock_path)?;
-        writeln!(self.file, "{line}").map_err(|error| error.to_string())
+        writeln!(self.file, "{line}").map_err(|error| error.to_string())?;
+        self.unsynced_appends += 1;
+        if self.unsynced_appends >= RESUME_JOURNAL_SYNC_INTERVAL_REGIONS {
+            self.sync_data_unlocked()?;
+        }
+        Ok(())
     }
 
-    fn sync(&self) -> std::result::Result<(), String> {
+    fn sync(&mut self) -> std::result::Result<(), String> {
         let _lock = acquire_resume_journal_lock_path(&self.lock_path)?;
-        self.file.sync_data().map_err(|error| error.to_string())
+        self.sync_data_unlocked()
     }
+
+    fn sync_data_unlocked(&mut self) -> std::result::Result<(), String> {
+        self.file.sync_data().map_err(|error| error.to_string())?;
+        self.unsynced_appends = 0;
+        Ok(())
+    }
+}
+
+fn reconcile_resume_completed_regions_with_valid_files(
+    world: &Path,
+    format: OutputFormat,
+    regions: impl IntoIterator<Item = (i32, i32)>,
+    completed_regions: &mut HashSet<(i32, i32)>,
+    journal: &Arc<Mutex<VanillaDelegatedResumeJournal>>,
+) -> std::result::Result<usize, String> {
+    let mut reconciled = 0usize;
+    for (region_x, region_z) in regions {
+        if completed_regions.contains(&(region_x, region_z)) {
+            continue;
+        }
+        let region_file = vanilla_delegated_region_file(world, format, region_x, region_z);
+        let Ok(validation) = validate_region_file_for_resume(
+            &region_file,
+            region_format_for_output(format),
+            region_x,
+            region_z,
+            REGION_CHUNKS_PER_REGION,
+        ) else {
+            continue;
+        };
+        completed_regions.insert((region_x, region_z));
+        journal
+            .lock()
+            .map_err(|_| "resume journal lock poisoned".to_string())?
+            .append_region_complete(
+                region_x,
+                region_z,
+                format,
+                validation.chunk_count,
+                validation.file_bytes,
+            )?;
+        reconciled += 1;
+    }
+    if reconciled > 0 {
+        journal
+            .lock()
+            .map_err(|_| "resume journal lock poisoned".to_string())?
+            .sync()?;
+    }
+    Ok(reconciled)
 }
 
 fn prepare_vanilla_delegated_resume_journal(
@@ -11799,6 +12197,7 @@ fn prepare_vanilla_delegated_resume_journal(
         journal: Arc::new(Mutex::new(VanillaDelegatedResumeJournal {
             file,
             lock_path,
+            unsynced_appends: 0,
         })),
         path,
         warnings,
@@ -13146,7 +13545,7 @@ fn effective_prefetch_config(
             total_physical_memory_bytes(),
             PREFETCH_MEMORY_PERCENT,
             PREFETCH_MAX_MEMORY_BYTES,
-            1 * BYTES_PER_GIB,
+            BYTES_PER_GIB,
         ))
     });
     let estimated_region_bytes = PREPARED_SURFACE_REGION_ESTIMATED_BYTES.max(1);
@@ -19063,6 +19462,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn surface_photo_confirmation_candidates_include_selected_and_reverse_fastest() {
+        let selected = SurfacePhotoWorkerCandidateConfig::new(4, 16, true);
+        let results = vec![
+            surface_photo_candidate_result(1, 16, true, 1_100),
+            surface_photo_candidate_result(4, 16, true, 1_050),
+            surface_photo_candidate_result(8, 16, true, 900),
+            surface_photo_candidate_result(2, 16, true, 1_000),
+        ];
+
+        let candidates = surface_photo_worker_confirmation_candidates(&results, selected);
+
+        assert_eq!(
+            candidates,
+            vec![
+                SurfacePhotoWorkerCandidateConfig::new(2, 16, true),
+                SurfacePhotoWorkerCandidateConfig::new(8, 16, true),
+                selected,
+            ]
+        );
+    }
+
     fn generate_single_chunk_render_world(world_dir: &Path, format: TopdownFormat) {
         let region_dir = world_dir.join("region");
         fs::create_dir_all(&region_dir).unwrap();
@@ -19083,12 +19504,12 @@ mod tests {
 
         match format {
             TopdownFormat::Mca => {
-                earthmap_region::write_mca_region(&region_dir.join("r.0.0.mca"), &payloads, 0)
+                earthmap_region::write_mca_region(region_dir.join("r.0.0.mca"), &payloads, 0)
                     .unwrap();
             }
             TopdownFormat::Linear => {
                 earthmap_region::write_linear_v2_region(
-                    &region_dir.join("r.0.0.linear"),
+                    region_dir.join("r.0.0.linear"),
                     &payloads,
                     0,
                 )
@@ -19262,6 +19683,48 @@ mod tests {
             fs::read_to_string(world.join(VANILLA_DELEGATED_RESUME_JOURNAL_FILE_NAME)).unwrap();
         assert!(!journal.contains("regionComplete"));
         assert!(journal.contains("\"test\":\"new\""));
+    }
+
+    #[test]
+    fn resume_reconciliation_adds_valid_existing_region_files_to_journal() {
+        let temp = tempdir().unwrap();
+        let world = temp.path().join("world");
+        let fingerprint = json!({"schemaVersion": 1, "test": "reconcile"});
+        let region_file = vanilla_delegated_region_file(&world, OutputFormat::LinearV2, 1, 2);
+        earthmap_region::write_linear_v2_region(&region_file, &full_resume_region_payloads(), 0)
+            .unwrap();
+
+        let prepared = prepare_vanilla_delegated_resume_journal(&world, &fingerprint).unwrap();
+        let mut completed_regions = prepared.completed_regions;
+        let reconciled = reconcile_resume_completed_regions_with_valid_files(
+            &world,
+            OutputFormat::LinearV2,
+            [(1, 2), (2, 3)],
+            &mut completed_regions,
+            &prepared.journal,
+        )
+        .unwrap();
+
+        assert_eq!(reconciled, 1);
+        assert!(completed_regions.contains(&(1, 2)));
+        prepared.journal.lock().unwrap().sync().unwrap();
+
+        let prepared = prepare_vanilla_delegated_resume_journal(&world, &fingerprint).unwrap();
+        assert!(prepared.fingerprint_matched);
+        assert!(prepared.completed_regions.contains(&(1, 2)));
+    }
+
+    fn full_resume_region_payloads() -> BTreeMap<ChunkLocalPos, Vec<u8>> {
+        let mut payloads = BTreeMap::new();
+        for z in 0..32 {
+            for x in 0..32 {
+                payloads.insert(
+                    ChunkLocalPos::new(x, z).unwrap(),
+                    format!("resume-reconcile-payload-{x}-{z}").into_bytes(),
+                );
+            }
+        }
+        payloads
     }
 
     #[test]
@@ -19525,6 +19988,64 @@ mod tests {
     }
 
     #[test]
+    fn worker_setup_failed_event_writes_json_event_and_marks_batch_failure() {
+        let mut out = Vec::new();
+        let mut stats = VanillaDelegatedParallelBatchStats::default();
+
+        handle_vanilla_delegated_parallel_event(
+            &mut out,
+            &mut stats,
+            VanillaDelegatedParallelEvent::WorkerSetupFailed {
+                worker_role: "regionWorker",
+                message: "heightmap missing, cannot continue".to_string(),
+            },
+        )
+        .unwrap();
+
+        let out = String::from_utf8(out).unwrap();
+        let mut lines = out.lines();
+        let event_line = lines.next().unwrap();
+        let event_json = event_line.strip_prefix("event\t").unwrap();
+        let event = serde_json::from_str::<Value>(event_json).unwrap();
+        assert_eq!(event["type"], "workerSetupFailed");
+        assert_eq!(event["workerRole"], "regionWorker");
+        assert_eq!(event["message"], "heightmap missing, cannot continue");
+        assert_eq!(stats.batch_failures, 1);
+        assert_eq!(stats.errors.len(), 1);
+        assert_eq!(
+            lines.next().unwrap(),
+            "batch,failed,,,,,,,\"regionWorker: heightmap missing, cannot continue\""
+        );
+    }
+
+    #[test]
+    fn unaccounted_submitted_regions_mark_batch_failure() {
+        let mut stats = VanillaDelegatedParallelBatchStats::default();
+
+        let unaccounted = record_vanilla_delegated_unaccounted_regions(&mut stats, 2);
+
+        assert_eq!(unaccounted, 2);
+        assert_eq!(stats.batch_failures, 1);
+        assert_eq!(stats.accounted_regions(), 0);
+        assert!(stats.errors[0]
+            .contains("left 2 of 2 submitted regions without generated, skipped, or failed"));
+    }
+
+    #[test]
+    fn failed_region_events_count_as_accounted_terminal_events() {
+        let mut stats = VanillaDelegatedParallelBatchStats {
+            failed_regions: 1,
+            ..Default::default()
+        };
+
+        let unaccounted = record_vanilla_delegated_unaccounted_regions(&mut stats, 1);
+
+        assert_eq!(unaccounted, 0);
+        assert_eq!(stats.batch_failures, 0);
+        assert!(stats.errors.is_empty());
+    }
+
+    #[test]
     fn generated_event_includes_per_region_phase_telemetry() {
         let temp = tempdir().unwrap();
         let region_file = temp.path().join("region").join("r.3.4.linear");
@@ -19593,7 +20114,7 @@ mod tests {
             VanillaDelegatedParallelEvent::RegionGenerated {
                 elapsed_millis: 4_629,
                 output_bytes: 37_083,
-                report,
+                report: Box::new(report),
                 prefetch_timing: None,
             },
         )
@@ -19906,6 +20427,67 @@ mod tests {
         assert!(out.is_empty());
         assert!(err.contains("default textureMode=photo requires a TrueMarble surface raster"));
         assert!(!err.contains("not implemented yet"));
+    }
+
+    #[test]
+    fn parallel_generation_rejects_grid_above_default_submitted_region_limit_before_io() {
+        let (code, out, err) = run_capture(&[
+            "generate-vanilla-delegated-regions-parallel",
+            "missing-heightmap.tif",
+            "world",
+            "1000",
+            "0",
+            "0",
+            "100001",
+            "1",
+            "linear",
+            "1",
+            "surfaceRaster=none",
+        ]);
+
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.is_empty());
+        assert!(err.contains("exceeds maxSubmittedRegions=100000"));
+        assert!(!err.contains("TrueMarble surface raster"));
+    }
+
+    #[test]
+    fn parallel_generation_missing_explicit_surface_raster_emits_worker_setup_failure() {
+        let temp = tempdir().unwrap();
+        let heightmap = temp.path().join("heightmap.tif");
+        let world = temp.path().join("world");
+        let missing_surface = temp.path().join("missing TrueMarble.vrt");
+        fs::write(&heightmap, synthetic_bigtiff_heightmap()).unwrap();
+        let surface_option = format!("surfaceRaster={}", missing_surface.display());
+        let args = vec![
+            "generate-vanilla-delegated-regions-parallel".to_string(),
+            heightmap.display().to_string(),
+            world.display().to_string(),
+            "1000".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "1".to_string(),
+            "1".to_string(),
+            "linear".to_string(),
+            "1".to_string(),
+            "surface".to_string(),
+            surface_option,
+            "workerAutotune=false".to_string(),
+        ];
+        let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let (code, out, err) = run_capture(&borrowed);
+
+        assert_ne!(code, EXIT_OK, "out={out}\nerr={err}");
+        assert!(
+            out.contains("\"type\":\"workerSetupFailed\""),
+            "out={out}\nerr={err}"
+        );
+        assert!(out.contains("batch,failed"), "out={out}\nerr={err}");
+        assert!(
+            out.contains("missing TrueMarble.vrt"),
+            "out={out}\nerr={err}"
+        );
     }
 
     #[test]
@@ -20587,6 +21169,28 @@ mod tests {
     }
 
     #[test]
+    fn known_generation_commands_with_missing_args_print_specific_usage() {
+        for (command, expected) in [
+            ("generate", "Usage: generate <heightmap>"),
+            (
+                "generate-vanilla-delegated-region",
+                "Usage: generate-vanilla-delegated-region",
+            ),
+            (
+                "generate-vanilla-delegated-regions-parallel",
+                "Usage: generate-vanilla-delegated-regions-parallel",
+            ),
+        ] {
+            let (code, out, err) = run_capture(&[command]);
+
+            assert_eq!(code, EXIT_USAGE, "command={command}");
+            assert!(out.is_empty(), "command={command}");
+            assert!(err.contains(expected), "command={command} err={err}");
+            assert!(!err.contains("Unknown command"), "command={command}");
+        }
+    }
+
+    #[test]
     fn meta_commands_are_detected_anywhere_like_java() {
         let (code, out, err) = run_capture(&["generate", "doctor"]);
 
@@ -21210,6 +21814,17 @@ mod tests {
     }
 
     #[test]
+    fn generation_runtime_options_parse_max_submitted_regions() {
+        let parsed = parse_generation_runtime_options(
+            OutputFormat::LinearV2,
+            &["maxSubmittedRegions=123456".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(parsed.max_submitted_regions, Some(123_456));
+    }
+
+    #[test]
     fn generation_runtime_options_parse_project_grid() {
         let parsed = parse_generation_runtime_options(
             OutputFormat::LinearV2,
@@ -21253,13 +21868,13 @@ mod tests {
         std::fs::write(region_dir.join("r.3.1.linear"), b"done").unwrap();
 
         let first = filter_remaining_region_shard(
-            build_grid_region_queue(0, 0, 4, 2),
+            build_grid_region_queue(0, 0, 4, 2).unwrap(),
             temp.path(),
             OutputFormat::LinearV2,
             GenerationRemainingShard { index: 0, total: 2 },
         );
         let second = filter_remaining_region_shard(
-            build_grid_region_queue(0, 0, 4, 2),
+            build_grid_region_queue(0, 0, 4, 2).unwrap(),
             temp.path(),
             OutputFormat::LinearV2,
             GenerationRemainingShard { index: 1, total: 2 },

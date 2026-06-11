@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust toolchain with `cargo` on `PATH`
+- Rust toolchain with `cargo` on `PATH`; install Clippy with `rustup component add clippy`
 - PowerShell 7 or Windows PowerShell for the repository scripts; native `cargo` commands also work from
   Bash-compatible shells
 - A HeightMap GeoTIFF, provided as an explicit CLI argument or `EARTHMAP_HEIGHTMAP`
@@ -28,6 +28,15 @@ Use the same variable names with POSIX paths on Linux/macOS.
 .\scripts\build.ps1
 .\scripts\test.ps1
 cargo run --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- --help
+```
+
+CI-equivalent local gates:
+
+```powershell
+cargo fmt --all --manifest-path rust\Cargo.toml -- --check
+cargo clippy --manifest-path rust\Cargo.toml --workspace --all-targets -- -D warnings
+.\scripts\lint.ps1
+.\scripts\test.ps1
 ```
 
 Rust GUI:

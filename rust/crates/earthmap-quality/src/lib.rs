@@ -175,6 +175,7 @@ pub struct StandardRemapBatchReport {
     pub results: Vec<StandardRemapJobResult>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_compare_report(
     actual_path: &Path,
     expected_path: &Path,
@@ -546,6 +547,7 @@ pub fn write_standard_remap_parity_report(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_current_metric_crop_report(
     source_path: &Path,
     expected_path: &Path,
@@ -573,6 +575,7 @@ pub fn write_current_metric_crop_report(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_metric_crop_report(
     source_path: &Path,
     expected_path: &Path,

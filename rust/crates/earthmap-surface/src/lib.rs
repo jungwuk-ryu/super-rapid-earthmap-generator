@@ -601,10 +601,8 @@ impl SurfaceRegionSample {
         local_chunk_x: i32,
         local_chunk_z: i32,
     ) -> Result<SurfaceChunkSample> {
-        if local_chunk_x < 0
-            || local_chunk_x >= REGION_CHUNKS
-            || local_chunk_z < 0
-            || local_chunk_z >= REGION_CHUNKS
+        if !(0..REGION_CHUNKS).contains(&local_chunk_x)
+            || !(0..REGION_CHUNKS).contains(&local_chunk_z)
         {
             return Err(SurfaceError::invalid(format!(
                 "local chunk outside region: {local_chunk_x},{local_chunk_z}"
@@ -2765,8 +2763,8 @@ fn classify_surface_material_by_ecoregion(
 
     if should_defer_ecoregion_at_transition(
         sample,
-        &key,
-        &eco_name,
+        key,
+        eco_name,
         metrics,
         elevation_meters,
         latitude,
@@ -8282,16 +8280,19 @@ impl EarthDataSurfaceMaterialSampler {
         let mut cell_indices = HashMap::<i64, usize>::new();
         let mut samples = Vec::<SurfaceMaterialSample>::new();
         let mut column_samples = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
-        for local_z in 0..SURFACE_REGION_WIDTH {
-            let latitude_cell = latitude_cells[local_z];
-            for local_x in 0..SURFACE_REGION_WIDTH {
+        for (local_z, latitude_cell) in latitude_cells.iter().enumerate().take(SURFACE_REGION_WIDTH)
+        {
+            for (local_x, longitude_cell) in longitude_cells
+                .iter()
+                .enumerate()
+                .take(SURFACE_REGION_WIDTH)
+            {
                 let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
                 if !should_sample_open_ocean_companion_material(
                     smoothed_center_elevations[column_index],
                 ) {
                     continue;
                 }
-                let longitude_cell = longitude_cells[local_x];
                 let cell_key = quantized_cell_key_with_code(
                     cell_code,
                     longitude_cell.cell,
@@ -10041,7 +10042,7 @@ fn system_time_to_java_millis(time: std::time::SystemTime) -> Option<i128> {
         Err(error) => {
             let duration = error.duration();
             let millis = (i128::from(duration.as_secs()) * 1_000)
-                + i128::from((duration.subsec_nanos() + 999_999) / 1_000_000);
+                + i128::from(duration.subsec_nanos().div_ceil(1_000_000));
             Some(-millis)
         }
     }
@@ -10878,7 +10879,7 @@ fn sample_ecoregion_evidence(
     let center_family = biome_family(&center.biome_id);
     for dz in -1..=1 {
         let sample_latitude = latitude + (f64::from(dz) * offset);
-        if sample_latitude < -90.0 || sample_latitude > 90.0 {
+        if !sample_latitude.is_nan() && !(-90.0..=90.0).contains(&sample_latitude) {
             continue;
         }
         for dx in -1..=1 {
@@ -11199,12 +11200,11 @@ fn open_surface_raster(
 ) -> Result<Option<GeoTiffSingleBandReader>> {
     for candidate_directory in surface_candidate_directories(directory) {
         let candidate = candidate_directory.join(name);
-        match GeoTiffSingleBandReader::open_if_present(
+        if let Ok(Some(reader)) = GeoTiffSingleBandReader::open_if_present(
             &candidate,
             tile_cache_entries.max(EarthDataSurfaceMaterialSampler::DEFAULT_CACHE_BLOCKS),
         ) {
-            Ok(Some(reader)) => return Ok(Some(reader)),
-            Ok(None) | Err(_) => {}
+            return Ok(Some(reader));
         }
     }
     Ok(None)
@@ -11216,9 +11216,8 @@ fn open_surface_float_raster(
 ) -> Result<Option<GeoTiffFloat32Reader>> {
     for candidate_directory in surface_candidate_directories(directory) {
         let candidate = candidate_directory.join(name);
-        match GeoTiffFloat32Reader::open_if_present(&candidate) {
-            Ok(Some(reader)) => return Ok(Some(reader)),
-            Ok(None) | Err(_) => {}
+        if let Ok(Some(reader)) = GeoTiffFloat32Reader::open_if_present(&candidate) {
+            return Ok(Some(reader));
         }
     }
     Ok(None)
@@ -12411,6 +12410,7 @@ pub fn sample_surface_region_scaled_with_texture_mode(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn sample_surface_region_scaled_with_material_sampler(
     region_x: i32,
     region_z: i32,
@@ -12437,6 +12437,7 @@ pub fn sample_surface_region_scaled_with_material_sampler(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_surface_region_with_elevation_fn<F>(
     region_x: i32,
     region_z: i32,
@@ -12862,6 +12863,7 @@ fn should_sample_surface_material(
         && should_sample_open_ocean_companion_material(smoothed_elevation_meters)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_surface_region_material(
     material_sampler: &dyn SurfaceMaterialSampler,
     texture_mode: SurfaceTextureMode,
@@ -13125,16 +13127,18 @@ fn precompute_open_ocean_companion_materials(
     let mut cell_indices = HashMap::<i64, usize>::new();
     let mut samples = Vec::<SurfaceMaterialSample>::new();
     let mut column_samples = vec![None; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
-    for local_z in 0..SURFACE_REGION_WIDTH {
-        let latitude_cell = latitude_cells[local_z];
-        for local_x in 0..SURFACE_REGION_WIDTH {
+    for (local_z, latitude_cell) in latitude_cells.iter().enumerate().take(SURFACE_REGION_WIDTH) {
+        for (local_x, longitude_cell) in longitude_cells
+            .iter()
+            .enumerate()
+            .take(SURFACE_REGION_WIDTH)
+        {
             let column_index = (local_z * SURFACE_REGION_WIDTH) + local_x;
             if !should_sample_open_ocean_companion_material(
                 smoothed_center_elevations[column_index],
             ) {
                 continue;
             }
-            let longitude_cell = longitude_cells[local_x];
             let cell_key =
                 quantized_cell_key_with_code(cell_code, longitude_cell.cell, latitude_cell.cell);
             let sample_index = if let Some(&index) = cell_indices.get(&cell_key) {
@@ -13727,7 +13731,7 @@ pub fn smooth_surface_classes(
     columns: &[EarthSurfaceColumn],
     width: usize,
 ) -> Result<Vec<EarthSurfaceColumn>> {
-    if width == 0 || columns.len() % width != 0 {
+    if width == 0 || !columns.len().is_multiple_of(width) {
         return Err(SurfaceError::invalid("width must divide columns length"));
     }
     let height = columns.len() / width;
@@ -15796,10 +15800,8 @@ fn surface_subblock_sample_valid(
     longitude: f64,
     latitude: f64,
 ) -> bool {
-    longitude >= -180.0
-        && longitude < 180.0
-        && latitude >= mapping.min_latitude
-        && latitude <= mapping.max_latitude
+    (-180.0..180.0).contains(&longitude)
+        && (mapping.min_latitude..=mapping.max_latitude).contains(&latitude)
 }
 
 const SURFACE_REGION_DISTANCE_INFINITY: i32 = 1_000_000_000;
@@ -15850,27 +15852,27 @@ fn surface_region_squared_distance_to_mask(
     let mut boundaries = vec![0.0; SURFACE_REGION_EXTENT + 1];
 
     for z in 0..SURFACE_REGION_EXTENT {
-        for x in 0..SURFACE_REGION_EXTENT {
+        for (x, input_value) in input.iter_mut().enumerate().take(SURFACE_REGION_EXTENT) {
             let index = surface_region_extent_index(x, z);
-            input[x] = if valid[index] && water_mask[index] == target_water {
+            *input_value = if valid[index] && water_mask[index] == target_water {
                 0
             } else {
                 SURFACE_REGION_DISTANCE_INFINITY
             };
         }
         surface_region_distance_transform_1d(&input, &mut output, &mut parabolas, &mut boundaries);
-        for x in 0..SURFACE_REGION_EXTENT {
-            row_distances[surface_region_extent_index(x, z)] = output[x];
+        for (x, output_value) in output.iter().enumerate().take(SURFACE_REGION_EXTENT) {
+            row_distances[surface_region_extent_index(x, z)] = *output_value;
         }
     }
 
     for x in 0..SURFACE_REGION_EXTENT {
-        for z in 0..SURFACE_REGION_EXTENT {
-            input[z] = row_distances[surface_region_extent_index(x, z)];
+        for (z, input_value) in input.iter_mut().enumerate().take(SURFACE_REGION_EXTENT) {
+            *input_value = row_distances[surface_region_extent_index(x, z)];
         }
         surface_region_distance_transform_1d(&input, &mut output, &mut parabolas, &mut boundaries);
-        for z in 0..SURFACE_REGION_EXTENT {
-            distances[surface_region_extent_index(x, z)] = output[z];
+        for (z, output_value) in output.iter().enumerate().take(SURFACE_REGION_EXTENT) {
+            distances[surface_region_extent_index(x, z)] = *output_value;
         }
     }
     distances
@@ -16494,7 +16496,7 @@ struct JavaHashI32Count {
 }
 
 fn require_surface_grid_width(columns: &[EarthSurfaceColumn], width: usize) -> Result<()> {
-    if width == 0 || columns.len() % width != 0 {
+    if width == 0 || !columns.len().is_multiple_of(width) {
         return Err(SurfaceError::invalid("width must divide columns length"));
     }
     Ok(())
@@ -16841,6 +16843,7 @@ fn surface_biome_component_trace(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue_same_intent_family(
     columns: &[EarthSurfaceColumn],
     visited: &mut [bool],
@@ -19752,8 +19755,7 @@ mod tests {
                     clamp_unit(0.22 + (dry_savanna * 0.28) + (confidence_blend * 0.35));
                 !is_sahel_latitude(latitude)
                     && surface_material_sahel_score(longitude, latitude) < 0.18
-                    && dry_savanna >= 0.32
-                    && dry_savanna < 0.35
+                    && (0.32..0.35).contains(&dry_savanna)
                     && surface_material_rainforest_score(longitude, latitude) < 0.35
                     && transition_noise < dry_savanna_blend
             })
@@ -21771,7 +21773,7 @@ mod tests {
         assert_eq!(cleaned.top_block_state_id, block_state_ids::GRASS_BLOCK);
         assert_eq!(cleaned.filler_block_state_id, block_state_ids::DIRT);
 
-        assert!(clean_coastal_surface_columns(&[inland.clone()], &[0.0], 0).is_err());
+        assert!(clean_coastal_surface_columns(std::slice::from_ref(&inland), &[0.0], 0).is_err());
         assert!(clean_coastal_surface_columns(&[inland], &[], 1).is_err());
     }
 
@@ -23221,7 +23223,7 @@ mod tests {
             ),
             63.0,
             8.938_240_798_502_97,
-            -0.381_555_747_143_153_35,
+            -0.381_555_747_143_153_3,
             0.98,
             0.0,
             199,
@@ -23825,9 +23827,9 @@ mod tests {
     #[test]
     fn photo_arid_dither_avoids_single_block_bayer_checkerboard() {
         let mut threshold_grid = [[0_i32; 4]; 4];
-        for z in 0..4 {
-            for x in 0..4 {
-                threshold_grid[z][x] = photo_dither_threshold(
+        for (z, row) in threshold_grid.iter_mut().enumerate() {
+            for (x, threshold) in row.iter_mut().enumerate() {
+                *threshold = photo_dither_threshold(
                     1388 + x as i32,
                     272 + z as i32,
                     block_state_ids::TERRACOTTA,
@@ -23871,8 +23873,8 @@ mod tests {
             1.0,
         );
         let mut top_grid = [[0_i32; 4]; 4];
-        for z in 0..4 {
-            for x in 0..4 {
+        for (z, row) in top_grid.iter_mut().enumerate() {
+            for (x, top_block) in row.iter_mut().enumerate() {
                 let column = apply_photo_surface_material(&PhotoSurfaceInput::new(
                     savanna.clone(),
                     sample.clone(),
@@ -23885,7 +23887,7 @@ mod tests {
                     272 + z as i32,
                 ))
                 .unwrap();
-                top_grid[z][x] = column.top_block_state_id;
+                *top_block = column.top_block_state_id;
             }
         }
         assert!(

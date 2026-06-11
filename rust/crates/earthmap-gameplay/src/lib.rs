@@ -1175,61 +1175,43 @@ fn flood_cave_component(
             caves,
             visited,
             queue,
-            local_x + 1,
-            local_y,
-            local_z,
-            size,
-            height,
+            (local_x + 1, local_y, local_z),
+            (size, height),
         );
         add_cave_neighbor(
             caves,
             visited,
             queue,
-            local_x - 1,
-            local_y,
-            local_z,
-            size,
-            height,
+            (local_x - 1, local_y, local_z),
+            (size, height),
         );
         add_cave_neighbor(
             caves,
             visited,
             queue,
-            local_x,
-            local_y + 1,
-            local_z,
-            size,
-            height,
+            (local_x, local_y + 1, local_z),
+            (size, height),
         );
         add_cave_neighbor(
             caves,
             visited,
             queue,
-            local_x,
-            local_y - 1,
-            local_z,
-            size,
-            height,
+            (local_x, local_y - 1, local_z),
+            (size, height),
         );
         add_cave_neighbor(
             caves,
             visited,
             queue,
-            local_x,
-            local_y,
-            local_z + 1,
-            size,
-            height,
+            (local_x, local_y, local_z + 1),
+            (size, height),
         );
         add_cave_neighbor(
             caves,
             visited,
             queue,
-            local_x,
-            local_y,
-            local_z - 1,
-            size,
-            height,
+            (local_x, local_y, local_z - 1),
+            (size, height),
         );
     }
     CaveComponent {
@@ -1242,13 +1224,10 @@ fn add_cave_neighbor(
     caves: &[bool],
     visited: &mut [bool],
     queue: &mut VecDeque<usize>,
-    x: i32,
-    y: i32,
-    z: i32,
-    size: i32,
-    height: i32,
+    (x, y, z): (i32, i32, i32),
+    (size, height): (i32, i32),
 ) {
-    if x < 0 || x >= size || y < 0 || y >= height || z < 0 || z >= size {
+    if !(0..size).contains(&x) || !(0..height).contains(&y) || !(0..size).contains(&z) {
         return;
     }
     let offset = cave_offset(x, y, z, size, height);
@@ -2056,7 +2035,7 @@ mod tests {
             natural_opening_column(42, 181, 362),
             natural_opening_column(42, 181, 362)
         );
-        assert_eq!(carve_candidate(42, 0, MIN_CAVE_Y - 1, 0), false);
+        assert!(!carve_candidate(42, 0, MIN_CAVE_Y - 1, 0));
     }
 
     #[test]

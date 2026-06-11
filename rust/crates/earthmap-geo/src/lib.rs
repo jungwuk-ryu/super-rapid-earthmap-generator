@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashMap},
+    collections::{btree_map::Entry, BTreeMap, HashMap},
 };
 use weezl::{decode::Decoder as LzwDecoder, BitOrder};
 
@@ -924,14 +924,14 @@ impl GeoTiffSingleBandReader {
                         GeoError::invalid("single-band block destination offset overflow")
                     })?;
                 if self.metadata.compression != TIFF_COMPRESSION_NONE {
-                    if !decoded_tiles.contains_key(&tile_index) {
+                    if let Entry::Vacant(entry) = decoded_tiles.entry(tile_index) {
                         let decoded = self.read_decoded_single_band_tile(
                             &mut file,
                             tile_index,
                             actual_tile_width,
                             actual_tile_height,
                         )?;
-                        decoded_tiles.insert(tile_index, decoded);
+                        entry.insert(decoded);
                     }
                     let tile = decoded_tiles
                         .get(&tile_index)
@@ -2346,6 +2346,11 @@ impl EarthScaleMapping {
         let width_blocks = round_to_i32_exact(circumference / f64::from(denominator))?;
         let height_blocks =
             round_to_i32_exact(f64::from(width_blocks) * ((max_latitude - min_latitude) / 360.0))?;
+        if width_blocks < 1 || height_blocks < 1 {
+            return Err(GeoError::invalid(format!(
+                "scale denominator produces zero-sized mapping: {denominator}"
+            )));
+        }
         Ok(Self {
             denominator,
             min_latitude,
@@ -2368,7 +2373,7 @@ impl EarthScaleMapping {
     }
 
     pub fn block_x_for_longitude(&self, longitude: f64) -> Result<i32> {
-        if longitude < -180.0 || longitude >= 180.0 {
+        if !longitude.is_nan() && !(-180.0..180.0).contains(&longitude) {
             return Err(GeoError::invalid(format!(
                 "longitude outside [-180, 180): {longitude}"
             )));
@@ -2432,13 +2437,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 }
 
 fn clamp_unit(value: f64) -> f64 {
-    if value < 0.0 {
-        0.0
-    } else if value > 1.0 {
-        1.0
-    } else {
-        value
-    }
+    value.clamp(0.0, 1.0)
 }
 
 fn touch_state(state: &mut RowCacheState) -> u64 {
@@ -2675,7 +2674,7 @@ fn parse_single_band_tiff(
             &tile_byte_counts,
         )?;
     } else {
-        validate_single_band_tile_byte_counts(
+        validate_single_band_tile_byte_counts(SingleBandTileByteCountValidation {
             width,
             height,
             tile_width,
@@ -2683,8 +2682,8 @@ fn parse_single_band_tiff(
             tiles_across,
             tiles_down,
             bytes_per_sample,
-            &tile_byte_counts,
-        )?;
+            tile_byte_counts: &tile_byte_counts,
+        })?;
     }
 
     let pixel_scale = tiff_double_array(
@@ -2741,7 +2740,7 @@ fn parse_single_band_tiff(
     })
 }
 
-fn validate_single_band_tile_byte_counts(
+struct SingleBandTileByteCountValidation<'a> {
     width: i32,
     height: i32,
     tile_width: i32,
@@ -2749,8 +2748,22 @@ fn validate_single_band_tile_byte_counts(
     tiles_across: i32,
     tiles_down: i32,
     bytes_per_sample: usize,
-    tile_byte_counts: &[usize],
+    tile_byte_counts: &'a [usize],
+}
+
+fn validate_single_band_tile_byte_counts(
+    input: SingleBandTileByteCountValidation<'_>,
 ) -> Result<()> {
+    let SingleBandTileByteCountValidation {
+        width,
+        height,
+        tile_width,
+        tile_length,
+        tiles_across,
+        tiles_down,
+        bytes_per_sample,
+        tile_byte_counts,
+    } = input;
     for tile_y in 0..tiles_down {
         for tile_x in 0..tiles_across {
             let tile_index = usize::try_from(
@@ -4132,6 +4145,7 @@ mod tests {
     fn validation_matches_java_earth_scale_mapping_test() {
         assert!(EarthScaleMapping::for_denominator(0, -84.0, 84.0).is_err());
         assert!(EarthScaleMapping::for_denominator(500, 84.0, -84.0).is_err());
+        assert!(EarthScaleMapping::for_denominator(i32::MAX, -84.0, 84.0).is_err());
 
         let mapping = EarthScaleMapping::for_denominator(500, -84.0, 84.0).unwrap();
         assert!(mapping.block_x_for_longitude(180.0).is_err());

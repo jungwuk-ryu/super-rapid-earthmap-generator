@@ -22,6 +22,7 @@ const DEFAULT_GRANULARITY: i64 = 100;
 const NANO_DEGREES: f64 = 1.0e-9;
 
 pub type Result<T> = std::result::Result<T, OsmError>;
+type DataBlockConsumer<'a> = &'a mut dyn FnMut(i32, u64, &[u8]) -> Result<()>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OsmError {
@@ -140,7 +141,7 @@ fn scan_pbf_internal(
     max_blobs: i32,
     skip_blobs: i32,
     parse_primitive_stats: bool,
-    mut data_block_consumer: Option<&mut dyn FnMut(i32, u64, &[u8]) -> Result<()>>,
+    mut data_block_consumer: Option<DataBlockConsumer<'_>>,
 ) -> Result<OsmPbfScanReport> {
     if max_blobs <= 0 {
         return Err(OsmError::invalid("maxBlobs must be positive"));
@@ -689,10 +690,9 @@ impl OsmRegionFeatureIndex {
         ways: &[OsmWay],
         allow_partial_segments: bool,
     ) -> Result<Self> {
-        let min_region_block_x = region_x * REGION_SIZE_BLOCKS;
-        let min_region_block_z = region_z * REGION_SIZE_BLOCKS;
-        let max_region_block_x = min_region_block_x + REGION_SIZE_BLOCKS - 1;
-        let max_region_block_z = min_region_block_z + REGION_SIZE_BLOCKS - 1;
+        validate_region_intersects_mapping(mapping, region_x, region_z)?;
+        let (min_region_block_x, min_region_block_z, max_region_block_x, max_region_block_z) =
+            checked_region_block_bounds(region_x, region_z)?;
         let mut skipped_unscoped_ways = 0;
         let mut skipped_missing_node_ways = 0;
         let mut features = Vec::new();
@@ -712,14 +712,18 @@ impl OsmRegionFeatureIndex {
             }
             for candidate in candidates {
                 if !intersects(
-                    candidate.min_block_x,
-                    candidate.min_block_z,
-                    candidate.max_block_x,
-                    candidate.max_block_z,
-                    min_region_block_x,
-                    min_region_block_z,
-                    max_region_block_x,
-                    max_region_block_z,
+                    (
+                        candidate.min_block_x,
+                        candidate.min_block_z,
+                        candidate.max_block_x,
+                        candidate.max_block_z,
+                    ),
+                    (
+                        min_region_block_x,
+                        min_region_block_z,
+                        max_region_block_x,
+                        max_region_block_z,
+                    ),
                 ) {
                     continue;
                 }
@@ -884,20 +888,105 @@ fn node_to_block_point(mapping: &EarthScaleMapping, node: OsmNode) -> Result<Osm
         .block_z_for_latitude(node.latitude)
         .map_err(|error| OsmError::invalid(error.to_string()))?;
     Ok(OsmBlockPoint {
-        block_x: map_x - (mapping.width_blocks / 2),
-        block_z: map_z - (mapping.height_blocks / 2),
+        block_x: map_x
+            .checked_sub(mapping.width_blocks / 2)
+            .ok_or_else(|| OsmError::invalid("OSM block X coordinate overflow"))?,
+        block_z: map_z
+            .checked_sub(mapping.height_blocks / 2)
+            .ok_or_else(|| OsmError::invalid("OSM block Z coordinate overflow"))?,
     })
 }
 
+fn checked_region_block_bounds(region_x: i32, region_z: i32) -> Result<(i32, i32, i32, i32)> {
+    let min_x = region_x
+        .checked_mul(REGION_SIZE_BLOCKS)
+        .ok_or_else(|| OsmError::invalid("OSM region X coordinate overflow"))?;
+    let min_z = region_z
+        .checked_mul(REGION_SIZE_BLOCKS)
+        .ok_or_else(|| OsmError::invalid("OSM region Z coordinate overflow"))?;
+    let max_x = min_x
+        .checked_add(REGION_SIZE_BLOCKS - 1)
+        .ok_or_else(|| OsmError::invalid("OSM region X coordinate overflow"))?;
+    let max_z = min_z
+        .checked_add(REGION_SIZE_BLOCKS - 1)
+        .ok_or_else(|| OsmError::invalid("OSM region Z coordinate overflow"))?;
+    Ok((min_x, min_z, max_x, max_z))
+}
+
+fn checked_region_block_bounds_with_padding(
+    region_x: i32,
+    region_z: i32,
+    padding_blocks: i32,
+) -> Result<(i32, i32, i32, i32)> {
+    if padding_blocks < 0 {
+        return Err(OsmError::invalid("OSM region padding must be non-negative"));
+    }
+    let (min_x, min_z, max_x, max_z) = checked_region_block_bounds(region_x, region_z)?;
+    Ok((
+        min_x
+            .checked_sub(padding_blocks)
+            .ok_or_else(|| OsmError::invalid("OSM region padded X coordinate overflow"))?,
+        min_z
+            .checked_sub(padding_blocks)
+            .ok_or_else(|| OsmError::invalid("OSM region padded Z coordinate overflow"))?,
+        max_x
+            .checked_add(padding_blocks)
+            .ok_or_else(|| OsmError::invalid("OSM region padded X coordinate overflow"))?,
+        max_z
+            .checked_add(padding_blocks)
+            .ok_or_else(|| OsmError::invalid("OSM region padded Z coordinate overflow"))?,
+    ))
+}
+
+fn mapping_block_bounds(mapping: &EarthScaleMapping) -> Result<(i32, i32, i32, i32)> {
+    if mapping.width_blocks <= 0 || mapping.height_blocks <= 0 {
+        return Err(OsmError::invalid("Earth mapping has no block extent"));
+    }
+    let half_width = mapping.width_blocks / 2;
+    let half_height = mapping.height_blocks / 2;
+    Ok((
+        -half_width,
+        -half_height,
+        mapping
+            .width_blocks
+            .checked_sub(1)
+            .and_then(|max| max.checked_sub(half_width))
+            .ok_or_else(|| OsmError::invalid("Earth mapping X extent overflow"))?,
+        mapping
+            .height_blocks
+            .checked_sub(1)
+            .and_then(|max| max.checked_sub(half_height))
+            .ok_or_else(|| OsmError::invalid("Earth mapping Z extent overflow"))?,
+    ))
+}
+
+fn validate_region_intersects_mapping(
+    mapping: &EarthScaleMapping,
+    region_x: i32,
+    region_z: i32,
+) -> Result<()> {
+    let (min_x, min_z, max_x, max_z) = checked_region_block_bounds(region_x, region_z)?;
+    let (map_min_x, map_min_z, map_max_x, map_max_z) = mapping_block_bounds(mapping)?;
+    if !intersects(
+        (min_x, min_z, max_x, max_z),
+        (map_min_x, map_min_z, map_max_x, map_max_z),
+    ) {
+        return Err(OsmError::invalid(format!(
+            "OSM region {region_x},{region_z} is outside Earth mapping block extent"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_local_block(block: i32, origin: i32, axis: &str) -> Result<i32> {
+    block
+        .checked_sub(origin)
+        .ok_or_else(|| OsmError::invalid(format!("OSM local {axis} coordinate overflow")))
+}
+
 fn intersects(
-    min_x: i32,
-    min_z: i32,
-    max_x: i32,
-    max_z: i32,
-    region_min_x: i32,
-    region_min_z: i32,
-    region_max_x: i32,
-    region_max_z: i32,
+    (min_x, min_z, max_x, max_z): (i32, i32, i32, i32),
+    (region_min_x, region_min_z, region_max_x, region_max_z): (i32, i32, i32, i32),
 ) -> bool {
     max_x >= region_min_x && min_x <= region_max_x && max_z >= region_min_z && min_z <= region_max_z
 }
@@ -911,22 +1000,22 @@ pub struct OsmRegionFeatureMask {
 }
 
 impl OsmRegionFeatureMask {
-    pub fn rasterize(index: &OsmRegionFeatureIndex) -> Self {
+    pub fn rasterize(index: &OsmRegionFeatureIndex) -> Result<Self> {
         let mut mask = Self {
             roads: vec![false; (REGION_SIZE_BLOCKS * REGION_SIZE_BLOCKS) as usize],
             waterways: vec![false; (REGION_SIZE_BLOCKS * REGION_SIZE_BLOCKS) as usize],
             landuse: vec![false; (REGION_SIZE_BLOCKS * REGION_SIZE_BLOCKS) as usize],
             buildings: vec![false; (REGION_SIZE_BLOCKS * REGION_SIZE_BLOCKS) as usize],
         };
-        let region_origin_x = index.region_x * REGION_SIZE_BLOCKS;
-        let region_origin_z = index.region_z * REGION_SIZE_BLOCKS;
+        let (region_origin_x, region_origin_z, _, _) =
+            checked_region_block_bounds(index.region_x, index.region_z)?;
         for feature in &index.features {
             if feature.points.len() == 1 {
                 let point = feature.points[0];
                 mask.mark(
                     feature.kind,
-                    point.block_x - region_origin_x,
-                    point.block_z - region_origin_z,
+                    checked_local_block(point.block_x, region_origin_x, "X")?,
+                    checked_local_block(point.block_z, region_origin_z, "Z")?,
                 );
                 continue;
             }
@@ -935,14 +1024,14 @@ impl OsmRegionFeatureMask {
                 let current = feature.points[point_index];
                 mask.mark_line(
                     feature.kind,
-                    previous.block_x - region_origin_x,
-                    previous.block_z - region_origin_z,
-                    current.block_x - region_origin_x,
-                    current.block_z - region_origin_z,
+                    checked_local_block(previous.block_x, region_origin_x, "X")?,
+                    checked_local_block(previous.block_z, region_origin_z, "Z")?,
+                    checked_local_block(current.block_x, region_origin_x, "X")?,
+                    checked_local_block(current.block_z, region_origin_z, "Z")?,
                 );
             }
         }
-        mask
+        Ok(mask)
     }
 
     pub fn road_count(&self) -> i32 {
@@ -1066,7 +1155,7 @@ pub fn extract_window(
     }
     let start = Instant::now();
     let bounds =
-        RegionGeoBounds::for_region(mapping, region_x, region_z, REGION_NODE_PADDING_BLOCKS);
+        RegionGeoBounds::try_for_region(mapping, region_x, region_z, REGION_NODE_PADDING_BLOCKS)?;
     let mut nodes = HashMap::new();
     let mut ways = Vec::new();
     let mut primitive_groups = 0i64;
@@ -1147,6 +1236,7 @@ pub fn extract_way_ref_window(
     if way_skip_blobs < 0 {
         return Err(OsmError::invalid("waySkipBlobs must be non-negative"));
     }
+    validate_region_intersects_mapping(mapping, region_x, region_z)?;
     let start = Instant::now();
     let mut nodes = HashMap::new();
     let mut ways = Vec::new();
@@ -1222,7 +1312,7 @@ where
     }
     let start = Instant::now();
     let bounds =
-        RegionGeoBounds::for_region(mapping, region_x, region_z, REGION_NODE_PADDING_BLOCKS);
+        RegionGeoBounds::try_for_region(mapping, region_x, region_z, REGION_NODE_PADDING_BLOCKS)?;
     let mut nodes = HashMap::new();
     let mut ways = Vec::new();
     let mut primitive_groups = 0i64;
@@ -1284,6 +1374,7 @@ pub struct FullScanProgress {
     pub primitive_groups: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn retain_decoded(
     bounds: &RegionGeoBounds,
     nodes: &mut HashMap<i64, OsmNode>,
@@ -1409,7 +1500,7 @@ fn build_extract_result(
     } else {
         OsmRegionFeatureIndex::build(mapping, region_x, region_z, nodes, ways)?
     };
-    let mask = OsmRegionFeatureMask::rasterize(&index);
+    let mask = OsmRegionFeatureMask::rasterize(&index)?;
     let report = OsmPbfRegionExtractReport {
         blobs_scanned: scan.blobs_scanned,
         osm_data_blobs: scan.osm_data_blobs,
@@ -1462,24 +1553,20 @@ struct RegionGeoBounds {
 }
 
 impl RegionGeoBounds {
-    fn for_region(
+    fn try_for_region(
         mapping: &EarthScaleMapping,
         region_x: i32,
         region_z: i32,
         padding_blocks: i32,
-    ) -> Self {
-        let min_global_x = (region_x * REGION_SIZE_BLOCKS) - padding_blocks;
-        let max_global_x = ((region_x + 1) * REGION_SIZE_BLOCKS) - 1 + padding_blocks;
-        let min_global_z = (region_z * REGION_SIZE_BLOCKS) - padding_blocks;
-        let max_global_z = ((region_z + 1) * REGION_SIZE_BLOCKS) - 1 + padding_blocks;
-        let min_map_x =
-            (min_global_x + (mapping.width_blocks / 2)).clamp(0, mapping.width_blocks - 1);
-        let max_map_x =
-            (max_global_x + (mapping.width_blocks / 2)).clamp(0, mapping.width_blocks - 1);
-        let min_map_z =
-            (min_global_z + (mapping.height_blocks / 2)).clamp(0, mapping.height_blocks - 1);
-        let max_map_z =
-            (max_global_z + (mapping.height_blocks / 2)).clamp(0, mapping.height_blocks - 1);
+    ) -> Result<Self> {
+        validate_region_intersects_mapping(mapping, region_x, region_z)?;
+        let (min_global_x, min_global_z, max_global_x, max_global_z) =
+            checked_region_block_bounds_with_padding(region_x, region_z, padding_blocks)?;
+        let (map_min_x, map_min_z, map_max_x, map_max_z) = mapping_block_bounds(mapping)?;
+        let min_map_x = (min_global_x.clamp(map_min_x, map_max_x)) + (mapping.width_blocks / 2);
+        let max_map_x = (max_global_x.clamp(map_min_x, map_max_x)) + (mapping.width_blocks / 2);
+        let min_map_z = (min_global_z.clamp(map_min_z, map_max_z)) + (mapping.height_blocks / 2);
+        let max_map_z = (max_global_z.clamp(map_min_z, map_max_z)) + (mapping.height_blocks / 2);
         let min_longitude = mapping.longitude_for_block_x(min_map_x).unwrap_or(-180.0);
         let max_longitude = mapping.longitude_for_block_x(max_map_x).unwrap_or(180.0);
         let max_latitude = mapping
@@ -1488,12 +1575,12 @@ impl RegionGeoBounds {
         let min_latitude = mapping
             .latitude_for_block_z(max_map_z)
             .unwrap_or(mapping.min_latitude);
-        Self {
+        Ok(Self {
             min_longitude,
             max_longitude,
             min_latitude,
             max_latitude,
-        }
+        })
     }
 
     fn contains(self, longitude: f64, latitude: f64) -> bool {
@@ -1515,6 +1602,8 @@ pub fn benchmark_osm_index(
     }
     let mapping = EarthScaleMapping::for_denominator(scale, -90.0, 90.0)
         .map_err(|error| OsmError::invalid(error.to_string()))?;
+    validate_region_intersects_mapping(&mapping, region_x, region_z)?;
+    let (region_origin_x, region_origin_z, _, _) = checked_region_block_bounds(region_x, region_z)?;
     let setup_start = Instant::now();
     let mut nodes = HashMap::with_capacity(way_count as usize * 2);
     let mut ways = Vec::with_capacity(way_count as usize);
@@ -1523,15 +1612,22 @@ pub fn benchmark_osm_index(
         let second_node_id = first_node_id + 1;
         let local_x = index % REGION_SIZE_BLOCKS;
         let local_z = (index / REGION_SIZE_BLOCKS) % REGION_SIZE_BLOCKS;
-        let first_block_x = (region_x * REGION_SIZE_BLOCKS) + local_x;
-        let first_block_z = (region_z * REGION_SIZE_BLOCKS) + local_z;
+        let first_block_x = region_origin_x
+            .checked_add(local_x)
+            .ok_or_else(|| OsmError::invalid("OSM benchmark X coordinate overflow"))?;
+        let first_block_z = region_origin_z
+            .checked_add(local_z)
+            .ok_or_else(|| OsmError::invalid("OSM benchmark Z coordinate overflow"))?;
+        let second_block_x = first_block_x
+            .checked_add(1)
+            .ok_or_else(|| OsmError::invalid("OSM benchmark X coordinate overflow"))?;
         nodes.insert(
             first_node_id,
             node_for_block(&mapping, first_node_id, first_block_x, first_block_z)?,
         );
         nodes.insert(
             second_node_id,
-            node_for_block(&mapping, second_node_id, first_block_x + 1, first_block_z)?,
+            node_for_block(&mapping, second_node_id, second_block_x, first_block_z)?,
         );
         ways.push(OsmWay {
             id: index as i64 + 1,
@@ -1630,7 +1726,7 @@ pub fn extract_xml_region_mask(
     }
     let start = Instant::now();
     let bounds =
-        RegionGeoBounds::for_region(mapping, region_x, region_z, REGION_NODE_PADDING_BLOCKS);
+        RegionGeoBounds::try_for_region(mapping, region_x, region_z, REGION_NODE_PADDING_BLOCKS)?;
     let mut nodes = HashMap::new();
     let mut ways = Vec::new();
     let mut files = osm_xml_files(directory)?;
@@ -2055,6 +2151,26 @@ mod tests {
         assert_eq!(result.report.indexed_features, 1);
         assert_eq!(result.report.road_features, 1);
         assert!(result.report.road_mask_pixels > 0);
+    }
+
+    #[test]
+    fn pbf_extract_rejects_i32_max_region_before_file_io() {
+        let mapping = EarthScaleMapping::for_denominator(1000, -90.0, 90.0).unwrap();
+        let error = extract_mask(Path::new("missing.osm.pbf"), 1, &mapping, i32::MAX, 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("coordinate overflow"), "error={error}");
+    }
+
+    #[test]
+    fn pbf_extract_rejects_i32_min_region_before_file_io() {
+        let mapping = EarthScaleMapping::for_denominator(1000, -90.0, 90.0).unwrap();
+        let error = extract_mask(Path::new("missing.osm.pbf"), 1, &mapping, i32::MIN, 0)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("coordinate overflow"), "error={error}");
     }
 
     #[test]

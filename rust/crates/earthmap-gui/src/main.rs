@@ -390,15 +390,59 @@ impl GenerationOptions {
     }
 
     fn validation_error(&self) -> Option<String> {
-        if self.heightmap_path.trim().is_empty() {
-            return Some(format!(
-                "Select a HeightMap GeoTIFF or set {HEIGHTMAP_PATH_ENV}."
-            ));
+        if let Some(error) = validate_required_file_path(
+            "HeightMap GeoTIFF",
+            &self.heightmap_path,
+            HEIGHTMAP_PATH_ENV,
+        ) {
+            return Some(error);
         }
-        if self.world_dir.trim().is_empty() {
-            return Some(format!(
-                "Select an output world directory or set {OUTPUT_ROOT_ENV}."
-            ));
+        if let Some(error) = validate_optional_directory_path("TifFiles root", &self.tif_root) {
+            return Some(error);
+        }
+        if let Some(error) = validate_surface_raster_path(&self.true_marble_path) {
+            return Some(error);
+        }
+        if let Some(error) = validate_output_world_dir(&self.world_dir) {
+            return Some(error);
+        }
+        if let Some(error) =
+            validate_auto_or_positive_usize("Height cache rows", &self.cache_rows, true)
+        {
+            return Some(error);
+        }
+        if let Some(error) = validate_auto_or_positive_usize(
+            "Surface tile cache",
+            &self.surface_tile_cache_entries,
+            true,
+        ) {
+            return Some(error);
+        }
+        if let Some(error) =
+            validate_auto_or_positive_usize("Rayon threads", &self.rayon_threads, true)
+        {
+            return Some(error);
+        }
+        if self.prefetch_enabled {
+            if let Some(error) = validate_auto_or_positive_number(
+                "Prefetch memory GB",
+                &self.prefetch_memory_gb,
+                true,
+            ) {
+                return Some(error);
+            }
+            if let Some(error) = validate_auto_or_positive_usize(
+                "Prefetch queue regions",
+                &self.prefetch_queue_regions,
+                true,
+            ) {
+                return Some(error);
+            }
+            if let Some(error) =
+                validate_auto_or_positive_usize("Prefetch workers", &self.prefetch_workers, true)
+            {
+                return Some(error);
+            }
         }
         None
     }
@@ -687,6 +731,128 @@ fn path_status(label: &str, path: &str, file: bool) -> String {
         format!("{label} status: found")
     } else {
         format!("{label} status: not found")
+    }
+}
+
+fn validate_required_file_path(label: &str, path: &str, env_name: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Some(format!("Select a {label} or set {env_name}."));
+    }
+    if !Path::new(trimmed).is_file() {
+        return Some(format!(
+            "{label} does not exist or is not a file: {trimmed}"
+        ));
+    }
+    None
+}
+
+fn validate_optional_directory_path(label: &str, path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !Path::new(trimmed).is_dir() {
+        return Some(format!(
+            "{label} does not exist or is not a directory: {trimmed}"
+        ));
+    }
+    None
+}
+
+fn validate_surface_raster_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let explicit_path = if let Some((key, value)) = trimmed.split_once('=') {
+        if !key.trim().eq_ignore_ascii_case("surfaceRaster") {
+            return Some(format!(
+                "Surface raster option must use surfaceRaster=...: {key}"
+            ));
+        }
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+            return None;
+        }
+        value
+    } else {
+        trimmed
+    };
+    if !Path::new(explicit_path).is_file() {
+        return Some(format!(
+            "Satellite raster does not exist or is not a file: {explicit_path}"
+        ));
+    }
+    None
+}
+
+fn validate_output_world_dir(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Some(format!(
+            "Select an output world directory or set {OUTPUT_ROOT_ENV}."
+        ));
+    }
+    let path = Path::new(trimmed);
+    if path.exists() {
+        if path.is_dir() {
+            return None;
+        }
+        return Some(format!(
+            "Output world path exists but is not a directory: {trimmed}"
+        ));
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    match parent {
+        Some(parent) if parent.is_dir() => None,
+        Some(parent) => Some(format!(
+            "Output world parent directory does not exist: {}",
+            parent.display()
+        )),
+        None => Some(format!(
+            "Output world parent directory does not exist: {trimmed}"
+        )),
+    }
+}
+
+fn validate_auto_or_positive_usize(label: &str, value: &str, allow_empty: bool) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return if allow_empty {
+            None
+        } else {
+            Some(format!("{label} must be auto or a positive integer."))
+        };
+    }
+    if trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    match trimmed.parse::<usize>() {
+        Ok(value) if value > 0 => None,
+        _ => Some(format!("{label} must be auto or a positive integer.")),
+    }
+}
+
+fn validate_auto_or_positive_number(label: &str, value: &str, allow_empty: bool) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return if allow_empty {
+            None
+        } else {
+            Some(format!("{label} must be auto or a positive number."))
+        };
+    }
+    if trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    match trimmed.parse::<f64>() {
+        Ok(value) if value.is_finite() && value > 0.0 => None,
+        _ => Some(format!("{label} must be auto or a positive number.")),
     }
 }
 
@@ -1140,6 +1306,16 @@ struct RegionProgressGrid {
     failed_regions: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RegionProgressCounts {
+    queued: usize,
+    running: usize,
+    generated: usize,
+    skipped: usize,
+    failed: usize,
+    missing: usize,
+}
+
 impl RegionProgressGrid {
     fn new(grid: RegionGrid) -> Self {
         debug_assert_eq!(REGION_STATE_MISSING, 0);
@@ -1184,6 +1360,21 @@ impl RegionProgressGrid {
             self.failed_regions = self.failed_regions.saturating_add(1);
         }
         true
+    }
+
+    fn counts(&self) -> RegionProgressCounts {
+        let mut counts = RegionProgressCounts::default();
+        for state in &self.states {
+            match *state {
+                REGION_STATE_QUEUED => counts.queued = counts.queued.saturating_add(1),
+                REGION_STATE_RUNNING => counts.running = counts.running.saturating_add(1),
+                REGION_STATE_GENERATED => counts.generated = counts.generated.saturating_add(1),
+                REGION_STATE_SKIPPED => counts.skipped = counts.skipped.saturating_add(1),
+                REGION_STATE_FAILED => counts.failed = counts.failed.saturating_add(1),
+                _ => counts.missing = counts.missing.saturating_add(1),
+            }
+        }
+        counts
     }
 }
 
@@ -1247,6 +1438,21 @@ fn region_state_color(state: u8) -> egui::Color32 {
         REGION_STATE_GENERATED => egui::Color32::from_rgba_premultiplied(64, 220, 120, 150),
         REGION_STATE_FAILED => egui::Color32::from_rgba_premultiplied(235, 60, 60, 220),
         _ => egui::Color32::TRANSPARENT,
+    }
+}
+
+fn progress_status_label(ui: &mut egui::Ui, label: &str, count: usize, state: u8) {
+    ui.colored_label(
+        region_state_legend_color(state),
+        format!("{label}: {count}"),
+    );
+}
+
+fn region_state_legend_color(state: u8) -> egui::Color32 {
+    match state {
+        REGION_STATE_QUEUED => egui::Color32::from_rgb(135, 145, 155),
+        REGION_STATE_MISSING => egui::Color32::from_rgb(120, 120, 120),
+        _ => region_state_color(state),
     }
 }
 
@@ -1547,6 +1753,7 @@ impl ProgressState {
     }
 }
 
+#[derive(Default)]
 struct EarthMapGuiApp {
     options: GenerationOptions,
     progress: ProgressState,
@@ -1555,20 +1762,6 @@ struct EarthMapGuiApp {
     log_lines: Vec<String>,
     loaded_project_world_dir: String,
     project_settings_status: Option<String>,
-}
-
-impl Default for EarthMapGuiApp {
-    fn default() -> Self {
-        Self {
-            options: GenerationOptions::default(),
-            progress: ProgressState::default(),
-            map_overlay: MapOverlayState::default(),
-            run: None,
-            log_lines: Vec::new(),
-            loaded_project_world_dir: String::new(),
-            project_settings_status: None,
-        }
-    }
 }
 
 impl EarthMapGuiApp {
@@ -2001,6 +2194,25 @@ impl EarthMapGuiApp {
             target_rect,
             egui::Color32::from_rgba_premultiplied(255, 255, 255, 190),
         );
+    }
+
+    fn show_map_status_legend(&self, ui: &mut egui::Ui) {
+        let Some(progress_grid) = &self.progress.grid else {
+            ui.label("Map status: no region progress loaded");
+            return;
+        };
+        let counts = progress_grid.counts();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Map status:");
+            progress_status_label(ui, "Queued", counts.queued, REGION_STATE_QUEUED);
+            progress_status_label(ui, "Running", counts.running, REGION_STATE_RUNNING);
+            progress_status_label(ui, "Generated", counts.generated, REGION_STATE_GENERATED);
+            progress_status_label(ui, "Skipped", counts.skipped, REGION_STATE_SKIPPED);
+            progress_status_label(ui, "Failed", counts.failed, REGION_STATE_FAILED);
+            if counts.missing > 0 {
+                progress_status_label(ui, "Missing", counts.missing, REGION_STATE_MISSING);
+            }
+        });
     }
 
     fn update_status_texture(&mut self, ctx: &egui::Context) {
@@ -2441,6 +2653,7 @@ impl eframe::App for EarthMapGuiApp {
             ui.separator();
             if self.map_overlay.enabled {
                 self.show_map_overlay(ui);
+                self.show_map_status_legend(ui);
                 ui.separator();
             }
             ui.heading("Resolved Command");
@@ -2450,14 +2663,14 @@ impl eframe::App for EarthMapGuiApp {
                     .first()
                     .map(|command| command.args.clone())
                     .unwrap_or_else(|| build_generation_args(&self.options));
-                ui.monospace(format!("earthmap-rs {}", args.join(" ")));
+                ui.monospace(powershell_command_line("earthmap-rs", &args));
             } else {
                 ui.monospace(format!("{} shard processes", commands.len()));
                 for command in commands.iter().take(8) {
                     ui.monospace(format!(
-                        "{}earthmap-rs {}",
+                        "{}{}",
                         process_log_prefix(command.tag),
-                        command.args.join(" ")
+                        powershell_command_line("earthmap-rs", &command.args)
                     ));
                 }
                 if commands.len() > 8 {
@@ -2570,9 +2783,9 @@ fn run_generation_processes(
         apply_generation_env(&mut command, &options);
 
         let _ = sender.send(WorkerEvent::Line(format!(
-            "{}starting earthmap-rs {}",
+            "{}starting {}",
             process_log_prefix(command_spec.tag),
-            command_spec.args.join(" ")
+            powershell_command_line("earthmap-rs", &command_spec.args)
         )));
 
         let mut child = match command.spawn() {
@@ -2915,6 +3128,43 @@ fn earthmap_cli_executable() -> PathBuf {
     PathBuf::from(exe_name)
 }
 
+fn powershell_command_line(executable: &str, args: &[String]) -> String {
+    std::iter::once(powershell_quote_arg(executable))
+        .chain(args.iter().map(|arg| powershell_quote_arg(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn powershell_quote_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(powershell_arg_needs_quotes) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', "''"))
+}
+
+fn powershell_arg_needs_quotes(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '\'' | '"'
+                | '`'
+                | '$'
+                | '&'
+                | '|'
+                | '<'
+                | '>'
+                | ';'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | ','
+                | '#'
+        )
+}
+
 fn apply_generation_env(command: &mut Command, options: &GenerationOptions) {
     if !options.heightmap_path.trim().is_empty() {
         command.env(HEIGHTMAP_PATH_ENV, options.heightmap_path.trim());
@@ -2941,7 +3191,9 @@ fn apply_generation_env(command: &mut Command, options: &GenerationOptions) {
             options.surface_tile_cache_entries.trim(),
         );
     }
-    if !options.rayon_threads.trim().is_empty() {
+    if !options.rayon_threads.trim().is_empty()
+        && !options.rayon_threads.trim().eq_ignore_ascii_case("auto")
+    {
         command.env("RAYON_NUM_THREADS", options.rayon_threads.trim());
     }
 }
@@ -2960,7 +3212,9 @@ fn generation_env_preview(options: &GenerationOptions) -> Vec<(String, String)> 
             options.surface_tile_cache_entries.trim().to_string(),
         ));
     }
-    if !options.rayon_threads.trim().is_empty() {
+    if !options.rayon_threads.trim().is_empty()
+        && !options.rayon_threads.trim().eq_ignore_ascii_case("auto")
+    {
         values.push((
             "RAYON_NUM_THREADS".to_string(),
             options.rayon_threads.trim().to_string(),
@@ -3141,6 +3395,68 @@ mod tests {
     }
 
     #[test]
+    fn generation_env_preview_omits_auto_rayon_threads() {
+        let options = GenerationOptions {
+            rayon_threads: "auto".to_string(),
+            ..GenerationOptions::default()
+        };
+        let env = generation_env_preview(&options);
+        assert!(!env.iter().any(|(key, _)| key == "RAYON_NUM_THREADS"));
+    }
+
+    #[test]
+    fn generation_validation_accepts_existing_paths_and_auto_numeric_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = valid_generation_options_for_validation(temp.path());
+
+        assert_eq!(options.validation_error(), None);
+    }
+
+    #[test]
+    fn generation_validation_blocks_missing_heightmap() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = valid_generation_options_for_validation(temp.path());
+        options.heightmap_path = temp.path().join("missing.tif").display().to_string();
+
+        let error = options.validation_error().unwrap();
+
+        assert!(error.contains("HeightMap GeoTIFF"), "error={error}");
+    }
+
+    #[test]
+    fn generation_validation_blocks_missing_explicit_surface_raster() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = valid_generation_options_for_validation(temp.path());
+        options.true_marble_path = temp.path().join("missing.vrt").display().to_string();
+
+        let error = options.validation_error().unwrap();
+
+        assert!(error.contains("Satellite raster"), "error={error}");
+    }
+
+    #[test]
+    fn generation_validation_blocks_invalid_cache_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = valid_generation_options_for_validation(temp.path());
+        options.cache_rows = "0".to_string();
+
+        let error = options.validation_error().unwrap();
+
+        assert!(error.contains("Height cache rows"), "error={error}");
+    }
+
+    #[test]
+    fn generation_validation_blocks_invalid_rayon_threads() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = valid_generation_options_for_validation(temp.path());
+        options.rayon_threads = "abc".to_string();
+
+        let error = options.validation_error().unwrap();
+
+        assert!(error.contains("Rayon threads"), "error={error}");
+    }
+
+    #[test]
     fn mca_generation_args_include_selected_compression_level() {
         let options = GenerationOptions {
             format: OutputFormatChoice::Mca,
@@ -3171,6 +3487,59 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[12], "verticalScale=legacy");
+    }
+
+    #[test]
+    fn resolved_command_preview_quotes_windows_paths_for_powershell() {
+        let args = vec![
+            "generate-vanilla-delegated-regions-parallel".to_string(),
+            "D:\\earth map\\height map.tif".to_string(),
+            "D:\\earth map\\world out".to_string(),
+            "250".to_string(),
+            "-157".to_string(),
+            "-74".to_string(),
+            "314".to_string(),
+            "148".to_string(),
+            "linear".to_string(),
+            "12".to_string(),
+            "surface".to_string(),
+            "surfaceRaster=D:\\earth map\\TifFiles\\terrain\\TrueMarble.vrt".to_string(),
+            "verticalScale=auto".to_string(),
+            "linearCompression=6".to_string(),
+            "label=Bob's run".to_string(),
+        ];
+
+        let command_line = powershell_command_line("earthmap-rs", &args);
+
+        assert!(command_line.contains("'D:\\earth map\\height map.tif'"));
+        assert!(command_line.contains("'D:\\earth map\\world out'"));
+        assert!(command_line
+            .contains("'surfaceRaster=D:\\earth map\\TifFiles\\terrain\\TrueMarble.vrt'"));
+        assert!(command_line.contains("'label=Bob''s run'"));
+        assert!(command_line.contains(" 250 "));
+    }
+
+    fn valid_generation_options_for_validation(root: &Path) -> GenerationOptions {
+        let heightmap = root.join("heightmap.tif");
+        let tif_root = root.join("TifFiles");
+        let true_marble = tif_root.join("terrain").join("TrueMarble.vrt");
+        let world = root.join("world");
+        std::fs::create_dir_all(true_marble.parent().unwrap()).unwrap();
+        std::fs::write(&heightmap, b"heightmap").unwrap();
+        std::fs::write(&true_marble, b"vrt").unwrap();
+        GenerationOptions {
+            heightmap_path: heightmap.display().to_string(),
+            tif_root: tif_root.display().to_string(),
+            true_marble_path: true_marble.display().to_string(),
+            world_dir: world.display().to_string(),
+            cache_rows: "auto".to_string(),
+            surface_tile_cache_entries: "auto".to_string(),
+            rayon_threads: "auto".to_string(),
+            prefetch_memory_gb: "auto".to_string(),
+            prefetch_queue_regions: "auto".to_string(),
+            prefetch_workers: "auto".to_string(),
+            ..GenerationOptions::default()
+        }
     }
 
     fn write_existing_parallel_project_fixture(root: &Path) -> (PathBuf, PathBuf) {
@@ -3443,6 +3812,33 @@ generation.verticalScaleMode=auto\n",
     }
 
     #[test]
+    fn region_progress_counts_track_all_map_statuses() {
+        let mut grid = RegionProgressGrid::new(RegionGrid {
+            start_region_x: 5,
+            start_region_z: -2,
+            cols: 3,
+            rows: 2,
+        });
+
+        grid.mark(5, -2, REGION_STATE_GENERATED);
+        grid.mark(6, -2, REGION_STATE_SKIPPED);
+        grid.mark(7, -2, REGION_STATE_RUNNING);
+        grid.mark(5, -1, REGION_STATE_FAILED);
+
+        assert_eq!(
+            grid.counts(),
+            RegionProgressCounts {
+                queued: 2,
+                running: 1,
+                generated: 1,
+                skipped: 1,
+                failed: 1,
+                missing: 0,
+            }
+        );
+    }
+
+    #[test]
     fn status_texture_layout_keeps_large_region_grids_capped() {
         assert_eq!(
             status_texture_layout(RegionGrid {
@@ -3583,7 +3979,10 @@ generation.verticalScaleMode=auto\n",
     #[test]
     fn parse_json_progress_event_extracts_batch_and_region_updates() {
         let tuning_started = parse_progress_event_line(
-            r#"event	{"schemaVersion":1,"type":"workerTuningStarted","enabled":true,"requestedThreads":8,"submittedRegions":100,"maxSamples":16}"#,
+            concat!(
+                "event\t",
+                r#"{"schemaVersion":1,"type":"workerTuningStarted","enabled":true,"requestedThreads":8,"submittedRegions":100,"maxSamples":16}"#
+            ),
         )
         .unwrap();
         assert!(matches!(
@@ -3597,7 +3996,10 @@ generation.verticalScaleMode=auto\n",
         ));
 
         let tuning_finished = parse_progress_event_line(
-            r#"event	{"schemaVersion":1,"type":"workerTuningFinished","workerTuning":{"mode":"autotuned","selectedRegionWorkerThreads":4,"selectedRayonThreads":12,"parallelColumnSampling":true,"sampleCount":16,"landSamples":5,"mixedSamples":6,"oceanSamples":5,"message":null}}"#,
+            concat!(
+                "event\t",
+                r#"{"schemaVersion":1,"type":"workerTuningFinished","workerTuning":{"mode":"autotuned","selectedRegionWorkerThreads":4,"selectedRayonThreads":12,"parallelColumnSampling":true,"sampleCount":16,"landSamples":5,"mixedSamples":6,"oceanSamples":5,"message":null}}"#
+            ),
         )
         .unwrap();
         match tuning_finished {
@@ -3614,7 +4016,10 @@ generation.verticalScaleMode=auto\n",
         }
 
         let batch = parse_progress_event_line(
-            r#"event	{"schemaVersion":1,"type":"batchStarted","regionStartX":-40,"regionStartZ":-20,"regionCols":80,"regionRows":40,"regionCount":3200,"resumeFingerprintMatched":true,"resumeJournalRegions":12}"#,
+            concat!(
+                "event\t",
+                r#"{"schemaVersion":1,"type":"batchStarted","regionStartX":-40,"regionStartZ":-20,"regionCols":80,"regionRows":40,"regionCount":3200,"resumeFingerprintMatched":true,"resumeJournalRegions":12}"#
+            ),
         )
         .unwrap();
         match batch {
@@ -3636,7 +4041,10 @@ generation.verticalScaleMode=auto\n",
         }
 
         let generated = parse_progress_event_line(
-            r#"event	{"schemaVersion":1,"type":"regionGenerated","regionX":27,"regionZ":-9,"elapsedMillis":10977}"#,
+            concat!(
+                "event\t",
+                r#"{"schemaVersion":1,"type":"regionGenerated","regionX":27,"regionZ":-9,"elapsedMillis":10977}"#
+            ),
         )
         .unwrap();
         assert!(matches!(

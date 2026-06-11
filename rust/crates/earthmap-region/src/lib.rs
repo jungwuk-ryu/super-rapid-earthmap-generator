@@ -398,10 +398,8 @@ pub fn write_linear_v2_region_with_compression(
         let bucket_hash = bucket.as_ref().map_or(0, |bytes| xxh64(bytes, 0) as i64);
         data.extend_from_slice(&bucket_hash.to_be_bytes());
     }
-    for bucket in &buckets {
-        if let Some(bytes) = bucket {
-            data.extend_from_slice(bytes);
-        }
+    for bytes in buckets.iter().flatten() {
+        data.extend_from_slice(bytes);
     }
     data.extend_from_slice(&LINEAR_SUPERBLOCK.to_be_bytes());
 
@@ -442,14 +440,52 @@ pub fn validate_region_file_for_resume(
             "region coordinates differ from expected: file={region_x},{region_z} expected={expected_region_x},{expected_region_z}"
         )));
     }
-    match expected_format {
+    let validation = match expected_format {
         RegionFormat::Mca => {
             validate_mca_region_for_resume(path, region_x, region_z, expected_chunks)
         }
         RegionFormat::Linear => {
             validate_linear_region_for_resume(path, region_x, region_z, expected_chunks)
         }
+    }?;
+    validate_region_payloads_for_resume(
+        path,
+        expected_format,
+        expected_region_x,
+        expected_region_z,
+        expected_chunks,
+    )?;
+    Ok(validation)
+}
+
+fn validate_region_payloads_for_resume(
+    path: &Path,
+    expected_format: RegionFormat,
+    expected_region_x: i32,
+    expected_region_z: i32,
+    expected_chunks: usize,
+) -> Result<()> {
+    let payloads = match expected_format {
+        RegionFormat::Mca => read_mca_region_payloads(path),
+        RegionFormat::Linear => read_linear_region_payloads(path),
+    }?;
+    if payloads.format != expected_format {
+        return Err(RegionError::Invalid(format!(
+            "region payload format differs from expected: file={:?} expected={:?}",
+            payloads.format, expected_format
+        )));
     }
+    if payloads.region_x != expected_region_x || payloads.region_z != expected_region_z {
+        return Err(RegionError::Invalid(format!(
+            "region payload coordinates differ from expected: file={},{} expected={},{}",
+            payloads.region_x, payloads.region_z, expected_region_x, expected_region_z
+        )));
+    }
+    validate_expected_chunk_count(payloads.chunks.len(), expected_chunks)?;
+    for (pos, payload) in &payloads.chunks {
+        validate_payload(*pos, payload)?;
+    }
+    Ok(())
 }
 
 pub fn sectors_for(byte_count: usize) -> Result<usize> {
@@ -650,8 +686,11 @@ fn validate_mca_region_for_resume(
     }
     let total_sectors = data.len() / MCA_SECTOR_BYTES;
     let mut occupied_sectors = vec![false; total_sectors];
-    for sector in 0..MCA_HEADER_SECTORS.min(total_sectors) {
-        occupied_sectors[sector] = true;
+    for occupied in occupied_sectors
+        .iter_mut()
+        .take(MCA_HEADER_SECTORS.min(total_sectors))
+    {
+        *occupied = true;
     }
 
     let mut chunk_count = 0usize;
@@ -681,13 +720,18 @@ fn validate_mca_region_for_resume(
                 "MCA chunk points beyond file sectors".to_string(),
             ));
         }
-        for sector in offset_sector..end_sector {
-            if occupied_sectors[sector] {
+        for (sector, occupied) in occupied_sectors
+            .iter_mut()
+            .enumerate()
+            .take(end_sector)
+            .skip(offset_sector)
+        {
+            if *occupied {
                 return Err(RegionError::Invalid(format!(
                     "MCA chunk sector overlap at sector {sector}"
                 )));
             }
-            occupied_sectors[sector] = true;
+            *occupied = true;
         }
 
         let chunk_start = offset_sector * MCA_SECTOR_BYTES;
@@ -940,12 +984,15 @@ fn read_mca_region_payloads(path: &Path) -> Result<RegionPayloads> {
                 "MCA chunk payload points beyond file at sector {offset_sector}"
             )));
         }
-        let mut decoder = ZlibDecoder::new(&data[compressed_start..compressed_end]);
-        let mut payload = Vec::new();
-        decoder.read_to_end(&mut payload)?;
-
         let local_x = u8::try_from(header_index % 32).expect("local x fits u8");
         let local_z = u8::try_from(header_index / 32).expect("local z fits u8");
+        let mut decoder = ZlibDecoder::new(&data[compressed_start..compressed_end]);
+        let mut payload = Vec::new();
+        decoder.read_to_end(&mut payload).map_err(|error| {
+            RegionError::Invalid(format!(
+                "invalid MCA zlib payload at {local_x},{local_z}: {error}"
+            ))
+        })?;
         chunks.insert(ChunkLocalPos::new(local_x, local_z)?, payload);
     }
 
@@ -1073,9 +1120,17 @@ fn read_linear_bucket(
     existence: &[bool],
     chunks: &mut BTreeMap<ChunkLocalPos, Vec<u8>>,
 ) -> Result<()> {
-    let mut decoder = zstd::stream::read::Decoder::new(bucket)?;
+    let mut decoder = zstd::stream::read::Decoder::new(bucket).map_err(|error| {
+        RegionError::Invalid(format!(
+            "invalid Linear zstd bucket at {bucket_index}: {error}"
+        ))
+    })?;
     let mut decompressed = Vec::new();
-    decoder.read_to_end(&mut decompressed)?;
+    decoder.read_to_end(&mut decompressed).map_err(|error| {
+        RegionError::Invalid(format!(
+            "invalid Linear zstd bucket at {bucket_index}: {error}"
+        ))
+    })?;
     let mut cursor = Cursor::new(&decompressed);
     let cell_count = 32 / usize::from(grid_size);
     let bucket_x = bucket_index / usize::from(grid_size);
@@ -1325,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_complete_mca_region_for_resume_without_decompression() {
+    fn validates_complete_mca_region_for_resume_with_payload_decode() {
         let path = temp_region_path("r.4.-7.mca");
         let payloads = full_region_payloads();
 
@@ -1380,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_complete_linear_region_for_resume_without_decompression() {
+    fn validates_complete_linear_region_for_resume_with_payload_decode() {
         let path = temp_region_path("r.-8.9.linear");
         let payloads = full_region_payloads();
 
@@ -1515,6 +1570,76 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("hash mismatch"), "error={error}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resume_validation_rejects_corrupted_mca_zlib_payload() {
+        let path = temp_region_path("r.0.0.mca");
+        write_mca_region_with_compression(&path, &full_region_payloads(), 42, 1)
+            .expect("complete MCA region should write");
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let location = read_u32_be(&bytes, 0).unwrap();
+        let offset_sector = usize::try_from(location >> 8).unwrap();
+        let chunk_start = offset_sector * MCA_SECTOR_BYTES;
+        let compressed_start = chunk_start + 5;
+        bytes[compressed_start] ^= 0x5a;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Mca,
+            0,
+            0,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid MCA zlib payload"), "error={error}");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn resume_validation_rejects_corrupted_linear_zstd_bucket_with_matching_hash() {
+        let path = temp_region_path("r.0.0.linear");
+        write_linear_v2_region_with_compression(&path, &full_region_payloads(), 42, 1)
+            .expect("complete Linear region should write");
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let bucket_table_offset = 8 + 1 + 8 + 1 + 4 + 4 + 128 + 1;
+        let bucket_size = i32::from_be_bytes(
+            bytes[bucket_table_offset..bucket_table_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(bucket_size > 0);
+        let bucket_size = usize::try_from(bucket_size).unwrap();
+        let first_bucket_offset = bucket_table_offset + (LINEAR_BUCKET_COUNT * 13);
+        bytes[first_bucket_offset] ^= 0x5a;
+        let bucket_hash = xxh64(
+            &bytes[first_bucket_offset..first_bucket_offset + bucket_size],
+            0,
+        ) as i64;
+        let hash_offset = bucket_table_offset + 5;
+        bytes[hash_offset..hash_offset + 8].copy_from_slice(&bucket_hash.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = validate_region_file_for_resume(
+            &path,
+            RegionFormat::Linear,
+            0,
+            0,
+            REGION_CHUNKS_PER_REGION,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("invalid Linear zstd bucket"),
+            "error={error}"
+        );
 
         let _ = std::fs::remove_file(path);
     }
