@@ -4657,7 +4657,7 @@ fn print_doctor(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "Status: active prototype; production readiness {} until docs/QUALITY-GATES.md passes.",
+        "Status: quality-gated full generation; readiness={} via docs/QUALITY-GATES.md.",
         build_info::PRODUCTION_READINESS
     )?;
     Ok(EXIT_OK)
@@ -20163,7 +20163,7 @@ mod tests {
 
         assert_eq!(code, EXIT_OK);
         assert!(err.is_empty());
-        assert!(out.contains("Super-Rapid-EarthMap-Generator 0.0.0-phase0"));
+        assert!(out.contains("Super-Rapid-EarthMap-Generator 0.1.0"));
         assert!(out.contains("Minecraft target: Java Edition 1.21.11"));
         assert!(out.contains("Gameplay profile: survival-complete"));
         assert!(out.contains("Server profile: nation-war"));
@@ -20179,6 +20179,7 @@ mod tests {
         assert!(out.contains(
             "timestamp,status,regionX,regionZ,format,elapsedMillis,chunks,outputBytes,regionFile,message"
         ));
+        assert!(out.contains("readiness=QUALITY_GATED"));
     }
 
     #[test]
@@ -21196,11 +21197,11 @@ mod tests {
 
         assert_eq!(code, EXIT_OK);
         assert!(err.is_empty());
-        assert!(out.contains("Rust port phase: phase1-cli-shell"));
+        assert!(out.contains("Rust port phase: rust-native"));
     }
 
     #[test]
-    fn help_lists_phase0_diagnostic_commands() {
+    fn help_lists_diagnostic_commands() {
         let (code, out, err) = run_capture(&["--help"]);
 
         assert_eq!(code, EXIT_OK);

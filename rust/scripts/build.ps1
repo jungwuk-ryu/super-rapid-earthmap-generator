@@ -12,7 +12,7 @@ if (!$cargo) {
 }
 
 $manifest = Join-Path $RustRoot 'Cargo.toml'
-$cargoArgs = @('build', '--manifest-path', $manifest, '--workspace')
+$cargoArgs = @('build', '--manifest-path', $manifest, '--workspace', '--locked')
 if ($Release) {
     $cargoArgs += '--release'
 }
@@ -23,4 +23,3 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Output "Rust build passed: $(Join-Path $RustRoot 'target')"
-

@@ -1,6 +1,6 @@
 # Documentation Index
 
-Status reviewed: 2026-06-11.
+Status reviewed: 2026-06-12.
 
 Use this file as the entry point for repository documentation. Completed one-off review documents and stale
 compatibility pointers have been removed; archived external-version pins remain under `archived-reference/`.
@@ -8,8 +8,9 @@ compatibility pointers have been removed; archived external-version pins remain 
 ## Current Operator Docs
 
 - `OPERATIONS.md`: setup, normal commands, GUI usage, quality batch usage, and recovery notes.
-- `QUALITY-GATES.md`: canonical production-readiness gate. Current full-generation state remains **NO-GO**.
+- `QUALITY-GATES.md`: canonical quality gate and full-generation promotion workflow.
 - `GENERATED-ARTIFACTS.md`: where generated worlds, logs, and quality artifacts belong.
+- `EXTERNAL-DATA.md`: external raster/server/data files that must stay out of the repository.
 - `run-folder-conventions.md`: output folder shapes for quality and agent-run evidence.
 
 ## Design And Policy Docs
@@ -17,6 +18,7 @@ compatibility pointers have been removed; archived external-version pins remain 
 - `ARCHITECTURE.md`: current Rust pipeline and structural boundaries.
 - `module-rules.md`: current workspace crate ownership.
 - `DECISIONS.md`: standing project decisions and production-surface policy.
+- `LICENSE-REVIEW.md`: MIT license suitability review and boundaries.
 - `survival-manifest-schema.md`: survival-complete manifest contract.
 
 ## Active Research Logs

@@ -5,9 +5,10 @@
 - Rust toolchain with `cargo` on `PATH`; install Clippy with `rustup component add clippy`
 - PowerShell 7 or Windows PowerShell for the repository scripts; native `cargo` commands also work from
   Bash-compatible shells
-- A HeightMap GeoTIFF, provided as an explicit CLI argument or `EARTHMAP_HEIGHTMAP`
-- A `TifFiles` dataset root, provided as `EARTHMAP_TIF_ROOT` or as `EARTHMAP_DATA_ROOT/TifFiles`
-- `terrain/TrueMarble.vrt` under that `TifFiles` root, or another explicit `surfaceRaster` path
+- A user-provided external HeightMap GeoTIFF, provided as an explicit CLI argument or `EARTHMAP_HEIGHTMAP`
+- A user-provided external `TifFiles` dataset root, provided as `EARTHMAP_TIF_ROOT` or as
+  `EARTHMAP_DATA_ROOT/TifFiles`
+- User-provided `terrain/TrueMarble.vrt` under that `TifFiles` root, or another explicit `surfaceRaster` path
 - ImageMagick only for optional archived reference-image workflows
 
 Portable setup example:
@@ -51,9 +52,10 @@ out of the GUI path; generation speed must remain governed by the CLI process.
 
 GUI data setup:
 
-- Select the HeightMap GeoTIFF. This controls terrain height, coast shape, water/land, and ocean depth.
-- Select the `TifFiles` root. The GUI fills `terrain\TrueMarble.vrt` from that root.
-- Keep the satellite raster as `TrueMarble.vrt` for photo-like terrain. Clearing it uses `surfaceRaster=auto`.
+- Select the external HeightMap GeoTIFF. This controls terrain height, coast shape, water/land, and ocean depth.
+- Select the external `TifFiles` root. The GUI fills `terrain\TrueMarble.vrt` from that root.
+- Keep the user-provided satellite raster as `TrueMarble.vrt` for photo-like terrain. Clearing it uses
+  `surfaceRaster=auto`.
 - Optional companion rasters are discovered relative to the same `TifFiles` root when present:
   `climate.tif`, `vegetation\*.tif`, `ocean_temp_infill.tif`, `bathymetry.tif`, and `slope.tif`.
 
@@ -161,7 +163,7 @@ local-average diagnostic sections.
 Add `-ProductionPreviewDebug auto` when investigating whether same-run production `source-color` differs from the
 reference source.
 Use `-NoQualityGate` only for research evidence. `-SkipGeneration` can proxy-check existing artifacts, but it is always
-reported as NO-GO for release evidence.
+reported as invalid release evidence.
 
 ## Recovery
 

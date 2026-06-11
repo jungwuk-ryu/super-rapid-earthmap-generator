@@ -1224,7 +1224,7 @@ if (-not [string]::IsNullOrWhiteSpace($ProductionSamplesCsv) -and -not $LegacyPe
         Write-Host "qualityAcceptance.batchGate=skipped,reason=NoQualityGate"
     }
     if ($SkipGeneration) {
-        throw "quality acceptance sample gate is NO-GO because -SkipGeneration was used; rerun without -SkipGeneration for fresh evidence"
+        throw "quality acceptance sample gate is invalid release evidence because -SkipGeneration was used; rerun without -SkipGeneration for fresh evidence"
     }
     return
 }
@@ -2319,9 +2319,9 @@ if ($sampleFailures.Count -gt 0) {
 if ($SkipGeneration) {
     Write-Host ("qualityAcceptance.summary=fail,passed={0},failed=1,total={1},elapsed={2},outputRoot={3},reason=SkipGeneration" -f `
             $passedSamples, $sampleDefinitions.Count, $gateElapsed, $OutputRoot)
-    Write-Host "qualityAcceptance.failure=gate=SkipGeneration,message=proxy artifact checks passed but -SkipGeneration cannot produce release go/no-go evidence"
+    Write-Host "qualityAcceptance.failure=gate=SkipGeneration,message=proxy artifact checks passed but -SkipGeneration cannot produce release evidence"
     Write-Host "qualityAcceptance.nextCommand=$(Get-QualityAcceptanceReplayCommand -SelectedSamples $selectedSampleNames)"
-    throw "quality acceptance sample gate is NO-GO because -SkipGeneration was used; rerun without -SkipGeneration for fresh evidence"
+    throw "quality acceptance sample gate is invalid release evidence because -SkipGeneration was used; rerun without -SkipGeneration for fresh evidence"
 }
 
 Write-Host ("qualityAcceptance.summary=pass,passed={0},failed=0,total={1},elapsed={2},outputRoot={3}" -f `

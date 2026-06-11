@@ -845,7 +845,7 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "earthmap-cli"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "earthmap-gameplay",
@@ -866,11 +866,11 @@ dependencies = [
 
 [[package]]
 name = "earthmap-core"
-version = "0.0.0-phase0"
+version = "0.1.0"
 
 [[package]]
 name = "earthmap-gameplay"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "earthmap-minecraft",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "earthmap-geo"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "quick-xml 0.40.1",
@@ -891,14 +891,13 @@ dependencies = [
 
 [[package]]
 name = "earthmap-gui"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "earthmap-cli",
  "earthmap-geo",
  "eframe",
  "mimalloc",
- "png 0.17.16",
  "rfd",
  "serde",
  "serde_json",
@@ -907,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "earthmap-minecraft"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "flate2",
@@ -915,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "earthmap-osm"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-geo",
  "flate2",
@@ -926,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "earthmap-parity"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "earthmap-region",
@@ -936,7 +935,7 @@ dependencies = [
 
 [[package]]
 name = "earthmap-quality"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "earthmap-region",
@@ -946,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "earthmap-region"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "earthmap-minecraft",
@@ -957,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "earthmap-surface"
-version = "0.0.0-phase0"
+version = "0.1.0"
 dependencies = [
  "earthmap-core",
  "earthmap-geo",

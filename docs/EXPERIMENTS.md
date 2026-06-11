@@ -51,7 +51,7 @@ for generated worlds. Such blocks may remain harness-only, but must not be emitt
 - Quality: raw Arabia still fails mean `7.039465`, p95 `10.637097`, SSIM `0.935872106`; current 4x4 local-average is
   mean `6.028665`, p95 `9.497752`, SSIM `0.947095865`, dE>20 `0`.
 - Finding: the fast batch wrapper now emits raw metrics, local-average metrics, and source baseline in one pass, then
-  exits nonzero on the current raw gate failure. This preserves NO-GO while giving the evidence needed to evaluate a
+  exits nonzero on the current raw gate failure. This preserves release-gate integrity while giving the evidence needed to evaluate a
   future dry-crop gate revision.
 
 ## v141 arid/Mediterranean full metric diagnostics
@@ -219,7 +219,7 @@ for generated worlds. Such blocks may remain harness-only, but must not be emitt
 
 - Path: `D:\earthmap\quality\photo-parity\v124-congo-europe-production-batch`
 - Status: rejected as gate evidence.
-- Reason: the outer command timed out; timeout is NO-GO even though artifacts were produced.
+- Reason: the outer command timed out; timeout makes the artifacts invalid as release evidence.
 - Result: full candidate-harness metrics were the immediate runtime bottleneck: Congo `299036ms`, Europe `383825ms`.
 
 ## v123 production canopy shadow hook

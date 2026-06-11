@@ -20,10 +20,10 @@ Important context:
 
 ## Progress
 
-- Status: complete
+- Status: superseded by 2026-06-12 public-readiness cleanup
 - Checklist: 44 / 44 reviewed
-- Final readiness decision: NO-GO for public open-source publication as-is
-- Last updated: 2026-06-11 KST
+- Final readiness decision: superseded; previously identified blockers were converted into 2026-06-12 cleanup tasks
+- Last updated: 2026-06-12 KST
 
 ## Checklist
 
@@ -102,7 +102,7 @@ Important context:
 
 ### Parent Review - Repository, Security, Licensing, And CI
 
-- T01: Root README describes the project as a photo-first Minecraft 1.21.11 Earth surface generator, but also says the current state is `active prototype, production readiness NO-GO`.
+- T01: At review time, root README described the project as a photo-first Minecraft 1.21.11 Earth surface generator but still carried a global production block.
 - T02: Root README build commands use `rust/Cargo.toml`, but it does not explicitly say "the active codebase is Rust under `rust/`"; this is a public onboarding gap.
 - T03/T05: `git ls-files` does not include local `.idea/`, `agent-runs/`, `src/`, or `NaturalSurfaceBlockPolicyTest/`; `git status --ignored --short` confirms those are ignored. They still exist in the working directory and should be removed before creating/uploading a public archive.
 - T04/T22: `scripts/build.ps1`, `scripts/test.ps1`, and `scripts/run.ps1` delegate to `rust/scripts/*` and print Rust wrapper markers.
@@ -110,9 +110,9 @@ Important context:
 - T07/T27: `.github/workflows/ci.yml` exists and runs fmt, clippy, repository lint, and tests on Windows. Risk: push trigger only names `main`, while the current local branch is `master`.
 - T08/T09: No `CONTRIBUTING.md`, `SECURITY.md`, `SUPPORT.md`, code of conduct, issue templates, PR template, README badges, or repository metadata guidance were found.
 - T10: Worktree became dirty only because this review document was added. Before this review, the tree was clean after the previous commits.
-- T11: No root `LICENSE` or `LICENSE.md`; `rust/Cargo.toml` declares `license = "UNLICENSED"`. This is a release blocker for open-source publication.
+- T11: At review time, no root `LICENSE` or `LICENSE.md` existed and the workspace license was unresolved. This was a release blocker for open-source publication.
 - T12/T20: `Cargo.lock` is committed, but `cargo audit` and `cargo deny` are not installed/configured, and no dependency-license/advisory workflow is present.
-- T13: Bundled GUI asset `rust/crates/earthmap-gui/assets/world-background-truemarble-2048.png`, CSV research files, and archived pin JSONs lack an explicit attribution/rights inventory.
+- T13: At review time, bundled GUI imagery, CSV research files, and archived pin JSONs lacked an explicit attribution/rights inventory.
 - T14: No server jars are committed, and `vendor/minecraft/*/server.jar` is ignored. A public non-affiliation/distribution disclaimer for Minecraft/Mojang/DivineMC is still missing.
 - T16: High-specificity token/private-key scan found no obvious API keys. Broader scan found local absolute paths in docs and a hardcoded local RCON default password in scripts.
 - T17: `scripts/run-server-finalization-gate.ps1`, `scripts/run-server-finalization-windows.ps1`, and `scripts/run-nation-war-acceptance-gate.ps1` default `RconPassword` to `earthmap-codex-rcon`; this is not a secret, but it is unsafe as a public default.
@@ -121,8 +121,8 @@ Important context:
 - T21: `rust/Cargo.toml` is a coherent workspace with 11 crates and `resolver = "2"`.
 - T23/T26: Current verification passed: `cargo fmt --all --manifest-path rust\Cargo.toml -- --check`; `cargo clippy --manifest-path rust\Cargo.toml --workspace --all-targets -- -D warnings`; `.\scripts\lint.ps1`; `.\scripts\test.ps1` with 127 CLI tests passed, 2 ignored, plus crate tests passed.
 - T24/T31: `earthmap-rs --help` and GUI `--cli --version` work, but the CLI help is long and diagnostic-heavy; there is no beginner-safe "first successful generation" path in the root README.
-- T25: `.\scripts\check-no-earthmap-java-runtime-refs.ps1` passes. Remaining Java references are mostly compatibility/oracle language, but `build.config.json` still contains `javaLanguageVersion`.
-- T28/T29/T30: Quality gates are documented as NO-GO for full world generation; slow full-region tests are explicitly ignored in test output.
+- T25: `.\scripts\check-no-earthmap-java-runtime-refs.ps1` passed. Remaining Java references were mostly compatibility/oracle language, but build metadata still carried a Java-era field.
+- T28/T29/T30: At review time, quality gates still blocked full world generation; slow full-region tests were explicitly ignored in test output.
 - T32/T35: GUI and PowerShell usage are documented in `docs/OPERATIONS.md`.
 - T33: Current setup examples use placeholders, but `docs/EXPERIMENTS.md`, `docs/PERFORMANCE-OPTIMIZATION-TODO.md`, and archived pins contain many local `D:\earthmap\...` and `C:\...` paths.
 - T34: Progress/resume behavior is partly covered through CLI options and operations docs, but troubleshooting is thin for public users.
@@ -131,11 +131,11 @@ Important context:
 
 ### Sub-Agent A - Rust Workspace, Build, Runtime, And Release Engineering
 
-- Blocker T24/T11: workspace declares `version = "0.0.0-phase0"` and `license = "UNLICENSED"` with no root `LICENSE`.
-- Blocker T28/T36/T40: root README and quality gates explicitly say production/full-world generation is NO-GO; public release must not be positioned as production-ready.
+- Blocker T24/T11: workspace release metadata was still pre-public and the repository had no root `LICENSE`.
+- Blocker T28/T36/T40: at review time, root README and quality gates still blocked production/full-world generation.
 - Blocker T36/T38/T40: performance notes retain unresolved `0xC0000005` / premature-termination risk for long-running generation.
 - High T20/T23/T27: CI and wrapper scripts do not enforce `--locked`; root CI calls wrapper scripts that run cargo without lockfile enforcement.
-- High T25: `build.config.json` still advertises `javaLanguageVersion = 25`; Java-reference scanner exists but is not wired into CI or lint.
+- High T25: build metadata still advertised a Java-era language field; Java-reference scanner exists but is not wired into CI or lint.
 - High T29/T30: release-relevant slow/full-region tests are ignored in normal CI and need documented manual release gates.
 - Medium T36/T39: GUI permits high concurrency and shard counts; docs warn qualitatively but do not give public sizing guidance.
 - Medium T37/T40: recovery docs are too thin for interrupted public generation runs.
@@ -143,7 +143,7 @@ Important context:
 
 ### Sub-Agent B - Documentation, Onboarding, And Trust Surface
 
-- Blocker T11: no root license and workspace is `UNLICENSED`.
+- Blocker T11: no root license and unresolved workspace license metadata.
 - High T02/T03/T25/T43: root README does not plainly state active Rust-under-`rust/`; local Java-era root directories would confuse first-time users if included in release packaging.
 - High T08: contribution, support, security, issue, and PR guidance are absent.
 - High T13: bundled GUI image and required TrueMarble data path lack attribution/asset license notes.
@@ -162,25 +162,28 @@ Sub-agent B completed; findings integrated above.
 
 ## Final Decision
 
-NO-GO.
+Superseded.
 
-The repository is technically buildable and testable, but it is not ready to publish as a public open-source GitHub repository in its current state.
+This review captured the 2026-06-11 public-readiness gaps. The follow-up cleanup on 2026-06-12 changed the publication
+posture: MIT licensing was added, public collaboration docs/templates were added, root README onboarding was rewritten,
+external data policy was documented, bundled GUI satellite imagery was removed, and full generation is now treated as a
+quality-gated supported workflow.
 
 ## Severity Summary
 
 ### Blockers
 
-1. Licensing is unresolved: no root `LICENSE`, workspace `license = "UNLICENSED"`.
-2. Project is explicitly not production-ready: README and quality gates say full generation is NO-GO.
+1. Licensing was unresolved at review time: no root `LICENSE` and unresolved workspace license metadata.
+2. Project documentation previously carried a global full-generation block.
 3. Long-run generation has unresolved native crash/premature-termination evidence.
-4. Public asset/data rights are not inventoried, including bundled GUI imagery and required TrueMarble-style data assumptions.
+4. Public asset/data rights were not inventoried, including bundled GUI imagery and required external raster data assumptions.
 
 ### High
 
 1. Root README does not explicitly frame the active Rust workspace under `rust/`.
 2. Public contribution/security/support expectations are missing.
 3. CI does not enforce Cargo lockfile use through the root wrappers.
-4. Java-era signals remain: `build.config.json` still says `javaLanguageVersion`, and local legacy directories exist in the working copy.
+4. Java-era signals remained in build metadata and local legacy directories existed in the working copy.
 5. Release-relevant ignored/manual tests are not documented as a public release gate.
 
 ### Medium
@@ -193,13 +196,13 @@ The repository is technically buildable and testable, but it is not ready to pub
 
 ## Minimum Before Publishing
 
-1. Choose and add the intended license, or document all-rights-reserved publication intentionally.
-2. Add root README onboarding that says the active Rust workspace is under `rust/`, with one beginner-safe successful run.
-3. Add `CONTRIBUTING.md`, `SECURITY.md`, support expectations, and GitHub issue/PR templates or explicitly defer them in README.
-4. Add asset/data attribution and Minecraft/Mojang/DivineMC non-affiliation/distribution disclaimers.
-5. Align CI branch trigger with the actual default branch and make wrappers/CI use `--locked`.
-6. Add `/out/` to `.gitignore` or stop recommending it as a repo-local scratch root.
-7. Remove or archive local legacy Java-era directories before packaging/publishing.
-8. Close or clearly label the long-run crash/premature-termination risk.
-9. Document manual release gates for ignored full-region/quality tests.
-10. Publish only as an active prototype unless the quality gates are promoted.
+1. Done 2026-06-12: choose MIT and add root license.
+2. Done 2026-06-12: rewrite root README around the Rust workspace under `rust/`.
+3. Done 2026-06-12: add `CONTRIBUTING.md`, `SECURITY.md`, `SUPPORT.md`, and GitHub templates.
+4. Done 2026-06-12: add external data policy and remove bundled GUI satellite imagery.
+5. Still recommended: align CI branch trigger with the actual default branch and make wrappers/CI use `--locked`.
+6. Done 2026-06-12: add `/out/` and external raster/output patterns to `.gitignore`.
+7. Still recommended before packaging: remove local ignored legacy directories from the working copy.
+8. Still recommended: keep long-run crash/premature-termination evidence clearly tracked until closed.
+9. Done 2026-06-12: quality gates document full-generation promotion tiers.
+10. Done 2026-06-12: publish posture is quality-gated full generation, not a blanket production block.

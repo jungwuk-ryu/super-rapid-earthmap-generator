@@ -1,8 +1,17 @@
 # Decisions
 
+## 2026-06-12: Public Release Preparation
+
+- The repository is MIT licensed.
+- The active runtime is the Rust workspace under `rust/`; root scripts and README intentionally point there instead of
+  moving the workspace to the repository root.
+- Full generation is allowed when the current build/config passes `docs/QUALITY-GATES.md`.
+- External raster datasets, Minecraft/server binaries, generated worlds, and GUI imagery derived from external datasets
+  must not be committed.
+
 ## 2026-06-01: Project State Reset
 
-- Full world generation is NO-GO.
+- Historical reset note: full world generation was paused until the quality gates were refreshed.
 - v123 is evidence-only and must not be treated as a pass.
 - The first priority is faster validation, not more surface heuristics.
 - Generated junk is archived under `<EARTHMAP_OUTPUT_ROOT>/archive` or `out/archive` before any deletion.

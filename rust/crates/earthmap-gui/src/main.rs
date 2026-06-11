@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,8 +40,6 @@ const REGION_STATE_SKIPPED: u8 = 3;
 const REGION_STATE_GENERATED: u8 = 4;
 const REGION_STATE_FAILED: u8 = 5;
 const ROLLING_SPEED_WINDOW: Duration = Duration::from_secs(60);
-const WORLD_MAP_BACKGROUND_PNG: &[u8] =
-    include_bytes!("../assets/world-background-truemarble-2048.png");
 const MAX_STATUS_TEXTURE_DIMENSION: usize = 2048;
 const STATUS_TEXTURE_UPLOAD_INTERVAL: Duration = Duration::from_millis(250);
 const GUI_OPTIONS_STORAGE_KEY: &str = "earthmap-gui.generation-options.v1";
@@ -1487,29 +1485,24 @@ fn draw_rect_outline(painter: &egui::Painter, rect: egui::Rect, color: egui::Col
 }
 
 fn world_map_background_image() -> egui::ColorImage {
-    let decoder = png::Decoder::new(Cursor::new(WORLD_MAP_BACKGROUND_PNG));
-    let mut reader = decoder
-        .read_info()
-        .expect("embedded world map PNG metadata must decode");
-    let mut buffer = vec![0; reader.output_buffer_size()];
-    let info = reader
-        .next_frame(&mut buffer)
-        .expect("embedded world map PNG pixels must decode");
-    let bytes = &buffer[..info.buffer_size()];
-    let pixels = match (info.color_type, info.bit_depth) {
-        (png::ColorType::Rgb, png::BitDepth::Eight) => bytes
-            .chunks_exact(3)
-            .map(|pixel| egui::Color32::from_rgb(pixel[0], pixel[1], pixel[2]))
-            .collect(),
-        (png::ColorType::Rgba, png::BitDepth::Eight) => bytes
-            .chunks_exact(4)
-            .map(|pixel| {
-                egui::Color32::from_rgba_unmultiplied(pixel[0], pixel[1], pixel[2], pixel[3])
-            })
-            .collect(),
-        _ => panic!("embedded world map PNG must be 8-bit RGB or RGBA"),
-    };
-    egui::ColorImage::new([info.width as usize, info.height as usize], pixels)
+    let width = 1024;
+    let height = 512;
+    let mut pixels = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let latitude = 90.0 - 180.0 * (y as f32 + 0.5) / height as f32;
+        let lat_abs = latitude.abs() / 90.0;
+        for x in 0..width {
+            let longitude = 360.0 * (x as f32 + 0.5) / width as f32 - 180.0;
+            let wave =
+                ((longitude * 0.07).sin() * 0.5 + (latitude * 0.11).cos() * 0.5).clamp(-1.0, 1.0);
+            let band = (1.0 - lat_abs).clamp(0.0, 1.0);
+            let red = (18.0 + 16.0 * band + 7.0 * wave).clamp(0.0, 255.0) as u8;
+            let green = (40.0 + 45.0 * band + 9.0 * wave).clamp(0.0, 255.0) as u8;
+            let blue = (64.0 + 58.0 * band - 5.0 * wave).clamp(0.0, 255.0) as u8;
+            pixels.push(egui::Color32::from_rgb(red, green, blue));
+        }
+    }
+    egui::ColorImage::new([width, height], pixels)
 }
 
 #[derive(Debug)]
@@ -2163,7 +2156,7 @@ impl EarthMapGuiApp {
         if self.map_overlay.background_texture.is_none() {
             let image = world_map_background_image();
             self.map_overlay.background_texture = Some(ui.ctx().load_texture(
-                "earthmap-world-background",
+                "earthmap-procedural-world-background",
                 image,
                 egui::TextureOptions::LINEAR,
             ));
@@ -3869,11 +3862,12 @@ generation.verticalScaleMode=auto\n",
     }
 
     #[test]
-    fn world_map_background_image_decodes_embedded_satellite_asset() {
+    fn world_map_background_image_builds_procedural_map() {
         let image = world_map_background_image();
 
-        assert_eq!(image.size, [2048, 1024]);
-        assert_eq!(image.pixels.len(), 2048 * 1024);
+        assert_eq!(image.size, [1024, 512]);
+        assert_eq!(image.pixels.len(), 1024 * 512);
+        assert_ne!(image.pixels[0], image.pixels[1024 * 256 + 512]);
     }
 
     #[test]

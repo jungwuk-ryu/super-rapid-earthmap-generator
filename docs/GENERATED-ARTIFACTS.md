@@ -6,10 +6,12 @@
 - `*.log`
 - `hs_err_pid*.log`
 - generated worlds
+- generated `.mca` and `.linear` region files
 - quality runs
 - preview tiles and mosaics
 - server logs
 - agent-run ledgers
+- external raster data such as `*.tif`, `*.tiff`, `*.vrt`, and `TifFiles/`
 
 ## Archive Roots
 

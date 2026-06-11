@@ -25,7 +25,7 @@ if ($List -and $Isolated) {
 }
 
 if ($Isolated) {
-    $buildArgs = @('test', '--manifest-path', $manifest, '--workspace', '--no-run', '--message-format', 'json')
+    $buildArgs = @('test', '--manifest-path', $manifest, '--workspace', '--locked', '--no-run', '--message-format', 'json')
     if ($Filter -ne '') {
         $buildArgs += $Filter
     }
@@ -93,7 +93,7 @@ if ($Isolated) {
     return
 }
 
-$cargoArgs = @('test', '--manifest-path', $manifest, '--workspace')
+$cargoArgs = @('test', '--manifest-path', $manifest, '--workspace', '--locked')
 if ($Filter -ne '') {
     $cargoArgs += $Filter
 }

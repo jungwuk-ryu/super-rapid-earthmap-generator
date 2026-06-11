@@ -342,7 +342,7 @@ function Write-CommandPlan {
     $out5000 = Join-Path $OutputRoot 'quality-acceptance-samples-5000'
     $out1000 = Join-Path $OutputRoot 'quality-acceptance-samples-1000'
     Write-Host 'nationWarAcceptanceGate.plan=evidence=false'
-    Write-Host 'nationWarAcceptanceGate.plan.parallelSampleGroups=not-enabled,reason=sample outputs are isolated but heavyweight generation concurrency must be proven safe for default go/no-go evidence'
+    Write-Host 'nationWarAcceptanceGate.plan.parallelSampleGroups=not-enabled,reason=sample outputs are isolated but heavyweight generation concurrency must be proven safe for default release evidence'
     Write-Host ''
     Write-Host '1:5000 representative sample gate:'
     Write-Host (Get-SampleGateCommand -Scale 5000 -Threads $Threads5000 -Samples $samples5000 -OutputDir $out5000 -BaselineRoot $BaselineRoot5000)
@@ -471,7 +471,7 @@ function Invoke-ParityGate {
     $parityStartedAt = Get-Date
     $freshAfter = $parityStartedAt.AddSeconds(-2)
     if ($UseLatestKnownParityEvidence) {
-        throw 'UseLatestKnownParityEvidence is stale regression evidence and is disabled for go/no-go. Pass candidate source/expected/current/mask PNG paths.'
+        throw 'UseLatestKnownParityEvidence is stale regression evidence and is disabled for release evidence. Pass candidate source/expected/current/mask PNG paths.'
     }
 
     foreach ($path in @($ParitySourcePng, $ParityExpectedPng, $ParityCurrentPng, $ParityMaskPng)) {
