@@ -1,8 +1,11 @@
 # Quality Gates
 
-Status date: 2026-06-01
+Status date: 2026-06-11
 
 Current release state: **NO-GO for full world generation**.
+
+2026-06-11 review: no newer same-build quality evidence has promoted the release state. Tooling gates now pass locally
+and in CI, but production readiness still depends on the quality promotion tiers below.
 
 ## Current Evidence
 

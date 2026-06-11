@@ -49,6 +49,7 @@ Use `previewDebug=auto` only for diagnostics that need same-run production `sour
 
 ## Important Docs
 
+- `docs/README.md`
 - `docs/ARCHITECTURE.md`
 - `docs/OPERATIONS.md`
 - `docs/QUALITY-GATES.md`

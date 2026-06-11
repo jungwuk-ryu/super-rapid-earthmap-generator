@@ -1,4 +1,9 @@
-# Performance Optimization TODO
+# Performance Optimization Notes And Active Follow-Up
+
+Status reviewed: 2026-06-11.
+
+The original optimization scope is complete. Keep this file because the crash/CPU-utilization follow-up below still has
+open items and real-run evidence that should not be collapsed into the operations guide.
 
 ## Scope
 

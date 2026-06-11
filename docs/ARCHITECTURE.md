@@ -3,12 +3,12 @@
 ## Pipeline
 
 1. Heightmap and Earth rasters are opened through shared reader/cache contexts.
-2. `EarthSurfaceRegionSampler` samples one region of surface columns.
-3. `PhotoSurfaceSolver` returns a traceable `PhotoSurfaceDecision`.
-4. `PhotoSurfaceMaterialClassifier.apply` adapts that decision back to `EarthSurfaceColumn`.
-5. `SurfaceRegionGenerator` writes MCA/Linear region files.
-6. `McaTopDownRenderer` renders direct MCA evidence for quality comparison.
-7. `PhotoParityHarness` writes crop metrics, candidates, and error images.
+2. `prepare_surface_region_sample_with_heightmap_sampler` prepares region-local surface evidence.
+3. `solve_photo_surface` returns a traceable `PhotoSurfaceDecision` for photo-mode material choices.
+4. `apply_photo_surface_material` adapts that decision back to `EarthSurfaceColumn`.
+5. `generate_surface_region_with_prepared_sample` writes MCA/Linear region files through `earthmap-region`.
+6. Top-down render and quality commands in `earthmap-cli`/`earthmap-quality` render direct evidence for comparison.
+7. Quality batch commands write crop metrics, candidate artifacts, summaries, and contact sheets.
 
 ## Solver Contract
 
@@ -34,6 +34,7 @@ with leaf blocks.
 ## Current Structural Boundaries
 
 - `earthmap-rs` is the public command entrypoint.
-- Long-term command extraction is planned, but command names and file outputs must stay stable first.
-- `scripts/test.ps1` delegates to the Rust workspace test wrapper.
+- Command extraction has started inside `earthmap-cli`; command names, stdout/stderr contracts, progress events, and
+  file outputs must stay stable.
+- `scripts/test.ps1` delegates to the Rust workspace test wrapper; CI also runs fmt, clippy, repository lint, and tests.
 - `quality-production-sample-batch` reuses Rust heightmap and surface-raster contexts for multiple samples.
