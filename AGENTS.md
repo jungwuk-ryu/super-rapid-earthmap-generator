@@ -24,7 +24,7 @@ These instructions apply to the Rust-only EarthMap project rooted at this direct
 
 ## Commit Discipline
 
-- Every task must end with a conventional atomic commit when the change is ready.
+- Every task must end with an atomic Conventional Commit when the change is ready.
 - Use Conventional Commits format, for example `docs: add agent workflow instructions` or `fix: preserve region payload parity`.
 - Keep one logical change per commit.
 - Do not include unrelated user or generated changes in the commit.

@@ -24,7 +24,7 @@ These instructions apply to the Rust workspace rooted at this directory.
 
 ## Commit Discipline
 
-- Every task must end with a conventional atomic commit when the change is ready.
+- Every task must end with an atomic Conventional Commit when the change is ready.
 - Use Conventional Commits format, for example `docs: add rust agent workflow instructions` or `fix: match java region writer bytes`.
 - Keep one logical change per commit.
 - Do not include unrelated user or generated changes in the commit.
