@@ -2,6 +2,7 @@ build/
 .idea/
 rust/target/
 rust/target-latest/
+vendor/
 vendor/minecraft/*/server.jar
 TifFiles/
 data/
