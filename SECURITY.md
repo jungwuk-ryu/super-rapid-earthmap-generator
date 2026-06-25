@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-The public repository tracks the current `master` branch. Security fixes should target the latest branch unless a
+The public repository tracks the current `main` branch. Security fixes should target the latest branch unless a
 maintainer states otherwise.
 
 ## Reporting A Vulnerability
