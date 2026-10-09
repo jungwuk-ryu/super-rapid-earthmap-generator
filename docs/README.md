@@ -23,6 +23,9 @@ compatibility pointers have been removed; archived external-version pins remain 
 
 ## Active Research Logs
 
+- `CONTINENT-GENERATION-PERFORMANCE.md`: full geography-to-Linear generation
+  benchmarks against the current land-optimized baseline, with equal CPU and
+  process budgets and complete-file equality checks.
 - `LAND-GENERATION-PERFORMANCE.md`: real Korean land benchmarks, exact-output
   checks, thread/process comparison and reproduction commands.
 - `EXPERIMENTS.md`: concise quality experiment history, newest first.

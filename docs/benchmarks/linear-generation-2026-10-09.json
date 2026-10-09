@@ -1,0 +1,436 @@
+{
+  "measured_on": "2026-10-09",
+  "baseline_commit": "7548edcac2b0debc6ae99580a016dce9d78f2bdc",
+  "binary_sha256": {
+    "before": "9a68af16f702a82faae52744b00254b2b963fd75241336b6fb98354265118e27",
+    "after": "2edb2949f4049d33ccdffad9b233a5546306157ae4314e39345d5b641f7db0bb"
+  },
+  "rust": "1.99.0 (b940084d7 2026-09-28)",
+  "cpu": "AMD EPYC 9V74",
+  "allocator": "system",
+  "source_resolution": {
+    "elevation_arcseconds": 1,
+    "rgb_arcseconds": 2
+  },
+  "dataset_sha256": {
+    "heightmap": "ed5b371669d9ebdb7fc1d0c1871bd908e206abaec598b50e9bd0b2befe272bb3",
+    "rgb": "0c2473c8044f2b99549d47489cd1f4aabbddb6859544ee45be9214a67bc4d730",
+    "vrt": "6d9fbb44955fb209f334b8f7c84d9c77d0206a1f2b33e86a63c891706335bc1b"
+  },
+  "full_workspace_tests_passed": 384,
+  "benchmarks": [
+    {
+      "purpose": "large_generation_goal",
+      "format": "linear",
+      "process_count": 1,
+      "requested_region_threads": 4,
+      "rayon_override": null,
+      "cpu_quota": "400000 100000",
+      "memory_limit": "17179869184",
+      "compression_level": 4,
+      "prefetch": "false",
+      "cases": [
+        {
+          "case": {
+            "name": "continent",
+            "scale": 50,
+            "x": 552,
+            "z": -12,
+            "cols": 8,
+            "rows": 8
+          },
+          "region_files": 64,
+          "chunks": 65536,
+          "land_columns": 15728328,
+          "water_columns": 1048888,
+          "ground_y": [
+            -60,
+            211
+          ],
+          "layout": {
+            "before": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 8,
+              "parallelColumnSampling": true
+            },
+            "after": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 4,
+              "parallelColumnSampling": true
+            }
+          },
+          "measured_seconds": {
+            "before": [
+              27.50702135499978,
+              27.051462979000462,
+              28.188124088000222
+            ],
+            "after": [
+              8.737410454999917,
+              9.086749455000245,
+              9.378075010999964
+            ]
+          },
+          "before_median_seconds": 27.50702135499978,
+          "after_median_seconds": 9.086749455000245,
+          "speedup": 3.027157455063675,
+          "reaches_3x": true,
+          "peak_rss_kib": {
+            "before": [
+              1031128,
+              1058508,
+              1053608
+            ],
+            "after": [
+              534032,
+              528244,
+              547604
+            ]
+          },
+          "exact_region_file_match": true,
+          "region_sha256_manifest_digest": "929b3be08c128b354841136740cbc22f8b23725b8a30a56c8d4c3e1437236588",
+          "warmups_per_binary": 1,
+          "measured_runs_per_binary": 3
+        },
+        {
+          "case": {
+            "name": "inland",
+            "scale": 50,
+            "x": 552,
+            "z": -12,
+            "cols": 6,
+            "rows": 8
+          },
+          "region_files": 48,
+          "chunks": 49152,
+          "land_columns": 12571545,
+          "water_columns": 11367,
+          "ground_y": [
+            35,
+            203
+          ],
+          "layout": {
+            "before": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 8,
+              "parallelColumnSampling": true
+            },
+            "after": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 4,
+              "parallelColumnSampling": true
+            }
+          },
+          "measured_seconds": {
+            "before": [
+              21.516218267000113,
+              20.31449161099954,
+              22.402289499999824
+            ],
+            "after": [
+              7.09882791400014,
+              7.015419123000356,
+              7.104184943000291
+            ]
+          },
+          "before_median_seconds": 21.516218267000113,
+          "after_median_seconds": 7.09882791400014,
+          "speedup": 3.0309536345523096,
+          "reaches_3x": true,
+          "peak_rss_kib": {
+            "before": [
+              1009320,
+              1018736,
+              1047304
+            ],
+            "after": [
+              504680,
+              509512,
+              510724
+            ]
+          },
+          "exact_region_file_match": true,
+          "region_sha256_manifest_digest": "1a1c3c81b75a6def2be790fda0cba8e85781af7bd1ed73648f9df97392d29f9d",
+          "warmups_per_binary": 1,
+          "measured_runs_per_binary": 3
+        }
+      ],
+      "min_land_fraction": 0.9
+    },
+    {
+      "purpose": "equal_compute_thread_control",
+      "format": "linear",
+      "process_count": 1,
+      "requested_region_threads": 4,
+      "rayon_override": "4",
+      "cpu_quota": "400000 100000",
+      "memory_limit": "17179869184",
+      "compression_level": 4,
+      "prefetch": "false",
+      "cases": [
+        {
+          "case": {
+            "name": "continent",
+            "scale": 50,
+            "x": 552,
+            "z": -12,
+            "cols": 8,
+            "rows": 8
+          },
+          "region_files": 64,
+          "chunks": 65536,
+          "land_columns": 15728328,
+          "water_columns": 1048888,
+          "ground_y": [
+            -60,
+            211
+          ],
+          "layout": {
+            "before": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 4,
+              "parallelColumnSampling": true
+            },
+            "after": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 4,
+              "parallelColumnSampling": true
+            }
+          },
+          "measured_seconds": {
+            "before": [
+              24.812920240000494,
+              23.93378710199977,
+              23.97015149500021
+            ],
+            "after": [
+              9.88934627799972,
+              9.346889352999824,
+              9.719876207999732
+            ]
+          },
+          "before_median_seconds": 23.97015149500021,
+          "after_median_seconds": 9.719876207999732,
+          "speedup": 2.4660963763378074,
+          "reaches_3x": false,
+          "peak_rss_kib": {
+            "before": [
+              898144,
+              845848,
+              833292
+            ],
+            "after": [
+              534220,
+              547280,
+              532176
+            ]
+          },
+          "exact_region_file_match": true,
+          "region_sha256_manifest_digest": "929b3be08c128b354841136740cbc22f8b23725b8a30a56c8d4c3e1437236588",
+          "warmups_per_binary": 1,
+          "measured_runs_per_binary": 3
+        }
+      ],
+      "min_land_fraction": 0.9
+    },
+    {
+      "purpose": "additional_linear_output_regression",
+      "format": "linear",
+      "process_count": 1,
+      "requested_region_threads": 4,
+      "rayon_override": null,
+      "cpu_quota": "400000 100000",
+      "memory_limit": "17179869184",
+      "compression_level": 4,
+      "prefetch": "false",
+      "cases": [
+        {
+          "case": {
+            "name": "seoul",
+            "scale": 200,
+            "x": 138,
+            "z": -2,
+            "cols": 2,
+            "rows": 2
+          },
+          "region_files": 4,
+          "chunks": 4096,
+          "land_columns": 1048573,
+          "water_columns": 3,
+          "ground_y": [
+            57,
+            190
+          ],
+          "layout": {
+            "before": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 8,
+              "parallelColumnSampling": true
+            },
+            "after": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 4,
+              "parallelColumnSampling": true
+            }
+          },
+          "measured_seconds": {
+            "before": [
+              3.7820911510007136
+            ],
+            "after": [
+              1.8721877389998554
+            ]
+          },
+          "before_median_seconds": 3.7820911510007136,
+          "after_median_seconds": 1.8721877389998554,
+          "speedup": 2.020145240894031,
+          "reaches_3x": false,
+          "peak_rss_kib": {
+            "before": [
+              879880
+            ],
+            "after": [
+              503804
+            ]
+          },
+          "exact_region_file_match": true,
+          "region_sha256_manifest_digest": "68049de73b27e40e4560ff39541f8678dae21eeacb8d999fc4670b42fb4b712f",
+          "warmups_per_binary": 0,
+          "measured_runs_per_binary": 1
+        },
+        {
+          "case": {
+            "name": "seorak",
+            "scale": 50,
+            "x": 557,
+            "z": -10,
+            "cols": 2,
+            "rows": 2
+          },
+          "region_files": 4,
+          "chunks": 4096,
+          "land_columns": 1048576,
+          "water_columns": 0,
+          "ground_y": [
+            63,
+            211
+          ],
+          "layout": {
+            "before": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 8,
+              "parallelColumnSampling": true
+            },
+            "after": {
+              "regionWorkerThreads": 4,
+              "rayonThreads": 4,
+              "parallelColumnSampling": true
+            }
+          },
+          "measured_seconds": {
+            "before": [
+              2.1639398340003027
+            ],
+            "after": [
+              0.9759426400005395
+            ]
+          },
+          "before_median_seconds": 2.1639398340003027,
+          "after_median_seconds": 0.9759426400005395,
+          "speedup": 2.2172817800020566,
+          "reaches_3x": false,
+          "peak_rss_kib": {
+            "before": [
+              765240
+            ],
+            "after": [
+              383004
+            ]
+          },
+          "exact_region_file_match": true,
+          "region_sha256_manifest_digest": "6b728119e9c04396f45bdee6bc7775d8d42284add3d8a7fd94193dd72a4b8b29",
+          "warmups_per_binary": 0,
+          "measured_runs_per_binary": 1
+        }
+      ],
+      "min_land_fraction": 0.95
+    },
+    {
+      "purpose": "shared_minecraft_mca_output_regression",
+      "format": "mca",
+      "process_count": 1,
+      "requested_region_threads": 1,
+      "rayon_override": "1",
+      "cpu_quota": "400000 100000",
+      "memory_limit": "17179869184",
+      "compression_level": 6,
+      "prefetch": "false",
+      "cases": [
+        {
+          "case": {
+            "name": "seoul-mca",
+            "scale": 200,
+            "x": 138,
+            "z": -2,
+            "cols": 1,
+            "rows": 1
+          },
+          "region_files": 1,
+          "chunks": 1024,
+          "land_columns": 262144,
+          "water_columns": 0,
+          "ground_y": [
+            63,
+            152
+          ],
+          "layout": {
+            "before": {
+              "regionWorkerThreads": 1,
+              "rayonThreads": 1,
+              "parallelColumnSampling": false
+            },
+            "after": {
+              "regionWorkerThreads": 1,
+              "rayonThreads": 1,
+              "parallelColumnSampling": false
+            }
+          },
+          "measured_seconds": {
+            "before": [
+              2.7740805209996324
+            ],
+            "after": [
+              1.6482899820002785
+            ]
+          },
+          "before_median_seconds": 2.7740805209996324,
+          "after_median_seconds": 1.6482899820002785,
+          "speedup": 1.683005145510351,
+          "reaches_3x": false,
+          "peak_rss_kib": {
+            "before": [
+              196140
+            ],
+            "after": [
+              138252
+            ]
+          },
+          "exact_region_file_match": true,
+          "region_sha256_manifest_digest": "a16484283910e15ee3b8fe18d7cba1c9a4ebbb50152128836272888d7eeb6aed",
+          "warmups_per_binary": 0,
+          "measured_runs_per_binary": 1
+        }
+      ],
+      "min_land_fraction": 0.95
+    }
+  ],
+  "settings": {
+    "vertical_scale": "auto",
+    "heightmap_cache_rows": 64,
+    "surface_tile_cache_entries": 32,
+    "worker_autotune": false,
+    "detailed_column_clocks": false,
+    "release_lto": "thin",
+    "release_codegen_units": 1
+  }
+}

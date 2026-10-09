@@ -1,12 +1,14 @@
 use crate::block_state_ids as ids;
 use crate::chunk_generation_status::ChunkGenerationStatus;
-use crate::chunk_model::{ChunkModel, SECTION_BIOME_CELL_COUNT, SECTION_BLOCK_COUNT};
+use crate::chunk_model::{BlockSection, ChunkModel, SECTION_BIOME_CELL_COUNT};
 use crate::dimension_profile::SECTION_HEIGHT;
 use crate::heightmap::{Heightmap, COLUMN_COUNT};
 use crate::nbt::{self, Compound, Tag};
 use crate::packed_long_array::PackedLongArray;
 use crate::section_palette::SectionPalette;
 use crate::{MinecraftError, Result};
+
+mod direct;
 
 pub const DATA_VERSION: i32 = 4671;
 
@@ -19,7 +21,7 @@ pub fn encode_to_bytes_with_status(
     last_update: i64,
     status: ChunkGenerationStatus,
 ) -> Result<Vec<u8>> {
-    nbt::write_to_bytes("", &encode(chunk, last_update, status)?)
+    direct::encode(chunk, last_update, status)
 }
 
 pub fn encode(
@@ -62,10 +64,14 @@ pub fn encode(
     Ok(root)
 }
 
+#[allow(
+    clippy::needless_range_loop,
+    reason = "The index addresses one column across three heightmaps and sparse block sections."
+)]
 fn compute_heightmaps(chunk: &ChunkModel) -> Result<[Heightmap; 3]> {
     let dimension = chunk.dimension();
     let sections = (0..chunk.section_count() as i32)
-        .map(|index| chunk.section_block_state_ids(index))
+        .map(|index| chunk.section_blocks(index))
         .collect::<Result<Vec<_>>>()?;
     let mut values = [(); 3].map(|_| vec![dimension.min_y(); COLUMN_COUNT]);
     for column in 0..COLUMN_COUNT {
@@ -73,8 +79,26 @@ fn compute_heightmaps(chunk: &ChunkModel) -> Result<[Heightmap; 3]> {
         'sections: for (section_index, section) in sections.iter().enumerate().rev() {
             // All three predicates exclude AIR; an unallocated section is AIR.
             let Some(section) = section else { continue };
+            if let BlockSection::Uniform(block) = section {
+                let counts = [
+                    counts_for_surface(*block),
+                    counts_for_ocean_floor(*block),
+                    counts_for_motion_blocking_no_leaves(*block),
+                ];
+                for map in 0..3 {
+                    if pending[map] && counts[map] {
+                        values[map][column] =
+                            dimension.min_y() + (section_index as i32 + 1) * SECTION_HEIGHT;
+                        pending[map] = false;
+                    }
+                }
+                if pending == [false; 3] {
+                    break 'sections;
+                }
+                continue;
+            }
             for local_y in (0..SECTION_HEIGHT as usize).rev() {
-                let block = section[local_y * COLUMN_COUNT + column];
+                let block = section.block_at(local_y * COLUMN_COUNT + column);
                 let counts = [
                     counts_for_surface(block),
                     counts_for_ocean_floor(block),
@@ -111,11 +135,11 @@ fn section_tags(chunk: &ChunkModel) -> Result<Vec<Tag>> {
         {
             continue;
         }
-        let palette = SectionPalette::pack_block_states(
-            chunk
-                .section_block_state_ids(section_index)?
-                .unwrap_or(&[ids::AIR; SECTION_BLOCK_COUNT]),
-        )?;
+        let palette = match chunk.section_blocks(section_index)? {
+            Some(BlockSection::Dense(blocks)) => SectionPalette::pack_block_states(blocks)?,
+            Some(BlockSection::Uniform(block)) => SectionPalette::uniform(*block)?,
+            None => SectionPalette::uniform(ids::AIR)?,
+        };
         let mut section = nbt::compound();
         section
             .put_byte("Y", chunk.section_y_for_index(section_index)?)?
@@ -404,6 +428,71 @@ fn counts_for_motion_blocking_no_leaves(block_state_id: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_chunk_bytes_match_tree_encoder_across_section_shapes_and_statuses() {
+        use crate::dimension_profile::{DimensionProfile, OVERWORLD_1_21_11};
+        for dimension in [
+            OVERWORLD_1_21_11.clone(),
+            DimensionProfile::new("test:short", -32, 64).unwrap(),
+        ] {
+            let mut chunk = ChunkModel::new(dimension.clone(), i32::MIN, i32::MAX);
+            let compare = |chunk: &ChunkModel| {
+                for status in [
+                    ChunkGenerationStatus::Full,
+                    ChunkGenerationStatus::Surface,
+                    ChunkGenerationStatus::Carvers,
+                ] {
+                    let expected =
+                        nbt::write_to_bytes("", &encode(chunk, i64::MIN, status).unwrap()).unwrap();
+                    assert_eq!(
+                        encode_to_bytes_with_status(chunk, i64::MIN, status).unwrap(),
+                        expected
+                    );
+                }
+            };
+            compare(&chunk);
+            chunk
+                .fill_layers(dimension.min_y(), dimension.max_y_inclusive(), ids::STONE)
+                .unwrap();
+            compare(&chunk);
+            chunk
+                .fill_layers(dimension.min_y(), dimension.min_y() + 15, ids::AIR)
+                .unwrap();
+            chunk
+                .fill_layers(dimension.min_y() + 16, dimension.min_y() + 31, ids::WATER)
+                .unwrap();
+            for id in 0..=ids::DRIPSTONE_BLOCK {
+                chunk
+                    .set_block_state_id(id % 16, dimension.max_y_inclusive(), id / 16, id)
+                    .unwrap();
+            }
+            chunk.set_biome_id("custom:숲_\0_🌳").unwrap();
+            chunk
+                .set_biome_id_at(4, dimension.max_y_inclusive(), 4, "minecraft:forest")
+                .unwrap();
+            let mut entity = nbt::compound();
+            entity
+                .put_string("id", "minecraft:chest")
+                .unwrap()
+                .put_int("x", i32::MIN)
+                .unwrap();
+            chunk.add_block_entity(entity);
+            compare(&chunk);
+            chunk
+                .set_block_state_id(0, dimension.min_y(), 0, i32::MAX)
+                .unwrap();
+            let expected = encode(&chunk, 0, ChunkGenerationStatus::Surface)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                encode_to_bytes_with_status(&chunk, 0, ChunkGenerationStatus::Surface)
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn combined_heightmaps_match_independent_scans_in_sparse_and_mixed_chunks() {

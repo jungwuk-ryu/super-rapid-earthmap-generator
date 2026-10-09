@@ -75,6 +75,10 @@ impl PackedLongArray {
         self.data.iter().map(|word| *word as i64).collect()
     }
 
+    pub(crate) fn data_words(&self) -> &[u64] {
+        &self.data
+    }
+
     #[cfg(test)]
     fn copy_data_words(&self) -> Vec<u64> {
         self.data.clone()

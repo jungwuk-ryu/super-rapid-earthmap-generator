@@ -2,6 +2,11 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+
+mod biome_keywords;
+mod ecology;
+use biome_keywords::known_biome_keywords;
+use ecology::SurfaceMaterialClimate;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
@@ -43,11 +48,12 @@ const OPEN_OCEAN_BATHYMETRY_ROW_CACHE_ROWS: usize = 256;
 
 static PHOTO_SURFACE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 static SURFACE_PHASE_DETAIL_ENABLED: OnceLock<bool> = OnceLock::new();
-const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 262_144;
+const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 1_048_576;
 const PHOTO_LAB_CACHE_MAX_ENTRIES: usize = 16_384;
-const PHOTO_PALETTE_SOLVE_CACHE_MAX_ENTRIES: usize = 8_192;
+const PHOTO_PALETTE_SOLVE_CACHE_MAX_ENTRIES: usize = 65_536;
 const STATIC_CARRIER_CACHE_MAX_ENTRIES: usize = 4_096;
 const NOISE_CELL_CACHE_ENTRIES: usize = 1_024;
+const MET_REMAP_CACHE_ENTRIES: usize = 65_536;
 
 #[derive(Clone, Copy)]
 struct NoiseCell {
@@ -88,12 +94,23 @@ fn surface_phase_detail_enabled() -> bool {
     })
 }
 
+fn indexed_surface_results<T>(results: Vec<Result<T>>) -> Result<Vec<T>> {
+    if let Some(index) = results.iter().position(Result::is_err) {
+        return Err(results.into_iter().nth(index).unwrap().err().unwrap());
+    }
+    // An indexed allocation followed by an infallible map permits Vec's
+    // in-place collection. Result's short-circuiting collector otherwise grows
+    // a second allocation and repeatedly copies large column build records.
+    Ok(results.into_iter().map(Result::unwrap).collect())
+}
+
 thread_local! {
     static PHOTO_CIEDE_CACHE: RefCell<Vec<PhotoColorCacheEntry<f64>>> = RefCell::new(vec![PhotoColorCacheEntry { key: u64::MAX, value: 0.0 }; PHOTO_CIEDE_CACHE_MAX_ENTRIES]);
     static PHOTO_LAB_CACHE: RefCell<Vec<PhotoColorCacheEntry<[f64; 3]>>> = RefCell::new(vec![PhotoColorCacheEntry { key: u64::MAX, value: [0.0; 3] }; PHOTO_LAB_CACHE_MAX_ENTRIES]);
     static PHOTO_PALETTE_SOLVE_CACHE: RefCell<HashMap<PhotoPaletteSolveKey<'static>, PhotoSurfaceSolve>> = RefCell::new(HashMap::new());
     static NOISE_CELL_CACHE: RefCell<Vec<Option<NoiseCell>>> = RefCell::new(vec![None; NOISE_CELL_CACHE_ENTRIES]);
     static STATIC_CARRIER_CACHE: RefCell<HashMap<(i32, Cow<'static, str>), StaticCarrier>> = RefCell::new(HashMap::new());
+    static MET_REMAP_CACHE: RefCell<Vec<(i32, Option<usize>)>> = RefCell::new(vec![(-1, None); MET_REMAP_CACHE_ENTRIES]);
 }
 
 fn photo_surface_trace(args: fmt::Arguments<'_>) -> String {
@@ -1424,10 +1441,21 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    haystack
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window[0].eq_ignore_ascii_case(&needle[0]) && window.eq_ignore_ascii_case(needle)
+    })
+}
+
+// Short identifiers retain arbitrary names without general-search setup.
+#[inline]
+fn contains_biome_keyword(biome: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    biome
         .as_bytes()
         .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
+        .any(|window| window == needle.as_bytes())
 }
 
 fn classify_surface_material_water(
@@ -1490,6 +1518,84 @@ fn surface_material_ocean_floor_block(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn classify_authoritative_land_material(
+    base: &EarthSurfaceColumn,
+    metrics: SurfaceColorMetrics,
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    coast_factor: f64,
+    sample: &SurfaceMaterialSample,
+    local_relief_meters: f64,
+    terrain: MetTerrainMatch,
+    semantic_terrain: bool,
+    ecology: &SurfaceMaterialClimate,
+) -> Option<EarthSurfaceColumn> {
+    let abs_lat = latitude.abs();
+    let immediate_beach = is_immediate_beach(base, coast_factor);
+    let beach_sand_allowed = should_use_beach_sand(metrics, longitude, latitude);
+    let warm_bright_dry_land = abs_lat <= 42.0
+        && metrics.value >= 0.58
+        && (28.0..=72.0).contains(&metrics.hue)
+        && metrics.red >= metrics.blue * 1.01
+        && metrics.green >= metrics.blue * 1.01;
+    if immediate_beach && beach_sand_allowed {
+        return Some(mark_surface_material(
+            surface_material_with_surface(
+                base,
+                block_state_ids::SAND,
+                block_state_ids::SAND,
+                "minecraft:beach",
+            ),
+            "shoreline",
+        ));
+    }
+
+    let snow_climate =
+        abs_lat >= 58.0 || base.ground_surface_y >= 165 || elevation_meters >= 2_800.0;
+    let snow_like = snow_climate
+        && metrics.value >= 0.70
+        && metrics.saturation <= 0.24
+        && metrics.blue >= metrics.red * 0.90
+        && !warm_bright_dry_land;
+    if snow_like || abs_lat >= 68.0 || (base.ground_surface_y >= 170 && abs_lat >= 25.0) {
+        return Some(mark_surface_material(
+            surface_material_with_surface(
+                base,
+                block_state_ids::SNOW_BLOCK,
+                block_state_ids::DIRT,
+                "minecraft:snowy_plains",
+            ),
+            "snow",
+        ));
+    }
+
+    if let Some(intent_column) = classify_surface_material_by_semantic_intent(
+        base,
+        sample,
+        metrics,
+        elevation_meters,
+        longitude,
+        latitude,
+        local_relief_meters,
+        terrain,
+        semantic_terrain,
+        ecology,
+    ) {
+        let vegetation_evidence = has_vegetation_evidence(sample, metrics);
+        let decision_source =
+            if is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence) {
+                "intent-ecoregion"
+            } else {
+                "intent"
+            };
+        return Some(mark_surface_material(intent_column, decision_source));
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn classify_surface_material_land(
     base: &EarthSurfaceColumn,
     metrics: SurfaceColorMetrics,
@@ -1507,16 +1613,8 @@ fn classify_surface_material_land(
     let olive_dry_grass = is_olive_dry_grass(metrics);
     let desert_sand_like = is_desert_sand_like(metrics);
     let orange_rock_like = is_orange_rock_like(metrics);
-    let sahara_score = surface_material_sahara_score(longitude, latitude);
-    let sahel_score = surface_material_sahel_score(longitude, latitude);
-    let rainforest_score = surface_material_rainforest_score(longitude, latitude);
-    let dry_savanna_score = surface_material_dry_savanna_score(longitude, latitude);
-    let mediterranean_score = surface_material_mediterranean_score(longitude, latitude);
-    let patch_noise = surface_material_ecology_noise(longitude, latitude, 2.4, 0x4165d9e7a1f31c0b);
-    let fine_noise =
-        surface_material_ecology_noise(longitude, latitude, 7.5, 0x9d6c63b5a8e33f21_u64 as i64);
+    let ecology = SurfaceMaterialClimate::new(longitude, latitude);
     let immediate_beach = is_immediate_beach(base, coast_factor);
-    let beach_sand_allowed = should_use_beach_sand(metrics, longitude, latitude);
     let terrain = surface_material_met_terrain(sample, metrics);
     let semantic_terrain =
         sample.terrain_token_source == TerrainTokenSource::Export && terrain.confident();
@@ -1526,63 +1624,20 @@ fn classify_surface_material_land(
         && metrics.red >= metrics.blue * 1.01
         && metrics.green >= metrics.blue * 1.01;
 
-    if immediate_beach && beach_sand_allowed {
-        return mark_surface_material(
-            surface_material_with_surface(
-                base,
-                block_state_ids::SAND,
-                block_state_ids::SAND,
-                "minecraft:beach",
-            ),
-            "shoreline",
-        );
-    }
-
-    let snow_climate =
-        abs_lat >= 58.0 || base.ground_surface_y >= 165 || elevation_meters >= 2_800.0;
-    let snow_like = snow_climate
-        && metrics.value >= 0.70
-        && metrics.saturation <= 0.24
-        && metrics.blue >= metrics.red * 0.90
-        && !warm_bright_dry_land;
-    if snow_like || abs_lat >= 68.0 || (base.ground_surface_y >= 170 && abs_lat >= 25.0) {
-        return mark_surface_material(
-            surface_material_with_surface(
-                base,
-                block_state_ids::SNOW_BLOCK,
-                block_state_ids::DIRT,
-                "minecraft:snowy_plains",
-            ),
-            "snow",
-        );
-    }
-
-    if let Some(intent_column) = classify_surface_material_by_semantic_intent(
+    if let Some(column) = classify_authoritative_land_material(
         base,
-        sample,
         metrics,
         elevation_meters,
         longitude,
         latitude,
-        sahara_score,
-        sahel_score,
-        rainforest_score,
-        dry_savanna_score,
-        mediterranean_score,
-        patch_noise,
-        fine_noise,
+        coast_factor,
+        sample,
         local_relief_meters,
         terrain,
         semantic_terrain,
+        &ecology,
     ) {
-        let vegetation_evidence = has_vegetation_evidence(sample, metrics);
-        let decision_source =
-            if is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence) {
-                "intent-ecoregion"
-            } else {
-                "intent"
-            };
-        return mark_surface_material(intent_column, decision_source);
+        return column;
     }
 
     let java_standard_terrain = sample.terrain_token_source
@@ -1595,27 +1650,26 @@ fn classify_surface_material_land(
         semantic_terrain,
         java_standard_terrain,
     );
-    let sparse_dry_open_tropical = is_sparse_dry_open_tropical(
-        sample,
-        metrics,
-        sahel_score,
-        dry_savanna_score,
-        token_vegetated,
-    );
-    let sparse_dry_open_has_dry_intent =
-        is_sahel_latitude(latitude) || sahel_score >= 0.22 || dry_savanna_score >= 0.35;
+    let sparse_dry_open_tropical =
+        is_sparse_dry_open_tropical(sample, metrics, token_vegetated, &ecology);
+    let sparse_dry_open_has_dry_intent = is_sahel_latitude(latitude)
+        || ecology.sahel_at_least(0.22)
+        || ecology.dry_savanna_at_least(0.35);
     if is_tropical_rain_climate(sample.climate_class)
         && sparse_dry_open_tropical
         && !sparse_dry_open_has_dry_intent
         && !is_named_forest_savanna_mosaic(sample)
     {
-        let biome = if sample.tree_cover() >= 0.15 || rainforest_score >= 0.45 || dark_vegetation {
+        let biome = if sample.tree_cover() >= 0.15
+            || ecology.rainforest_at_least(0.45)
+            || dark_vegetation
+        {
             rainforest_biome_with_sample(
                 sample,
-                rainforest_score.max(0.65),
+                ecology.rainforest().max(0.65),
                 dark_vegetation,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
             )
         } else {
             "minecraft:sparse_jungle".to_string()
@@ -1637,12 +1691,12 @@ fn classify_surface_material_land(
         && elevation_meters < 1_500.0
     {
         let biome = dry_grass_biome(
-            dry_savanna_score.max(sahel_score).max(0.45),
+            ecology.dry_savanna().max(ecology.sahel()).max(0.45),
             elevation_meters,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
         );
-        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.44);
+        let top = dry_grass_surface(metrics, ecology.patch(), ecology.fine(), 0.44);
         return mark_surface_material(
             surface_material_with_surface(base, top, block_state_ids::DIRT, biome),
             "environment",
@@ -1654,7 +1708,7 @@ fn classify_surface_material_land(
         && terrain.kind == MetTerrainKind::Vegetated
         && desert_sand_like
         && warm_bright_dry_land
-        && (sahara_score >= 0.18 || desert_score(longitude, latitude) >= 0.50)
+        && (ecology.sahara_at_least(0.18) || desert_score(longitude, latitude) >= 0.50)
     {
         return surface_material_with_surface(
             base,
@@ -1671,17 +1725,12 @@ fn classify_surface_material_land(
         elevation_meters,
         longitude,
         latitude,
-        sahara_score,
-        sahel_score,
-        rainforest_score,
-        dry_savanna_score,
-        patch_noise,
-        fine_noise,
         local_relief_meters,
         sample.slope_ratio(),
         coast_factor,
         terrain,
         semantic_terrain,
+        &ecology,
     ) {
         return mark_surface_material(ecoregion_column, "ecoregion");
     }
@@ -1695,12 +1744,12 @@ fn classify_surface_material_land(
             || (desert_sand_like && metrics.value < 0.66))
     {
         let biome = dry_grass_biome(
-            sahel_score.max(0.70),
+            ecology.sahel().max(0.70),
             elevation_meters,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
         );
-        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+        let top = dry_grass_surface(metrics, ecology.patch(), ecology.fine(), 0.48);
         return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
     }
 
@@ -1710,8 +1759,8 @@ fn classify_surface_material_land(
             elevation_meters,
             longitude,
             latitude,
-            sahara_score,
-            dry_savanna_score,
+            ecology.sahara(),
+            ecology.dry_savanna(),
             local_relief_meters,
             sample.slope_ratio(),
         )
@@ -1721,7 +1770,7 @@ fn classify_surface_material_land(
         } else {
             block_state_ids::TERRACOTTA
         };
-        let biome = if elevation_meters >= 1_200.0 || fine_noise >= 0.68 {
+        let biome = if elevation_meters >= 1_200.0 || ecology.fine() >= 0.68 {
             "minecraft:wooded_badlands"
         } else {
             "minecraft:badlands"
@@ -1729,8 +1778,13 @@ fn classify_surface_material_land(
         return surface_material_with_surface(base, top, top, biome);
     }
 
-    if rainforest_score >= 0.35 && (green_like || metrics.value < 0.44) {
-        let biome = rainforest_biome(rainforest_score, dark_vegetation, patch_noise, fine_noise);
+    if ecology.rainforest_at_least(0.35) && (green_like || metrics.value < 0.44) {
+        let biome = rainforest_biome(
+            ecology.rainforest(),
+            dark_vegetation,
+            ecology.patch(),
+            ecology.fine(),
+        );
         return surface_material_with_surface(
             base,
             block_state_ids::GRASS_BLOCK,
@@ -1739,13 +1793,18 @@ fn classify_surface_material_land(
         );
     }
 
-    if sahel_score >= 0.24 && (green_like || olive_dry_grass || metrics.value < 0.75) {
-        let biome = dry_grass_biome(sahel_score, elevation_meters, patch_noise, fine_noise);
+    if ecology.sahel_at_least(0.24) && (green_like || olive_dry_grass || metrics.value < 0.75) {
+        let biome = dry_grass_biome(
+            ecology.sahel(),
+            elevation_meters,
+            ecology.patch(),
+            ecology.fine(),
+        );
         let top = dry_grass_surface(
             metrics,
-            patch_noise,
-            fine_noise,
-            0.42 + (sahel_score * 0.18),
+            ecology.patch(),
+            ecology.fine(),
+            0.42 + (ecology.sahel() * 0.18),
         );
         return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
     }
@@ -1755,21 +1814,21 @@ fn classify_surface_material_land(
         && (olive_dry_grass || desert_sand_like || orange_rock_like)
     {
         let biome = dry_grass_biome(
-            sahel_score.max(0.70),
+            ecology.sahel().max(0.70),
             elevation_meters,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
         );
-        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+        let top = dry_grass_surface(metrics, ecology.patch(), ecology.fine(), 0.48);
         return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
     }
 
-    if sahara_score >= 0.45 && (desert_sand_like || !green_like || warm_bright_dry_land) {
+    if ecology.sahara_at_least(0.45) && (desert_sand_like || !green_like || warm_bright_dry_land) {
         if orange_rock_like
             && metrics.value < 0.42
             && elevation_meters >= 450.0
             && local_relief_meters >= 160.0
-            && fine_noise >= 0.60
+            && ecology.fine() >= 0.60
         {
             let top = if metrics.hue <= 35.0 {
                 block_state_ids::ORANGE_TERRACOTTA
@@ -1780,9 +1839,9 @@ fn classify_surface_material_land(
         }
         let top = desert_surface(
             metrics,
-            patch_noise,
-            fine_noise,
-            sahara_score,
+            ecology.patch(),
+            ecology.fine(),
+            ecology.sahara(),
             terrain,
             semantic_terrain,
         );
@@ -1790,32 +1849,37 @@ fn classify_surface_material_land(
             base,
             top,
             desert_filler(top),
-            desert_biome(elevation_meters, patch_noise, fine_noise),
+            desert_biome(elevation_meters, ecology.patch(), ecology.fine()),
         );
     }
 
-    if dry_savanna_score >= 0.35
+    if ecology.dry_savanna_at_least(0.35)
         && (green_like || olive_dry_grass || desert_sand_like || orange_rock_like)
     {
-        let biome = dry_grass_biome(dry_savanna_score, elevation_meters, patch_noise, fine_noise);
+        let biome = dry_grass_biome(
+            ecology.dry_savanna(),
+            elevation_meters,
+            ecology.patch(),
+            ecology.fine(),
+        );
         let top = dry_grass_surface(
             metrics,
-            patch_noise,
-            fine_noise,
-            0.38 + (dry_savanna_score * 0.18),
+            ecology.patch(),
+            ecology.fine(),
+            0.38 + (ecology.dry_savanna() * 0.18),
         );
         return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
     }
 
-    if mediterranean_score >= 0.40
+    if ecology.mediterranean_at_least(0.40)
         && (green_like || olive_dry_grass || orange_rock_like || desert_sand_like)
     {
-        let biome = if patch_noise >= 0.62 || dark_vegetation {
+        let biome = if ecology.patch() >= 0.62 || dark_vegetation {
             "minecraft:forest"
         } else {
             "minecraft:plains"
         };
-        let top = if fine_noise >= 0.76 && !green_like {
+        let top = if ecology.fine() >= 0.76 && !green_like {
             block_state_ids::COARSE_DIRT
         } else {
             block_state_ids::GRASS_BLOCK
@@ -1828,22 +1892,24 @@ fn classify_surface_material_land(
             base,
             block_state_ids::GRASS_BLOCK,
             block_state_ids::DIRT,
-            lush_biome(abs_lat, dark_vegetation, patch_noise),
+            lush_biome(abs_lat, dark_vegetation, ecology.patch()),
         );
     }
 
     if !immediate_beach && desert_sand_like {
         if abs_lat <= 28.0
             && metrics.value < 0.66
-            && (olive_dry_grass || dry_savanna_score >= 0.20 || sahel_score >= 0.18)
+            && (olive_dry_grass
+                || ecology.dry_savanna_at_least(0.20)
+                || ecology.sahel_at_least(0.18))
         {
             let biome = dry_grass_biome(
-                dry_savanna_score.max(sahel_score).max(0.45),
+                ecology.dry_savanna().max(ecology.sahel()).max(0.45),
                 elevation_meters,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
             );
-            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.48);
+            let top = dry_grass_surface(metrics, ecology.patch(), ecology.fine(), 0.48);
             return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
         }
         let sand = if metrics.red > metrics.green * 1.18 && metrics.hue <= 45.0 {
@@ -1868,14 +1934,14 @@ fn classify_surface_material_land(
     }
 
     if orange_rock_like {
-        if dry_savanna_score >= 0.20 || (abs_lat <= 35.0 && metrics.value >= 0.45) {
+        if ecology.dry_savanna_at_least(0.20) || (abs_lat <= 35.0 && metrics.value >= 0.45) {
             let biome = dry_grass_biome(
-                dry_savanna_score.max(0.40),
+                ecology.dry_savanna().max(0.40),
                 elevation_meters,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
             );
-            let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.46);
+            let top = dry_grass_surface(metrics, ecology.patch(), ecology.fine(), 0.46);
             return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
         }
         let top = if metrics.value < 0.36 {
@@ -1904,12 +1970,12 @@ fn classify_surface_material_land(
 
     if olive_dry_grass || ((45.0..=95.0).contains(&metrics.hue) && metrics.saturation < 0.28) {
         let biome = dry_grass_biome(
-            dry_savanna_score.max(0.45),
+            ecology.dry_savanna().max(0.45),
             elevation_meters,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
         );
-        let top = dry_grass_surface(metrics, patch_noise, fine_noise, 0.42);
+        let top = dry_grass_surface(metrics, ecology.patch(), ecology.fine(), 0.42);
         return surface_material_with_surface(base, top, block_state_ids::DIRT, biome);
     }
 
@@ -1917,7 +1983,7 @@ fn classify_surface_material_land(
         base,
         block_state_ids::GRASS_BLOCK,
         block_state_ids::DIRT,
-        fallback_biome(base, latitude, patch_noise),
+        fallback_biome(base, latitude, ecology.patch()),
     )
 }
 
@@ -1929,16 +1995,10 @@ fn classify_surface_material_by_semantic_intent(
     elevation_meters: f64,
     longitude: f64,
     latitude: f64,
-    sahara_score: f64,
-    sahel_score: f64,
-    rainforest_score: f64,
-    dry_savanna_score: f64,
-    mediterranean_score: f64,
-    patch_noise: f64,
-    fine_noise: f64,
     local_relief_meters: f64,
     terrain: MetTerrainMatch,
     semantic_terrain: bool,
+    ecology: &SurfaceMaterialClimate,
 ) -> Option<EarthSurfaceColumn> {
     let climate = sample.climate_class;
     let has_climate = sample.has_climate_class();
@@ -1954,8 +2014,9 @@ fn classify_surface_material_by_semantic_intent(
     let savanna_like = is_savanna_like_ecoregion(sample);
     let vegetation_evidence = has_vegetation_evidence(sample, metrics);
     let ecoregion_dry_core = is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence);
-    let dry_tropical_woodland =
-        latitude.abs() <= 25.0 && dry_savanna_score >= 0.20 && !is_tropical_rain_climate(climate);
+    let dry_tropical_woodland = latitude.abs() <= 25.0
+        && ecology.dry_savanna_at_least(0.20)
+        && !is_tropical_rain_climate(climate);
     let java_standard_terrain = sample.terrain_token_source
         == TerrainTokenSource::JavaStandardPalette
         && terrain.confident();
@@ -1990,7 +2051,7 @@ fn classify_surface_material_by_semantic_intent(
     }
 
     if sample.swamp_cover_ratio() >= 0.35 && latitude.abs() <= 45.0 {
-        let top = if fine_noise >= 0.82 {
+        let top = if ecology.fine() >= 0.82 {
             block_state_ids::MUD
         } else {
             block_state_ids::GRASS_BLOCK
@@ -2015,10 +2076,10 @@ fn classify_surface_material_by_semantic_intent(
             elevation_meters,
             longitude,
             latitude,
-            sahara_score,
-            dry_savanna_score,
-            patch_noise,
-            fine_noise,
+            ecology.sahara(),
+            ecology.dry_savanna(),
+            ecology.patch(),
+            ecology.fine(),
             local_relief_meters,
             terrain,
             semantic_terrain,
@@ -2030,41 +2091,44 @@ fn classify_surface_material_by_semantic_intent(
         metrics,
         longitude,
         latitude,
-        sahara_score,
-        rainforest_score,
-        dry_savanna_score,
         token_vegetated,
-        patch_noise,
-        fine_noise,
+        ecology,
     ) {
         let mut canopy_weight = clamp_unit(
             0.10 + (sample.canopy_cover() * 0.48)
                 + (sample.vegetation_cover() * 0.12)
-                + (rainforest_score * 0.22)
-                - (sahel_score * 0.38)
-                - (dry_savanna_score * 0.34),
+                + (ecology.rainforest() * 0.22)
+                - (ecology.sahel() * 0.38)
+                - (ecology.dry_savanna() * 0.34),
         );
-        if is_humid_forest_core(sample, rainforest_score, sahel_score, dry_savanna_score) {
+        if is_humid_forest_core(
+            sample,
+            ecology.rainforest(),
+            ecology.sahel(),
+            ecology.dry_savanna(),
+        ) {
             canopy_weight = canopy_weight.max(0.72);
         } else if is_named_forest_savanna_mosaic(sample) {
             canopy_weight = canopy_weight.max(clamp_unit(
-                0.52 + (rainforest_score * 0.08)
-                    - (sahel_score * 0.12)
-                    - (dry_savanna_score * 0.12),
+                0.52 + (ecology.rainforest() * 0.08)
+                    - (ecology.sahel() * 0.12)
+                    - (ecology.dry_savanna() * 0.12),
             ));
         }
-        let local = (patch_noise * 0.68) + (fine_noise * 0.32);
+        let local = (ecology.patch() * 0.68) + (ecology.fine() * 0.32);
         let lush_patch = local < canopy_weight
-            || (sample.canopy_cover() >= 0.62 && sample.tree_cover() >= 0.28 && fine_noise < 0.80);
+            || (sample.canopy_cover() >= 0.62
+                && sample.tree_cover() >= 0.28
+                && ecology.fine() < 0.80);
         if lush_patch {
-            let humid_score = rainforest_score.max(0.48);
+            let humid_score = ecology.rainforest().max(0.48);
             return Some(surface_material_with_surface(
                 base,
                 lush_vegetation_surface(
                     sample,
                     metrics,
-                    patch_noise,
-                    fine_noise,
+                    ecology.patch(),
+                    ecology.fine(),
                     humid_score,
                     terrain,
                 ),
@@ -2073,17 +2137,17 @@ fn classify_surface_material_by_semantic_intent(
                     sample,
                     humid_score,
                     metrics.value < 0.48,
-                    patch_noise,
-                    fine_noise,
+                    ecology.patch(),
+                    ecology.fine(),
                 ),
             ));
         }
-        let dry_score = sahel_score.max(dry_savanna_score).max(0.50);
+        let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.50);
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -2093,21 +2157,16 @@ fn classify_surface_material_by_semantic_intent(
             base,
             top,
             block_state_ids::DIRT,
-            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise),
+            dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine()),
         ));
     }
 
-    let sparse_dry_open_tropical = is_sparse_dry_open_tropical(
-        sample,
-        metrics,
-        sahel_score,
-        dry_savanna_score,
-        token_vegetated,
-    );
+    let sparse_dry_open_tropical =
+        is_sparse_dry_open_tropical(sample, metrics, token_vegetated, ecology);
     let rainforest_intent =
         (has_climate && is_tropical_rain_climate(climate) && !sparse_dry_open_tropical)
-            || (rainforest_score >= 0.35 && tree_cover >= 0.12)
-            || (rainforest_score >= 0.45
+            || (ecology.rainforest_at_least(0.35) && tree_cover >= 0.12)
+            || (ecology.rainforest_at_least(0.45)
                 && (sample.vegetation_cover() >= 0.18
                     || tree_cover >= 0.08
                     || green_like
@@ -2118,40 +2177,40 @@ fn classify_surface_material_by_semantic_intent(
             lush_vegetation_surface(
                 sample,
                 metrics,
-                patch_noise,
-                fine_noise,
-                rainforest_score,
+                ecology.patch(),
+                ecology.fine(),
+                ecology.rainforest(),
                 terrain,
             ),
             block_state_ids::DIRT,
             rainforest_biome_with_sample(
                 sample,
-                rainforest_score.max(0.60),
+                ecology.rainforest().max(0.60),
                 metrics.value < 0.48,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
             ),
         ));
     }
 
-    if (is_sahel_latitude(latitude) || sahel_score >= 0.22)
+    if (is_sahel_latitude(latitude) || ecology.sahel_at_least(0.22))
         && (vegetation_evidence
             || olive_dry_grass
-            || dry_savanna_score >= 0.25
+            || ecology.dry_savanna_at_least(0.25)
             || token_vegetated
             || (desert_sand_like && metrics.value < 0.72)
             || (orange_rock_like && metrics.value < 0.74))
     {
-        let desert_edge = is_desert_climate(climate) || sahara_score >= 0.35;
-        let dry_score =
-            sahel_score
-                .max(dry_savanna_score)
-                .max(if desert_edge { 0.58 } else { 0.45 });
+        let desert_edge = is_desert_climate(climate) || ecology.sahara_at_least(0.35);
+        let dry_score = ecology
+            .sahel()
+            .max(ecology.dry_savanna())
+            .max(if desert_edge { 0.58 } else { 0.45 });
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -2160,7 +2219,7 @@ fn classify_surface_material_by_semantic_intent(
         let biome = if desert_edge && dry_score >= 0.58 {
             "minecraft:savanna".to_string()
         } else {
-            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise)
+            dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine())
         };
         return Some(surface_material_with_surface(
             base,
@@ -2171,26 +2230,28 @@ fn classify_surface_material_by_semantic_intent(
     }
 
     let strong_dry_core = is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
-        || (is_desert_climate(climate) && !vegetation_evidence && sahara_score >= 0.35);
-    if mediterranean_score >= 0.40 && !strong_dry_core {
+        || (is_desert_climate(climate) && !vegetation_evidence && ecology.sahara_at_least(0.35));
+    if ecology.mediterranean_at_least(0.40) && !strong_dry_core {
         return Some(surface_material_with_surface(
             base,
-            mediterranean_surface(sample, metrics, fine_noise),
+            mediterranean_surface(sample, metrics, ecology.fine()),
             block_state_ids::DIRT,
-            mediterranean_biome(sample, metrics, patch_noise),
+            mediterranean_biome(sample, metrics, ecology.patch()),
         ));
     }
 
     if sparse_dry_open_tropical
-        && (is_sahel_latitude(latitude) || sahel_score >= 0.22 || dry_savanna_score >= 0.35)
+        && (is_sahel_latitude(latitude)
+            || ecology.sahel_at_least(0.22)
+            || ecology.dry_savanna_at_least(0.35))
     {
-        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
-        let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+        let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.45);
+        let biome = dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine());
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -2205,13 +2266,13 @@ fn classify_surface_material_by_semantic_intent(
     }
 
     if is_tropical_savanna_climate(climate) {
-        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
-        let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+        let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.45);
+        let biome = dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine());
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -2226,17 +2287,18 @@ fn classify_surface_material_by_semantic_intent(
     }
 
     if is_steppe_climate(climate) {
-        if dry_savanna_score >= 0.35
-            || sahel_score >= 0.18
-            || (latitude.abs() <= 32.0 && dry_savanna_score >= 0.18)
+        if ecology.dry_savanna_at_least(0.35)
+            || ecology.sahel_at_least(0.18)
+            || (latitude.abs() <= 32.0 && ecology.dry_savanna_at_least(0.18))
         {
-            let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
-            let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+            let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.45);
+            let biome =
+                dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine());
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 dry_score,
                 terrain,
                 semantic_terrain,
@@ -2249,7 +2311,8 @@ fn classify_surface_material_by_semantic_intent(
                 biome,
             ));
         }
-        let biome = temperate_grassland_biome(latitude, sample, metrics, patch_noise, fine_noise);
+        let biome =
+            temperate_grassland_biome(latitude, sample, metrics, ecology.patch(), ecology.fine());
         return Some(surface_material_with_surface(
             base,
             block_state_ids::GRASS_BLOCK,
@@ -2258,15 +2321,15 @@ fn classify_surface_material_by_semantic_intent(
         ));
     }
 
-    if dry_savanna_score >= 0.35
+    if ecology.dry_savanna_at_least(0.35)
         && !is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
     {
-        let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+        let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.45);
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -2276,13 +2339,13 @@ fn classify_surface_material_by_semantic_intent(
             base,
             top,
             block_state_ids::DIRT,
-            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise),
+            dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine()),
         ));
     }
 
     if savanna_like
         && sample.ecoregion_confidence >= 0.78
-        && (is_sahel_latitude(latitude) || sahel_score >= 0.22)
+        && (is_sahel_latitude(latitude) || ecology.sahel_at_least(0.22))
         && is_desert_climate(climate)
         && !is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
         && !is_tropical_rain_climate(climate)
@@ -2291,9 +2354,9 @@ fn classify_surface_material_by_semantic_intent(
             let sand_patch_noise =
                 surface_material_ecology_noise(longitude, latitude, 0.46, 0x519bc3a22e8f4d31);
             let sand_patch_threshold = clamp_unit(
-                0.04 + (sahara_score * 0.10) + ((metrics.value - 0.78) * 0.28)
-                    - (sahel_score * 0.18)
-                    - (dry_savanna_score * 0.10),
+                0.04 + (ecology.sahara() * 0.10) + ((metrics.value - 0.78) * 0.28)
+                    - (ecology.sahel() * 0.18)
+                    - (ecology.dry_savanna() * 0.10),
             );
             if sand_patch_noise < sand_patch_threshold {
                 return Some(hot_desert_surface_column(
@@ -2303,22 +2366,22 @@ fn classify_surface_material_by_semantic_intent(
                     elevation_meters,
                     longitude,
                     latitude,
-                    sahara_score,
-                    dry_savanna_score,
-                    patch_noise,
-                    fine_noise,
+                    ecology.sahara(),
+                    ecology.dry_savanna(),
+                    ecology.patch(),
+                    ecology.fine(),
                     local_relief_meters,
                     terrain,
                     semantic_terrain,
                 ));
             }
         }
-        let dry_score = sahel_score.max(dry_savanna_score).max(0.58);
+        let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.58);
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -2346,9 +2409,9 @@ fn classify_surface_material_by_semantic_intent(
             let sand_patch_noise =
                 surface_material_ecology_noise(longitude, latitude, 0.42, 0x1b8d4a732e66c1d7);
             let sand_patch_threshold = clamp_unit(
-                0.12 + (sahara_score * 0.24) + ((metrics.value - 0.70) * 0.46)
-                    - (sahel_score * 0.10)
-                    - (dry_savanna_score * 0.08),
+                0.12 + (ecology.sahara() * 0.24) + ((metrics.value - 0.70) * 0.46)
+                    - (ecology.sahel() * 0.10)
+                    - (ecology.dry_savanna() * 0.08),
             );
             if sand_patch_noise < sand_patch_threshold {
                 return Some(hot_desert_surface_column(
@@ -2358,27 +2421,27 @@ fn classify_surface_material_by_semantic_intent(
                     elevation_meters,
                     longitude,
                     latitude,
-                    sahara_score,
-                    dry_savanna_score,
-                    patch_noise,
-                    fine_noise,
+                    ecology.sahara(),
+                    ecology.dry_savanna(),
+                    ecology.patch(),
+                    ecology.fine(),
                     local_relief_meters,
                     terrain,
                     semantic_terrain,
                 ));
             }
         }
-        if dry_savanna_score >= 0.25
-            || sahel_score >= 0.18
+        if ecology.dry_savanna_at_least(0.25)
+            || ecology.sahel_at_least(0.18)
             || is_tropical_savanna_climate(climate)
             || latitude.abs() <= 32.0
         {
-            let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
+            let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.45);
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 dry_score,
                 terrain,
                 semantic_terrain,
@@ -2388,14 +2451,14 @@ fn classify_surface_material_by_semantic_intent(
                 base,
                 top,
                 block_state_ids::DIRT,
-                dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise),
+                dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine()),
             ));
         }
         return Some(surface_material_with_surface(
             base,
             block_state_ids::GRASS_BLOCK,
             block_state_ids::DIRT,
-            temperate_grassland_biome(latitude, sample, metrics, patch_noise, fine_noise),
+            temperate_grassland_biome(latitude, sample, metrics, ecology.patch(), ecology.fine()),
         ));
     }
 
@@ -2404,19 +2467,21 @@ fn classify_surface_material_by_semantic_intent(
         && !green_like
         && !is_tropical_rain_climate(climate)
         && latitude.abs() <= 35.0
-        && (sahel_score >= 0.18 || dry_savanna_score >= 0.18 || mediterranean_score >= 0.32)
+        && (ecology.sahel_at_least(0.18)
+            || ecology.dry_savanna_at_least(0.18)
+            || ecology.mediterranean_at_least(0.32))
         && metrics.value < 0.76
     {
-        let desert_edge = sahara_score >= 0.35 || is_desert_climate(climate);
-        let dry_score =
-            sahel_score
-                .max(dry_savanna_score)
-                .max(if desert_edge { 0.58 } else { 0.45 });
+        let desert_edge = ecology.sahara_at_least(0.35) || is_desert_climate(climate);
+        let dry_score = ecology
+            .sahel()
+            .max(ecology.dry_savanna())
+            .max(if desert_edge { 0.58 } else { 0.45 });
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -2425,7 +2490,7 @@ fn classify_surface_material_by_semantic_intent(
         let biome = if desert_edge && dry_score >= 0.58 {
             "minecraft:savanna".to_string()
         } else {
-            dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise)
+            dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine())
         };
         return Some(surface_material_with_surface(
             base,
@@ -2441,8 +2506,8 @@ fn classify_surface_material_by_semantic_intent(
             elevation_meters,
             longitude,
             latitude,
-            sahara_score,
-            dry_savanna_score,
+            ecology.sahara(),
+            ecology.dry_savanna(),
             local_relief_meters,
             sample.slope_ratio(),
         )
@@ -2452,8 +2517,8 @@ fn classify_surface_material_by_semantic_intent(
             base,
             metrics,
             elevation_meters,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
         ));
     }
 
@@ -2461,7 +2526,7 @@ fn classify_surface_material_by_semantic_intent(
         && java_standard_terrain
         && !vegetation_evidence
         && !token_vegetated
-        && (sahara_score >= 0.35
+        && (ecology.sahara_at_least(0.35)
             || is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence))
         && matches!(terrain.kind, MetTerrainKind::Gravel | MetTerrainKind::Rock)
         && (elevation_meters >= 700.0 || local_relief_meters >= 200.0)
@@ -2470,13 +2535,13 @@ fn classify_surface_material_by_semantic_intent(
             base,
             metrics,
             elevation_meters,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
         ));
     }
 
     if ecoregion_dry_core
-        && dry_savanna_score >= 0.32
+        && ecology.dry_savanna_at_least(0.32)
         && sample.ecoregion_confidence < 0.92
         && latitude.abs() <= 42.0
         && metrics.value < 0.78
@@ -2485,14 +2550,14 @@ fn classify_surface_material_by_semantic_intent(
             surface_material_ecology_noise(longitude, latitude, 1.25, 0x4bd1a7240f78c8d3);
         let confidence_blend = (0.92 - sample.ecoregion_confidence) / 0.92;
         let dry_savanna_blend =
-            clamp_unit(0.22 + (dry_savanna_score * 0.28) + (confidence_blend * 0.35));
+            clamp_unit(0.22 + (ecology.dry_savanna() * 0.28) + (confidence_blend * 0.35));
         if transition_noise < dry_savanna_blend {
-            let dry_score = sahel_score.max(dry_savanna_score).max(0.58);
+            let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.58);
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 dry_score,
                 terrain,
                 semantic_terrain,
@@ -2509,18 +2574,23 @@ fn classify_surface_material_by_semantic_intent(
 
     if ecoregion_dry_core
         || (has_climate && is_desert_climate(climate))
-        || sahara_score >= 0.45
-        || (desert_sand_like && latitude.abs() <= 38.0 && !green_like && sahara_score >= 0.25)
+        || ecology.sahara_at_least(0.45)
+        || (desert_sand_like
+            && latitude.abs() <= 38.0
+            && !green_like
+            && ecology.sahara_at_least(0.25))
     {
         if (vegetation_evidence || (java_standard_terrain && token_vegetated))
-            && (sahel_score >= 0.18 || dry_savanna_score >= 0.18 || !desert_sand_like)
+            && (ecology.sahel_at_least(0.18)
+                || ecology.dry_savanna_at_least(0.18)
+                || !desert_sand_like)
         {
-            let dry_score = sahel_score.max(dry_savanna_score).max(0.58);
+            let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.58);
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 dry_score,
                 terrain,
                 semantic_terrain,
@@ -2540,10 +2610,10 @@ fn classify_surface_material_by_semantic_intent(
             elevation_meters,
             longitude,
             latitude,
-            sahara_score,
-            dry_savanna_score,
-            patch_noise,
-            fine_noise,
+            ecology.sahara(),
+            ecology.dry_savanna(),
+            ecology.patch(),
+            ecology.fine(),
             local_relief_meters,
             terrain,
             semantic_terrain,
@@ -2557,9 +2627,9 @@ fn classify_surface_material_by_semantic_intent(
     {
         return Some(surface_material_with_surface(
             base,
-            temperate_forest_surface(sample, metrics, patch_noise, fine_noise),
+            temperate_forest_surface(sample, metrics, ecology.patch(), ecology.fine()),
             block_state_ids::DIRT,
-            temperate_biome(latitude, sample, metrics, patch_noise, fine_noise),
+            temperate_biome(latitude, sample, metrics, ecology.patch(), ecology.fine()),
         ));
     }
 
@@ -2569,22 +2639,22 @@ fn classify_surface_material_by_semantic_intent(
     {
         return Some(surface_material_with_surface(
             base,
-            temperate_forest_surface(sample, metrics, patch_noise, fine_noise),
+            temperate_forest_surface(sample, metrics, ecology.patch(), ecology.fine()),
             block_state_ids::DIRT,
-            temperate_biome(latitude, sample, metrics, patch_noise, fine_noise),
+            temperate_biome(latitude, sample, metrics, ecology.patch(), ecology.fine()),
         ));
     }
 
     if is_desert_climate(climate) {
         if (tree_cover >= 0.12 || herb_cover >= 0.35 || shrub_cover >= 0.35 || green_like)
-            && (savanna_like || is_sahel_latitude(latitude) || sahel_score >= 0.18)
+            && (savanna_like || is_sahel_latitude(latitude) || ecology.sahel_at_least(0.18))
         {
-            let dry_score = sahel_score.max(dry_savanna_score).max(0.58);
+            let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.58);
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 dry_score,
                 terrain,
                 semantic_terrain,
@@ -2603,12 +2673,12 @@ fn classify_surface_material_by_semantic_intent(
                 elevation_meters,
                 longitude,
                 latitude,
-                sahara_score,
-                dry_savanna_score,
+                ecology.sahara(),
+                ecology.dry_savanna(),
                 local_relief_meters,
                 sample.slope_ratio(),
             )
-            && fine_noise >= 0.70
+            && ecology.fine() >= 0.70
         {
             let top = if metrics.hue <= 35.0 {
                 block_state_ids::ORANGE_TERRACOTTA
@@ -2624,9 +2694,9 @@ fn classify_surface_material_by_semantic_intent(
         }
         let top = desert_surface(
             metrics,
-            patch_noise,
-            fine_noise,
-            sahara_score.max(0.65),
+            ecology.patch(),
+            ecology.fine(),
+            ecology.sahara().max(0.65),
             terrain,
             semantic_terrain,
         );
@@ -2634,19 +2704,20 @@ fn classify_surface_material_by_semantic_intent(
             base,
             top,
             desert_filler(top),
-            desert_biome(elevation_meters, patch_noise, fine_noise),
+            desert_biome(elevation_meters, ecology.patch(), ecology.fine()),
         ));
     }
 
     if is_temperate_climate(climate) {
         if dry_tropical_woodland {
-            let dry_score = dry_savanna_score.max(0.45);
-            let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+            let dry_score = ecology.dry_savanna().max(0.45);
+            let biome =
+                dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine());
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 dry_score,
                 terrain,
                 semantic_terrain,
@@ -2662,19 +2733,19 @@ fn classify_surface_material_by_semantic_intent(
         if tree_cover >= 0.06 || dark_vegetation || forest_like {
             return Some(surface_material_with_surface(
                 base,
-                temperate_forest_surface(sample, metrics, patch_noise, fine_noise),
+                temperate_forest_surface(sample, metrics, ecology.patch(), ecology.fine()),
                 block_state_ids::DIRT,
                 forest_biome_for_environment(
                     latitude,
                     climate,
                     tree_cover,
                     dark_vegetation,
-                    patch_noise,
+                    ecology.patch(),
                 ),
             ));
         }
         if herb_cover >= 0.18 || shrub_cover >= 0.18 || green_like || metrics.value >= 0.42 {
-            let top = if fine_noise >= 0.86 && shrub_cover > herb_cover {
+            let top = if ecology.fine() >= 0.86 && shrub_cover > herb_cover {
                 block_state_ids::COARSE_DIRT
             } else {
                 block_state_ids::GRASS_BLOCK
@@ -2697,7 +2768,7 @@ fn classify_surface_material_by_semantic_intent(
                 "minecraft:snowy_plains",
             ));
         }
-        let biome = if tree_cover >= 0.12 || patch_noise >= 0.48 {
+        let biome = if tree_cover >= 0.12 || ecology.patch() >= 0.48 {
             "minecraft:taiga"
         } else {
             "minecraft:plains"
@@ -2721,18 +2792,19 @@ fn classify_surface_material_by_semantic_intent(
                     climate,
                     tree_cover,
                     dark_vegetation,
-                    patch_noise,
+                    ecology.patch(),
                 ),
             ));
         }
         if savanna_like && sample.vegetation_cover() > 0.0 {
-            let dry_score = sahel_score.max(dry_savanna_score).max(0.45);
-            let biome = dry_grass_biome(dry_score, elevation_meters, patch_noise, fine_noise);
+            let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.45);
+            let biome =
+                dry_grass_biome(dry_score, elevation_meters, ecology.patch(), ecology.fine());
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 dry_score,
                 terrain,
                 semantic_terrain,
@@ -2758,17 +2830,12 @@ fn classify_surface_material_by_ecoregion(
     elevation_meters: f64,
     longitude: f64,
     latitude: f64,
-    sahara_score: f64,
-    sahel_score: f64,
-    rainforest_score: f64,
-    dry_savanna_score: f64,
-    patch_noise: f64,
-    fine_noise: f64,
     local_relief_meters: f64,
     slope: f64,
     coast_factor: f64,
     terrain: MetTerrainMatch,
     semantic_terrain: bool,
+    ecology: &SurfaceMaterialClimate,
 ) -> Option<EarthSurfaceColumn> {
     if !sample.has_ecoregion_biome() {
         return None;
@@ -2790,11 +2857,11 @@ fn classify_surface_material_by_ecoregion(
         metrics,
         elevation_meters,
         latitude,
-        sahara_score,
-        rainforest_score,
-        dry_savanna_score,
-        patch_noise,
-        fine_noise,
+        ecology.sahara(),
+        ecology.rainforest(),
+        ecology.dry_savanna(),
+        ecology.patch(),
+        ecology.fine(),
         vegetation_evidence,
     ) {
         return None;
@@ -2853,7 +2920,7 @@ fn classify_surface_material_by_ecoregion(
         {
             return None;
         }
-        let top = if fine_noise >= 0.72 || sample.swamp_cover_ratio() >= 0.55 {
+        let top = if ecology.fine() >= 0.72 || sample.swamp_cover_ratio() >= 0.55 {
             block_state_ids::MUD
         } else {
             block_state_ids::GRASS_BLOCK
@@ -2876,21 +2943,21 @@ fn classify_surface_material_by_ecoregion(
     }
     if contains_ascii_case_insensitive(key, "jungle") {
         if !vegetation_evidence
-            && rainforest_score < 0.25
+            && ecology.rainforest() < 0.25
             && !is_tropical_rain_climate(sample.climate_class)
         {
             return None;
         }
         let mosaic = contains_ascii_case_insensitive(eco_name, "mosaic")
             || contains_ascii_case_insensitive(eco_name, "savanna");
-        if mosaic || rainforest_score < 0.42 || (vegetation_strength < 0.12 && !green_like) {
-            if (olive_dry_grass || dry_savanna_score >= 0.25) && patch_noise < 0.46 {
+        if mosaic || ecology.rainforest() < 0.42 || (vegetation_strength < 0.12 && !green_like) {
+            if (olive_dry_grass || ecology.dry_savanna_at_least(0.25)) && ecology.patch() < 0.46 {
                 let top = dry_grass_surface_conservative(
                     metrics,
                     sample,
-                    patch_noise,
-                    fine_noise,
-                    dry_savanna_score.max(0.55),
+                    ecology.patch(),
+                    ecology.fine(),
+                    ecology.dry_savanna().max(0.55),
                     terrain,
                     semantic_terrain,
                     local_relief_meters,
@@ -2905,30 +2972,30 @@ fn classify_surface_material_by_ecoregion(
             let top = lush_vegetation_surface(
                 sample,
                 metrics,
-                patch_noise,
-                fine_noise,
-                rainforest_score.max(0.45),
+                ecology.patch(),
+                ecology.fine(),
+                ecology.rainforest().max(0.45),
                 terrain,
             );
             return Some(surface_material_with_surface(
                 base,
                 top,
                 block_state_ids::DIRT,
-                if patch_noise >= 0.58 {
+                if ecology.patch() >= 0.58 {
                     "minecraft:jungle"
                 } else {
                     "minecraft:sparse_jungle"
                 },
             ));
         }
-        if rainforest_score < 0.58 || vegetation_strength < 0.16 || !green_like {
-            if olive_dry_grass && patch_noise < 0.34 {
+        if ecology.rainforest() < 0.58 || vegetation_strength < 0.16 || !green_like {
+            if olive_dry_grass && ecology.patch() < 0.34 {
                 let top = dry_grass_surface_conservative(
                     metrics,
                     sample,
-                    patch_noise,
-                    fine_noise,
-                    dry_savanna_score.max(0.48),
+                    ecology.patch(),
+                    ecology.fine(),
+                    ecology.dry_savanna().max(0.48),
                     terrain,
                     semantic_terrain,
                     local_relief_meters,
@@ -2943,16 +3010,16 @@ fn classify_surface_material_by_ecoregion(
             let top = lush_vegetation_surface(
                 sample,
                 metrics,
-                patch_noise,
-                fine_noise,
-                rainforest_score.max(0.45),
+                ecology.patch(),
+                ecology.fine(),
+                ecology.rainforest().max(0.45),
                 terrain,
             );
             return Some(surface_material_with_surface(
                 base,
                 top,
                 block_state_ids::DIRT,
-                if patch_noise >= 0.54 {
+                if ecology.patch() >= 0.54 {
                     "minecraft:jungle"
                 } else {
                     "minecraft:sparse_jungle"
@@ -2961,9 +3028,9 @@ fn classify_surface_material_by_ecoregion(
         }
         let jungle_biome = if contains_ascii_case_insensitive(key, "sparse") {
             "minecraft:sparse_jungle"
-        } else if sample.tree_cover() >= 0.55 && patch_noise >= 0.64 {
+        } else if sample.tree_cover() >= 0.55 && ecology.patch() >= 0.64 {
             "minecraft:bamboo_jungle"
-        } else if patch_noise < 0.28 && fine_noise < 0.62 {
+        } else if ecology.patch() < 0.28 && ecology.fine() < 0.62 {
             "minecraft:sparse_jungle"
         } else {
             "minecraft:jungle"
@@ -2971,9 +3038,9 @@ fn classify_surface_material_by_ecoregion(
         let top = lush_vegetation_surface(
             sample,
             metrics,
-            patch_noise,
-            fine_noise,
-            rainforest_score.max(0.58),
+            ecology.patch(),
+            ecology.fine(),
+            ecology.rainforest().max(0.58),
             terrain,
         );
         return Some(surface_material_with_surface(
@@ -2986,8 +3053,8 @@ fn classify_surface_material_by_ecoregion(
     if contains_ascii_case_insensitive(key, "savanna") {
         if !vegetation_evidence
             && desert_sand_like
-            && sahara_score >= 0.35
-            && dry_savanna_score < 0.25
+            && ecology.sahara_at_least(0.35)
+            && ecology.dry_savanna() < 0.25
         {
             return None;
         }
@@ -2995,17 +3062,17 @@ fn classify_surface_material_by_ecoregion(
             && vegetation_strength < 0.10
             && !green_like
             && metrics.value >= 0.58
-            && (sahara_score >= 0.24 || sahel_score >= 0.20)
-            && patch_noise < 0.58
+            && (ecology.sahara_at_least(0.24) || ecology.sahel_at_least(0.20))
+            && ecology.patch() < 0.58
         {
             return None;
         }
-        let dry_score = sahel_score.max(dry_savanna_score).max(0.62);
+        let dry_score = ecology.sahel().max(ecology.dry_savanna()).max(0.62);
         let top = dry_grass_surface_conservative(
             metrics,
             sample,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             dry_score,
             terrain,
             semantic_terrain,
@@ -3026,17 +3093,17 @@ fn classify_surface_material_by_ecoregion(
     }
     if contains_ascii_case_insensitive(key, "desert") {
         if vegetation_evidence
-            && (sahel_score >= 0.18 || dry_savanna_score >= 0.18)
+            && (ecology.sahel_at_least(0.18) || ecology.dry_savanna_at_least(0.18))
             && (!contains_ascii_case_insensitive(eco_name, "sahara desert")
-                || sahel_score >= 0.28
-                || dry_savanna_score >= 0.28
+                || ecology.sahel_at_least(0.28)
+                || ecology.dry_savanna_at_least(0.28)
                 || is_sahel_latitude(latitude))
         {
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 0.70,
                 terrain,
                 semantic_terrain,
@@ -3051,14 +3118,14 @@ fn classify_surface_material_by_ecoregion(
         }
         if contains_ascii_case_insensitive(eco_name, "sahara desert")
             && (olive_dry_grass || green_like)
-            && (sahel_score >= 0.18 || latitude <= 20.0)
-            && patch_noise >= 0.42
+            && (ecology.sahel_at_least(0.18) || latitude <= 20.0)
+            && ecology.patch() >= 0.42
         {
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
                 0.62,
                 terrain,
                 semantic_terrain,
@@ -3073,10 +3140,10 @@ fn classify_surface_material_by_ecoregion(
         }
         let top = hot_desert_surface(
             metrics,
-            patch_noise,
-            fine_noise,
+            ecology.patch(),
+            ecology.fine(),
             local_relief_meters,
-            sahara_score,
+            ecology.sahara(),
             terrain,
             semantic_terrain,
         );
@@ -3093,8 +3160,8 @@ fn classify_surface_material_by_ecoregion(
             elevation_meters,
             longitude,
             latitude,
-            sahara_score,
-            dry_savanna_score,
+            ecology.sahara(),
+            ecology.dry_savanna(),
             local_relief_meters,
             slope,
         );
@@ -3103,8 +3170,8 @@ fn classify_surface_material_by_ecoregion(
                 base,
                 metrics,
                 elevation_meters,
-                patch_noise,
-                fine_noise,
+                ecology.patch(),
+                ecology.fine(),
             ));
         }
         if contains_ascii_case_insensitive(eco_name, "desert")
@@ -3115,7 +3182,7 @@ fn classify_surface_material_by_ecoregion(
             } else {
                 block_state_ids::SAND
             };
-            if metrics.value < 0.42 && fine_noise >= 0.82 {
+            if metrics.value < 0.42 && ecology.fine() >= 0.82 {
                 top = block_state_ids::COARSE_DIRT;
             }
             return Some(surface_material_with_surface(
@@ -3125,10 +3192,10 @@ fn classify_surface_material_by_ecoregion(
                 biome,
             ));
         }
-        if vegetation_evidence || dry_savanna_score >= 0.20 || olive_dry_grass {
+        if vegetation_evidence || ecology.dry_savanna_at_least(0.20) || olive_dry_grass {
             return None;
         }
-        let top = if fine_noise >= 0.88 && !green_like {
+        let top = if ecology.fine() >= 0.88 && !green_like {
             block_state_ids::COARSE_DIRT
         } else {
             block_state_ids::GRASS_BLOCK
@@ -3151,15 +3218,15 @@ fn classify_surface_material_by_ecoregion(
         }
         if contains_ascii_case_insensitive(eco_name, "mosaic")
             && vegetation_strength < 0.16
-            && (olive_dry_grass || dry_savanna_score >= 0.25)
-            && patch_noise < 0.50
+            && (olive_dry_grass || ecology.dry_savanna_at_least(0.25))
+            && ecology.patch() < 0.50
         {
             let top = dry_grass_surface_conservative(
                 metrics,
                 sample,
-                patch_noise,
-                fine_noise,
-                dry_savanna_score.max(0.52),
+                ecology.patch(),
+                ecology.fine(),
+                ecology.dry_savanna().max(0.52),
                 terrain,
                 semantic_terrain,
                 local_relief_meters,
@@ -3180,7 +3247,7 @@ fn classify_surface_material_by_ecoregion(
         } else {
             biome
         };
-        let top = temperate_forest_surface(sample, metrics, patch_noise, fine_noise);
+        let top = temperate_forest_surface(sample, metrics, ecology.patch(), ecology.fine());
         return Some(surface_material_with_surface(
             base,
             top,
@@ -3191,7 +3258,7 @@ fn classify_surface_material_by_ecoregion(
     if contains_ascii_case_insensitive(key, "meadow")
         || contains_ascii_case_insensitive(key, "plains")
     {
-        let top = if fine_noise >= 0.92 && !green_like && !olive_dry_grass {
+        let top = if ecology.fine() >= 0.92 && !green_like && !olive_dry_grass {
             block_state_ids::COARSE_DIRT
         } else {
             block_state_ids::GRASS_BLOCK
@@ -3350,7 +3417,14 @@ fn mark_surface_material(
     mut column: EarthSurfaceColumn,
     decision_source: &str,
 ) -> EarthSurfaceColumn {
-    column.decision_source = normalize_text_default(decision_source.to_string(), "unknown");
+    column.decision_source.clear();
+    column
+        .decision_source
+        .push_str(if decision_source.trim().is_empty() {
+            "unknown"
+        } else {
+            decision_source
+        });
     column
 }
 
@@ -3428,12 +3502,14 @@ fn surface_material_ocean_biome_id(
         }
         .to_string();
     }
-    if fallback_biome.contains("ocean") {
-        if deep && !fallback_biome.contains("deep") {
-            if fallback_biome.contains("lukewarm") || fallback_biome.contains("warm") {
+    if contains_biome_keyword(fallback_biome, "ocean") {
+        if deep && !contains_biome_keyword(fallback_biome, "deep") {
+            if contains_biome_keyword(fallback_biome, "lukewarm")
+                || contains_biome_keyword(fallback_biome, "warm")
+            {
                 return "minecraft:deep_lukewarm_ocean".to_string();
             }
-            if fallback_biome.contains("cold") {
+            if contains_biome_keyword(fallback_biome, "cold") {
                 return "minecraft:deep_cold_ocean".to_string();
             }
             return "minecraft:deep_ocean".to_string();
@@ -4457,40 +4533,29 @@ fn is_forest_savanna_mosaic_intent(
     metrics: SurfaceColorMetrics,
     longitude: f64,
     latitude: f64,
-    sahara_score: f64,
-    rainforest_score: f64,
-    dry_savanna_score: f64,
     token_vegetated: bool,
-    patch_noise: f64,
-    fine_noise: f64,
+    ecology: &SurfaceMaterialClimate,
 ) -> bool {
     let biome_id = sample.ecoregion_biome_id.as_str();
     let sparse_jungle_savanna_edge = contains_ascii_case_insensitive(biome_id, "sparse_jungle")
-        && (is_tropical_savanna_climate(sample.climate_class) || dry_savanna_score >= 0.18);
-    let climate_ecotone = is_humid_dry_tropical_ecotone(
-        sample,
-        metrics,
-        longitude,
-        latitude,
-        rainforest_score,
-        dry_savanna_score,
-        patch_noise,
-        fine_noise,
-    );
+        && (is_tropical_savanna_climate(sample.climate_class)
+            || ecology.dry_savanna_at_least(0.18));
+    let climate_ecotone =
+        is_humid_dry_tropical_ecotone(sample, metrics, longitude, latitude, ecology);
     if !is_named_forest_savanna_mosaic(sample) && !sparse_jungle_savanna_edge && !climate_ecotone {
         return false;
     }
     let vegetation_evidence = has_vegetation_evidence(sample, metrics);
     if is_dry_core_ecoregion_evidence(sample, metrics, vegetation_evidence)
         || is_desert_climate(sample.climate_class)
-        || sahara_score >= 0.35
+        || ecology.sahara_at_least(0.35)
     {
         return false;
     }
     let ecological_edge = is_tropical_savanna_climate(sample.climate_class)
         || is_tropical_rain_climate(sample.climate_class)
-        || rainforest_score >= 0.15
-        || dry_savanna_score >= 0.15;
+        || ecology.rainforest_at_least(0.15)
+        || ecology.dry_savanna_at_least(0.15);
     let evidence = sample.tree_cover() >= 0.10
         || sample.vegetation_cover() >= 0.18
         || is_green_like(metrics)
@@ -4498,7 +4563,7 @@ fn is_forest_savanna_mosaic_intent(
         || token_vegetated;
     let strong_rainforest_core = is_tropical_rain_climate(sample.climate_class)
         && sample.tree_cover() >= 0.60
-        && rainforest_score >= 0.65;
+        && ecology.rainforest_at_least(0.65);
     ecological_edge && evidence && !strong_rainforest_core
 }
 
@@ -4529,33 +4594,32 @@ fn is_humid_dry_tropical_ecotone(
     metrics: SurfaceColorMetrics,
     longitude: f64,
     latitude: f64,
-    rainforest_score: f64,
-    dry_savanna_score: f64,
-    patch_noise: f64,
-    fine_noise: f64,
+    ecology: &SurfaceMaterialClimate,
 ) -> bool {
-    let sahel_score = surface_material_sahel_score(longitude, latitude);
-    if latitude >= 3.0 && (-22.0..=45.0).contains(&longitude) && sahel_score >= 0.08 {
+    if latitude >= 3.0 && (-22.0..=45.0).contains(&longitude) && ecology.sahel_at_least(0.08) {
         return false;
     }
     let humid_side = is_tropical_rain_climate(sample.climate_class)
-        || rainforest_score >= 0.22
+        || ecology.rainforest_at_least(0.22)
         || sample.tree_cover() >= 0.12
         || is_forest_like_ecoregion(sample);
+    if !humid_side {
+        return false;
+    }
     let dry_side = is_tropical_savanna_climate(sample.climate_class)
-        || sahel_score >= 0.10
-        || dry_savanna_score >= 0.10
+        || ecology.sahel_at_least(0.10)
+        || ecology.dry_savanna_at_least(0.10)
         || is_savanna_like_ecoregion(sample)
         || is_olive_dry_grass(metrics);
     if !humid_side || !dry_side {
         return false;
     }
-    if sample.tree_cover() >= 0.60 && rainforest_score >= 0.62 && patch_noise < 0.78 {
+    if sample.tree_cover() >= 0.60 && ecology.rainforest_at_least(0.62) && ecology.patch() < 0.78 {
         return false;
     }
-    let transition_latitude = latitude.abs() <= 18.0 || dry_savanna_score >= 0.20;
+    let transition_latitude = latitude.abs() <= 18.0 || ecology.dry_savanna_at_least(0.20);
     let transition_texture =
-        patch_noise >= 0.18 || fine_noise >= 0.34 || sample.tree_cover() < 0.42;
+        ecology.patch() >= 0.18 || ecology.fine() >= 0.34 || sample.tree_cover() < 0.42;
     transition_latitude
         && transition_texture
         && sample.vegetation_cover() >= 0.08
@@ -4689,16 +4753,15 @@ fn is_trusted_vegetated_token(
 fn is_sparse_dry_open_tropical(
     sample: &SurfaceMaterialSample,
     metrics: SurfaceColorMetrics,
-    sahel_score: f64,
-    dry_savanna_score: f64,
     token_vegetated: bool,
+    ecology: &SurfaceMaterialClimate,
 ) -> bool {
     if !is_tropical_rain_climate(sample.climate_class) {
         return false;
     }
     let dry_open = is_savanna_like_ecoregion(sample)
-        || dry_savanna_score >= 0.15
-        || sahel_score >= 0.12
+        || ecology.dry_savanna_at_least(0.15)
+        || ecology.sahel_at_least(0.12)
         || is_tropical_savanna_climate(sample.climate_class);
     if !dry_open {
         return false;
@@ -4787,164 +4850,26 @@ fn surface_material_met_terrain(
 }
 
 fn surface_material_sahara_score(longitude: f64, latitude: f64) -> f64 {
-    let mut score = surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -20.0,
-        38.0,
-        15.0,
-        34.0,
-        5.5,
-        0x3340b42e9c8f1231,
-    );
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        35.0,
-        60.0,
-        12.0,
-        32.0,
-        4.0,
-        0x5b18c62a7f921935,
-    ));
-    score
+    ecology::SAHARA.evaluate(longitude, latitude)
 }
 
 fn surface_material_sahel_score(longitude: f64, latitude: f64) -> f64 {
-    surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -20.0,
-        45.0,
-        7.0,
-        17.5,
-        4.5,
-        0x71a9e2d5065c17a1,
-    )
+    ecology::SAHEL.evaluate(longitude, latitude)
 }
 
+#[cfg(test)]
 fn surface_material_rainforest_score(longitude: f64, latitude: f64) -> f64 {
-    let mut score = surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -16.0,
-        10.0,
-        3.0,
-        10.0,
-        2.5,
-        0x119b6617db734561,
-    );
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        8.0,
-        33.0,
-        -9.0,
-        7.0,
-        4.0,
-        0x3a86d32fd8e71855,
-    ));
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        95.0,
-        145.0,
-        -11.0,
-        20.0,
-        4.5,
-        0x6e8ac59a6f19d72b,
-    ));
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -77.0,
-        -45.0,
-        -16.0,
-        7.0,
-        4.5,
-        0x243f6a8885a308d3,
-    ));
-    score
+    ecology::RAINFOREST.evaluate(longitude, latitude)
 }
 
+#[cfg(test)]
 fn surface_material_dry_savanna_score(longitude: f64, latitude: f64) -> f64 {
-    let mut score = surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -18.0,
-        42.0,
-        -35.0,
-        -10.0,
-        5.0,
-        0x5225f1ab3df447c9,
-    );
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        24.0,
-        45.0,
-        -8.0,
-        12.0,
-        4.0,
-        0x21cf64acb1a77e15,
-    ));
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -80.0,
-        -36.0,
-        -34.0,
-        -8.0,
-        4.5,
-        0x789f2bc3d49b7011,
-    ));
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        110.0,
-        155.0,
-        -38.0,
-        -12.0,
-        5.0,
-        0x14f9e6b7556303f1,
-    ));
-    let texture = surface_material_ecology_noise(longitude, latitude, 0.35, 0x1f5b28a9c472d733);
-    clamp_unit(score + ((texture - 0.5) * 0.18))
+    ecology::DRY_SAVANNA.evaluate(longitude, latitude)
 }
 
+#[cfg(test)]
 fn surface_material_mediterranean_score(longitude: f64, latitude: f64) -> f64 {
-    let mut score = surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -11.0,
-        43.0,
-        31.0,
-        46.0,
-        4.0,
-        0x68405c2d09d2ec45,
-    );
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        -125.0,
-        -112.0,
-        30.0,
-        42.0,
-        3.0,
-        0x63cf8b99e48aa305,
-    ));
-    score = score.max(surface_material_textured_smooth_box(
-        longitude,
-        latitude,
-        115.0,
-        147.0,
-        -39.0,
-        -28.0,
-        3.5,
-        0x0f73e21989b4c351,
-    ));
-    let texture = surface_material_ecology_noise(longitude, latitude, 0.45, 0x7b3e2f64a91c0d11);
-    clamp_unit(score + ((texture - 0.5) * 0.16))
+    ecology::MEDITERRANEAN.evaluate(longitude, latitude)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5717,6 +5642,7 @@ struct PhotoPaletteSolveKey<'a> {
     dark_standard_shadow: bool,
     coastal_sand_halo: bool,
     wet_carrier_dither: bool,
+    static_top_only: bool,
 }
 
 impl PhotoPaletteSolveKey<'_> {
@@ -5731,8 +5657,31 @@ impl PhotoPaletteSolveKey<'_> {
             dark_standard_shadow: self.dark_standard_shadow,
             coastal_sand_halo: self.coastal_sand_halo,
             wet_carrier_dither: self.wet_carrier_dither,
+            static_top_only: self.static_top_only,
         }
     }
+
+    fn for_region(mut self, token: MetTerrainMatch) -> Self {
+        if matches!(
+            token.kind,
+            MetTerrainKind::CoarseDirt | MetTerrainKind::Gravel | MetTerrainKind::Rock
+        ) {
+            // These palettes contain no tinted blocks. The top and score
+            // depend on RGB/token/bias flags; adapt the resulting biome to
+            // each column after sharing the search across base biomes.
+            self.static_top_only = true;
+            self.base_biome = Cow::Borrowed("");
+            self.preferred_biome = Cow::Borrowed("");
+        }
+        self
+    }
+}
+
+fn region_photo_palette_cache(
+) -> &'static Mutex<HashMap<PhotoPaletteSolveKey<'static>, PhotoSurfaceSolve>> {
+    static CACHE: OnceLock<Mutex<HashMap<PhotoPaletteSolveKey<'static>, PhotoSurfaceSolve>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl JavaStandardPaletteCandidateContext {
@@ -5802,6 +5751,7 @@ fn photo_palette_solve_context<'a>(
                 token.top_block_state_id,
                 block_state_ids::OAK_LEAVES,
             ) < 5,
+        static_top_only: false,
     };
     (candidate_context, key)
 }
@@ -5816,7 +5766,8 @@ fn cached_photo_palette_solve(
     match cached {
         Some(baseline) => Some(baseline),
         None => {
-            let solve = if matches!(token.kind, MetTerrainKind::Vegetated | MetTerrainKind::Wet) {
+            let mut solve = if matches!(token.kind, MetTerrainKind::Vegetated | MetTerrainKind::Wet)
+            {
                 let baseline =
                     java_standard_vegetation_palette_baseline(input, candidate_context, token)?;
                 direct_java_standard_vegetation_recipe_solve(
@@ -5837,6 +5788,9 @@ fn cached_photo_palette_solve(
             } else {
                 java_standard_static_palette_solve(input, candidate_context, token)?
             };
+            if key.static_top_only {
+                solve.biome_id.clear();
+            }
             PHOTO_PALETTE_SOLVE_CACHE.with(|cache| {
                 let mut cache = cache.borrow_mut();
                 if cache.len() >= PHOTO_PALETTE_SOLVE_CACHE_MAX_ENTRIES {
@@ -5884,9 +5838,17 @@ fn java_standard_vegetation_palette_baseline(
     candidate_context: JavaStandardPaletteCandidateContext,
     token: MetTerrainMatch,
 ) -> Option<PhotoSurfaceSolve> {
-    let mut best: Option<PhotoSurfaceSolve> = None;
+    let mut best: Option<(i32, Cow<'_, str>, f64)> = None;
     for &top in PHOTO_SOLVER_CANDIDATE_BLOCKS {
         if is_tinted_vegetation_block(top) {
+            let bias = java_standard_palette_candidate_bias_with_context(
+                input,
+                candidate_context,
+                token,
+                top,
+            );
+            let mut seen_rgb = [-1; PHOTO_GRASS_RENDER_BIOMES.len() + 2];
+            let mut seen_count = 0;
             for_each_photo_solver_grass_biome(
                 &input.semantic_column.biome_id,
                 input.sample,
@@ -5897,19 +5859,20 @@ fn java_standard_vegetation_palette_baseline(
                     if biome.trim().is_empty() {
                         return;
                     }
-                    let score = java_standard_palette_candidate_score_with_context(
-                        input,
-                        candidate_context,
-                        token,
-                        top,
-                        biome,
-                    );
-                    if best.as_ref().is_none_or(|current| score < current.score) {
-                        best = Some(PhotoSurfaceSolve {
-                            top_block_state_id: top,
-                            biome_id: biome.to_string(),
-                            score,
-                        });
+                    let render = photo_render_metrics_for_surface(top, biome);
+                    // Bias depends on the block and input, not the candidate
+                    // biome. Equal render colors therefore have identical
+                    // scores; keep the first biome to preserve tie behavior.
+                    if seen_rgb[..seen_count].contains(&render.rgb) {
+                        return;
+                    }
+                    seen_rgb[seen_count] = render.rgb;
+                    seen_count += 1;
+                    let score =
+                        java_standard_palette_candidate_base_score(candidate_context, render)
+                            + bias;
+                    if best.as_ref().is_none_or(|current| score < current.2) {
+                        best = Some((top, Cow::Borrowed(biome), score));
                     }
                 },
             );
@@ -5923,16 +5886,16 @@ fn java_standard_vegetation_palette_baseline(
                 top,
                 biome.as_ref(),
             );
-            if best.as_ref().is_none_or(|current| score < current.score) {
-                best = Some(PhotoSurfaceSolve {
-                    top_block_state_id: top,
-                    biome_id: biome.into_owned(),
-                    score,
-                });
+            if best.as_ref().is_none_or(|current| score < current.2) {
+                best = Some((top, biome, score));
             }
         }
     }
-    best
+    best.map(|(top_block_state_id, biome, score)| PhotoSurfaceSolve {
+        top_block_state_id,
+        biome_id: biome.into_owned(),
+        score,
+    })
 }
 
 fn java_standard_palette_candidate(
@@ -5986,6 +5949,42 @@ fn java_standard_palette_candidate_base_score(
 ) -> f64 {
     photo_ciede2000_rgb_pair_cached(context.target_rgb, render_metrics.rgb)
         + java_standard_source_render_preservation_score_with_context(context, render_metrics)
+}
+
+fn apply_photo_palette_solve(column: &mut EarthSurfaceColumn, solve: &PhotoSurfaceSolve) {
+    apply_photo_palette_solve_blocks(column, solve);
+    column.biome_id.clear();
+    column
+        .biome_id
+        .push_str(if solve.biome_id.trim().is_empty() {
+            "minecraft:plains"
+        } else {
+            &solve.biome_id
+        });
+}
+
+fn apply_static_photo_palette_solve(column: &mut EarthSurfaceColumn, solve: &PhotoSurfaceSolve) {
+    let biome =
+        compatible_biome_for_palette_non_grass_cow(&column.biome_id, solve.top_block_state_id);
+    if biome.as_ref() != column.biome_id {
+        column.biome_id = biome.into_owned();
+    }
+    apply_photo_palette_solve_blocks(column, solve);
+}
+
+fn apply_photo_palette_solve_blocks(column: &mut EarthSurfaceColumn, solve: &PhotoSurfaceSolve) {
+    let top = solve.top_block_state_id;
+    let filler = if top == column.top_block_state_id {
+        column.filler_block_state_id
+    } else {
+        smoother_filler_for(top)
+    };
+    column.water =
+        column.water && top == column.top_block_state_id && filler == column.filler_block_state_id;
+    column.top_block_state_id = top;
+    column.filler_block_state_id = filler;
+    column.decision_source.clear();
+    column.decision_source.push_str("photo-palette");
 }
 
 fn photo_surface_decision_from_solve(
@@ -10375,7 +10374,16 @@ impl MetTerrainVocabulary {
         if !color.available {
             return MetTerrainMatch::unavailable();
         }
-        let Some(entry_index) = nearest_image_magick_remap(color) else {
+        let key = rgb_color_to_i32(color);
+        let slot = ((key as u32).wrapping_mul(0x9e37_79b9) >> 16) as usize;
+        let entry_index = MET_REMAP_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache[slot].0 != key {
+                cache[slot] = (key, nearest_image_magick_remap(color));
+            }
+            cache[slot].1
+        });
+        let Some(entry_index) = entry_index else {
             return MetTerrainMatch::unavailable();
         };
         let entry = MET_TERRAIN_ENTRIES[entry_index];
@@ -11139,25 +11147,25 @@ fn sample_ecoregion_evidence(
 }
 
 fn biome_family(biome: &str) -> &str {
-    if biome.contains("desert") {
+    if contains_biome_keyword(biome, "desert") {
         "desert"
-    } else if biome.contains("badlands") {
+    } else if contains_biome_keyword(biome, "badlands") {
         "badlands"
-    } else if biome.contains("savanna") {
+    } else if contains_biome_keyword(biome, "savanna") {
         "savanna"
-    } else if biome.contains("jungle") {
+    } else if contains_biome_keyword(biome, "jungle") {
         "jungle"
-    } else if biome.contains("forest") {
+    } else if contains_biome_keyword(biome, "forest") {
         "forest"
-    } else if biome.contains("swamp") {
+    } else if contains_biome_keyword(biome, "swamp") {
         "swamp"
-    } else if biome.contains("taiga") {
+    } else if contains_biome_keyword(biome, "taiga") {
         "taiga"
-    } else if biome.contains("snow") || biome.contains("frozen") {
+    } else if contains_biome_keyword(biome, "snow") || contains_biome_keyword(biome, "frozen") {
         "snow"
-    } else if biome.contains("beach") {
+    } else if contains_biome_keyword(biome, "beach") {
         "beach"
-    } else if biome.contains("plains") || biome.contains("meadow") {
+    } else if contains_biome_keyword(biome, "plains") || contains_biome_keyword(biome, "meadow") {
         "grassland"
     } else {
         biome
@@ -12361,6 +12369,97 @@ pub fn classify_shaped_surface_scaled(
         coast_factor,
         vertical_scale,
     );
+    Ok(classify_surface_at_ground_y(
+        elevation_meters,
+        longitude,
+        latitude,
+        water,
+        coast_factor,
+        ground_y,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_shaped_surface_with_material(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+    coast_factor: f64,
+    vertical_scale: f64,
+    sample: Option<&SurfaceMaterialSample>,
+    local_relief_meters: f64,
+) -> Result<(EarthSurfaceColumn, bool)> {
+    let vertical_scale = require_valid_vertical_scale(vertical_scale)?;
+    let coast_factor = clamp_unit(coast_factor);
+    let ground_y = shaped_ground_surface_y(
+        elevation_meters,
+        longitude,
+        latitude,
+        water,
+        coast_factor,
+        vertical_scale,
+    );
+    if !water {
+        if let Some(sample) =
+            sample.filter(|sample| sample.color.available && !sample.color.is_near_black())
+        {
+            let base = EarthSurfaceColumn {
+                water: false,
+                ground_surface_y: ground_y,
+                water_surface_y: i32::MIN,
+                top_block_state_id: block_state_ids::AIR,
+                filler_block_state_id: block_state_ids::AIR,
+                biome_id: String::new(),
+                decision_source: String::new(),
+                terrain_token_source: TerrainTokenSource::None,
+                data_evidence_flags: 0,
+            };
+            if !should_bathymetry_override_land(&base, sample, elevation_meters, coast_factor) {
+                let metrics = SurfaceColorMetrics::from(sample.color);
+                let terrain = surface_material_met_terrain(sample, metrics);
+                let semantic = sample.terrain_token_source == TerrainTokenSource::Export
+                    && terrain.confident();
+                let ecology = SurfaceMaterialClimate::new(longitude, latitude);
+                if let Some(column) = classify_authoritative_land_material(
+                    &base,
+                    metrics,
+                    elevation_meters,
+                    longitude,
+                    latitude,
+                    coast_factor,
+                    sample,
+                    local_relief_meters.max(0.0) * vertical_scale,
+                    terrain,
+                    semantic,
+                    &ecology,
+                ) {
+                    return Ok((with_surface_material_metadata(column, sample), true));
+                }
+            }
+        }
+    }
+    Ok((
+        classify_surface_at_ground_y(
+            elevation_meters,
+            longitude,
+            latitude,
+            water,
+            coast_factor,
+            ground_y,
+        ),
+        false,
+    ))
+}
+
+fn classify_surface_at_ground_y(
+    elevation_meters: f64,
+    longitude: f64,
+    latitude: f64,
+    water: bool,
+    coast_factor: f64,
+    ground_y: i32,
+) -> EarthSurfaceColumn {
     let biome = biome_id(
         elevation_meters,
         longitude,
@@ -12380,7 +12479,7 @@ pub fn classify_shaped_surface_scaled(
     );
     let filler = filler_block_state_id(top, water);
     let water_surface_y = if water { SEA_LEVEL_Y } else { i32::MIN };
-    Ok(EarthSurfaceColumn::new(
+    EarthSurfaceColumn::new(
         water,
         ground_y,
         water_surface_y,
@@ -12388,7 +12487,7 @@ pub fn classify_shaped_surface_scaled(
         filler,
         biome,
         "height-rule",
-    ))
+    )
 }
 
 pub fn normalize_surface_column_for_chunk(column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
@@ -12434,18 +12533,26 @@ pub fn sanitize_surface_column_for_production(column: &EarthSurfaceColumn) -> Ea
 fn sanitize_surface_column_for_production_borrowed(
     column: &EarthSurfaceColumn,
 ) -> Cow<'_, EarthSurfaceColumn> {
+    match production_surface_block_replacement(column) {
+        Some(replacement) => Cow::Owned(replace_surface_blocks_owned(column.clone(), replacement)),
+        None => Cow::Borrowed(column),
+    }
+}
+
+fn production_surface_block_replacement(
+    column: &EarthSurfaceColumn,
+) -> Option<SurfaceBlockReplacement> {
     if !column.water && is_photo_preserved_natural_surface_column(column) {
         let top = column.top_block_state_id;
         let filler = smoother_filler_for(top);
         if filler == column.filler_block_state_id {
-            return Cow::Borrowed(column);
+            return None;
         }
-        return Cow::Owned(replace_surface_blocks(
-            column,
+        return Some(SurfaceBlockReplacement {
             top,
             filler,
-            "photo-natural-surface",
-        ));
+            source_suffix: "photo-natural-surface",
+        });
     }
     let mut top =
         production_surface_top_for_water(column.top_block_state_id, &column.biome_id, column.water);
@@ -12484,14 +12591,13 @@ fn sanitize_surface_column_for_production_borrowed(
         filler = filler_for_production_top(top);
     }
     if top == column.top_block_state_id && filler == column.filler_block_state_id {
-        return Cow::Borrowed(column);
+        return None;
     }
-    Cow::Owned(replace_surface_blocks(
-        column,
+    Some(SurfaceBlockReplacement {
         top,
         filler,
-        "natural-surface",
-    ))
+        source_suffix: "natural-surface",
+    })
 }
 
 pub fn build_surface_chunk(
@@ -12699,7 +12805,7 @@ pub fn sample_surface_region_scaled_with_material_sampler(
     material_sampler: Option<&dyn SurfaceMaterialSampler>,
     parallel_column_sampling: bool,
 ) -> Result<SurfaceRegionSample> {
-    sample_surface_region_with_elevation_fn(
+    sample_surface_region_with_elevation_fn_and_sampler(
         region_x,
         region_z,
         mapping,
@@ -12712,11 +12818,40 @@ pub fn sample_surface_region_scaled_with_material_sampler(
         texture_mode,
         material_sampler,
         parallel_column_sampling,
+        Some(sampler),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn sample_surface_region_with_elevation_fn<F>(
+    region_x: i32,
+    region_z: i32,
+    mapping: &EarthScaleMapping,
+    vertical_scale: f64,
+    elevation_fn: F,
+    texture_mode: SurfaceTextureMode,
+    material_sampler: Option<&dyn SurfaceMaterialSampler>,
+    parallel_column_sampling: bool,
+) -> Result<SurfaceRegionSample>
+where
+    F: FnMut(f64, f64) -> Result<f64>,
+{
+    sample_surface_region_with_elevation_fn_and_sampler(
+        region_x,
+        region_z,
+        mapping,
+        vertical_scale,
+        elevation_fn,
+        texture_mode,
+        material_sampler,
+        parallel_column_sampling,
+        None,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sample_surface_region_with_elevation_fn<F>(
+fn sample_surface_region_with_elevation_fn_and_sampler<F>(
     region_x: i32,
     region_z: i32,
     mapping: &EarthScaleMapping,
@@ -12725,6 +12860,7 @@ fn sample_surface_region_with_elevation_fn<F>(
     texture_mode: SurfaceTextureMode,
     material_sampler: Option<&dyn SurfaceMaterialSampler>,
     parallel_column_sampling: bool,
+    elevation_sampler: Option<&HeightmapScalarSampler<'_>>,
 ) -> Result<SurfaceRegionSample>
 where
     F: FnMut(f64, f64) -> Result<f64>,
@@ -12736,26 +12872,62 @@ where
     let mut valid = vec![false; SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT];
     let region_block_x = region_x.wrapping_mul(REGION_SIZE_BLOCKS);
     let region_block_z = region_z.wrapping_mul(REGION_SIZE_BLOCKS);
-    for z in 0..SURFACE_REGION_EXTENT {
-        for x in 0..SURFACE_REGION_EXTENT {
-            let global_block_x = region_block_x
-                .wrapping_add(x as i32)
-                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
-            let global_block_z = region_block_z
-                .wrapping_add(z as i32)
-                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
-            let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
-            let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
-            let index = surface_region_extent_index(x, z);
-            if !surface_chunk_map_position_valid(mapping, map_x, map_z) {
-                elevations[index] = 0.0;
-                valid[index] = false;
-                continue;
+    if let Some(sampler) = elevation_sampler {
+        let mut xs = Vec::with_capacity(SURFACE_REGION_EXTENT);
+        let mut longitudes = Vec::with_capacity(SURFACE_REGION_EXTENT);
+        let mut zs = Vec::with_capacity(SURFACE_REGION_EXTENT);
+        let mut latitudes = Vec::with_capacity(SURFACE_REGION_EXTENT);
+        for index in 0..SURFACE_REGION_EXTENT {
+            let map_x = region_block_x
+                .wrapping_add(index as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32)
+                .wrapping_add(mapping.width_blocks / 2);
+            if (0..mapping.width_blocks).contains(&map_x) {
+                xs.push(index);
+                longitudes.push(mapping.longitude_for_block_x(map_x)?);
             }
-            let longitude = mapping.longitude_for_block_x(map_x)?;
-            let latitude = mapping.latitude_for_block_z(map_z)?;
-            elevations[index] = elevation_fn(longitude, latitude)?;
-            valid[index] = true;
+            let map_z = region_block_z
+                .wrapping_add(index as i32)
+                .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32)
+                .wrapping_add(mapping.height_blocks / 2);
+            if (0..mapping.height_blocks).contains(&map_z) {
+                zs.push(index);
+                latitudes.push(mapping.latitude_for_block_z(map_z)?);
+            }
+        }
+        let sampled = sampler.bilinear_meters_grid(&longitudes, &latitudes)?;
+        if xs.len() == SURFACE_REGION_EXTENT && zs.len() == SURFACE_REGION_EXTENT {
+            elevations = sampled;
+            valid.fill(true);
+        } else {
+            for (sample_z, &z) in zs.iter().enumerate() {
+                for (sample_x, &x) in xs.iter().enumerate() {
+                    let index = surface_region_extent_index(x, z);
+                    elevations[index] = sampled[sample_z * xs.len() + sample_x];
+                    valid[index] = true;
+                }
+            }
+        }
+    } else {
+        for z in 0..SURFACE_REGION_EXTENT {
+            for x in 0..SURFACE_REGION_EXTENT {
+                let global_block_x = region_block_x
+                    .wrapping_add(x as i32)
+                    .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+                let global_block_z = region_block_z
+                    .wrapping_add(z as i32)
+                    .wrapping_sub(SURFACE_REGION_COAST_RADIUS as i32);
+                let map_x = global_block_x.wrapping_add(mapping.width_blocks / 2);
+                let map_z = global_block_z.wrapping_add(mapping.height_blocks / 2);
+                let index = surface_region_extent_index(x, z);
+                if !surface_chunk_map_position_valid(mapping, map_x, map_z) {
+                    continue;
+                }
+                let longitude = mapping.longitude_for_block_x(map_x)?;
+                let latitude = mapping.latitude_for_block_z(map_z)?;
+                elevations[index] = elevation_fn(longitude, latitude)?;
+                valid[index] = true;
+            }
         }
     }
     phase_nanos.elevation_fill = phase_start.elapsed().as_nanos();
@@ -12870,7 +13042,10 @@ where
 
     enum SurfaceColumnMaterial<'a> {
         Borrowed(&'a SurfaceMaterialSample),
-        Owned(SurfaceMaterialSample),
+        // Most photo columns borrow a region sample. Keep the uncommon owned
+        // variant out of each column record to avoid reserving/copying its
+        // complete sample storage even for borrowed columns.
+        Owned(Box<SurfaceMaterialSample>),
     }
 
     impl SurfaceColumnMaterial<'_> {
@@ -12884,36 +13059,46 @@ where
 
     struct SurfaceColumnSampleBuild<'a> {
         column: EarthSurfaceColumn,
-        coast_factor: f64,
         material: Option<SurfaceColumnMaterial<'a>>,
-        sampled_water: bool,
-        classify_nanos: u128,
-        semantic_apply_nanos: u128,
-        smoothed_elevation: f64,
-        latitude: f64,
-        local_relief_meters: f64,
-        global_block_x: i32,
-        global_block_z: i32,
+        // Detailed clocks are opt-in. Do not copy two u128 counters through
+        // every normal column build when both are always zero.
+        timing: Option<Box<[u128; 2]>>,
     }
 
-    impl SurfaceColumnSampleBuild<'_> {
-        fn photo_context<'a>(
-            &'a self,
-            vertical_scale: f64,
+    // Coordinates, elevation, relief and coast values already live in region
+    // arrays. Borrow those arrays instead of repeating them in 262,144 records.
+    struct RegionPhotoContext<'a> {
+        latitudes: &'a [f64],
+        elevations: &'a [f64],
+        relief: Option<&'a [f64]>,
+        coast_factors: &'a [f64],
+        region_block_x: i32,
+        region_block_z: i32,
+        vertical_scale: f64,
+    }
+
+    impl RegionPhotoContext<'_> {
+        fn column<'a>(
+            &self,
+            build: &'a SurfaceColumnSampleBuild<'_>,
+            index: usize,
             profile: &'a PhotoSurfaceTokenLumaProfile,
         ) -> Option<PhotoSurfaceContext<'a>> {
-            if self.column.water {
+            if build.column.water {
                 return None;
             }
+            let local_x = index % SURFACE_REGION_WIDTH;
+            let local_z = index / SURFACE_REGION_WIDTH;
             Some(PhotoSurfaceContext {
-                semantic_column: &self.column,
-                sample: self.material.as_ref()?.as_sample(),
-                elevation_meters: self.smoothed_elevation,
-                latitude: self.latitude,
-                coast_factor: self.coast_factor,
-                local_relief_meters: self.local_relief_meters * vertical_scale,
-                global_block_x: self.global_block_x,
-                global_block_z: self.global_block_z,
+                semantic_column: &build.column,
+                sample: build.material.as_ref()?.as_sample(),
+                elevation_meters: self.elevations[index],
+                latitude: self.latitudes[local_z],
+                coast_factor: self.coast_factors[index],
+                local_relief_meters: self.relief.map(|relief| relief[index]).unwrap_or(0.0)
+                    * self.vertical_scale,
+                global_block_x: self.region_block_x.wrapping_add(local_x as i32),
+                global_block_z: self.region_block_z.wrapping_add(local_z as i32),
                 token_luma_profile: Some(profile),
                 palette_solves: None,
             })
@@ -12926,48 +13111,53 @@ where
         let local_x = column_index % SURFACE_REGION_WIDTH;
         let center_x = local_x + SURFACE_REGION_COAST_RADIUS;
         let center_z = local_z + SURFACE_REGION_COAST_RADIUS;
-        let global_block_x = region_block_x.wrapping_add(local_x as i32);
-        let global_block_z = region_block_z.wrapping_add(local_z as i32);
         let longitude = longitudes[local_x];
         let latitude = latitudes[local_z];
         let sample_index = surface_region_extent_index(center_x, center_z);
         let smoothed_elevation = smoothed_center_elevations[column_index];
         let water = water_mask[sample_index];
         let coast_factor = coast_factor_extent[sample_index];
+        let precomputed_material = precomputed_photo_land_materials
+            .as_ref()
+            .and_then(|materials| materials.sample(column_index));
+        let precomputed_relief = local_relief_center_meters
+            .as_ref()
+            .map(|relief| relief[column_index])
+            .unwrap_or(0.0);
         let classify_start = detailed_column_phase_timing.then(Instant::now);
-        let mut column = classify_shaped_surface_scaled(
+        let (mut column, material_applied) = classify_shaped_surface_with_material(
             smoothed_elevation,
             longitude,
             latitude,
             water,
             coast_factor,
             vertical_scale,
+            if detailed_column_phase_timing {
+                None
+            } else {
+                precomputed_material
+            },
+            precomputed_relief,
         )?;
         let classify_nanos = classify_start
             .map(|started_at| started_at.elapsed().as_nanos())
             .unwrap_or(0);
         let mut material = None;
-        let mut local_relief_meters = 0.0;
         let mut semantic_apply_nanos = 0;
-        if let Some(precomputed_material) = precomputed_photo_land_materials
-            .as_ref()
-            .and_then(|materials| materials.sample(column_index))
-        {
-            local_relief_meters = local_relief_center_meters
-                .as_ref()
-                .map(|relief| relief[column_index])
-                .unwrap_or(0.0);
+        if let Some(precomputed_material) = precomputed_material {
             let semantic_start = detailed_column_phase_timing.then(Instant::now);
-            column = apply_surface_region_semantic_material_sample(
-                column,
-                precomputed_material,
-                smoothed_elevation,
-                longitude,
-                latitude,
-                coast_factor,
-                local_relief_meters,
-                vertical_scale,
-            )?;
+            if !material_applied {
+                column = apply_surface_region_semantic_material_sample(
+                    column,
+                    precomputed_material,
+                    smoothed_elevation,
+                    longitude,
+                    latitude,
+                    coast_factor,
+                    precomputed_relief,
+                    vertical_scale,
+                )?;
+            }
             semantic_apply_nanos += semantic_start
                 .map(|started_at| started_at.elapsed().as_nanos())
                 .unwrap_or(0);
@@ -12990,10 +13180,6 @@ where
                     longitude_span_degrees,
                     latitude_span_degrees,
                 )?;
-                local_relief_meters = local_relief_center_meters
-                    .as_ref()
-                    .map(|relief| relief[column_index])
-                    .unwrap_or(0.0);
                 let semantic_start = detailed_column_phase_timing.then(Instant::now);
                 column = apply_surface_region_semantic_material_sample(
                     column,
@@ -13002,36 +13188,31 @@ where
                     longitude,
                     latitude,
                     coast_factor,
-                    local_relief_meters,
+                    precomputed_relief,
                     vertical_scale,
                 )?;
                 semantic_apply_nanos += semantic_start
                     .map(|started_at| started_at.elapsed().as_nanos())
                     .unwrap_or(0);
-                material = Some(SurfaceColumnMaterial::Owned(sampled_material));
+                material = Some(SurfaceColumnMaterial::Owned(Box::new(sampled_material)));
             }
         }
 
         Ok(SurfaceColumnSampleBuild {
             column,
-            coast_factor,
             material,
-            sampled_water: water,
-            classify_nanos,
-            semantic_apply_nanos,
-            smoothed_elevation,
-            latitude,
-            local_relief_meters,
-            global_block_x,
-            global_block_z,
+            timing: detailed_column_phase_timing
+                .then(|| Box::new([classify_nanos, semantic_apply_nanos])),
         })
     };
     let column_loop_phase_start = Instant::now();
-    let column_builds = if parallel_column_sampling {
-        (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
-            .into_par_iter()
-            .map(build_column)
-            .collect::<Result<Vec<_>>>()?
+    let mut column_builds = if parallel_column_sampling {
+        indexed_surface_results(
+            (0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH))
+                .into_par_iter()
+                .map(build_column)
+                .collect::<Vec<_>>(),
+        )?
     } else {
         let mut column_builds = Vec::with_capacity(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH);
         for column_index in 0..(SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH) {
@@ -13042,29 +13223,47 @@ where
     phase_nanos.column_loop = column_loop_phase_start.elapsed().as_nanos();
     phase_nanos.column_classify = column_builds
         .iter()
-        .map(|build| build.classify_nanos)
+        .filter_map(|build| build.timing.as_deref().map(|timing| timing[0]))
         .sum::<u128>();
     phase_nanos.column_semantic_apply = column_builds
         .iter()
-        .map(|build| build.semantic_apply_nanos)
+        .filter_map(|build| build.timing.as_deref().map(|timing| timing[1]))
         .sum::<u128>();
     phase_nanos.column_build = column_build_phase_start.elapsed().as_nanos();
     phase_nanos.sampled_material_columns = column_builds
         .iter()
         .filter(|build| build.material.is_some())
         .count() as u64;
-    phase_nanos.sampled_land_material_columns = column_builds
-        .iter()
-        .filter(|build| build.material.is_some() && !build.sampled_water)
-        .count() as u64;
-    phase_nanos.sampled_water_material_columns = column_builds
-        .iter()
-        .filter(|build| build.material.is_some() && build.sampled_water)
-        .count() as u64;
-    let coast_factors = column_builds
-        .iter()
-        .map(|build| build.coast_factor)
+    for (index, build) in column_builds.iter().enumerate() {
+        if build.material.is_some() {
+            let extent_index = surface_region_extent_index(
+                index % SURFACE_REGION_WIDTH + SURFACE_REGION_COAST_RADIUS,
+                index / SURFACE_REGION_WIDTH + SURFACE_REGION_COAST_RADIUS,
+            );
+            if water_mask[extent_index] {
+                phase_nanos.sampled_water_material_columns += 1;
+            } else {
+                phase_nanos.sampled_land_material_columns += 1;
+            }
+        }
+    }
+    let coast_factors = (0..column_builds.len())
+        .map(|index| {
+            coast_factor_extent[surface_region_extent_index(
+                index % SURFACE_REGION_WIDTH + SURFACE_REGION_COAST_RADIUS,
+                index / SURFACE_REGION_WIDTH + SURFACE_REGION_COAST_RADIUS,
+            )]
+        })
         .collect::<Vec<_>>();
+    let photo_contexts = RegionPhotoContext {
+        latitudes: &latitudes,
+        elevations: &smoothed_center_elevations,
+        relief: local_relief_center_meters.as_deref(),
+        coast_factors: &coast_factors,
+        region_block_x,
+        region_block_z,
+        vertical_scale,
+    };
 
     let columns = if collect_photo_materials {
         let phase_start = Instant::now();
@@ -13083,9 +13282,11 @@ where
         // cache alone repeats the same search on several workers and can thrash
         // when a large region has many colors. This region table is immutable,
         // needs no locks, and is bounded by the number of sampled columns.
-        let mut solve_jobs = HashMap::new();
+        let mut solve_job_indices = HashMap::new();
+        let mut solve_jobs = Vec::new();
+        let mut solve_by_column = vec![None; column_builds.len()];
         for (index, build) in column_builds.iter().enumerate() {
-            let Some(input) = build.photo_context(vertical_scale, &photo_token_luma_profile) else {
+            let Some(input) = photo_contexts.column(build, index, &photo_token_luma_profile) else {
                 continue;
             };
             if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette
@@ -13124,13 +13325,35 @@ where
                 continue;
             }
             let (_, key) = photo_palette_solve_context(&input, input.sample.color, token);
-            solve_jobs.entry(key).or_insert(index);
+            let key = key.for_region(token);
+            let job = *solve_job_indices.entry(key.clone()).or_insert_with(|| {
+                let job = solve_jobs.len();
+                solve_jobs.push((key, index));
+                job
+            });
+            solve_by_column[index] = Some(job);
         }
+        // Reuse full-key solves across regions and workers. Read and publish
+        // in batches, so the shared cache never locks in a per-column loop.
+        let cached_solves = match region_photo_palette_cache().lock() {
+            Ok(cache) => solve_jobs
+                .iter()
+                .map(|(key, _)| cache.get(key).cloned())
+                .collect::<Vec<_>>(),
+            Err(_) => vec![None; solve_jobs.len()],
+        };
         let palette_solves = solve_jobs
-            .into_par_iter()
-            .filter_map(|(key, index)| {
-                let input = column_builds[index]
-                    .photo_context(vertical_scale, &photo_token_luma_profile)?;
+            .par_iter()
+            .enumerate()
+            .map(|(job, (key, index))| {
+                if let Some(solve) = &cached_solves[job] {
+                    return Some(solve.clone());
+                }
+                let input = photo_contexts.column(
+                    &column_builds[*index],
+                    *index,
+                    &photo_token_luma_profile,
+                )?;
                 let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
                 let context = JavaStandardPaletteCandidateContext {
                     target_rgb: key.target_rgb,
@@ -13139,22 +13362,85 @@ where
                     snow_context: key.snow_context,
                     dark_standard_shadow: key.dark_standard_shadow,
                 };
-                let baseline = cached_photo_palette_solve(&input, context, token, key.clone())?;
-                Some((key, baseline))
+                cached_photo_palette_solve(&input, context, token, key.clone())
             })
-            .collect::<HashMap<_, _>>();
-        let columns = column_builds
-            .par_iter()
-            .map(|build| -> Result<EarthSurfaceColumn> {
-                if let Some(mut input) =
-                    build.photo_context(vertical_scale, &photo_token_luma_profile)
-                {
-                    input.palette_solves = Some(&palette_solves);
-                    return Ok(solve_photo_surface_with_context(&input)?.into_column(&build.column));
+            .collect::<Vec<_>>();
+        if let Ok(mut cache) = region_photo_palette_cache().lock() {
+            for (job, (key, _)) in solve_jobs.iter().enumerate() {
+                if cached_solves[job].is_some() {
+                    continue;
                 }
-                Ok(build.column.clone())
-            })
-            .collect::<Result<Vec<_>>>()?;
+                if let Some(solve) = &palette_solves[job] {
+                    if cache.len() >= PHOTO_PALETTE_SOLVE_CACHE_MAX_ENTRIES * 4 {
+                        cache.clear();
+                    }
+                    cache
+                        .entry(key.clone().into_owned())
+                        .or_insert_with(|| solve.clone());
+                }
+            }
+        }
+        let static_top_only = solve_jobs
+            .iter()
+            .map(|(key, _)| key.static_top_only)
+            .collect::<Vec<_>>();
+        drop(solve_jobs);
+        drop(solve_job_indices);
+        column_builds
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(index, build)| -> Result<()> {
+                if let Some(input) = photo_contexts.column(build, index, &photo_token_luma_profile)
+                {
+                    if let Some((job, solve)) = solve_by_column[index]
+                        .and_then(|job| palette_solves[job].as_ref().map(|solve| (job, solve)))
+                    {
+                        if !photo_surface_trace_enabled() {
+                            if static_top_only[job] {
+                                apply_static_photo_palette_solve(&mut build.column, solve);
+                            } else {
+                                apply_photo_palette_solve(&mut build.column, solve);
+                            }
+                            return Ok(());
+                        }
+                        let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+                        let reason = if matches!(
+                            token.kind,
+                            MetTerrainKind::Vegetated | MetTerrainKind::Wet
+                        ) {
+                            "authoritative java standard vegetation token"
+                        } else {
+                            "authoritative java standard static token"
+                        };
+                        let mut solve = solve.clone();
+                        if static_top_only[job] {
+                            solve.biome_id = compatible_biome_for_palette_non_grass(
+                                &input.semantic_column.biome_id,
+                                solve.top_block_state_id,
+                            );
+                        }
+                        let column = photo_surface_decision_from_solve(
+                            &input,
+                            solve,
+                            "photo-palette",
+                            "palette-token-solver",
+                            input.sample.color,
+                            reason,
+                        )
+                        .into_column(&build.column);
+                        build.column = column;
+                        return Ok(());
+                    }
+                    let column =
+                        solve_photo_surface_with_context(&input)?.into_column(&build.column);
+                    build.column = column;
+                }
+                Ok(())
+            })?;
+        let columns = column_builds
+            .into_iter()
+            .map(|build| build.column)
+            .collect();
         phase_nanos.photo_apply = phase_start.elapsed().as_nanos();
         columns
     } else {
@@ -13198,22 +13484,32 @@ fn post_process_surface_region_columns_owned(
             // Apply the recorded changes only after that pass finishes, reusing
             // the unchanged columns through all five passes.
             let mut result = columns;
-            for pass in [
-                stabilize_surface_biome_cells_changes
-                    as fn(&[EarthSurfaceColumn], usize, bool) -> _,
-                stabilize_small_surface_biome_family_components_changes,
-            ] {
-                let changes = pass(&result, width, true);
+            // Every photo pass preserves water and render-locked columns.
+            // If the whole region is immutable to those passes, no counting,
+            // component buffers or repeated region scans are necessary.
+            if result
+                .iter()
+                .all(|column| column.water || is_render_locked_photo_biome(column))
+            {
+                result
+            } else {
+                for pass in [
+                    stabilize_surface_biome_cells_changes
+                        as fn(&[EarthSurfaceColumn], usize, bool) -> _,
+                    stabilize_small_surface_biome_family_components_changes,
+                ] {
+                    let changes = pass(&result, width, true);
+                    apply_surface_column_changes(&mut result, changes);
+                }
+                let changes = smooth_photo_texture_local_changes(&result, width);
                 apply_surface_column_changes(&mut result, changes);
+                let changes = smooth_photo_macro_vegetation_changes(&result, width);
+                apply_surface_column_changes(&mut result, changes);
+                let changes =
+                    stabilize_small_surface_biome_family_components_changes(&result, width, true);
+                apply_surface_column_changes(&mut result, changes);
+                result
             }
-            let changes = smooth_photo_texture_local_changes(&result, width);
-            apply_surface_column_changes(&mut result, changes);
-            let changes = smooth_photo_macro_vegetation_changes(&result, width);
-            apply_surface_column_changes(&mut result, changes);
-            let changes =
-                stabilize_small_surface_biome_family_components_changes(&result, width, true);
-            apply_surface_column_changes(&mut result, changes);
-            result
         }
         SurfaceTextureMode::Classified => {
             let stabilized = stabilize_surface_biome_families(&columns, width)?;
@@ -13229,20 +13525,19 @@ fn post_process_surface_region_columns_owned(
     Ok(post_smoothed
         .into_iter()
         .zip(coast_factors)
-        .map(|(column, &coast)| {
-            let cleaned = if column.water {
-                clean_water_surface_column(&column, coast)
+        .map(|(mut column, &coast)| {
+            let replacement = if column.water {
+                water_coastal_block_replacement(&column, coast)
             } else {
-                clean_land_surface_column(&column, coast)
+                land_coastal_block_replacement(&column, coast)
             };
-            let column = match cleaned {
-                Cow::Borrowed(_) => column,
-                Cow::Owned(cleaned) => cleaned,
-            };
-            match sanitize_surface_column_for_production_borrowed(&column) {
-                Cow::Borrowed(_) => column,
-                Cow::Owned(cleaned) => cleaned,
+            if let Some(replacement) = replacement {
+                column = replace_surface_blocks_owned(column, replacement);
             }
+            if let Some(replacement) = production_surface_block_replacement(&column) {
+                column = replace_surface_blocks_owned(column, replacement);
+            }
+            column
         })
         .collect())
 }
@@ -13938,6 +14233,52 @@ fn surface_region_smoothed_center_elevations(
     valid: &[bool],
     parallel: bool,
 ) -> Vec<f64> {
+    if valid.iter().all(|&valid| valid) {
+        let kernel = surface_smooth_kernel()
+            .iter()
+            .map(|&(dx, dz, weight)| {
+                (
+                    dz as isize * SURFACE_REGION_EXTENT as isize + dx as isize,
+                    weight,
+                )
+            })
+            .collect::<Vec<_>>();
+        let weight_sum = kernel.iter().fold(0.0, |sum, &(_, weight)| sum + weight);
+        // Keep each column's accumulation order while processing adjacent
+        // columns together. The inner slice loop can use vector instructions
+        // without reassociating floating-point sums.
+        const TILE_WIDTH: usize = 32;
+        let build = |(tile_index, output): (usize, &mut [f64])| {
+            let column_index = tile_index * TILE_WIDTH;
+            let center = ((column_index / SURFACE_REGION_WIDTH + SURFACE_REGION_COAST_RADIUS)
+                * SURFACE_REGION_EXTENT
+                + column_index % SURFACE_REGION_WIDTH
+                + SURFACE_REGION_COAST_RADIUS) as isize;
+            let mut weighted = [0.0; TILE_WIDTH];
+            for &(offset, weight) in &kernel {
+                let start = (center + offset) as usize;
+                for (sum, &elevation) in weighted
+                    .iter_mut()
+                    .zip(&elevations[start..start + TILE_WIDTH])
+                {
+                    *sum += elevation * weight;
+                }
+            }
+            for (value, sum) in output.iter_mut().zip(weighted) {
+                *value = sum / weight_sum;
+            }
+        };
+        let mut output = vec![0.0; SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH];
+        if parallel {
+            output
+                .par_chunks_mut(TILE_WIDTH)
+                .enumerate()
+                .for_each(build);
+        } else {
+            output.chunks_mut(TILE_WIDTH).enumerate().for_each(build);
+        }
+        return output;
+    }
     let build = |column_index| {
         let local_z = column_index / SURFACE_REGION_WIDTH;
         let local_x = column_index % SURFACE_REGION_WIDTH;
@@ -13965,6 +14306,60 @@ fn surface_region_local_relief_center_meters(
     valid: &[bool],
     parallel: bool,
 ) -> Vec<f64> {
+    // Min/max is separable on the square relief kernel. Keep the direct path
+    // for invalid cells, NaNs and negative zero, whose bit-level tie semantics
+    // depend on scan order. Ordinary finite samples use 18 comparisons rather
+    // than rescanning all 81 neighbors for each column.
+    if valid.iter().all(|&valid| valid)
+        && elevations
+            .iter()
+            .all(|&value| value.is_finite() && value.to_bits() != (-0.0_f64).to_bits())
+    {
+        let radius = SURFACE_REGION_RELIEF_RADIUS as usize;
+        let row_start = SURFACE_REGION_COAST_RADIUS - radius;
+        let row_count = SURFACE_REGION_WIDTH + 2 * radius;
+        let row = |z: usize| {
+            (0..SURFACE_REGION_WIDTH)
+                .map(|local_x| {
+                    let x = local_x + SURFACE_REGION_COAST_RADIUS;
+                    let mut low = f64::INFINITY;
+                    let mut high = f64::NEG_INFINITY;
+                    for dx in x - radius..=x + radius {
+                        let value = elevations[surface_region_extent_index(dx, z + row_start)];
+                        low = low.min(value);
+                        high = high.max(value);
+                    }
+                    [low, high]
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows: Vec<Vec<[f64; 2]>> = if parallel {
+            (0..row_count).into_par_iter().map(row).collect::<Vec<_>>()
+        } else {
+            (0..row_count).map(row).collect::<Vec<_>>()
+        };
+        let build = |index: usize| {
+            let x = index % SURFACE_REGION_WIDTH;
+            let z = index / SURFACE_REGION_WIDTH;
+            let mut low = f64::INFINITY;
+            let mut high = f64::NEG_INFINITY;
+            for row in &rows[z..=z + 2 * radius] {
+                low = low.min(row[x][0]);
+                high = high.max(row[x][1]);
+            }
+            high - low
+        };
+        return if parallel {
+            (0..SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH)
+                .into_par_iter()
+                .map(build)
+                .collect()
+        } else {
+            (0..SURFACE_REGION_WIDTH * SURFACE_REGION_WIDTH)
+                .map(build)
+                .collect()
+        };
+    }
     let build = |column_index| {
         let local_z = column_index / SURFACE_REGION_WIDTH;
         let local_x = column_index % SURFACE_REGION_WIDTH;
@@ -14243,7 +14638,7 @@ pub fn production_surface_top(block: i32, biome: &str) -> i32 {
 
 fn production_surface_top_for_water(block: i32, biome: &str, water: bool) -> i32 {
     if is_allowed_natural_surface_top(block) {
-        if (water || is_coast_surface_biome(biome)) && !is_coastal_native_surface_top(block) {
+        if !is_coastal_native_surface_top(block) && (water || is_coast_surface_biome(biome)) {
             return coastal_replacement(block, biome);
         }
         return block;
@@ -14664,6 +15059,18 @@ fn is_drab_temperate_earth(block: i32) -> bool {
 }
 
 fn is_temperate_vegetated_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::FOREST != 0)
+            || (keywords & biome_keywords::TAIGA != 0)
+            || (keywords & biome_keywords::JUNGLE != 0)
+            || (keywords & biome_keywords::PLAINS != 0)
+            || (keywords & biome_keywords::MEADOW != 0)
+            || (keywords & biome_keywords::GROVE != 0)
+            || (keywords & biome_keywords::WINDSWEPT != 0)
+            || (keywords & biome_keywords::MOUNTAIN != 0)
+            || (keywords & biome_keywords::HILL != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "forest")
         || contains_ascii_case_insensitive(biome, "taiga")
         || contains_ascii_case_insensitive(biome, "jungle")
@@ -14676,12 +15083,25 @@ fn is_temperate_vegetated_surface_biome(biome: &str) -> bool {
 }
 
 fn is_hard_alpine_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::STONY != 0)
+            || (keywords & biome_keywords::PEAK != 0)
+            || (keywords & biome_keywords::JAGGED != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "stony")
         || contains_ascii_case_insensitive(biome, "peak")
         || contains_ascii_case_insensitive(biome, "jagged")
 }
 
 fn is_coast_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::BEACH != 0)
+            || (keywords & biome_keywords::OCEAN != 0)
+            || (keywords & biome_keywords::RIVER != 0)
+            || (keywords & biome_keywords::SHORE != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "beach")
         || contains_ascii_case_insensitive(biome, "ocean")
         || contains_ascii_case_insensitive(biome, "river")
@@ -14689,6 +15109,14 @@ fn is_coast_surface_biome(biome: &str) -> bool {
 }
 
 fn is_dry_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::DESERT != 0)
+            || (keywords & biome_keywords::BADLANDS != 0)
+            || (keywords & biome_keywords::SAVANNA != 0)
+            || (keywords & biome_keywords::STEPPE != 0)
+            || (keywords & biome_keywords::GRASSLAND != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "desert")
         || contains_ascii_case_insensitive(biome, "badlands")
         || contains_ascii_case_insensitive(biome, "savanna")
@@ -14697,29 +15125,59 @@ fn is_dry_surface_biome(biome: &str) -> bool {
 }
 
 fn is_arid_bare_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::DESERT != 0)
+            || (keywords & biome_keywords::BADLANDS != 0)
+            || (keywords & biome_keywords::STEPPE != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "desert")
         || contains_ascii_case_insensitive(biome, "badlands")
         || contains_ascii_case_insensitive(biome, "steppe")
 }
 
 fn is_true_sandy_land_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::DESERT != 0)
+            || (keywords & biome_keywords::BADLANDS != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "desert")
         || contains_ascii_case_insensitive(biome, "badlands")
 }
 
 fn is_wet_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::SWAMP != 0)
+            || (keywords & biome_keywords::MANGROVE != 0)
+            || (keywords & biome_keywords::WETLAND != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "swamp")
         || contains_ascii_case_insensitive(biome, "mangrove")
         || contains_ascii_case_insensitive(biome, "wetland")
 }
 
 fn is_snowy_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::SNOW != 0)
+            || (keywords & biome_keywords::FROZEN != 0)
+            || (keywords & biome_keywords::ICE != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "snow")
         || contains_ascii_case_insensitive(biome, "frozen")
         || contains_ascii_case_insensitive(biome, "ice")
 }
 
 fn is_rocky_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::MOUNTAIN != 0)
+            || (keywords & biome_keywords::PEAK != 0)
+            || (keywords & biome_keywords::STONY != 0)
+            || (keywords & biome_keywords::WINDSWEPT != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "mountain")
         || contains_ascii_case_insensitive(biome, "peak")
         || contains_ascii_case_insensitive(biome, "stony")
@@ -14727,11 +15185,19 @@ fn is_rocky_surface_biome(biome: &str) -> bool {
 }
 
 fn is_forest_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::FOREST != 0) || (keywords & biome_keywords::TAIGA != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "forest")
         || contains_ascii_case_insensitive(biome, "taiga")
 }
 
 fn is_jungle_surface_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return keywords & biome_keywords::JUNGLE != 0;
+    }
+
     contains_ascii_case_insensitive(biome, "jungle")
 }
 
@@ -14772,43 +15238,61 @@ fn clean_land_surface_column(
     column: &EarthSurfaceColumn,
     coast_factor: f64,
 ) -> Cow<'_, EarthSurfaceColumn> {
+    match land_coastal_block_replacement(column, coast_factor) {
+        Some(replacement) => Cow::Owned(replace_surface_blocks_owned(column.clone(), replacement)),
+        None => Cow::Borrowed(column),
+    }
+}
+
+fn land_coastal_block_replacement(
+    column: &EarthSurfaceColumn,
+    coast_factor: f64,
+) -> Option<SurfaceBlockReplacement> {
     if coast_factor < NEAR_COAST_FACTOR
         || column.ground_surface_y > SEA_LEVEL_Y + 4
         || (!is_rock_surface_top(column.top_block_state_id)
             && !is_sand_surface_top(column.top_block_state_id))
     {
-        return Cow::Borrowed(column);
+        return None;
     }
     let top = land_shore_top(&column.biome_id);
-    Cow::Owned(replace_surface_blocks(
-        column,
+    Some(SurfaceBlockReplacement {
         top,
-        land_shore_filler(top),
-        "coastal-cleanup",
-    ))
+        filler: land_shore_filler(top),
+        source_suffix: "coastal-cleanup",
+    })
 }
 
 fn clean_water_surface_column(
     column: &EarthSurfaceColumn,
     coast_factor: f64,
 ) -> Cow<'_, EarthSurfaceColumn> {
+    match water_coastal_block_replacement(column, coast_factor) {
+        Some(replacement) => Cow::Owned(replace_surface_blocks_owned(column.clone(), replacement)),
+        None => Cow::Borrowed(column),
+    }
+}
+
+fn water_coastal_block_replacement(
+    column: &EarthSurfaceColumn,
+    coast_factor: f64,
+) -> Option<SurfaceBlockReplacement> {
     if coast_factor < SHALLOW_WATER_COAST_FACTOR
         || (!is_rock_surface_top(column.top_block_state_id)
             && !is_sand_surface_top(column.top_block_state_id))
     {
-        return Cow::Borrowed(column);
+        return None;
     }
     let depth = 0.max(column.water_surface_y - column.ground_surface_y);
     if depth > 9 && coast_factor < IMMEDIATE_COAST_FACTOR {
-        return Cow::Borrowed(column);
+        return None;
     }
     let top = water_floor_top(&column.biome_id, depth);
-    Cow::Owned(replace_surface_blocks(
-        column,
+    Some(SurfaceBlockReplacement {
         top,
-        top,
-        "coastal-water-cleanup",
-    ))
+        filler: top,
+        source_suffix: "coastal-water-cleanup",
+    })
 }
 
 fn land_shore_top(biome: &str) -> i32 {
@@ -14882,27 +15366,35 @@ fn is_sand_surface_top(block: i32) -> bool {
     )
 }
 
-fn replace_surface_blocks(
-    column: &EarthSurfaceColumn,
+struct SurfaceBlockReplacement {
     top: i32,
     filler: i32,
-    source_suffix: &str,
-) -> EarthSurfaceColumn {
-    if top == column.top_block_state_id && filler == column.filler_block_state_id {
-        return column.clone();
-    }
-    let mut replaced = EarthSurfaceColumn::new(
-        column.water,
-        column.ground_surface_y,
-        column.water_surface_y,
+    source_suffix: &'static str,
+}
+
+fn replace_surface_blocks_owned(
+    mut column: EarthSurfaceColumn,
+    SurfaceBlockReplacement {
         top,
         filler,
-        column.biome_id.clone(),
-        format!("{}+{}", column.decision_source, source_suffix),
-    );
-    replaced.terrain_token_source = column.terrain_token_source;
-    replaced.data_evidence_flags = column.data_evidence_flags;
-    replaced
+        source_suffix,
+    }: SurfaceBlockReplacement,
+) -> EarthSurfaceColumn {
+    if top == column.top_block_state_id && filler == column.filler_block_state_id {
+        return column;
+    }
+    column.top_block_state_id = top;
+    column.filler_block_state_id = filler;
+    if column.biome_id.trim().is_empty() {
+        column.biome_id.clear();
+        column.biome_id.push_str("minecraft:plains");
+    }
+    // Retain the biome allocation and grow the existing source once, instead
+    // of cloning both strings and formatting through a new growing buffer.
+    column.decision_source.reserve(1 + source_suffix.len());
+    column.decision_source.push('+');
+    column.decision_source.push_str(source_suffix);
+    column
 }
 
 const SURFACE_BIOME_BELOW_PADDING: i32 = 4;
@@ -15328,43 +15820,65 @@ fn grass_render_color(biome: Option<&str>) -> i32 {
     let Some(biome) = biome else {
         return rgb(99, 139, 63);
     };
-    if biome.contains("sparse_jungle") {
+    match biome {
+        "minecraft:plains" => return rgb(100, 146, 67),
+        "minecraft:forest" | "minecraft:birch_forest" | "minecraft:old_growth_birch_forest" => {
+            return rgb(64, 124, 54)
+        }
+        "minecraft:flower_forest" => return rgb(76, 135, 62),
+        "minecraft:dark_forest" => return rgb(42, 82, 45),
+        "minecraft:meadow" => return rgb(119, 151, 82),
+        "minecraft:savanna" | "minecraft:savanna_plateau" => return rgb(151, 153, 77),
+        "minecraft:windswept_savanna" => return rgb(135, 141, 75),
+        "minecraft:taiga"
+        | "minecraft:snowy_taiga"
+        | "minecraft:old_growth_pine_taiga"
+        | "minecraft:old_growth_spruce_taiga" => return rgb(88, 120, 92),
+        "minecraft:sparse_jungle" => return rgb(72, 130, 54),
+        "minecraft:bamboo_jungle" => return rgb(54, 136, 48),
+        "minecraft:jungle" => return rgb(45, 118, 45),
+        "minecraft:swamp" | "minecraft:mangrove_swamp" => return rgb(73, 101, 56),
+        "minecraft:snowy_plains" => return rgb(157, 179, 145),
+        "minecraft:sunflower_plains" => return rgb(117, 153, 68),
+        _ => {}
+    }
+    if contains_biome_keyword(biome, "sparse_jungle") {
         return rgb(72, 130, 54);
     }
-    if biome.contains("bamboo_jungle") {
+    if contains_biome_keyword(biome, "bamboo_jungle") {
         return rgb(54, 136, 48);
     }
-    if biome.contains("jungle") {
+    if contains_biome_keyword(biome, "jungle") {
         return rgb(45, 118, 45);
     }
-    if biome.contains("meadow") {
+    if contains_biome_keyword(biome, "meadow") {
         return rgb(119, 151, 82);
     }
-    if biome.contains("windswept_savanna") {
+    if contains_biome_keyword(biome, "windswept_savanna") {
         return rgb(135, 141, 75);
     }
-    if biome.contains("savanna") {
+    if contains_biome_keyword(biome, "savanna") {
         return rgb(151, 153, 77);
     }
-    if biome.contains("dark_forest") {
+    if contains_biome_keyword(biome, "dark_forest") {
         return rgb(42, 82, 45);
     }
-    if biome.contains("flower_forest") {
+    if contains_biome_keyword(biome, "flower_forest") {
         return rgb(76, 135, 62);
     }
-    if biome.contains("forest") {
+    if contains_biome_keyword(biome, "forest") {
         return rgb(64, 124, 54);
     }
-    if biome.contains("sunflower_plains") {
+    if contains_biome_keyword(biome, "sunflower_plains") {
         return rgb(117, 153, 68);
     }
-    if biome.contains("taiga") {
+    if contains_biome_keyword(biome, "taiga") {
         return rgb(88, 120, 92);
     }
-    if biome.contains("swamp") {
+    if contains_biome_keyword(biome, "swamp") {
         return rgb(73, 101, 56);
     }
-    if biome.contains("snowy") {
+    if contains_biome_keyword(biome, "snowy") {
         return rgb(157, 179, 145);
     }
     rgb(100, 146, 67)
@@ -15385,37 +15899,37 @@ fn leaf_render_color(block: i32, biome: Option<&str>) -> i32 {
         };
     };
     if block == block_state_ids::DARK_OAK_LEAVES {
-        if biome.contains("savanna") {
+        if contains_biome_keyword(biome, "savanna") {
             return rgb(72, 80, 38);
         }
         return rgb(25, 58, 28);
     }
     if block == block_state_ids::SPRUCE_LEAVES {
-        if biome.contains("taiga") || biome.contains("snow") {
+        if contains_biome_keyword(biome, "taiga") || contains_biome_keyword(biome, "snow") {
             return rgb(50, 76, 53);
         }
         return rgb(55, 82, 49);
     }
-    if biome.contains("jungle") {
+    if contains_biome_keyword(biome, "jungle") {
         return if block == block_state_ids::JUNGLE_LEAVES {
             rgb(30, 92, 34)
         } else {
             rgb(38, 91, 39)
         };
     }
-    if biome.contains("dark_forest") {
+    if contains_biome_keyword(biome, "dark_forest") {
         return rgb(25, 58, 28);
     }
-    if biome.contains("forest") {
+    if contains_biome_keyword(biome, "forest") {
         return rgb(38, 86, 38);
     }
-    if biome.contains("taiga") {
+    if contains_biome_keyword(biome, "taiga") {
         return rgb(58, 86, 62);
     }
-    if biome.contains("swamp") {
+    if contains_biome_keyword(biome, "swamp") {
         return rgb(44, 70, 32);
     }
-    if biome.contains("savanna") {
+    if contains_biome_keyword(biome, "savanna") {
         return rgb(92, 96, 45);
     }
     if block == block_state_ids::JUNGLE_LEAVES {
@@ -16776,6 +17290,14 @@ fn can_absorb_dry_vegetation_sand_patch(
 }
 
 fn is_dry_vegetation_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::SAVANNA != 0)
+            || (keywords & biome_keywords::PLAINS != 0)
+            || (keywords & biome_keywords::MEADOW != 0)
+            || (keywords & biome_keywords::GRASSLAND != 0)
+            || (keywords & biome_keywords::STEPPE != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "savanna")
         || contains_ascii_case_insensitive(biome, "plains")
         || contains_ascii_case_insensitive(biome, "meadow")
@@ -16788,12 +17310,23 @@ fn is_photo_vegetation_biome(biome: &str) -> bool {
 }
 
 fn is_lush_vegetation_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::JUNGLE != 0)
+            || (keywords & biome_keywords::FOREST != 0)
+            || (keywords & biome_keywords::TAIGA != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "jungle")
         || contains_ascii_case_insensitive(biome, "forest")
         || contains_ascii_case_insensitive(biome, "taiga")
 }
 
 fn is_desert_like_biome(biome: &str) -> bool {
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::DESERT != 0)
+            || (keywords & biome_keywords::BADLANDS != 0);
+    }
+
     contains_ascii_case_insensitive(biome, "desert")
         || contains_ascii_case_insensitive(biome, "badlands")
 }
@@ -16853,7 +17386,7 @@ fn photo_texture_family(top: i32) -> i32 {
 }
 
 fn compatible_top_for_smoother_biome(current_top: i32, biome: &str) -> i32 {
-    if !biome.contains("snow") && !biome.contains("frozen") {
+    if !contains_biome_keyword(biome, "snow") && !contains_biome_keyword(biome, "frozen") {
         return current_top;
     }
     if matches!(
@@ -17044,8 +17577,8 @@ fn stabilize_surface_biome_cells_changes(
                             None => first_biome = Some(biome),
                         }
                         if !editable {
-                            editable = !is_protected_intent_biome(biome)
-                                && !(preserve_surface && is_render_locked_photo_biome(column));
+                            editable = !(preserve_surface && is_render_locked_photo_biome(column))
+                                && !is_protected_intent_biome(biome);
                         }
                     }
                 }
@@ -17159,8 +17692,8 @@ fn stabilize_small_surface_biome_family_components_changes(
         }
         let seed = &columns[index];
         if seed.water
-            || is_protected_intent_biome(&seed.biome_id)
             || (preserve_surface && is_render_locked_photo_biome(seed))
+            || is_protected_intent_biome(&seed.biome_id)
         {
             visited[index] = true;
             continue;
@@ -17419,8 +17952,8 @@ fn enqueue_same_intent_family(
     }
     let column = &columns[index];
     if column.water
-        || is_protected_intent_biome(&column.biome_id)
         || (preserve_surface && is_render_locked_photo_biome(column))
+        || is_protected_intent_biome(&column.biome_id)
     {
         return;
     }
@@ -17673,10 +18206,10 @@ fn intent_compatible_top_for_biome(current_top: i32, biome: &str) -> i32 {
         }
         return block_state_ids::GRASS_BLOCK;
     }
-    if biome.contains("desert") {
+    if contains_biome_keyword(biome, "desert") {
         return block_state_ids::SAND;
     }
-    if biome.contains("badlands") {
+    if contains_biome_keyword(biome, "badlands") {
         if matches!(
             current_top,
             block_state_ids::RED_SAND
@@ -17692,10 +18225,29 @@ fn intent_compatible_top_for_biome(current_top: i32, biome: &str) -> i32 {
 }
 
 fn is_protected_intent_biome(biome: &str) -> bool {
+    // Common unprotected names avoid classifying all 27 keywords during
+    // component scans. Custom names retain the original substring rules.
+    match biome {
+        "minecraft:forest"
+        | "minecraft:plains"
+        | "minecraft:savanna"
+        | "minecraft:taiga"
+        | "minecraft:dark_forest"
+        | "minecraft:jungle"
+        | "minecraft:windswept_savanna" => return false,
+        _ => {}
+    }
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return biome == "minecraft:beach"
+            || (keywords & biome_keywords::SNOW != 0)
+            || (keywords & biome_keywords::SWAMP != 0)
+            || (keywords & biome_keywords::MANGROVE != 0);
+    }
+
     biome == "minecraft:beach"
-        || biome.contains("snow")
-        || biome.contains("swamp")
-        || biome.contains("mangrove")
+        || contains_biome_keyword(biome, "snow")
+        || contains_biome_keyword(biome, "swamp")
+        || contains_biome_keyword(biome, "mangrove")
 }
 
 fn is_render_locked_photo_biome(column: &EarthSurfaceColumn) -> bool {
@@ -17716,24 +18268,50 @@ fn is_tinted_intent_render_surface(top: i32) -> bool {
 }
 
 fn is_snow_intent_biome(biome: &str) -> bool {
-    biome.contains("snow") || biome.contains("frozen")
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::SNOW != 0) || (keywords & biome_keywords::FROZEN != 0);
+    }
+
+    contains_biome_keyword(biome, "snow") || contains_biome_keyword(biome, "frozen")
 }
 
 fn is_vegetated_intent_biome(biome: &str) -> bool {
-    biome.contains("savanna")
-        || biome.contains("jungle")
-        || biome.contains("forest")
-        || biome.contains("plains")
-        || biome.contains("meadow")
-        || biome.contains("taiga")
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::SAVANNA != 0)
+            || (keywords & biome_keywords::JUNGLE != 0)
+            || (keywords & biome_keywords::FOREST != 0)
+            || (keywords & biome_keywords::PLAINS != 0)
+            || (keywords & biome_keywords::MEADOW != 0)
+            || (keywords & biome_keywords::TAIGA != 0);
+    }
+
+    contains_biome_keyword(biome, "savanna")
+        || contains_biome_keyword(biome, "jungle")
+        || contains_biome_keyword(biome, "forest")
+        || contains_biome_keyword(biome, "plains")
+        || contains_biome_keyword(biome, "meadow")
+        || contains_biome_keyword(biome, "taiga")
 }
 
 fn is_dry_vegetated_intent_biome(biome: &str) -> bool {
-    biome.contains("savanna") || biome.contains("plains")
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::SAVANNA != 0)
+            || (keywords & biome_keywords::PLAINS != 0);
+    }
+
+    contains_biome_keyword(biome, "savanna") || contains_biome_keyword(biome, "plains")
 }
 
 fn is_lush_vegetated_intent_biome(biome: &str) -> bool {
-    biome.contains("jungle") || biome.contains("forest") || biome.contains("taiga")
+    if let Some(keywords) = known_biome_keywords(biome) {
+        return (keywords & biome_keywords::JUNGLE != 0)
+            || (keywords & biome_keywords::FOREST != 0)
+            || (keywords & biome_keywords::TAIGA != 0);
+    }
+
+    contains_biome_keyword(biome, "jungle")
+        || contains_biome_keyword(biome, "forest")
+        || contains_biome_keyword(biome, "taiga")
 }
 
 fn is_arid_transition_cell(family_counts: &BTreeMap<&str, i32>) -> bool {
@@ -17762,28 +18340,55 @@ fn is_arid_transition_family(family: &str) -> bool {
 }
 
 fn intent_biome_family(biome: &str) -> &str {
-    if biome.contains("desert") {
+    match biome {
+        "minecraft:plains"
+        | "minecraft:sunflower_plains"
+        | "minecraft:snowy_plains"
+        | "minecraft:meadow" => return "grassland",
+        "minecraft:forest"
+        | "minecraft:flower_forest"
+        | "minecraft:dark_forest"
+        | "minecraft:birch_forest"
+        | "minecraft:old_growth_birch_forest" => return "forest",
+        "minecraft:taiga"
+        | "minecraft:snowy_taiga"
+        | "minecraft:old_growth_pine_taiga"
+        | "minecraft:old_growth_spruce_taiga" => return "taiga",
+        "minecraft:savanna" | "minecraft:savanna_plateau" | "minecraft:windswept_savanna" => {
+            return "savanna"
+        }
+        "minecraft:jungle" | "minecraft:sparse_jungle" | "minecraft:bamboo_jungle" => {
+            return "jungle"
+        }
+        "minecraft:swamp" | "minecraft:mangrove_swamp" => return "swamp",
+        "minecraft:desert" => return "desert",
+        "minecraft:badlands" | "minecraft:wooded_badlands" | "minecraft:eroded_badlands" => {
+            return "badlands"
+        }
+        _ => {}
+    }
+    if contains_biome_keyword(biome, "desert") {
         return "desert";
     }
-    if biome.contains("badlands") {
+    if contains_biome_keyword(biome, "badlands") {
         return "badlands";
     }
-    if biome.contains("savanna") {
+    if contains_biome_keyword(biome, "savanna") {
         return "savanna";
     }
-    if biome.contains("jungle") {
+    if contains_biome_keyword(biome, "jungle") {
         return "jungle";
     }
-    if biome.contains("forest") {
+    if contains_biome_keyword(biome, "forest") {
         return "forest";
     }
-    if biome.contains("swamp") {
+    if contains_biome_keyword(biome, "swamp") {
         return "swamp";
     }
-    if biome.contains("taiga") {
+    if contains_biome_keyword(biome, "taiga") {
         return "taiga";
     }
-    if biome.contains("plains") || biome.contains("meadow") {
+    if contains_biome_keyword(biome, "plains") || contains_biome_keyword(biome, "meadow") {
         return "grassland";
     }
     biome
@@ -18926,6 +19531,71 @@ mod tests {
     }
 
     #[test]
+    fn complete_region_neighborhood_fast_paths_preserve_float_bits_and_fallbacks() {
+        let len = SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT;
+        let mut elevations = (0..len)
+            .map(|index| {
+                let bits = (index as u64).wrapping_mul(0x9e3779b97f4a7c15);
+                (bits as i64 as f64) * 1e-15 + (index as f64) * 0.0013
+            })
+            .collect::<Vec<_>>();
+        let mut valid = vec![true; len];
+        let points = [
+            (0, 0),
+            (31, 0),
+            (32, 0),
+            (511, 0),
+            (12, 6),
+            (128, 257),
+            (511, 511),
+        ];
+        for exceptional in [None, Some(-0.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            if let Some(value) = exceptional {
+                elevations[surface_region_extent_index(
+                    SURFACE_REGION_COAST_RADIUS + 12,
+                    SURFACE_REGION_COAST_RADIUS + 6,
+                )] = value;
+            }
+            for parallel in [false, true] {
+                let smoothed =
+                    surface_region_smoothed_center_elevations(&elevations, &valid, parallel);
+                let relief =
+                    surface_region_local_relief_center_meters(&elevations, &valid, parallel);
+                for (x, z) in points {
+                    let index = z * SURFACE_REGION_WIDTH + x;
+                    let center_x = x + SURFACE_REGION_COAST_RADIUS;
+                    let center_z = z + SURFACE_REGION_COAST_RADIUS;
+                    assert_eq!(
+                        smoothed[index].to_bits(),
+                        surface_region_smoothed_elevation(&elevations, &valid, center_x, center_z)
+                            .to_bits()
+                    );
+                    assert_eq!(
+                        relief[index].to_bits(),
+                        surface_region_local_relief_meters(&elevations, &valid, center_x, center_z)
+                            .to_bits()
+                    );
+                }
+            }
+        }
+        valid[surface_region_extent_index(
+            SURFACE_REGION_COAST_RADIUS + 12,
+            SURFACE_REGION_COAST_RADIUS + 6,
+        )] = false;
+        let relief = surface_region_local_relief_center_meters(&elevations, &valid, true);
+        assert_eq!(
+            relief[6 * SURFACE_REGION_WIDTH + 12].to_bits(),
+            surface_region_local_relief_meters(
+                &elevations,
+                &valid,
+                SURFACE_REGION_COAST_RADIUS + 12,
+                SURFACE_REGION_COAST_RADIUS + 6
+            )
+            .to_bits()
+        );
+    }
+
+    #[test]
     fn precomputed_region_smoothing_and_relief_match_direct_neighborhoods() {
         let len = SURFACE_REGION_EXTENT * SURFACE_REGION_EXTENT;
         let mut elevations = vec![0.0; len];
@@ -19754,12 +20424,20 @@ mod tests {
             bare_metrics,
             80.0,
             3.0,
-            surface_material_sahara_score(80.0, 3.0),
-            surface_material_rainforest_score(80.0, 3.0),
-            surface_material_dry_savanna_score(80.0, 3.0),
             false,
-            0.0,
-            0.0,
+            &SurfaceMaterialClimate::with_values(
+                80.0,
+                3.0,
+                [
+                    surface_material_sahara_score(80.0, 3.0),
+                    0.0,
+                    surface_material_rainforest_score(80.0, 3.0),
+                    surface_material_dry_savanna_score(80.0, 3.0),
+                    0.0,
+                    0.0,
+                    0.0
+                ]
+            ),
         ));
         let bare_mosaic = apply_test_surface_material_sample(
             &base_land,
@@ -19802,12 +20480,20 @@ mod tests {
             sahara_metrics,
             20.0,
             25.0,
-            surface_material_sahara_score(20.0, 25.0),
-            surface_material_rainforest_score(20.0, 25.0),
-            surface_material_dry_savanna_score(20.0, 25.0),
             false,
-            0.0,
-            0.0,
+            &SurfaceMaterialClimate::with_values(
+                20.0,
+                25.0,
+                [
+                    surface_material_sahara_score(20.0, 25.0),
+                    0.0,
+                    surface_material_rainforest_score(20.0, 25.0),
+                    surface_material_dry_savanna_score(20.0, 25.0),
+                    0.0,
+                    0.0,
+                    0.0
+                ]
+            ),
         ));
 
         let humid_named_mosaic = SurfaceMaterialSample::with_export_token(
@@ -26115,6 +26801,274 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_material_overrides_match_full_base_classification() {
+        let mut applied_count = 0;
+        let mut fallback_count = 0;
+        for (longitude, latitude) in [
+            (127.0, 37.0),
+            (15.0, 24.0),
+            (18.0, 12.0),
+            (-60.0, -8.0),
+            (12.0, 38.0),
+            (135.0, -25.0),
+            (25.0, 65.0),
+        ] {
+            for color in [
+                RgbColor::of(48, 98, 40),
+                RgbColor::of(132, 140, 90),
+                RgbColor::of(210, 180, 120),
+                RgbColor::of(245, 246, 245),
+                RgbColor::of(8, 16, 36),
+                RgbColor::unavailable(),
+            ] {
+                for climate in [SurfaceMaterialSample::UNKNOWN, 2, 6, 12, 29] {
+                    let mut sample = SurfaceMaterialSample::color_only(color);
+                    sample.climate_class = climate;
+                    sample.terrain_token_source = TerrainTokenSource::JavaStandardPalette;
+                    sample.terrain_token_color = RgbColor::of(50, 60, 30);
+                    sample.bathymetry_meters = -80;
+                    for elevation in [-20.0, 10.0, 150.0, 1_500.0, 3_000.0] {
+                        for coast in [0.0, 0.71, 0.95] {
+                            for vertical in [0.5, 4.0] {
+                                for water in [false, true] {
+                                    let base = classify_shaped_surface_scaled(
+                                        elevation, longitude, latitude, water, coast, vertical,
+                                    )
+                                    .unwrap();
+                                    let expected = apply_surface_material(
+                                        &base,
+                                        &sample,
+                                        elevation,
+                                        longitude,
+                                        latitude,
+                                        coast,
+                                        80.0 * vertical,
+                                        vertical,
+                                    )
+                                    .unwrap();
+                                    let (mut actual, applied) =
+                                        classify_shaped_surface_with_material(
+                                            elevation,
+                                            longitude,
+                                            latitude,
+                                            water,
+                                            coast,
+                                            vertical,
+                                            Some(&sample),
+                                            80.0,
+                                        )
+                                        .unwrap();
+                                    if applied {
+                                        applied_count += 1;
+                                    } else {
+                                        fallback_count += 1;
+                                        actual = apply_surface_material(
+                                            &actual,
+                                            &sample,
+                                            elevation,
+                                            longitude,
+                                            latitude,
+                                            coast,
+                                            80.0 * vertical,
+                                            vertical,
+                                        )
+                                        .unwrap();
+                                    }
+                                    assert_eq!(actual, expected, "lon={longitude} lat={latitude} climate={climate} height={elevation} coast={coast} vertical={vertical} water={water}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(applied_count > 0 && fallback_count > 0);
+    }
+
+    #[test]
+    fn reused_photo_palette_columns_match_traced_decisions_and_metadata() {
+        for water in [false, true] {
+            for top in [
+                block_state_ids::GRASS_BLOCK,
+                block_state_ids::STONE,
+                block_state_ids::OAK_LEAVES,
+            ] {
+                for biome in ["minecraft:forest", " custom:숲 ", " "] {
+                    let semantic = surface_column(
+                        water,
+                        75,
+                        80,
+                        block_state_ids::STONE,
+                        block_state_ids::DIRT,
+                        "minecraft:plains",
+                    )
+                    .with_terrain_token_source(TerrainTokenSource::Export)
+                    .with_data_evidence_flags(123);
+                    let owned = PhotoSurfaceInput::new(
+                        semantic.clone(),
+                        SurfaceMaterialSample::color_only(RgbColor::of(110, 130, 80)),
+                        100.0,
+                        127.0,
+                        37.0,
+                        0.0,
+                        80.0,
+                        -10,
+                        20,
+                    );
+                    let input = PhotoSurfaceContext::from(&owned);
+                    let solve = PhotoSurfaceSolve {
+                        top_block_state_id: top,
+                        biome_id: biome.to_string(),
+                        score: 0.0,
+                    };
+                    let expected = photo_surface_decision_from_solve(
+                        &input,
+                        solve.clone(),
+                        "photo-palette",
+                        "palette-token-solver",
+                        input.sample.color,
+                        "test",
+                    )
+                    .into_column(&semantic);
+                    let mut actual = semantic;
+                    apply_photo_palette_solve(&mut actual, &solve);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn met_remap_cache_preserves_full_keys_collisions_and_availability() {
+        let mut slots = vec![None; MET_REMAP_CACHE_ENTRIES];
+        let (left, right) = (0..=MET_REMAP_CACHE_ENTRIES as i32)
+            .find_map(|key| {
+                let slot = ((key as u32).wrapping_mul(0x9e37_79b9) >> 16) as usize;
+                slots[slot].replace(key).map(|previous| (previous, key))
+            })
+            .unwrap();
+        for key in (0..1024)
+            .map(|key| key * 16381)
+            .chain([left, right, left, right])
+        {
+            let color = RgbColor::of((key >> 16) as u8, (key >> 8) as u8, key as u8);
+            let expected = nearest_image_magick_remap(color)
+                .map(|index| {
+                    let entry = MET_TERRAIN_ENTRIES[index];
+                    MetTerrainMatch::from_entry(entry, met_terrain_distance_squared(color, entry))
+                })
+                .unwrap_or_else(MetTerrainMatch::unavailable);
+            assert_eq!(MetTerrainVocabulary::nearest(color), expected);
+        }
+        assert_eq!(
+            MetTerrainVocabulary::nearest(RgbColor::unavailable()),
+            MetTerrainMatch::unavailable()
+        );
+    }
+
+    #[test]
+    fn vegetation_palette_unique_render_colors_preserve_first_biome_and_exact_score() {
+        for biome in PHOTO_GRASS_RENDER_BIOMES.into_iter().chain([
+            "custom:forest_savanna",
+            "custom:숲\0",
+            " ",
+        ]) {
+            for source in [
+                RgbColor::of(42, 82, 45),
+                RgbColor::of(100, 146, 67),
+                RgbColor::of(136, 137, 137),
+                RgbColor::of(170, 146, 94),
+                RgbColor::of(232, 238, 236),
+            ] {
+                for token_color in [
+                    RgbColor::of(0, 50, 0),
+                    RgbColor::of(50, 60, 30),
+                    RgbColor::of(250, 255, 250),
+                ] {
+                    for coast in [0.699, 0.70] {
+                        let mut sample = SurfaceMaterialSample::color_only(source);
+                        sample.terrain_token_color = token_color;
+                        sample.terrain_token_source = TerrainTokenSource::JavaStandardPalette;
+                        let owned = PhotoSurfaceInput::new(
+                            surface_column(
+                                false,
+                                75,
+                                i32::MIN,
+                                block_state_ids::GRASS_BLOCK,
+                                block_state_ids::DIRT,
+                                biome,
+                            ),
+                            sample,
+                            750.0,
+                            127.0,
+                            37.0,
+                            coast,
+                            100.0,
+                            -10,
+                            20,
+                        );
+                        let input = PhotoSurfaceContext::from(&owned);
+                        let token = MetTerrainVocabulary::exact(token_color);
+                        let (context, _) = photo_palette_solve_context(&input, source, token);
+                        // Exhaustively evaluate the original ordered candidate
+                        // list, including duplicate colors and duplicate names.
+                        let mut expected: Option<PhotoSurfaceSolve> = None;
+                        for &top in PHOTO_SOLVER_CANDIDATE_BLOCKS {
+                            let mut visit = |biome: &str| {
+                                if biome.trim().is_empty() {
+                                    return;
+                                }
+                                let score = java_standard_palette_candidate_score_with_context(
+                                    &input, context, token, top, biome,
+                                );
+                                if expected
+                                    .as_ref()
+                                    .is_none_or(|current| score < current.score)
+                                {
+                                    expected = Some(PhotoSurfaceSolve {
+                                        top_block_state_id: top,
+                                        biome_id: biome.to_string(),
+                                        score,
+                                    });
+                                }
+                            };
+                            if is_tinted_vegetation_block(top) {
+                                for_each_photo_solver_grass_biome(
+                                    biome,
+                                    input.sample,
+                                    input.elevation_meters,
+                                    input.latitude,
+                                    input.local_relief_meters,
+                                    &mut visit,
+                                );
+                            } else {
+                                visit(&compatible_biome_for_palette_non_grass(biome, top));
+                            }
+                        }
+                        let expected = expected.unwrap();
+                        let actual =
+                            java_standard_vegetation_palette_baseline(&input, context, token)
+                                .unwrap();
+                        assert_eq!(
+                            (
+                                actual.top_block_state_id,
+                                actual.biome_id,
+                                actual.score.to_bits()
+                            ),
+                            (
+                                expected.top_block_state_id,
+                                expected.biome_id,
+                                expected.score.to_bits()
+                            ),
+                            "biome={biome:?} source={source:?} token={token_color:?} coast={coast}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cached_static_palette_solves_preserve_candidate_order_and_coastal_bias() {
         for entry in MET_TERRAIN_ENTRIES.iter().filter(|entry| {
             matches!(
@@ -26132,6 +27086,8 @@ mod tests {
                     "minecraft:beach",
                     "minecraft:desert",
                     "minecraft:badlands",
+                    "custom:forest_savanna",
+                    "custom:beach_숲",
                 ] {
                     for coast in [0.699, 0.70] {
                         let mut sample = SurfaceMaterialSample::color_only(source);
@@ -26191,6 +27147,21 @@ mod tests {
                             }
                         }
                         let expected = expected.unwrap();
+                        let region_key = key.clone().for_region(token);
+                        let region_solve =
+                            cached_photo_palette_solve(&input, context, token, region_key).unwrap();
+                        assert_eq!(
+                            (
+                                region_solve.top_block_state_id,
+                                region_solve.score.to_bits()
+                            ),
+                            (expected.top_block_state_id, expected.score.to_bits())
+                        );
+                        let mut reference_column = owned.semantic_column.clone();
+                        apply_photo_palette_solve(&mut reference_column, &expected);
+                        let mut region_column = owned.semantic_column.clone();
+                        apply_static_photo_palette_solve(&mut region_column, &region_solve);
+                        assert_eq!(region_column, reference_column);
                         for _ in 0..2 {
                             let actual =
                                 cached_photo_palette_solve(&input, context, token, key.clone())

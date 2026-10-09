@@ -9,12 +9,57 @@ pub const BIOME_CELL_WIDTH: usize = 4;
 pub const SECTION_BIOME_CELL_COUNT: usize = BIOME_CELL_WIDTH * BIOME_CELL_WIDTH * BIOME_CELL_WIDTH;
 const DEFAULT_BIOME_ID: &str = "minecraft:plains";
 
+#[derive(Clone, Debug)]
+pub(crate) enum BlockSection {
+    Uniform(i32),
+    Dense(Vec<i32>),
+}
+
+impl BlockSection {
+    pub(crate) fn block_at(&self, index: usize) -> i32 {
+        match self {
+            Self::Uniform(block) => *block,
+            Self::Dense(blocks) => blocks[index],
+        }
+    }
+
+    fn dense_mut(&mut self) -> &mut Vec<i32> {
+        if let Self::Uniform(block) = self {
+            *self = Self::Dense(vec![*block; SECTION_BLOCK_COUNT]);
+        }
+        let Self::Dense(blocks) = self else {
+            unreachable!("uniform section expanded above")
+        };
+        blocks
+    }
+
+    fn copy_blocks(&self) -> Vec<i32> {
+        match self {
+            Self::Uniform(block) => vec![*block; SECTION_BLOCK_COUNT],
+            Self::Dense(blocks) => blocks.clone(),
+        }
+    }
+}
+
+impl PartialEq for BlockSection {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Uniform(left), Self::Uniform(right)) => left == right,
+            (Self::Dense(left), Self::Dense(right)) => left == right,
+            (Self::Uniform(block), Self::Dense(blocks))
+            | (Self::Dense(blocks), Self::Uniform(block)) => {
+                blocks.iter().all(|value| value == block)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChunkModel {
     dimension: DimensionProfile,
     chunk_x: i32,
     chunk_z: i32,
-    sections: Vec<Option<Vec<i32>>>,
+    sections: Vec<Option<BlockSection>>,
     section_biomes: Vec<Option<Vec<Option<String>>>>,
     block_entities: Vec<nbt::Compound>,
     biome_id: String,
@@ -123,7 +168,7 @@ impl ChunkModel {
         let Some(section) = &self.sections[section_index] else {
             return Ok(block_state_ids::AIR);
         };
-        Ok(section[section_block_index(&self.dimension, local_x, y, local_z)?])
+        Ok(section.block_at(section_block_index(&self.dimension, local_x, y, local_z)?))
     }
 
     pub fn set_block_state_id(
@@ -137,6 +182,10 @@ impl ChunkModel {
         block_state_ids::require_valid(block_state_id)?;
         let section_index = self.dimension.section_index_for_block_y(y)?;
         if block_state_id == block_state_ids::AIR && self.sections[section_index].is_none() {
+            return Ok(());
+        }
+        if matches!(self.sections[section_index], Some(BlockSection::Uniform(block)) if block == block_state_id)
+        {
             return Ok(());
         }
         let block_index = section_block_index(&self.dimension, local_x, y, local_z)?;
@@ -164,6 +213,10 @@ impl ChunkModel {
         let end_section = self.dimension.section_index_for_block_y(to_y_inclusive)?;
         let column_base = ((local_z as usize) << 4) | local_x as usize;
         for section_index in start_section..=end_section {
+            if matches!(self.sections[section_index], Some(BlockSection::Uniform(block)) if block == block_state_id)
+            {
+                continue;
+            }
             let section_min_y = self.dimension.min_y() + (section_index as i32 * SECTION_HEIGHT);
             let start_y = from_y_inclusive.max(section_min_y);
             let end_y = to_y_inclusive.min(section_min_y + SECTION_HEIGHT - 1);
@@ -194,6 +247,14 @@ impl ChunkModel {
             let section_min_y = self.dimension.min_y() + section_index as i32 * SECTION_HEIGHT;
             let start_y = from_y_inclusive.max(section_min_y) - section_min_y;
             let end_y = to_y_inclusive.min(section_min_y + SECTION_HEIGHT - 1) - section_min_y;
+            if start_y == 0 && end_y == SECTION_HEIGHT - 1 {
+                self.sections[section_index] = Some(BlockSection::Uniform(block_state_id));
+                continue;
+            }
+            if matches!(self.sections[section_index], Some(BlockSection::Uniform(block)) if block == block_state_id)
+            {
+                continue;
+            }
             let section = self.section_or_allocate(section_index);
             section[start_y as usize * CHUNK_WIDTH * CHUNK_WIDTH
                 ..(end_y as usize + 1) * CHUNK_WIDTH * CHUNK_WIDTH]
@@ -205,13 +266,14 @@ impl ChunkModel {
     pub fn copy_section_block_state_ids(&self, section_index: i32) -> Result<Vec<i32>> {
         let section_index = self.section_index(section_index)?;
         Ok(self.sections[section_index]
-            .clone()
+            .as_ref()
+            .map(BlockSection::copy_blocks)
             .unwrap_or_else(|| vec![block_state_ids::AIR; SECTION_BLOCK_COUNT]))
     }
 
-    pub(crate) fn section_block_state_ids(&self, section_index: i32) -> Result<Option<&[i32]>> {
+    pub(crate) fn section_blocks(&self, section_index: i32) -> Result<Option<&BlockSection>> {
         let section_index = self.section_index(section_index)?;
-        Ok(self.sections[section_index].as_deref())
+        Ok(self.sections[section_index].as_ref())
     }
 
     pub(crate) fn section_biome_ids(
@@ -255,7 +317,8 @@ impl ChunkModel {
 
     fn section_or_allocate(&mut self, section_index: usize) -> &mut Vec<i32> {
         self.sections[section_index]
-            .get_or_insert_with(|| vec![block_state_ids::AIR; SECTION_BLOCK_COUNT])
+            .get_or_insert(BlockSection::Uniform(block_state_ids::AIR))
+            .dense_mut()
     }
 
     fn section_index(&self, section_index: i32) -> Result<usize> {
@@ -366,6 +429,37 @@ mod tests {
         assert!(chunk.set_block_state_id(0, 0, 0, -1).is_err());
         assert!(chunk.copy_section_block_state_ids(-1).is_err());
         assert!(chunk.copy_section_block_state_ids(24).is_err());
+    }
+
+    #[test]
+    fn uniform_sections_expand_only_when_a_block_changes() {
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.fill_layers(-64, -49, STONE).unwrap();
+        assert!(matches!(
+            chunk.section_blocks(0).unwrap(),
+            Some(BlockSection::Uniform(STONE))
+        ));
+        chunk.set_block_state_id(3, -60, 4, STONE).unwrap();
+        chunk.fill_column(0, 0, -64, -49, STONE).unwrap();
+        assert!(matches!(
+            chunk.section_blocks(0).unwrap(),
+            Some(BlockSection::Uniform(STONE))
+        ));
+        let mut copy = chunk.clone();
+        copy.set_block_state_id(3, -60, 4, WATER).unwrap();
+        assert!(matches!(
+            copy.section_blocks(0).unwrap(),
+            Some(BlockSection::Dense(_))
+        ));
+        assert_eq!(chunk.get_block_state_id(3, -60, 4).unwrap(), STONE);
+        assert_eq!(copy.get_block_state_id(3, -60, 4).unwrap(), WATER);
+        assert_eq!(copy.get_block_state_id(4, -60, 4).unwrap(), STONE);
+        copy.fill_layers(-64, -49, AIR).unwrap();
+        assert!(copy.is_section_allocated(0).unwrap());
+        assert_eq!(
+            copy.copy_section_block_state_ids(0).unwrap(),
+            vec![AIR; SECTION_BLOCK_COUNT]
+        );
     }
 
     #[test]

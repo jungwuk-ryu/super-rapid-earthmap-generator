@@ -7,6 +7,17 @@ Historical entries may mention render carriers such as terracotta, black concret
 research only for production purposes: the 2026-06-01 Natural Surface Contract in `docs/DECISIONS.md` supersedes them
 for generated worlds. Such blocks may remain harness-only, but must not be emitted as terrain ground.
 
+## 2026-10-09 large Linear generation performance
+
+- Status: accepted performance change; existing world content is preserved.
+- Result: full geography-to-Linear generation improves 3.03× on both 64-region
+  land and 48-region inland workloads, with the same four-core quota and one
+  generation process. This includes automatic compute-thread sizing from eight
+  threads to four; an explicit four-thread control improves 2.47×.
+- Quality: every compressed region file matches the current baseline by SHA-256
+  on warm-ups and all three AB/BA repeats; the full workspace passes 384 tests.
+- Evidence: [measurements and reproduction](CONTINENT-GENERATION-PERFORMANCE.md).
+
 ## v145 Arabia arid luma-guard rejection
 
 - Path: `D:\earthmap\quality\photo-parity\v145-arabia-arid-luma-guard-natural`

@@ -56,7 +56,7 @@ impl Tag {
         }
     }
 
-    fn write_payload(&self, output: &mut impl Write) -> Result<()> {
+    pub(crate) fn write_payload(&self, output: &mut impl Write) -> Result<()> {
         match self {
             Tag::Byte(value) => write_i8(output, *value),
             Tag::Short(value) => write_i16(output, *value),
@@ -245,7 +245,7 @@ impl Compound {
         &self.entries
     }
 
-    fn write_payload(&self, output: &mut impl Write) -> Result<()> {
+    pub(crate) fn write_payload(&self, output: &mut impl Write) -> Result<()> {
         for (name, tag) in &self.entries {
             write_u8(output, tag.type_id())?;
             write_utf(output, name)?;
@@ -508,7 +508,14 @@ fn read_len_i32(input: &mut impl Read, what: &str) -> Result<usize> {
     Ok(size as usize)
 }
 
-fn write_utf(output: &mut impl Write, value: &str) -> Result<()> {
+pub(crate) fn write_utf(output: &mut impl Write, value: &str) -> Result<()> {
+    if value.is_ascii() && !value.as_bytes().contains(&0) {
+        let length = u16::try_from(value.len())
+            .map_err(|_| MinecraftError::invalid("encoded UTF string too long"))?;
+        write_u16(output, length)?;
+        output.write_all(value.as_bytes())?;
+        return Ok(());
+    }
     let bytes = modified_utf8_bytes(value);
     if bytes.len() > u16::MAX as usize {
         return Err(MinecraftError::invalid("encoded UTF string too long"));

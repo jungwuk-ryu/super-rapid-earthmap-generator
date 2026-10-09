@@ -166,10 +166,18 @@ fn configured_surface_photo_rayon_thread_count(requested_threads: usize) -> usiz
     if let Some(explicit) = explicit_rayon_num_threads() {
         return explicit.max(1);
     }
+    let cpu_budget = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(usize::MAX);
+    default_surface_photo_rayon_thread_count(requested_threads, cpu_budget)
+}
+
+fn default_surface_photo_rayon_thread_count(requested_threads: usize, cpu_budget: usize) -> usize {
     requested_threads
         .saturating_mul(SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER)
         .max(requested_threads.max(1))
         .min(SURFACE_PHOTO_RAYON_THREAD_LIMIT)
+        .min(cpu_budget.max(1))
 }
 
 fn explicit_rayon_num_threads() -> Option<usize> {
@@ -19276,6 +19284,26 @@ mod tests {
     }
 
     #[test]
+    fn default_photo_rayon_threads_respect_cpu_budget_and_existing_limits() {
+        for (requested, cpu_budget, expected) in [
+            (0, 0, 1),
+            (1, 1, 1),
+            (1, 8, 2),
+            (4, 4, 4),
+            (4, 8, 8),
+            (10, 4, 4),
+            (10, 32, 16),
+            (usize::MAX, 4, 4),
+            (usize::MAX, usize::MAX, 16),
+        ] {
+            assert_eq!(
+                default_surface_photo_rayon_thread_count(requested, cpu_budget),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn surface_photo_worker_candidate_configs_compare_legacy_and_requested_parallel_workers() {
         let configs = surface_photo_worker_candidate_configs(10, 100);
         let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(4);
@@ -19296,10 +19324,25 @@ mod tests {
         )));
         assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
             10,
-            tuned_rayon,
-            surface_photo_parallel_column_sampling(10, tuned_rayon)
+            tuned_rayon.max(10),
+            surface_photo_parallel_column_sampling(10, tuned_rayon.max(10))
         )));
-        assert_eq!(configs.len(), 7);
+        assert_eq!(
+            configs
+                .iter()
+                .filter(|config| config.worker_count == 1)
+                .count(),
+            1
+        );
+        for workers in [2, 4, 10] {
+            assert_eq!(
+                configs
+                    .iter()
+                    .filter(|config| config.worker_count == workers)
+                    .count(),
+                if tuned_rayon > workers { 2 } else { 1 },
+            );
+        }
     }
 
     #[test]

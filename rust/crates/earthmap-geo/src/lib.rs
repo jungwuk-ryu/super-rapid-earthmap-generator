@@ -2296,6 +2296,58 @@ impl<'a> HeightmapScalarSampler<'a> {
         Ok(lerp(top, bottom, ty))
     }
 
+    /// Sample a longitude/latitude grid in row-major order, with exactly the
+    /// scalar interpolation and edge clamping. Cached raster rows are borrowed
+    /// once per output row rather than cloning two Arcs for every grid point.
+    pub fn bilinear_meters_grid(&self, longitudes: &[f64], latitudes: &[f64]) -> Result<Vec<f64>> {
+        let count = longitudes
+            .len()
+            .checked_mul(latitudes.len())
+            .ok_or_else(|| GeoError::invalid("heightmap sample grid too large"))?;
+        let mut output = Vec::with_capacity(count);
+        if longitudes.is_empty() || latitudes.is_empty() {
+            return Ok(output);
+        }
+        if self.row_cache.is_none() {
+            for &latitude in latitudes {
+                for &longitude in longitudes {
+                    output.push(self.bilinear_meters(longitude, latitude)?);
+                }
+            }
+            return Ok(output);
+        }
+        let xs = longitudes
+            .iter()
+            .map(|&longitude| {
+                let pixel_x =
+                    ((longitude - self.top_left_longitude) / self.pixel_width_degrees) - 0.5;
+                let floor_x = pixel_x.floor();
+                let x0 = clamp(floor_x as i32, self.width);
+                let x1 = clamp(x0 + 1, self.width);
+                (x0 as usize, x1 as usize, clamp_unit(pixel_x - floor_x))
+            })
+            .collect::<Vec<_>>();
+        for &latitude in latitudes {
+            let pixel_y = ((self.top_left_latitude - latitude) / self.pixel_height_degrees) - 0.5;
+            let floor_y = pixel_y.floor();
+            let y0 = clamp(floor_y as i32, self.height);
+            let y1 = clamp(y0 + 1, self.height);
+            let ty = clamp_unit(pixel_y - floor_y);
+            let row0 = self.cached_row(y0)?;
+            let row1 = if y1 == y0 {
+                Arc::clone(&row0)
+            } else {
+                self.cached_row(y1)?
+            };
+            for &(x0, x1, tx) in &xs {
+                let top = lerp(f64::from(row0[x0]), f64::from(row0[x1]), tx);
+                let bottom = lerp(f64::from(row1[x0]), f64::from(row1[x1]), tx);
+                output.push(lerp(top, bottom, ty));
+            }
+        }
+        Ok(output)
+    }
+
     fn sample_at_pixel(&self, x: i32, y: i32) -> Result<i16> {
         if let Some(cache) = self.row_cache {
             cache.sample_at_pixel(x, y)
@@ -4777,6 +4829,58 @@ mod tests {
         assert_eq!(stats.prefetch_rows, usize::MAX);
         assert_eq!(stats.prefetch_requests, 2);
         assert_eq!(stats.prefetch_loads, 2);
+    }
+
+    #[test]
+    fn heightmap_grid_matches_scalar_bits_at_centers_edges_and_outside_coverage() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("tiny-bigtiff-grid.tif");
+        fs::write(&path, synthetic_bigtiff_scalar_sampler()).unwrap();
+        let reader = GeoTiffHeightmapReader::open(&path).unwrap();
+        let cache = GeoTiffRowCache::new(&reader, 2).unwrap();
+        let longitudes = [
+            -100.0,
+            -0.5,
+            0.0,
+            0.5,
+            0.999999,
+            1.0,
+            1.5,
+            2.0,
+            2.5,
+            100.0,
+            f64::NAN,
+        ];
+        let latitudes = [100.0, 3.0, 2.5, 2.0, 1.0, 0.5, 0.0, -100.0, f64::NAN];
+        for sampler in [
+            HeightmapScalarSampler::new(&reader),
+            HeightmapScalarSampler::with_row_cache(&reader, &cache),
+        ] {
+            let actual = sampler
+                .bilinear_meters_grid(&longitudes, &latitudes)
+                .unwrap();
+            let mut index = 0;
+            for &latitude in &latitudes {
+                for &longitude in &longitudes {
+                    assert_eq!(
+                        actual[index].to_bits(),
+                        sampler
+                            .bilinear_meters(longitude, latitude)
+                            .unwrap()
+                            .to_bits()
+                    );
+                    index += 1;
+                }
+            }
+            assert!(sampler
+                .bilinear_meters_grid(&[], &latitudes)
+                .unwrap()
+                .is_empty());
+            assert!(sampler
+                .bilinear_meters_grid(&longitudes, &[])
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]

@@ -11,6 +11,15 @@ pub struct SectionPalette {
 }
 
 impl SectionPalette {
+    pub(crate) fn uniform(block_state_id: i32) -> Result<Self> {
+        block_state_ids::require_valid(block_state_id)?;
+        Self::new(
+            vec![block_state_id],
+            0,
+            PackedLongArray::from_words(SECTION_BLOCK_COUNT, 0, Vec::new())?,
+        )
+    }
+
     fn new(
         palette_block_state_ids: Vec<i32>,
         bits_per_entry: u8,
@@ -42,21 +51,29 @@ impl SectionPalette {
 
         let first = block_state_ids[0];
         block_state_ids::require_valid(first)?;
-        if block_state_ids.iter().all(|&block| block == first) {
+        let first_run_end = block_state_ids
+            .iter()
+            .position(|&block| block != first)
+            .unwrap_or(SECTION_BLOCK_COUNT);
+        if first_run_end == SECTION_BLOCK_COUNT {
             // Solid underground sections need neither an index buffer nor a
             // second 4096-value pass to validate the known zero indices.
-            return Self::new(
-                vec![first],
-                0,
-                PackedLongArray::from_words(SECTION_BLOCK_COUNT, 0, Vec::new())?,
-            );
+            return Self::uniform(first);
         }
 
         let mut palette = Vec::<i32>::with_capacity(16);
-        let mut indices = vec![0i32; SECTION_BLOCK_COUNT];
+        palette.push(first);
+        // A section has at most 4096 distinct states. The bounded stack array
+        // avoids an allocation, and long runs need one palette lookup each.
+        let mut indices = [0u16; SECTION_BLOCK_COUNT];
         let mut common_indices = [usize::MAX; 128];
+        if let Some(index) = common_indices.get_mut(first as usize) {
+            *index = 0;
+        }
 
-        for (index, block_state_id) in block_state_ids.iter().copied().enumerate() {
+        let mut run_start = first_run_end;
+        while run_start < SECTION_BLOCK_COUNT {
+            let block_state_id = block_state_ids[run_start];
             block_state_ids::require_valid(block_state_id)?;
             let cached = common_indices.get(block_state_id as usize).copied();
             let existing = match cached {
@@ -76,17 +93,49 @@ impl SectionPalette {
                     palette.len() - 1
                 }
             };
-            indices[index] = palette_index as i32;
+            let run_end = block_state_ids[run_start + 1..]
+                .iter()
+                .position(|&block| block != block_state_id)
+                .map_or(SECTION_BLOCK_COUNT, |offset| run_start + 1 + offset);
+            indices[run_start..run_end].fill(palette_index as u16);
+            run_start = run_end;
         }
 
         let bits_per_entry = bits_per_entry_for_palette_size(palette.len())?;
-        let packed_indices =
-            PackedLongArray::pack(SECTION_BLOCK_COUNT, bits_per_entry, |index| indices[index])?;
+        let packed_indices = if bits_per_entry == 4 {
+            // Each index has already been bounded by a palette of 2..=16
+            // entries. Pack sixteen nibbles per word, with no padding bits.
+            let words = indices
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|values| {
+                    let mut word = 0;
+                    for (index, &value) in values.iter().enumerate() {
+                        word |= u64::from(value) << (index * 4);
+                    }
+                    word
+                })
+                .collect();
+            PackedLongArray::from_words(SECTION_BLOCK_COUNT, 4, words)?
+        } else {
+            PackedLongArray::pack(SECTION_BLOCK_COUNT, bits_per_entry, |index| {
+                i32::from(indices[index])
+            })?
+        };
         Self::new(palette, bits_per_entry, packed_indices)
     }
 
     pub fn palette_size(&self) -> usize {
         self.palette_block_state_ids.len()
+    }
+
+    pub(crate) fn palette_block_state_ids(&self) -> &[i32] {
+        &self.palette_block_state_ids
+    }
+
+    pub(crate) fn packed_data_words(&self) -> &[u64] {
+        self.packed_indices.data_words()
     }
 
     pub fn bits_per_entry(&self) -> u8 {
@@ -230,6 +279,35 @@ mod tests {
         let mut invalid = [STONE; SECTION_BLOCK_COUNT];
         invalid[SECTION_BLOCK_COUNT - 1] = -1;
         assert!(SectionPalette::pack_block_states(&invalid).is_err());
+    }
+
+    #[test]
+    fn runs_crossing_packed_words_preserve_palette_order_and_full_section_capacity() {
+        for distinct in [2, 16, 17, 4096] {
+            for run_length in [1, 15, 16, 17, 255] {
+                let states = (0..SECTION_BLOCK_COUNT)
+                    .map(|index| i32::MAX - ((index / run_length) % distinct) as i32)
+                    .collect::<Vec<_>>();
+                let count = distinct.min((SECTION_BLOCK_COUNT - 1) / run_length + 1);
+                let section = SectionPalette::pack_block_states(&states).unwrap();
+                assert_eq!(
+                    section.copy_palette_block_state_ids(),
+                    (0..count)
+                        .map(|index| i32::MAX - index as i32)
+                        .collect::<Vec<_>>()
+                );
+                let reference = PackedLongArray::pack(
+                    SECTION_BLOCK_COUNT,
+                    bits_per_entry_for_palette_size(count).unwrap(),
+                    |index| ((index / run_length) % distinct) as i32,
+                )
+                .unwrap();
+                assert_eq!(section.copy_packed_data(), reference.copy_data());
+                for (index, state) in states.into_iter().enumerate() {
+                    assert_eq!(section.block_state_id_at(index).unwrap(), state);
+                }
+            }
+        }
     }
 
     #[test]
