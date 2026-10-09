@@ -950,6 +950,7 @@ dependencies = [
  "earthmap-core",
  "earthmap-minecraft",
  "flate2",
+ "rayon",
  "xxhash-rust",
  "zstd",
 ]

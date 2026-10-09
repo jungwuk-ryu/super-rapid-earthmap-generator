@@ -19,11 +19,24 @@ impl PackedLongArray {
         require_shape(value_count, bits_per_value)?;
         let mask = mask_for(bits_per_value);
         let mut packed = vec![0u64; word_count(value_count, bits_per_value)?];
-        for index in 0..value_count {
-            let value = values(index);
-            require_value_fits(value, mask, bits_per_value)?;
-            if bits_per_value > 0 {
-                write_value(&mut packed, index, bits_per_value, mask, value);
+        if bits_per_value == 0 {
+            for index in 0..value_count {
+                require_value_fits(values(index), mask, bits_per_value)?;
+            }
+        } else {
+            // Traverse each word's entries in their original order. Computing
+            // a quotient and remainder for every block dominates small palettes.
+            let per_word = values_per_word(bits_per_value);
+            let mut index = 0;
+            for word in &mut packed {
+                let mut bit_offset = 0;
+                for _ in 0..per_word.min(value_count - index) {
+                    let value = values(index);
+                    require_value_fits(value, mask, bits_per_value)?;
+                    *word |= ((value as u64) & mask) << bit_offset;
+                    bit_offset += usize::from(bits_per_value);
+                    index += 1;
+                }
             }
         }
         Self::from_words(value_count, bits_per_value, packed)
@@ -96,14 +109,6 @@ pub fn word_count(value_count: usize, bits_per_value: u8) -> Result<usize> {
         return Err(MinecraftError::invalid("packed array too large"));
     }
     Ok(words)
-}
-
-fn write_value(packed: &mut [u64], index: usize, bits_per_value: u8, mask: u64, value: i32) {
-    let values_per_word = values_per_word(bits_per_value);
-    let word_index = index / values_per_word;
-    let bit_offset = (index % values_per_word) * usize::from(bits_per_value);
-    let masked_value = (value as u64) & mask;
-    packed[word_index] |= masked_value << bit_offset;
 }
 
 fn values_per_word(bits_per_value: u8) -> usize {
@@ -215,6 +220,44 @@ mod tests {
         assert_eq!(full_section.get(11).unwrap(), 11);
         assert_eq!(full_section.get(12).unwrap(), 12);
         assert_eq!(full_section.get(4095).unwrap(), 31);
+    }
+
+    #[test]
+    fn word_traversal_preserves_all_widths_padding_and_value_callback_order() {
+        for bits in 0..=31 {
+            for count in [0, 1, 13, 65, 256, 4096] {
+                let mask = mask_for(bits);
+                let mut calls = Vec::new();
+                let packed = PackedLongArray::pack(count, bits, |index| {
+                    calls.push(index);
+                    ((index as u64 * 31) & mask) as i32
+                })
+                .unwrap();
+                assert_eq!(calls, (0..count).collect::<Vec<_>>());
+                let mut expected = vec![0_u64; word_count(count, bits).unwrap()];
+                for index in 0..count {
+                    let value = (index as u64 * 31) & mask;
+                    assert_eq!(packed.get(index).unwrap(), value as i32);
+                    if bits > 0 {
+                        let per_word = 64 / usize::from(bits);
+                        expected[index / per_word] |=
+                            value << ((index % per_word) * usize::from(bits));
+                    }
+                }
+                assert_eq!(packed.copy_data_words(), expected);
+            }
+        }
+        let mut calls = Vec::new();
+        let error = PackedLongArray::pack(65, 4, |index| {
+            calls.push(index);
+            if index == 17 {
+                16
+            } else {
+                0
+            }
+        });
+        assert!(error.is_err());
+        assert_eq!(calls, (0..=17).collect::<Vec<_>>());
     }
 
     #[test]

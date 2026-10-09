@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use rayon::prelude::*;
 use xxhash_rust::xxh64::xxh64;
 
 pub const MODULE_STATUS: &str = "phase3-region-writer-bootstrap";
@@ -289,9 +290,13 @@ pub fn write_mca_region_with_compression(
     }
     let path = path.as_ref();
     let mut entries = Vec::new();
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(compression_level));
     for (pos, payload) in chunk_payloads {
         validate_payload(*pos, payload)?;
-        let compressed = zlib(payload, compression_level)?;
+        encoder.write_all(payload)?;
+        // Finish an independent stream and reset its dictionary/checksum.
+        // Reuse zlib's working memory across the region's 1024 chunks.
+        let compressed = encoder.reset(Vec::new())?;
         let chunk_length = compressed
             .len()
             .checked_add(1)
@@ -497,6 +502,7 @@ pub fn sectors_for(byte_count: usize) -> Result<usize> {
     Ok(byte_count.div_ceil(MCA_SECTOR_BYTES))
 }
 
+#[cfg(test)]
 fn zlib(payload: &[u8], compression_level: u32) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(compression_level));
     encoder.write_all(payload)?;
@@ -526,21 +532,24 @@ fn build_linear_buckets(
     timestamp: i64,
     compression_level: i32,
 ) -> Result<Vec<Option<Vec<u8>>>> {
-    let mut buckets = Vec::with_capacity(LINEAR_BUCKET_COUNT);
     let cell_count = usize::from(REGION_CHUNK_WIDTH) / usize::from(LINEAR_GRID_SIZE);
-    for bucket_x in 0..usize::from(LINEAR_GRID_SIZE) {
-        for bucket_z in 0..usize::from(LINEAR_GRID_SIZE) {
-            buckets.push(build_linear_bucket(
+    // Bucket indices retain the Java X-major order. Collect results first so
+    // parallel completion cannot change which invalid payload is reported.
+    (0..LINEAR_BUCKET_COUNT)
+        .into_par_iter()
+        .map(|index| {
+            build_linear_bucket(
                 chunk_payloads,
                 timestamp,
                 compression_level,
                 cell_count,
-                bucket_x,
-                bucket_z,
-            )?);
-        }
-    }
-    Ok(buckets)
+                index / usize::from(LINEAR_GRID_SIZE),
+                index % usize::from(LINEAR_GRID_SIZE),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn build_linear_bucket(
@@ -1339,6 +1348,79 @@ mod tests {
         assert_eq!(sectors_for(1).unwrap(), 1);
         assert_eq!(sectors_for(4096).unwrap(), 1);
         assert_eq!(sectors_for(4097).unwrap(), 2);
+    }
+
+    #[test]
+    fn region_compression_preserves_bytes_and_error_order_across_thread_counts() {
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut payloads = full_region_payloads();
+        payloads.insert(
+            ChunkLocalPos::new(31, 31).unwrap(),
+            b"mixed stone/dirt/grass palette".repeat(4096),
+        );
+        payloads.insert(
+            ChunkLocalPos::new(0, 1).unwrap(),
+            (0..131071).map(|index| (index * 31) as u8).collect(),
+        );
+        for (format, levels) in [
+            (RegionFormat::Mca, vec![0, 1, 6, 9]),
+            (RegionFormat::Linear, vec![1, 4, 9]),
+        ] {
+            let extension = format.extension();
+            let first = temp_region_path(&format!("r.3.-4.{extension}"));
+            let second = temp_region_path(&format!("r.3.-4.{extension}"));
+            for level in levels {
+                let write = |path: &Path, payloads: &BTreeMap<ChunkLocalPos, Vec<u8>>| match format
+                {
+                    RegionFormat::Mca => {
+                        write_mca_region_with_compression(path, payloads, 42, level as u32)
+                    }
+                    RegionFormat::Linear => {
+                        write_linear_v2_region_with_compression(path, payloads, 42, level)
+                    }
+                };
+                single.install(|| write(&first, &payloads)).unwrap();
+                parallel.install(|| write(&second, &payloads)).unwrap();
+                assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+                assert_eq!(read_region_payloads(&second).unwrap().chunks, payloads);
+                if format == RegionFormat::Mca {
+                    let bytes = fs::read(&second).unwrap();
+                    for (pos, payload) in &payloads {
+                        let offset = (read_u32_be(&bytes, pos.header_index() * 4).unwrap() >> 8)
+                            as usize
+                            * MCA_SECTOR_BYTES;
+                        let length = read_u32_be(&bytes, offset).unwrap() as usize;
+                        // Compare compressed bytes with a fresh encoder, not
+                        // just the decompressed content of the reused stream.
+                        assert_eq!(
+                            &bytes[offset + 5..offset + 4 + length],
+                            zlib(payload, level as u32).unwrap()
+                        );
+                    }
+                }
+                let mut invalid = payloads.clone();
+                invalid.insert(ChunkLocalPos::new(1, 0).unwrap(), Vec::new());
+                invalid.insert(ChunkLocalPos::new(0, 1).unwrap(), Vec::new());
+                let expected = single
+                    .install(|| write(&first, &invalid))
+                    .unwrap_err()
+                    .to_string();
+                let actual = parallel
+                    .install(|| write(&second, &invalid))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(actual, expected);
+            }
+            fs::remove_file(first).unwrap();
+            fs::remove_file(second).unwrap();
+        }
     }
 
     #[test]

@@ -5,6 +5,11 @@ Status reviewed: 2026-06-11.
 The original optimization scope is complete. Keep this file because the crash/CPU-utilization follow-up below still has
 open items and real-run evidence that should not be collapsed into the operations guide.
 
+The 2026-10-09 land-generation optimization and reproducible benchmarks are in
+[`LAND-GENERATION-PERFORMANCE.md`](LAND-GENERATION-PERFORMANCE.md). The current
+prefetch implementation shares one compute pool; the split-pool experiments
+below describe earlier implementations.
+
 ## Scope
 
 - [x] Pause the currently running full-Earth generation before changing code.

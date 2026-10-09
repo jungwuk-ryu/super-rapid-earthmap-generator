@@ -176,11 +176,55 @@ impl ChunkModel {
         Ok(())
     }
 
+    /// Fill every X/Z column between the inclusive Y bounds, preserving the
+    /// section allocation behavior of calling `fill_column` for each column.
+    pub fn fill_layers(
+        &mut self,
+        from_y_inclusive: i32,
+        to_y_inclusive: i32,
+        block_state_id: i32,
+    ) -> Result<()> {
+        block_state_ids::require_valid(block_state_id)?;
+        if from_y_inclusive > to_y_inclusive {
+            return Ok(());
+        }
+        let start_section = self.dimension.section_index_for_block_y(from_y_inclusive)?;
+        let end_section = self.dimension.section_index_for_block_y(to_y_inclusive)?;
+        for section_index in start_section..=end_section {
+            let section_min_y = self.dimension.min_y() + section_index as i32 * SECTION_HEIGHT;
+            let start_y = from_y_inclusive.max(section_min_y) - section_min_y;
+            let end_y = to_y_inclusive.min(section_min_y + SECTION_HEIGHT - 1) - section_min_y;
+            let section = self.section_or_allocate(section_index);
+            section[start_y as usize * CHUNK_WIDTH * CHUNK_WIDTH
+                ..(end_y as usize + 1) * CHUNK_WIDTH * CHUNK_WIDTH]
+                .fill(block_state_id);
+        }
+        Ok(())
+    }
+
     pub fn copy_section_block_state_ids(&self, section_index: i32) -> Result<Vec<i32>> {
         let section_index = self.section_index(section_index)?;
         Ok(self.sections[section_index]
             .clone()
             .unwrap_or_else(|| vec![block_state_ids::AIR; SECTION_BLOCK_COUNT]))
+    }
+
+    pub(crate) fn section_block_state_ids(&self, section_index: i32) -> Result<Option<&[i32]>> {
+        let section_index = self.section_index(section_index)?;
+        Ok(self.sections[section_index].as_deref())
+    }
+
+    pub(crate) fn section_biome_ids(
+        &self,
+        section_index: i32,
+    ) -> Result<impl ExactSizeIterator<Item = &str>> {
+        let section_index = self.section_index(section_index)?;
+        let biomes = self.section_biomes[section_index].as_deref();
+        Ok((0..SECTION_BIOME_CELL_COUNT).map(move |index| {
+            biomes
+                .and_then(|biomes| biomes[index].as_deref())
+                .unwrap_or(&self.biome_id)
+        }))
     }
 
     pub fn copy_section_biome_ids(&self, section_index: i32) -> Result<Vec<String>> {
@@ -337,6 +381,43 @@ mod tests {
 
         chunk.fill_column(3, 4, 10, 9, WATER).unwrap();
         assert_eq!(chunk.allocated_section_count(), 1);
+    }
+
+    #[test]
+    fn filling_layers_matches_individual_columns_with_partial_sections_and_air() {
+        for dimension in [
+            OVERWORLD_1_21_11.clone(),
+            DimensionProfile::new("test:short", -32, 64).unwrap(),
+        ] {
+            let mut layers = ChunkModel::new(dimension.clone(), 1, -2);
+            let mut columns = layers.clone();
+            for (from, to, block) in [
+                (dimension.min_y(), dimension.max_y_inclusive(), STONE),
+                (dimension.min_y() + 3, dimension.min_y() + 19, WATER),
+                (
+                    dimension.max_y_inclusive() - 7,
+                    dimension.max_y_inclusive(),
+                    AIR,
+                ),
+                (10, 9, STONE),
+            ] {
+                layers.fill_layers(from, to, block).unwrap();
+                for z in 0..CHUNK_WIDTH as i32 {
+                    for x in 0..CHUNK_WIDTH as i32 {
+                        columns.fill_column(x, z, from, to, block).unwrap();
+                    }
+                }
+                assert_eq!(layers, columns);
+            }
+            assert!(layers.fill_layers(dimension.min_y() - 1, 0, STONE).is_err());
+            assert!(layers
+                .fill_layers(0, dimension.max_y_inclusive() + 1, STONE)
+                .is_err());
+            assert!(layers.fill_layers(10, 9, -1).is_err());
+            let mut air = ChunkModel::new(dimension, 1, -2);
+            air.fill_layers(0, 0, AIR).unwrap();
+            assert_eq!(air.allocated_section_count(), 1);
+        }
     }
 
     #[test]

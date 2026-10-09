@@ -40,18 +40,39 @@ impl SectionPalette {
             )));
         }
 
+        let first = block_state_ids[0];
+        block_state_ids::require_valid(first)?;
+        if block_state_ids.iter().all(|&block| block == first) {
+            // Solid underground sections need neither an index buffer nor a
+            // second 4096-value pass to validate the known zero indices.
+            return Self::new(
+                vec![first],
+                0,
+                PackedLongArray::from_words(SECTION_BLOCK_COUNT, 0, Vec::new())?,
+            );
+        }
+
         let mut palette = Vec::<i32>::with_capacity(16);
         let mut indices = vec![0i32; SECTION_BLOCK_COUNT];
+        let mut common_indices = [usize::MAX; 128];
 
         for (index, block_state_id) in block_state_ids.iter().copied().enumerate() {
             block_state_ids::require_valid(block_state_id)?;
-            let palette_index = match palette
-                .iter()
-                .position(|candidate| *candidate == block_state_id)
-            {
+            let cached = common_indices.get(block_state_id as usize).copied();
+            let existing = match cached {
+                Some(usize::MAX) => None,
+                Some(index) => Some(index),
+                None => palette
+                    .iter()
+                    .position(|candidate| *candidate == block_state_id),
+            };
+            let palette_index = match existing {
                 Some(existing) => existing,
                 None => {
                     palette.push(block_state_id);
+                    if let Some(index) = common_indices.get_mut(block_state_id as usize) {
+                        *index = palette.len() - 1;
+                    }
                     palette.len() - 1
                 }
             };
@@ -176,6 +197,39 @@ mod tests {
         assert_eq!(section.block_state_id_at(0).unwrap(), STONE);
         assert_eq!(section.block_state_id_at(1).unwrap(), WATER);
         assert_eq!(section.block_state_id_at(2).unwrap(), AIR);
+    }
+
+    #[test]
+    fn optimized_palettes_preserve_large_ids_and_first_seen_packed_indices() {
+        for palette_size in [1, 2, 16, 17, 80, 129] {
+            let ids = (0..palette_size)
+                .map(|index| {
+                    if index % 3 == 0 {
+                        i32::MAX - index
+                    } else {
+                        index
+                    }
+                })
+                .collect::<Vec<_>>();
+            let states = (0..SECTION_BLOCK_COUNT)
+                .map(|index| ids[index % ids.len()])
+                .collect::<Vec<_>>();
+            let section = SectionPalette::pack_block_states(&states).unwrap();
+            assert_eq!(section.copy_palette_block_state_ids(), ids);
+            let bits = bits_per_entry_for_palette_size(ids.len()).unwrap();
+            let reference = PackedLongArray::pack(SECTION_BLOCK_COUNT, bits, |index| {
+                (index % ids.len()) as i32
+            })
+            .unwrap();
+            assert_eq!(section.copy_packed_data(), reference.copy_data());
+            for (index, state) in states.into_iter().enumerate() {
+                assert_eq!(section.block_state_id_at(index).unwrap(), state);
+            }
+        }
+        assert!(SectionPalette::pack_block_states(&[-1; SECTION_BLOCK_COUNT]).is_err());
+        let mut invalid = [STONE; SECTION_BLOCK_COUNT];
+        invalid[SECTION_BLOCK_COUNT - 1] = -1;
+        assert!(SectionPalette::pack_block_states(&invalid).is_err());
     }
 
     #[test]

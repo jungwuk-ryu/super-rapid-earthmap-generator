@@ -44,6 +44,24 @@ const OPEN_OCEAN_BATHYMETRY_ROW_CACHE_ROWS: usize = 256;
 static PHOTO_SURFACE_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 static SURFACE_PHASE_DETAIL_ENABLED: OnceLock<bool> = OnceLock::new();
 const PHOTO_CIEDE_CACHE_MAX_ENTRIES: usize = 262_144;
+const PHOTO_LAB_CACHE_MAX_ENTRIES: usize = 16_384;
+const PHOTO_PALETTE_SOLVE_CACHE_MAX_ENTRIES: usize = 8_192;
+const STATIC_CARRIER_CACHE_MAX_ENTRIES: usize = 4_096;
+const NOISE_CELL_CACHE_ENTRIES: usize = 1_024;
+
+#[derive(Clone, Copy)]
+struct NoiseCell {
+    seed: i64,
+    x: i32,
+    z: i32,
+    corners: [f64; 4],
+}
+
+#[derive(Clone, Copy)]
+struct PhotoColorCacheEntry<T> {
+    key: u64,
+    value: T,
+}
 
 fn photo_surface_trace_enabled() -> bool {
     cfg!(test)
@@ -71,7 +89,11 @@ fn surface_phase_detail_enabled() -> bool {
 }
 
 thread_local! {
-    static PHOTO_CIEDE_CACHE: RefCell<HashMap<u64, f64>> = RefCell::new(HashMap::with_capacity(PHOTO_CIEDE_CACHE_MAX_ENTRIES));
+    static PHOTO_CIEDE_CACHE: RefCell<Vec<PhotoColorCacheEntry<f64>>> = RefCell::new(vec![PhotoColorCacheEntry { key: u64::MAX, value: 0.0 }; PHOTO_CIEDE_CACHE_MAX_ENTRIES]);
+    static PHOTO_LAB_CACHE: RefCell<Vec<PhotoColorCacheEntry<[f64; 3]>>> = RefCell::new(vec![PhotoColorCacheEntry { key: u64::MAX, value: [0.0; 3] }; PHOTO_LAB_CACHE_MAX_ENTRIES]);
+    static PHOTO_PALETTE_SOLVE_CACHE: RefCell<HashMap<PhotoPaletteSolveKey<'static>, PhotoSurfaceSolve>> = RefCell::new(HashMap::new());
+    static NOISE_CELL_CACHE: RefCell<Vec<Option<NoiseCell>>> = RefCell::new(vec![None; NOISE_CELL_CACHE_ENTRIES]);
+    static STATIC_CARRIER_CACHE: RefCell<HashMap<(i32, Cow<'static, str>), StaticCarrier>> = RefCell::new(HashMap::new());
 }
 
 fn photo_surface_trace(args: fmt::Arguments<'_>) -> String {
@@ -3324,20 +3346,23 @@ fn surface_material_with_surface(
     column
 }
 
-fn mark_surface_material(column: EarthSurfaceColumn, decision_source: &str) -> EarthSurfaceColumn {
-    column.with_decision_source(decision_source)
+fn mark_surface_material(
+    mut column: EarthSurfaceColumn,
+    decision_source: &str,
+) -> EarthSurfaceColumn {
+    column.decision_source = normalize_text_default(decision_source.to_string(), "unknown");
+    column
 }
 
 fn with_surface_material_metadata(
-    column: EarthSurfaceColumn,
+    mut column: EarthSurfaceColumn,
     sample: &SurfaceMaterialSample,
 ) -> EarthSurfaceColumn {
-    let mut with_evidence =
-        column.with_data_evidence_flags(surface_data_evidence::from_sample(sample));
+    column.data_evidence_flags = surface_data_evidence::from_sample(sample);
     if sample.terrain_token_color.available {
-        with_evidence = with_evidence.with_terrain_token_source(sample.terrain_token_source);
+        column.terrain_token_source = sample.terrain_token_source;
     }
-    with_evidence
+    column
 }
 
 fn surface_material_bathymetry_ground_surface_y(
@@ -4933,26 +4958,39 @@ fn surface_material_textured_smooth_box(
     edge_degrees: f64,
     seed: i64,
 ) -> f64 {
-    let longitude_jitter = (surface_material_ecology_noise(longitude, latitude, 0.38, seed) - 0.5)
-        * edge_degrees
-        * 2.8;
-    let latitude_jitter = (surface_material_ecology_noise(
-        longitude,
-        latitude,
-        0.38,
-        seed ^ (0x9e3779b97f4a7c15_u64 as i64),
-    ) - 0.5)
-        * edge_degrees
-        * 2.8;
-    let score = smooth_box(
-        longitude + longitude_jitter,
-        latitude + latitude_jitter,
-        min_longitude,
-        max_longitude,
-        min_latitude,
-        max_latitude,
-        edge_degrees,
-    );
+    // Noise is in [0, 1], so jitter cannot reach past 1.4 * edge_degrees.
+    // Use a conservative 2 * edge bound to omit only provably zero box work.
+    // The edge texture still contributes outside the box and must be evaluated.
+    let margin = edge_degrees * 2.0;
+    let outside = longitude < min_longitude - margin
+        || longitude > max_longitude + margin
+        || latitude < min_latitude - margin
+        || latitude > max_latitude + margin;
+    let score = if outside {
+        0.0
+    } else {
+        let longitude_jitter = (surface_material_ecology_noise(longitude, latitude, 0.38, seed)
+            - 0.5)
+            * edge_degrees
+            * 2.8;
+        let latitude_jitter = (surface_material_ecology_noise(
+            longitude,
+            latitude,
+            0.38,
+            seed ^ (0x9e3779b97f4a7c15_u64 as i64),
+        ) - 0.5)
+            * edge_degrees
+            * 2.8;
+        smooth_box(
+            longitude + longitude_jitter,
+            latitude + latitude_jitter,
+            min_longitude,
+            max_longitude,
+            min_latitude,
+            max_latitude,
+            edge_degrees,
+        )
+    };
     let edge_texture = surface_material_ecology_noise(
         longitude,
         latitude,
@@ -5039,6 +5077,38 @@ impl PhotoSurfaceInput {
     pub fn with_token_luma_profile(mut self, profile: Arc<PhotoSurfaceTokenLumaProfile>) -> Self {
         self.token_luma_profile = Some(profile);
         self
+    }
+}
+
+// The public input owns its data for diagnostics. Generation borrows the region
+// samples instead, avoiding per-column sample clones and Arc reference traffic.
+struct PhotoSurfaceContext<'a> {
+    semantic_column: &'a EarthSurfaceColumn,
+    sample: &'a SurfaceMaterialSample,
+    elevation_meters: f64,
+    latitude: f64,
+    coast_factor: f64,
+    local_relief_meters: f64,
+    global_block_x: i32,
+    global_block_z: i32,
+    token_luma_profile: Option<&'a PhotoSurfaceTokenLumaProfile>,
+    palette_solves: Option<&'a HashMap<PhotoPaletteSolveKey<'a>, PhotoSurfaceSolve>>,
+}
+
+impl<'a> From<&'a PhotoSurfaceInput> for PhotoSurfaceContext<'a> {
+    fn from(input: &'a PhotoSurfaceInput) -> Self {
+        Self {
+            semantic_column: &input.semantic_column,
+            sample: &input.sample,
+            elevation_meters: input.elevation_meters,
+            latitude: input.latitude,
+            coast_factor: input.coast_factor,
+            local_relief_meters: input.local_relief_meters,
+            global_block_x: input.global_block_x,
+            global_block_z: input.global_block_z,
+            token_luma_profile: input.token_luma_profile.as_deref(),
+            palette_solves: None,
+        }
     }
 }
 
@@ -5177,15 +5247,10 @@ impl PhotoSurfaceDecision {
     }
 
     pub fn to_column(&self, semantic_column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
-        if self.top_block_state_id == semantic_column.top_block_state_id
-            && self.filler_block_state_id == semantic_column.filler_block_state_id
-        {
-            return semantic_column
-                .with_biome_id(self.biome_id.clone())
-                .with_decision_source(self.recipe_id.clone());
-        }
+        let same_surface = self.top_block_state_id == semantic_column.top_block_state_id
+            && self.filler_block_state_id == semantic_column.filler_block_state_id;
         let mut column = EarthSurfaceColumn::new(
-            false,
+            same_surface && semantic_column.water,
             semantic_column.ground_surface_y,
             semantic_column.water_surface_y,
             self.top_block_state_id,
@@ -5197,12 +5262,35 @@ impl PhotoSurfaceDecision {
         column.data_evidence_flags = semantic_column.data_evidence_flags;
         column
     }
+
+    fn into_column(self, semantic_column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
+        let same_surface = self.top_block_state_id == semantic_column.top_block_state_id
+            && self.filler_block_state_id == semantic_column.filler_block_state_id;
+        let mut column = EarthSurfaceColumn::new(
+            same_surface && semantic_column.water,
+            semantic_column.ground_surface_y,
+            semantic_column.water_surface_y,
+            self.top_block_state_id,
+            self.filler_block_state_id,
+            self.biome_id,
+            self.recipe_id,
+        );
+        column.terrain_token_source = semantic_column.terrain_token_source;
+        column.data_evidence_flags = semantic_column.data_evidence_flags;
+        column
+    }
 }
 
 pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDecision> {
+    solve_photo_surface_with_context(&PhotoSurfaceContext::from(input))
+}
+
+fn solve_photo_surface_with_context(
+    input: &PhotoSurfaceContext<'_>,
+) -> Result<PhotoSurfaceDecision> {
     if input.semantic_column.water {
         return Ok(PhotoSurfaceDecision::from_column(
-            &input.semantic_column,
+            input.semantic_column,
             "water",
             "semantic water column preserved",
         ));
@@ -5210,7 +5298,7 @@ pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDeci
     let source = input.sample.color;
     if !source.available || source.is_near_black() {
         return Ok(PhotoSurfaceDecision::from_column(
-            &input.semantic_column,
+            input.semantic_column,
             "no-photo-source",
             "photo source unavailable or near black",
         ));
@@ -5280,7 +5368,7 @@ pub fn solve_photo_surface(input: &PhotoSurfaceInput) -> Result<PhotoSurfaceDeci
 }
 
 pub fn apply_photo_surface_material(input: &PhotoSurfaceInput) -> Result<EarthSurfaceColumn> {
-    Ok(solve_photo_surface(input)?.to_column(&input.semantic_column))
+    Ok(solve_photo_surface(input)?.into_column(&input.semantic_column))
 }
 
 fn photo_solver_biome(
@@ -5293,7 +5381,11 @@ fn photo_solver_biome(
     semantic_column.biome_id.clone()
 }
 
-fn photo_solver_biome_for_top(input: &PhotoSurfaceInput, top: i32, source: RgbColor) -> String {
+fn photo_solver_biome_for_top(
+    input: &PhotoSurfaceContext<'_>,
+    top: i32,
+    source: RgbColor,
+) -> String {
     if is_tinted_vegetation_block(top) {
         return photo_solver_tinted_vegetation_biome(input, top, source);
     }
@@ -5301,7 +5393,7 @@ fn photo_solver_biome_for_top(input: &PhotoSurfaceInput, top: i32, source: RgbCo
 }
 
 fn photo_solver_tinted_vegetation_biome(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     top: i32,
     source: RgbColor,
 ) -> String {
@@ -5313,7 +5405,7 @@ fn photo_solver_tinted_vegetation_biome(
     let mut best: Option<(&str, f64)> = None;
     for_each_photo_solver_grass_biome(
         fallback,
-        &input.sample,
+        input.sample,
         input.elevation_meters,
         input.latitude,
         input.local_relief_meters,
@@ -5419,7 +5511,7 @@ fn photo_solver_tropical(latitude: f64, sample: &SurfaceMaterialSample) -> bool 
 }
 
 fn solve_authoritative_arid_token_surface(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
 ) -> Option<PhotoSurfaceDecision> {
     if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette {
@@ -5466,7 +5558,7 @@ fn solve_authoritative_arid_token_surface(
 }
 
 fn solve_java_standard_vegetation_token_surface(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
 ) -> Option<PhotoSurfaceDecision> {
     if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette {
@@ -5544,7 +5636,7 @@ fn solve_java_standard_vegetation_token_surface(
 }
 
 fn solve_java_standard_static_token_surface(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
 ) -> Option<PhotoSurfaceDecision> {
     if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette {
@@ -5565,33 +5657,14 @@ fn solve_java_standard_static_token_surface(
     {
         return None;
     }
-    let target = photo_blend(
-        source,
-        input.sample.terrain_token_color,
-        java_standard_render_anchor_weight(source, input.sample.terrain_token_color, token),
-    );
-    let blocks = match token.kind {
-        MetTerrainKind::CoarseDirt => &PALETTE_COARSE_DIRT_CANDIDATES[..],
-        MetTerrainKind::Gravel | MetTerrainKind::Rock => &PALETTE_ROCK_CANDIDATES[..],
-        _ => return None,
-    };
-    let mut best: Option<PhotoSurfaceSolve> = None;
-    for &top in blocks {
-        if top == block_state_ids::SNOW_BLOCK {
-            continue;
-        }
-        let biome = compatible_biome_for_palette_non_grass(&input.semantic_column.biome_id, top);
-        let candidate = java_standard_palette_candidate(input, source, target, token, top, biome);
-        if best
-            .as_ref()
-            .is_none_or(|current| candidate.score < current.score)
-        {
-            best = Some(candidate);
-        }
-    }
+    let (context, key) = photo_palette_solve_context(input, source, token);
+    let solve = input
+        .palette_solves
+        .and_then(|solves| solves.get(&key).cloned())
+        .or_else(|| cached_photo_palette_solve(input, context, token, key))?;
     Some(photo_surface_decision_from_solve(
         input,
-        best?,
+        solve,
         "photo-palette",
         "palette-token-solver",
         source,
@@ -5630,8 +5703,40 @@ struct JavaStandardPaletteCandidateContext {
     dark_standard_shadow: bool,
 }
 
+// Cache vegetation and static palette solves. The coordinate-dependent wet
+// carrier choice is represented explicitly; arid texture and profile dithering
+// stay in their original per-column paths.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PhotoPaletteSolveKey<'a> {
+    source_rgb: i32,
+    target_rgb: i32,
+    token_rgb: i32,
+    base_biome: Cow<'a, str>,
+    preferred_biome: Cow<'a, str>,
+    snow_context: bool,
+    dark_standard_shadow: bool,
+    coastal_sand_halo: bool,
+    wet_carrier_dither: bool,
+}
+
+impl PhotoPaletteSolveKey<'_> {
+    fn into_owned(self) -> PhotoPaletteSolveKey<'static> {
+        PhotoPaletteSolveKey {
+            source_rgb: self.source_rgb,
+            target_rgb: self.target_rgb,
+            token_rgb: self.token_rgb,
+            base_biome: Cow::Owned(self.base_biome.into_owned()),
+            preferred_biome: Cow::Owned(self.preferred_biome.into_owned()),
+            snow_context: self.snow_context,
+            dark_standard_shadow: self.dark_standard_shadow,
+            coastal_sand_halo: self.coastal_sand_halo,
+            wet_carrier_dither: self.wet_carrier_dither,
+        }
+    }
+}
+
 impl JavaStandardPaletteCandidateContext {
-    fn new(input: &PhotoSurfaceInput, source: RgbColor, target: RgbColor) -> Self {
+    fn new(input: &PhotoSurfaceContext<'_>, source: RgbColor, target: RgbColor) -> Self {
         Self {
             target_rgb: rgb_color_to_i32(target),
             source_rgb: rgb_color_to_i32(source),
@@ -5643,7 +5748,7 @@ impl JavaStandardPaletteCandidateContext {
 }
 
 fn java_standard_vegetation_palette_solve(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     token: MetTerrainMatch,
 ) -> Option<PhotoSurfaceSolve> {
@@ -5651,18 +5756,140 @@ fn java_standard_vegetation_palette_solve(
     if !token_color.available || !source.available || source.is_near_black() {
         return None;
     }
+    let (candidate_context, key) = photo_palette_solve_context(input, source, token);
+    input
+        .palette_solves
+        .and_then(|baselines| baselines.get(&key).cloned())
+        .or_else(|| cached_photo_palette_solve(input, candidate_context, token, key))
+}
+
+fn photo_palette_solve_context<'a>(
+    input: &PhotoSurfaceContext<'a>,
+    source: RgbColor,
+    token: MetTerrainMatch,
+) -> (
+    JavaStandardPaletteCandidateContext,
+    PhotoPaletteSolveKey<'a>,
+) {
+    let token_color = input.sample.terrain_token_color;
     let target = photo_blend(
         source,
         token_color,
         java_standard_render_anchor_weight(source, token_color, token),
     );
     let candidate_context = JavaStandardPaletteCandidateContext::new(input, source, target);
+    let biomes = photo_solver_grass_biome_candidates(
+        &input.semantic_column.biome_id,
+        input.sample,
+        input.elevation_meters,
+        input.latitude,
+        input.local_relief_meters,
+    );
+    let key = PhotoPaletteSolveKey {
+        source_rgb: candidate_context.source_rgb,
+        target_rgb: candidate_context.target_rgb,
+        token_rgb: met_terrain_match_rgb(token),
+        base_biome: Cow::Borrowed(input.semantic_column.biome_id.as_str()),
+        preferred_biome: Cow::Borrowed(biomes.preferred),
+        snow_context: candidate_context.snow_context,
+        dark_standard_shadow: candidate_context.dark_standard_shadow,
+        coastal_sand_halo: input.coast_factor >= 0.70
+            && !is_photo_solver_naturally_sandy_biome(&input.semantic_column.biome_id),
+        wet_carrier_dither: token_rgb(token) == 0x323C1E
+            && photo_dither_threshold(
+                input.global_block_x,
+                input.global_block_z,
+                token.top_block_state_id,
+                block_state_ids::OAK_LEAVES,
+            ) < 5,
+    };
+    (candidate_context, key)
+}
+
+fn cached_photo_palette_solve(
+    input: &PhotoSurfaceContext<'_>,
+    candidate_context: JavaStandardPaletteCandidateContext,
+    token: MetTerrainMatch,
+    key: PhotoPaletteSolveKey<'_>,
+) -> Option<PhotoSurfaceSolve> {
+    let cached = PHOTO_PALETTE_SOLVE_CACHE.with(|cache| cache.borrow().get(&key).cloned());
+    match cached {
+        Some(baseline) => Some(baseline),
+        None => {
+            let solve = if matches!(token.kind, MetTerrainKind::Vegetated | MetTerrainKind::Wet) {
+                let baseline =
+                    java_standard_vegetation_palette_baseline(input, candidate_context, token)?;
+                direct_java_standard_vegetation_recipe_solve(
+                    input,
+                    input.sample.color,
+                    token,
+                    &baseline,
+                )
+                .or_else(|| {
+                    preferred_java_standard_carrier_solve(
+                        input,
+                        input.sample.color,
+                        token,
+                        &baseline,
+                    )
+                })
+                .unwrap_or(baseline)
+            } else {
+                java_standard_static_palette_solve(input, candidate_context, token)?
+            };
+            PHOTO_PALETTE_SOLVE_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if cache.len() >= PHOTO_PALETTE_SOLVE_CACHE_MAX_ENTRIES {
+                    cache.clear();
+                }
+                cache.insert(key.into_owned(), solve.clone());
+            });
+            Some(solve)
+        }
+    }
+}
+
+fn java_standard_static_palette_solve(
+    input: &PhotoSurfaceContext<'_>,
+    context: JavaStandardPaletteCandidateContext,
+    token: MetTerrainMatch,
+) -> Option<PhotoSurfaceSolve> {
+    let blocks = match token.kind {
+        MetTerrainKind::CoarseDirt => &PALETTE_COARSE_DIRT_CANDIDATES[..],
+        MetTerrainKind::Gravel | MetTerrainKind::Rock => &PALETTE_ROCK_CANDIDATES[..],
+        _ => return None,
+    };
+    let mut best: Option<PhotoSurfaceSolve> = None;
+    for &top in blocks {
+        if top == block_state_ids::SNOW_BLOCK {
+            continue;
+        }
+        let biome =
+            compatible_biome_for_palette_non_grass_cow(&input.semantic_column.biome_id, top);
+        let score =
+            java_standard_palette_candidate_score_with_context(input, context, token, top, &biome);
+        if best.as_ref().is_none_or(|current| score < current.score) {
+            best = Some(PhotoSurfaceSolve {
+                top_block_state_id: top,
+                biome_id: biome.into_owned(),
+                score,
+            });
+        }
+    }
+    best
+}
+
+fn java_standard_vegetation_palette_baseline(
+    input: &PhotoSurfaceContext<'_>,
+    candidate_context: JavaStandardPaletteCandidateContext,
+    token: MetTerrainMatch,
+) -> Option<PhotoSurfaceSolve> {
     let mut best: Option<PhotoSurfaceSolve> = None;
     for &top in PHOTO_SOLVER_CANDIDATE_BLOCKS {
         if is_tinted_vegetation_block(top) {
             for_each_photo_solver_grass_biome(
                 &input.semantic_column.biome_id,
-                &input.sample,
+                input.sample,
                 input.elevation_meters,
                 input.latitude,
                 input.local_relief_meters,
@@ -5705,14 +5932,11 @@ fn java_standard_vegetation_palette_solve(
             }
         }
     }
-    let baseline = best?;
-    direct_java_standard_vegetation_recipe_solve(input, source, token, &baseline)
-        .or_else(|| preferred_java_standard_carrier_solve(input, source, token, &baseline))
-        .or(Some(baseline))
+    best
 }
 
 fn java_standard_palette_candidate(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     target: RgbColor,
     token: MetTerrainMatch,
@@ -5724,7 +5948,7 @@ fn java_standard_palette_candidate(
 }
 
 fn java_standard_palette_candidate_with_context(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     context: JavaStandardPaletteCandidateContext,
     token: MetTerrainMatch,
     top: i32,
@@ -5745,7 +5969,7 @@ fn java_standard_palette_candidate_with_context(
 }
 
 fn java_standard_palette_candidate_score_with_context(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     context: JavaStandardPaletteCandidateContext,
     token: MetTerrainMatch,
     top: i32,
@@ -5765,7 +5989,7 @@ fn java_standard_palette_candidate_base_score(
 }
 
 fn photo_surface_decision_from_solve(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     solve: PhotoSurfaceSolve,
     recipe_id: &str,
     stage_id: &str,
@@ -5777,22 +6001,24 @@ fn photo_surface_decision_from_solve(
     } else {
         smoother_filler_for(solve.top_block_state_id)
     };
+    let rendered_rgb = render_surface_color(solve.top_block_state_id, Some(&solve.biome_id));
+    let trace = photo_surface_trace(format_args!(
+        "sourceRgb={},{},{};{};top={};biome={}",
+        source.red, source.green, source.blue, reason, solve.top_block_state_id, solve.biome_id
+    ));
     PhotoSurfaceDecision::new(
         solve.top_block_state_id,
         filler,
-        solve.biome_id.clone(),
-        render_surface_color(solve.top_block_state_id, Some(&solve.biome_id)),
+        solve.biome_id,
+        rendered_rgb,
         recipe_id,
         stage_id,
-        photo_surface_trace(format_args!(
-            "sourceRgb={},{},{};{};top={};biome={}",
-            source.red, source.green, source.blue, reason, solve.top_block_state_id, solve.biome_id
-        )),
+        trace,
     )
 }
 
 fn photo_surface_decision_for_top(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     top: i32,
     recipe_id: &str,
     stage_id: &str,
@@ -5805,22 +6031,16 @@ fn photo_surface_decision_for_top(
     } else {
         smoother_filler_for(top)
     };
-    PhotoSurfaceDecision::new(
-        top,
-        filler,
-        biome.clone(),
-        render_surface_color(top, Some(&biome)),
-        recipe_id,
-        stage_id,
-        photo_surface_trace(format_args!(
-            "sourceRgb={},{},{};{};top={};biome={}",
-            source.red, source.green, source.blue, reason, top, biome
-        )),
-    )
+    let rendered_rgb = render_surface_color(top, Some(&biome));
+    let trace = photo_surface_trace(format_args!(
+        "sourceRgb={},{},{};{};top={};biome={}",
+        source.red, source.green, source.blue, reason, top, biome
+    ));
+    PhotoSurfaceDecision::new(top, filler, biome, rendered_rgb, recipe_id, stage_id, trace)
 }
 
 fn ordered_arid_token_top(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     token: MetTerrainMatch,
 ) -> i32 {
@@ -5834,7 +6054,7 @@ fn ordered_arid_token_top(
     } else {
         &PALETTE_SAND_CANDIDATES[..]
     };
-    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    let biome = photo_solver_biome(input.semantic_column, input.sample);
     let mut scored = candidates
         .iter()
         .copied()
@@ -5878,7 +6098,7 @@ fn ordered_arid_token_top(
 }
 
 fn cross_crop_arid_right_slots(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     token: MetTerrainMatch,
     first: i32,
@@ -5910,11 +6130,11 @@ fn source_ranked_cross_crop_token(token: MetTerrainMatch) -> bool {
 }
 
 fn learned_cross_crop_source_luma_rank(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     token: MetTerrainMatch,
 ) -> f64 {
-    if let Some(profile) = input.token_luma_profile.as_deref() {
+    if let Some(profile) = input.token_luma_profile {
         if let Some(rank) = profile.normalized_luma(token, source) {
             return rank;
         }
@@ -5967,7 +6187,7 @@ fn met_terrain_match_rgb(token: MetTerrainMatch) -> i32 {
 }
 
 fn java_standard_tan_carrier_top(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     palette_top: i32,
 ) -> i32 {
@@ -5989,7 +6209,7 @@ fn java_standard_tan_carrier_top(
         block_state_ids::CALCITE,
         block_state_ids::WHITE_TERRACOTTA,
     ];
-    let biome = photo_solver_biome(&input.semantic_column, &input.sample);
+    let biome = photo_solver_biome(input.semantic_column, input.sample);
     candidates
         .iter()
         .copied()
@@ -6002,7 +6222,7 @@ fn java_standard_tan_carrier_top(
         .unwrap_or(block_state_ids::SANDSTONE)
 }
 
-fn photo_solver_dry_context(input: &PhotoSurfaceInput, source: RgbColor) -> bool {
+fn photo_solver_dry_context(input: &PhotoSurfaceContext<'_>, source: RgbColor) -> bool {
     let biome = input.semantic_column.biome_id.as_str();
     let eco_biome = input.sample.ecoregion_biome_id.as_str();
     let eco_name = input.sample.ecoregion_name.as_str();
@@ -6048,7 +6268,7 @@ fn photo_solver_olive_vegetation_like(source: RgbColor) -> bool {
 }
 
 fn photo_solver_gray_rock_source_for_sand_token(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
 ) -> bool {
     let value = f64::from(photo_color_value(source)) / 255.0;
@@ -6057,7 +6277,7 @@ fn photo_solver_gray_rock_source_for_sand_token(
         && (input.local_relief_meters >= 80.0 || input.elevation_meters >= 700.0)
 }
 
-fn photo_solver_dark_standard_shadow(input: &PhotoSurfaceInput) -> bool {
+fn photo_solver_dark_standard_shadow(input: &PhotoSurfaceContext<'_>) -> bool {
     if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette
         || !input.sample.terrain_token_color.available
         || !input.sample.color.available
@@ -6169,7 +6389,7 @@ fn java_standard_source_render_preservation_score_with_context(
 }
 
 fn java_standard_palette_candidate_bias_with_context(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     context: JavaStandardPaletteCandidateContext,
     token: MetTerrainMatch,
     top: i32,
@@ -6229,7 +6449,7 @@ fn java_standard_palette_candidate_bias_with_context(
 }
 
 fn preferred_java_standard_carrier_solve(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     token: MetTerrainMatch,
     baseline: &PhotoSurfaceSolve,
@@ -6319,7 +6539,7 @@ fn preferred_java_standard_carrier(token: MetTerrainMatch) -> Option<(i32, Optio
 }
 
 fn direct_java_standard_vegetation_recipe_solve(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     token: MetTerrainMatch,
     baseline: &PhotoSurfaceSolve,
@@ -6368,7 +6588,7 @@ fn direct_java_standard_vegetation_recipe_solve(
         if is_tinted_vegetation_block(top) {
             for_each_photo_solver_grass_biome(
                 &input.semantic_column.biome_id,
-                &input.sample,
+                input.sample,
                 input.elevation_meters,
                 input.latitude,
                 input.local_relief_meters,
@@ -6413,7 +6633,7 @@ fn direct_java_standard_vegetation_recipe_solve(
 }
 
 fn java_standard_dry_grass_texture_candidate(
-    input: &PhotoSurfaceInput,
+    input: &PhotoSurfaceContext<'_>,
     source: RgbColor,
     standard: RgbColor,
 ) -> Option<PhotoSurfaceSolve> {
@@ -6603,7 +6823,7 @@ fn compatible_biome_for_palette_non_grass_cow(biome: &str, top: i32) -> Cow<'_, 
     Cow::Borrowed(fallback)
 }
 
-fn is_photo_solver_coastal_sand_halo_candidate(top: i32, input: &PhotoSurfaceInput) -> bool {
+fn is_photo_solver_coastal_sand_halo_candidate(top: i32, input: &PhotoSurfaceContext<'_>) -> bool {
     is_photo_solver_sand_like_carrier(top)
         && input.coast_factor >= 0.70
         && !is_photo_solver_naturally_sandy_biome(&input.semantic_column.biome_id)
@@ -6715,21 +6935,26 @@ fn photo_ciede2000_rgb_rgb(left_rgb: i32, right_rgb: i32) -> f64 {
 
 fn photo_ciede2000_rgb_pair_cached(left_rgb: i32, right_rgb: i32) -> f64 {
     let key = photo_ciede_cache_key(left_rgb, right_rgb);
-    if let Some(cached) = PHOTO_CIEDE_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
-        return cached;
+    let slot = photo_color_cache_slot(key, PHOTO_CIEDE_CACHE_MAX_ENTRIES);
+    let cached = PHOTO_CIEDE_CACHE.with(|cache| cache.borrow()[slot]);
+    if cached.key == key {
+        return cached.value;
     }
     let value = photo_ciede2000(
         photo_rgb_i32_to_lab(left_rgb),
         photo_rgb_i32_to_lab(right_rgb),
     );
     PHOTO_CIEDE_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.len() >= PHOTO_CIEDE_CACHE_MAX_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(key, value);
+        cache.borrow_mut()[slot] = PhotoColorCacheEntry { key, value };
     });
     value
+}
+
+fn photo_color_cache_slot(key: u64, entries: usize) -> usize {
+    // Full RGB keys are checked on every hit. A collision only recomputes the
+    // exact value; no colors or distances are quantized. Fixed tables avoid
+    // hashing and repeatedly clearing all palette colors at a cache limit.
+    (key.wrapping_mul(0x9e3779b97f4a7c15) >> (64 - entries.trailing_zeros())) as usize
 }
 
 fn photo_ciede_cache_key(left_rgb: i32, right_rgb: i32) -> u64 {
@@ -6737,7 +6962,18 @@ fn photo_ciede_cache_key(left_rgb: i32, right_rgb: i32) -> u64 {
 }
 
 fn photo_rgb_i32_to_lab(color: i32) -> [f64; 3] {
-    photo_rgb_to_lab((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff)
+    let color = color & 0x00ff_ffff;
+    let key = color as u64;
+    let slot = photo_color_cache_slot(key, PHOTO_LAB_CACHE_MAX_ENTRIES);
+    let cached = PHOTO_LAB_CACHE.with(|cache| cache.borrow()[slot]);
+    if cached.key == key {
+        return cached.value;
+    }
+    let value = photo_rgb_to_lab((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+    PHOTO_LAB_CACHE.with(|cache| {
+        cache.borrow_mut()[slot] = PhotoColorCacheEntry { key, value };
+    });
+    value
 }
 
 fn photo_ciede2000(left: [f64; 3], right: [f64; 3]) -> f64 {
@@ -6875,7 +7111,7 @@ fn fine_photo_solver_hash(x: i32, z: i32) -> f64 {
     ((hash >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
 }
 
-fn photo_solver_snow_evidence(input: &PhotoSurfaceInput, source: RgbColor) -> bool {
+fn photo_solver_snow_evidence(input: &PhotoSurfaceContext<'_>, source: RgbColor) -> bool {
     if input.sample.snow_cover_ratio() >= 0.10 {
         return true;
     }
@@ -6911,7 +7147,7 @@ fn photo_luma_rgb(rgb: i32) -> f64 {
         + (f64::from(rgb & 0xff) * 0.0722)
 }
 
-fn arid_token_candidate_bias(source: RgbColor, top: i32, input: &PhotoSurfaceInput) -> f64 {
+fn arid_token_candidate_bias(source: RgbColor, top: i32, input: &PhotoSurfaceContext<'_>) -> f64 {
     let mut bias = 0.0;
     if top == block_state_ids::SAND && input.coast_factor >= 0.70 {
         bias += 9.0;
@@ -9163,12 +9399,12 @@ fn load_met_png_rgb(image_path: &Path) -> Result<MetTerrainImage> {
     let mut pixels = Vec::with_capacity(width.saturating_mul(height));
     match info.color_type {
         png::ColorType::Rgb => {
-            for chunk in bytes.chunks_exact(3) {
+            for chunk in bytes.as_chunks::<3>().0 {
                 pixels.push(RgbColor::of(chunk[0], chunk[1], chunk[2]));
             }
         }
         png::ColorType::Rgba => {
-            for chunk in bytes.chunks_exact(4) {
+            for chunk in bytes.as_chunks::<4>().0 {
                 pixels.push(RgbColor::of(chunk[0], chunk[1], chunk[2]));
             }
         }
@@ -9178,7 +9414,7 @@ fn load_met_png_rgb(image_path: &Path) -> Result<MetTerrainImage> {
             }
         }
         png::ColorType::GrayscaleAlpha => {
-            for chunk in bytes.chunks_exact(2) {
+            for chunk in bytes.as_chunks::<2>().0 {
                 pixels.push(RgbColor::of(chunk[0], chunk[0], chunk[0]));
             }
         }
@@ -10755,7 +10991,8 @@ impl MetOctreeNode {
 }
 
 fn nearest_image_magick_remap(color: RgbColor) -> Option<usize> {
-    let nodes = build_met_remap_tree();
+    static NODES: OnceLock<Vec<MetOctreeNode>> = OnceLock::new();
+    let nodes = NODES.get_or_init(build_met_remap_tree);
     let rgb = met_rgb(color);
     let mut node = 0usize;
     for bit in (1..=7).rev() {
@@ -10770,7 +11007,7 @@ fn nearest_image_magick_remap(color: RgbColor) -> Option<usize> {
         entry: None,
         distance_squared: i32::MAX,
     };
-    find_met_closest(&nodes, search_root, color, &mut closest);
+    find_met_closest(nodes, search_root, color, &mut closest);
     closest.entry
 }
 
@@ -12155,8 +12392,14 @@ pub fn classify_shaped_surface_scaled(
 }
 
 pub fn normalize_surface_column_for_chunk(column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
+    normalize_surface_column_for_chunk_borrowed(column).into_owned()
+}
+
+fn normalize_surface_column_for_chunk_borrowed(
+    column: &EarthSurfaceColumn,
+) -> Cow<'_, EarthSurfaceColumn> {
     if !column.water {
-        return column.clone();
+        return Cow::Borrowed(column);
     }
     let water_surface_y = if column.water_surface_y == i32::MIN {
         SEA_LEVEL_Y
@@ -12168,7 +12411,7 @@ pub fn normalize_surface_column_for_chunk(column: &EarthSurfaceColumn) -> EarthS
         ground_y = MIN_SURFACE_Y.max(water_surface_y - 1);
     }
     if ground_y == column.ground_surface_y && water_surface_y == column.water_surface_y {
-        return column.clone();
+        return Cow::Borrowed(column);
     }
     let mut normalized = EarthSurfaceColumn::new(
         true,
@@ -12181,17 +12424,28 @@ pub fn normalize_surface_column_for_chunk(column: &EarthSurfaceColumn) -> EarthS
     );
     normalized.terrain_token_source = column.terrain_token_source;
     normalized.data_evidence_flags = column.data_evidence_flags;
-    normalized
+    Cow::Owned(normalized)
 }
 
 pub fn sanitize_surface_column_for_production(column: &EarthSurfaceColumn) -> EarthSurfaceColumn {
+    sanitize_surface_column_for_production_borrowed(column).into_owned()
+}
+
+fn sanitize_surface_column_for_production_borrowed(
+    column: &EarthSurfaceColumn,
+) -> Cow<'_, EarthSurfaceColumn> {
     if !column.water && is_photo_preserved_natural_surface_column(column) {
         let top = column.top_block_state_id;
         let filler = smoother_filler_for(top);
         if filler == column.filler_block_state_id {
-            return column.clone();
+            return Cow::Borrowed(column);
         }
-        return replace_surface_blocks(column, top, filler, "photo-natural-surface");
+        return Cow::Owned(replace_surface_blocks(
+            column,
+            top,
+            filler,
+            "photo-natural-surface",
+        ));
     }
     let mut top =
         production_surface_top_for_water(column.top_block_state_id, &column.biome_id, column.water);
@@ -12230,9 +12484,14 @@ pub fn sanitize_surface_column_for_production(column: &EarthSurfaceColumn) -> Ea
         filler = filler_for_production_top(top);
     }
     if top == column.top_block_state_id && filler == column.filler_block_state_id {
-        return column.clone();
+        return Cow::Borrowed(column);
     }
-    replace_surface_blocks(column, top, filler, "natural-surface")
+    Cow::Owned(replace_surface_blocks(
+        column,
+        top,
+        filler,
+        "natural-surface",
+    ))
 }
 
 pub fn build_surface_chunk(
@@ -12280,20 +12539,32 @@ where
 {
     let expected_columns = CHUNK_WIDTH * CHUNK_WIDTH;
     let mut chunk = ChunkModel::overworld(chunk_x, chunk_z);
+    // Every column shares this underground prefix. Fill contiguous layers once
+    // before writing the variable terrain, rather than striding through the
+    // same sections 256 times. OSM overlays only write their own columns.
+    let common_stone_top = (0..expected_columns)
+        .map(|index| {
+            let column = normalize_surface_column_for_chunk_borrowed(column_at(index));
+            (-63).max(column.ground_surface_y - 4)
+        })
+        .min()
+        .unwrap_or(-63);
+    chunk.fill_layers(-64, -64, block_state_ids::BEDROCK)?;
+    chunk.fill_layers(-63, common_stone_top, block_state_ids::STONE)?;
     let mut land_columns = 0;
     let mut water_columns = 0;
     let mut min_ground_y = i32::MAX;
     let mut max_ground_y = i32::MIN;
-    let mut biome_by_local_column = vec![String::new(); expected_columns];
+    let mut biome_by_local_column = vec![""; expected_columns];
     let mut biome_min_y_by_local_column = vec![0; expected_columns];
     let mut biome_max_y_by_local_column = vec![0; expected_columns];
     let mut ground_surface_y_by_local_column = vec![0; expected_columns];
     let mut water_by_local_column = vec![false; expected_columns];
-    let mut biome_counts = BTreeMap::<String, i32>::new();
+    let mut biome_counts = BTreeMap::<&str, i32>::new();
     for local_z in 0..CHUNK_WIDTH {
         for local_x in 0..CHUNK_WIDTH {
             let column_index = (local_z * CHUNK_WIDTH) + local_x;
-            let column = normalize_surface_column_for_chunk(column_at(column_index));
+            let column = normalize_surface_column_for_chunk_borrowed(column_at(column_index));
             if column.water {
                 water_columns += 1;
             } else {
@@ -12301,7 +12572,8 @@ where
             }
             min_ground_y = min_ground_y.min(column.ground_surface_y);
             max_ground_y = max_ground_y.max(column.ground_surface_y);
-            biome_by_local_column[column_index] = column.biome_id.clone();
+            let biome_id = column_at(column_index).biome_id.as_str();
+            biome_by_local_column[column_index] = biome_id;
             biome_min_y_by_local_column[column_index] = column.ground_surface_y;
             biome_max_y_by_local_column[column_index] = if column.water {
                 column.water_surface_y
@@ -12310,8 +12582,14 @@ where
             };
             ground_surface_y_by_local_column[column_index] = column.ground_surface_y;
             water_by_local_column[column_index] = column.water;
-            *biome_counts.entry(column.biome_id.clone()).or_insert(0) += 1;
-            fill_surface_column(&mut chunk, local_x as i32, local_z as i32, &column)?;
+            *biome_counts.entry(biome_id).or_insert(0) += 1;
+            fill_surface_column_above_stone_prefix(
+                &mut chunk,
+                local_x as i32,
+                local_z as i32,
+                &column,
+                common_stone_top,
+            )?;
             apply_osm_surface_overlay(
                 &mut chunk,
                 local_x as i32,
@@ -12325,7 +12603,7 @@ where
     }
     let biome = dominant_surface_biome(&biome_counts);
     chunk.set_biome_id(biome.clone())?;
-    apply_surface_biome_cells(
+    apply_surface_biome_cells_impl(
         &mut chunk,
         &biome_by_local_column,
         &biome_min_y_by_local_column,
@@ -12612,11 +12890,34 @@ where
         classify_nanos: u128,
         semantic_apply_nanos: u128,
         smoothed_elevation: f64,
-        longitude: f64,
         latitude: f64,
         local_relief_meters: f64,
         global_block_x: i32,
         global_block_z: i32,
+    }
+
+    impl SurfaceColumnSampleBuild<'_> {
+        fn photo_context<'a>(
+            &'a self,
+            vertical_scale: f64,
+            profile: &'a PhotoSurfaceTokenLumaProfile,
+        ) -> Option<PhotoSurfaceContext<'a>> {
+            if self.column.water {
+                return None;
+            }
+            Some(PhotoSurfaceContext {
+                semantic_column: &self.column,
+                sample: self.material.as_ref()?.as_sample(),
+                elevation_meters: self.smoothed_elevation,
+                latitude: self.latitude,
+                coast_factor: self.coast_factor,
+                local_relief_meters: self.local_relief_meters * vertical_scale,
+                global_block_x: self.global_block_x,
+                global_block_z: self.global_block_z,
+                token_luma_profile: Some(profile),
+                palette_solves: None,
+            })
+        }
     }
 
     let detailed_column_phase_timing = surface_phase_detail_enabled();
@@ -12719,7 +13020,6 @@ where
             classify_nanos,
             semantic_apply_nanos,
             smoothed_elevation,
-            longitude,
             latitude,
             local_relief_meters,
             global_block_x,
@@ -12779,28 +13079,80 @@ where
         let photo_token_luma_profile = Arc::new(photo_token_luma_profile);
         phase_nanos.photo_profile = phase_start.elapsed().as_nanos();
         let phase_start = Instant::now();
-        let columns = column_builds
+        // Deduplicate candidate work before Rayon distributes columns. A thread
+        // cache alone repeats the same search on several workers and can thrash
+        // when a large region has many colors. This region table is immutable,
+        // needs no locks, and is bounded by the number of sampled columns.
+        let mut solve_jobs = HashMap::new();
+        for (index, build) in column_builds.iter().enumerate() {
+            let Some(input) = build.photo_context(vertical_scale, &photo_token_luma_profile) else {
+                continue;
+            };
+            if input.sample.terrain_token_source != TerrainTokenSource::JavaStandardPalette
+                || !input.sample.color.available
+                || input.sample.color.is_near_black()
+            {
+                continue;
+            }
+            let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+            if !token.confident()
+                || !matches!(
+                    token.kind,
+                    MetTerrainKind::Vegetated
+                        | MetTerrainKind::Wet
+                        | MetTerrainKind::CoarseDirt
+                        | MetTerrainKind::Gravel
+                        | MetTerrainKind::Rock
+                )
+            {
+                continue;
+            }
+            if !matches!(token.kind, MetTerrainKind::Vegetated | MetTerrainKind::Wet)
+                && (photo_solver_snow_evidence(&input, input.sample.color)
+                    || photo_solver_source_looks_clearly_green(SurfaceColorMetrics::from(
+                        input.sample.color,
+                    )))
+            {
+                continue;
+            }
+            if matches!(token.kind, MetTerrainKind::Vegetated | MetTerrainKind::Wet)
+                && (photo_solver_dark_standard_shadow(&input)
+                    || (token.kind == MetTerrainKind::Vegetated
+                        && token.top_block_state_id == block_state_ids::GRASS_BLOCK
+                        && photo_solver_gray_olive_standard_target(input.sample.color)))
+            {
+                continue;
+            }
+            let (_, key) = photo_palette_solve_context(&input, input.sample.color, token);
+            solve_jobs.entry(key).or_insert(index);
+        }
+        let palette_solves = solve_jobs
             .into_par_iter()
+            .filter_map(|(key, index)| {
+                let input = column_builds[index]
+                    .photo_context(vertical_scale, &photo_token_luma_profile)?;
+                let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+                let context = JavaStandardPaletteCandidateContext {
+                    target_rgb: key.target_rgb,
+                    source_rgb: key.source_rgb,
+                    source_luma: photo_luma(input.sample.color),
+                    snow_context: key.snow_context,
+                    dark_standard_shadow: key.dark_standard_shadow,
+                };
+                let baseline = cached_photo_palette_solve(&input, context, token, key.clone())?;
+                Some((key, baseline))
+            })
+            .collect::<HashMap<_, _>>();
+        let columns = column_builds
+            .par_iter()
             .map(|build| -> Result<EarthSurfaceColumn> {
-                if let Some(material) = build.material {
-                    if build.column.water {
-                        return Ok(build.column);
-                    }
-                    return apply_surface_region_photo_material_sample(
-                        build.column,
-                        material.as_sample(),
-                        build.smoothed_elevation,
-                        build.longitude,
-                        build.latitude,
-                        build.coast_factor,
-                        build.local_relief_meters,
-                        build.global_block_x,
-                        build.global_block_z,
-                        vertical_scale,
-                        Some(&photo_token_luma_profile),
-                    );
+                if let Some(mut input) =
+                    build.photo_context(vertical_scale, &photo_token_luma_profile)
+                {
+                    input.palette_solves = Some(&palette_solves);
+                    return Ok(solve_photo_surface_with_context(&input)?.into_column(&build.column));
                 }
-                Ok(build.column)
+                Ok(build.column.clone())
             })
             .collect::<Result<Vec<_>>>()?;
         phase_nanos.photo_apply = phase_start.elapsed().as_nanos();
@@ -12813,8 +13165,8 @@ where
     };
 
     let phase_start = Instant::now();
-    let cleaned = post_process_surface_region_columns(
-        &columns,
+    let cleaned = post_process_surface_region_columns_owned(
+        columns,
         &coast_factors,
         SURFACE_REGION_WIDTH,
         texture_mode,
@@ -12823,25 +13175,85 @@ where
     SurfaceRegionSample::new_with_phase_nanos(cleaned, phase_nanos)
 }
 
+#[cfg(test)]
 fn post_process_surface_region_columns(
     columns: &[EarthSurfaceColumn],
     coast_factors: &[f64],
     width: usize,
     texture_mode: SurfaceTextureMode,
 ) -> Result<Vec<EarthSurfaceColumn>> {
+    post_process_surface_region_columns_owned(columns.to_vec(), coast_factors, width, texture_mode)
+}
+
+fn post_process_surface_region_columns_owned(
+    columns: Vec<EarthSurfaceColumn>,
+    coast_factors: &[f64],
+    width: usize,
+    texture_mode: SurfaceTextureMode,
+) -> Result<Vec<EarthSurfaceColumn>> {
+    require_surface_grid_width(&columns, width)?;
     let post_smoothed = match texture_mode {
         SurfaceTextureMode::Photo => {
-            let stabilized = stabilize_surface_biome_families_preserving_surfaces(columns, width)?;
-            let smoothed = smooth_photo_textures(&stabilized, width)?;
-            stabilize_small_surface_biome_family_components(&smoothed, width, true)
+            // Each pass makes decisions against its complete input snapshot.
+            // Apply the recorded changes only after that pass finishes, reusing
+            // the unchanged columns through all five passes.
+            let mut result = columns;
+            for pass in [
+                stabilize_surface_biome_cells_changes
+                    as fn(&[EarthSurfaceColumn], usize, bool) -> _,
+                stabilize_small_surface_biome_family_components_changes,
+            ] {
+                let changes = pass(&result, width, true);
+                apply_surface_column_changes(&mut result, changes);
+            }
+            let changes = smooth_photo_texture_local_changes(&result, width);
+            apply_surface_column_changes(&mut result, changes);
+            let changes = smooth_photo_macro_vegetation_changes(&result, width);
+            apply_surface_column_changes(&mut result, changes);
+            let changes =
+                stabilize_small_surface_biome_family_components_changes(&result, width, true);
+            apply_surface_column_changes(&mut result, changes);
+            result
         }
         SurfaceTextureMode::Classified => {
-            let stabilized = stabilize_surface_biome_families(columns, width)?;
+            let stabilized = stabilize_surface_biome_families(&columns, width)?;
             let smoothed = smooth_surface_classes(&stabilized, width)?;
             stabilize_small_surface_biome_family_components(&smoothed, width, false)
         }
     };
-    clean_coastal_surface_columns(&post_smoothed, coast_factors, width)
+    if coast_factors.len() != post_smoothed.len() {
+        return Err(SurfaceError::invalid(
+            "width must divide columns and coastFactors must match columns",
+        ));
+    }
+    Ok(post_smoothed
+        .into_iter()
+        .zip(coast_factors)
+        .map(|(column, &coast)| {
+            let cleaned = if column.water {
+                clean_water_surface_column(&column, coast)
+            } else {
+                clean_land_surface_column(&column, coast)
+            };
+            let column = match cleaned {
+                Cow::Borrowed(_) => column,
+                Cow::Owned(cleaned) => cleaned,
+            };
+            match sanitize_surface_column_for_production_borrowed(&column) {
+                Cow::Borrowed(_) => column,
+                Cow::Owned(cleaned) => cleaned,
+            }
+        })
+        .collect())
+}
+
+fn apply_surface_column_changes(
+    columns: &mut [EarthSurfaceColumn],
+    changes: Vec<(usize, EarthSurfaceColumn)>,
+) {
+    for (index, column) in changes {
+        columns[index] = column;
+    }
 }
 fn should_sample_surface_material(
     material_sampler: &dyn SurfaceMaterialSampler,
@@ -13603,7 +14015,7 @@ fn apply_surface_region_photo_material_sample(
     semantic_column: EarthSurfaceColumn,
     sample: &SurfaceMaterialSample,
     elevation_meters: f64,
-    longitude: f64,
+    _longitude: f64,
     latitude: f64,
     coast_factor: f64,
     local_relief_meters: f64,
@@ -13612,21 +14024,19 @@ fn apply_surface_region_photo_material_sample(
     vertical_scale: f64,
     token_luma_profile: Option<&Arc<PhotoSurfaceTokenLumaProfile>>,
 ) -> Result<EarthSurfaceColumn> {
-    let mut input = PhotoSurfaceInput::new_shared(
-        semantic_column,
-        Arc::new(sample.clone()),
+    let input = PhotoSurfaceContext {
+        semantic_column: &semantic_column,
+        sample,
         elevation_meters,
-        longitude,
         latitude,
         coast_factor,
-        local_relief_meters * vertical_scale,
+        local_relief_meters: local_relief_meters * vertical_scale,
         global_block_x,
         global_block_z,
-    );
-    if let Some(profile) = token_luma_profile {
-        input = input.with_token_luma_profile(Arc::clone(profile));
-    }
-    apply_photo_surface_material(&input)
+        token_luma_profile: token_luma_profile.map(AsRef::as_ref),
+        palette_solves: None,
+    };
+    Ok(solve_photo_surface_with_context(&input)?.into_column(&semantic_column))
 }
 
 #[cfg(test)]
@@ -14355,37 +14765,50 @@ pub fn clean_coastal_surface_column(
     } else {
         clean_land_surface_column(column, coast_factor)
     };
-    sanitize_surface_column_for_production(&cleaned)
+    sanitize_surface_column_for_production_borrowed(&cleaned).into_owned()
 }
 
-fn clean_land_surface_column(column: &EarthSurfaceColumn, coast_factor: f64) -> EarthSurfaceColumn {
+fn clean_land_surface_column(
+    column: &EarthSurfaceColumn,
+    coast_factor: f64,
+) -> Cow<'_, EarthSurfaceColumn> {
     if coast_factor < NEAR_COAST_FACTOR
         || column.ground_surface_y > SEA_LEVEL_Y + 4
         || (!is_rock_surface_top(column.top_block_state_id)
             && !is_sand_surface_top(column.top_block_state_id))
     {
-        return column.clone();
+        return Cow::Borrowed(column);
     }
     let top = land_shore_top(&column.biome_id);
-    replace_surface_blocks(column, top, land_shore_filler(top), "coastal-cleanup")
+    Cow::Owned(replace_surface_blocks(
+        column,
+        top,
+        land_shore_filler(top),
+        "coastal-cleanup",
+    ))
 }
 
 fn clean_water_surface_column(
     column: &EarthSurfaceColumn,
     coast_factor: f64,
-) -> EarthSurfaceColumn {
+) -> Cow<'_, EarthSurfaceColumn> {
     if coast_factor < SHALLOW_WATER_COAST_FACTOR
         || (!is_rock_surface_top(column.top_block_state_id)
             && !is_sand_surface_top(column.top_block_state_id))
     {
-        return column.clone();
+        return Cow::Borrowed(column);
     }
     let depth = 0.max(column.water_surface_y - column.ground_surface_y);
     if depth > 9 && coast_factor < IMMEDIATE_COAST_FACTOR {
-        return column.clone();
+        return Cow::Borrowed(column);
     }
     let top = water_floor_top(&column.biome_id, depth);
-    replace_surface_blocks(column, top, top, "coastal-water-cleanup")
+    Cow::Owned(replace_surface_blocks(
+        column,
+        top,
+        top,
+        "coastal-water-cleanup",
+    ))
 }
 
 fn land_shore_top(biome: &str) -> i32 {
@@ -14507,6 +14930,22 @@ pub fn apply_surface_biome_cells(
     max_y_by_local_column: &[i32],
     chunk_default_biome: &str,
 ) -> Result<()> {
+    apply_surface_biome_cells_impl(
+        chunk,
+        biome_by_local_column,
+        min_y_by_local_column,
+        max_y_by_local_column,
+        chunk_default_biome,
+    )
+}
+
+fn apply_surface_biome_cells_impl(
+    chunk: &mut ChunkModel,
+    biome_by_local_column: &[impl AsRef<str>],
+    min_y_by_local_column: &[i32],
+    max_y_by_local_column: &[i32],
+    chunk_default_biome: &str,
+) -> Result<()> {
     let expected_columns = CHUNK_WIDTH * CHUNK_WIDTH;
     if biome_by_local_column.len() != expected_columns
         || min_y_by_local_column.len() != expected_columns
@@ -14559,13 +14998,13 @@ pub fn apply_surface_biome_cells(
 
 fn render_aware_surface_biome_cell(
     chunk: &ChunkModel,
-    biome_by_local_column: &[String],
+    biome_by_local_column: &[impl AsRef<str>],
     min_y_by_local_column: &[i32],
     max_y_by_local_column: &[i32],
     cell_x: usize,
     cell_z: usize,
 ) -> Result<SurfaceBiomeCell> {
-    let mut counts = BTreeMap::<String, i32>::new();
+    let mut counts = BTreeMap::<&str, i32>::new();
     let mut min_y = i32::MAX;
     let mut max_y = i32::MIN;
     for dz in 0..BIOME_CELL_WIDTH {
@@ -14574,7 +15013,7 @@ fn render_aware_surface_biome_cell(
             let local_z = (cell_z * BIOME_CELL_WIDTH) + dz;
             let column_index = (local_z * CHUNK_WIDTH) + local_x;
             *counts
-                .entry(biome_by_local_column[column_index].clone())
+                .entry(biome_by_local_column[column_index].as_ref())
                 .or_insert(0) += 1;
             min_y = min_y.min(min_y_by_local_column[column_index]);
             max_y = max_y.max(max_y_by_local_column[column_index]);
@@ -14596,13 +15035,16 @@ fn render_aware_surface_biome_cell(
 
 fn best_render_surface_biome(
     chunk: &ChunkModel,
-    biome_by_local_column: &[String],
+    biome_by_local_column: &[impl AsRef<str>],
     min_y_by_local_column: &[i32],
-    counts: &BTreeMap<String, i32>,
+    counts: &BTreeMap<&str, i32>,
     cell_x: usize,
     cell_z: usize,
 ) -> Result<String> {
     let dominant = dominant_surface_biome(counts);
+    if counts.len() == 1 {
+        return Ok(dominant);
+    }
     let mut best = dominant.clone();
     let mut best_error = i64::MAX;
     let mut best_count = -1;
@@ -14619,7 +15061,7 @@ fn best_render_surface_biome(
             || (error == best_error && count > best_count)
             || (error == best_error && count == best_count && candidate == &dominant)
         {
-            best = candidate.clone();
+            best = candidate.to_string();
             best_error = error;
             best_count = count;
         }
@@ -14629,7 +15071,7 @@ fn best_render_surface_biome(
 
 fn render_error_for_surface_biome_cell(
     chunk: &ChunkModel,
-    biome_by_local_column: &[String],
+    biome_by_local_column: &[impl AsRef<str>],
     min_y_by_local_column: &[i32],
     cell_x: usize,
     cell_z: usize,
@@ -14646,7 +15088,8 @@ fn render_error_for_surface_biome_cell(
                 min_y_by_local_column[column_index],
                 local_z as i32,
             )?;
-            let intended = render_surface_color(top, Some(&biome_by_local_column[column_index]));
+            let intended =
+                render_surface_color(top, Some(biome_by_local_column[column_index].as_ref()));
             let actual = render_surface_color(top, Some(candidate_biome));
             error += squared_rgb_distance(actual, intended);
         }
@@ -14656,7 +15099,7 @@ fn render_error_for_surface_biome_cell(
 
 fn apply_static_carrier_fallbacks(
     chunk: &mut ChunkModel,
-    biome_by_local_column: &[String],
+    biome_by_local_column: &[impl AsRef<str>],
     min_y_by_local_column: &[i32],
     cell_x: usize,
     cell_z: usize,
@@ -14669,7 +15112,7 @@ fn apply_static_carrier_fallbacks(
             let column_index = (local_z * CHUNK_WIDTH) + local_x;
             let y = min_y_by_local_column[column_index];
             let mut top = chunk.get_block_state_id(local_x as i32, y, local_z as i32)?;
-            let column_biome = &biome_by_local_column[column_index];
+            let column_biome = biome_by_local_column[column_index].as_ref();
             if !is_allowed_production_top(top, column_biome) {
                 top = production_surface_top(top, column_biome);
                 chunk.set_block_state_id(local_x as i32, y, local_z as i32, top)?;
@@ -14680,6 +15123,11 @@ fn apply_static_carrier_fallbacks(
             let intended_color = render_surface_color(top, Some(column_biome));
             let tinted_error =
                 replacement_score(render_surface_color(top, Some(cell_biome)), intended_color);
+            // All replacement errors are nonnegative. No candidate can clear
+            // the improvement threshold when the existing tint is this close.
+            if tinted_error <= STATIC_CARRIER_MIN_IMPROVEMENT {
+                continue;
+            }
             let carrier = nearest_static_carrier(intended_color, cell_biome);
             if is_sand_like_surface(carrier.block) && !is_naturally_sandy_biome(column_biome) {
                 continue;
@@ -14693,6 +15141,22 @@ fn apply_static_carrier_fallbacks(
 }
 
 fn nearest_static_carrier(target_color: i32, biome: &str) -> StaticCarrier {
+    let key = (target_color, Cow::Borrowed(biome));
+    if let Some(cached) = STATIC_CARRIER_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
+        return cached;
+    }
+    let best = nearest_static_carrier_uncached(target_color, biome);
+    STATIC_CARRIER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= STATIC_CARRIER_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert((target_color, Cow::Owned(biome.to_string())), best);
+    });
+    best
+}
+
+fn nearest_static_carrier_uncached(target_color: i32, biome: &str) -> StaticCarrier {
     let mut best = StaticCarrier {
         block: -1,
         error: i64::MAX,
@@ -14709,12 +15173,12 @@ fn nearest_static_carrier(target_color: i32, biome: &str) -> StaticCarrier {
     best
 }
 
-fn dominant_surface_biome(counts: &BTreeMap<String, i32>) -> String {
+fn dominant_surface_biome<K: AsRef<str>>(counts: &BTreeMap<K, i32>) -> String {
     let mut dominant = String::new();
     let mut max_count = -1;
     for (biome, &count) in counts {
         if count > max_count {
-            dominant = biome.clone();
+            dominant = biome.as_ref().to_string();
             max_count = count;
         }
     }
@@ -15345,19 +15809,30 @@ fn apply_osm_waterway(
     Ok(())
 }
 
+#[cfg(test)]
 fn fill_surface_column(
     chunk: &mut ChunkModel,
     local_x: i32,
     local_z: i32,
     column: &EarthSurfaceColumn,
 ) -> Result<()> {
-    let column = normalize_surface_column_for_chunk(column);
-    let column = sanitize_surface_column_for_production(&column);
     chunk.set_block_state_id(local_x, -64, local_z, block_state_ids::BEDROCK)?;
+    fill_surface_column_above_stone_prefix(chunk, local_x, local_z, column, -64)
+}
+
+fn fill_surface_column_above_stone_prefix(
+    chunk: &mut ChunkModel,
+    local_x: i32,
+    local_z: i32,
+    column: &EarthSurfaceColumn,
+    common_stone_top: i32,
+) -> Result<()> {
+    let column = normalize_surface_column_for_chunk_borrowed(column);
+    let column = sanitize_surface_column_for_production_borrowed(&column);
     chunk.fill_column(
         local_x,
         local_z,
-        -63,
+        common_stone_top + 1,
         (-63).max(column.ground_surface_y - 4),
         block_state_ids::STONE,
     )?;
@@ -16026,8 +16501,18 @@ fn smooth_photo_texture_local(
     columns: &[EarthSurfaceColumn],
     width: usize,
 ) -> Vec<EarthSurfaceColumn> {
-    let height = columns.len() / width;
+    let changes = smooth_photo_texture_local_changes(columns, width);
     let mut result = columns.to_vec();
+    apply_surface_column_changes(&mut result, changes);
+    result
+}
+
+fn smooth_photo_texture_local_changes(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Vec<(usize, EarthSurfaceColumn)> {
+    let height = columns.len() / width;
+    let mut result = Vec::new();
     for z in 0..height {
         for x in 0..width {
             let index = surface_class_index(x, z, width);
@@ -16062,7 +16547,10 @@ fn smooth_photo_texture_local(
                 }
             }
             if smoothed_top != top {
-                result[index] = photo_smoother_replacement(column, smoothed_top, "smoother-photo");
+                result.push((
+                    index,
+                    photo_smoother_replacement(column, smoothed_top, "smoother-photo"),
+                ));
             }
         }
     }
@@ -16073,8 +16561,18 @@ fn smooth_photo_macro_vegetation(
     columns: &[EarthSurfaceColumn],
     width: usize,
 ) -> Vec<EarthSurfaceColumn> {
-    let height = columns.len() / width;
+    let changes = smooth_photo_macro_vegetation_changes(columns, width);
     let mut result = columns.to_vec();
+    apply_surface_column_changes(&mut result, changes);
+    result
+}
+
+fn smooth_photo_macro_vegetation_changes(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+) -> Vec<(usize, EarthSurfaceColumn)> {
+    let height = columns.len() / width;
+    let mut result = Vec::new();
     for z in 0..height {
         for x in 0..width {
             let index = surface_class_index(x, z, width);
@@ -16119,8 +16617,10 @@ fn smooth_photo_macro_vegetation(
             if !compact_accent {
                 continue;
             }
-            result[index] =
-                photo_smoother_replacement(column, replacement_top, "smoother-photo-macro");
+            result.push((
+                index,
+                photo_smoother_replacement(column, replacement_top, "smoother-photo-macro"),
+            ));
         }
     }
     result
@@ -16507,79 +17007,127 @@ fn stabilize_surface_biome_cells(
     width: usize,
     preserve_surface: bool,
 ) -> Vec<EarthSurfaceColumn> {
-    let height = columns.len() / width;
+    let changes = stabilize_surface_biome_cells_changes(columns, width, preserve_surface);
     let mut result = columns.to_vec();
-    for cell_z in (0..height).step_by(BIOME_INTENT_CELL_WIDTH) {
-        for cell_x in (0..width).step_by(BIOME_INTENT_CELL_WIDTH) {
-            let mut counts = Vec::<JavaHashStringCount>::new();
-            let mut family_counts = BTreeMap::<String, i32>::new();
-            let mut land_count = 0;
-            for dz in 0..BIOME_INTENT_CELL_WIDTH {
-                if cell_z + dz >= height {
-                    break;
-                }
-                for dx in 0..BIOME_INTENT_CELL_WIDTH {
-                    if cell_x + dx >= width {
-                        break;
-                    }
-                    let column = &columns[surface_class_index(cell_x + dx, cell_z + dz, width)];
-                    if column.water {
-                        continue;
-                    }
-                    land_count += 1;
-                    increment_java_hash_string_count(&mut counts, &column.biome_id);
-                    *family_counts
-                        .entry(intent_biome_family(&column.biome_id))
-                        .or_insert(0) += 1;
-                }
-            }
-            let Some((majority_biome, majority_count)) =
-                java_hashmap_string_majority_with_count(&counts)
-            else {
-                continue;
-            };
-            if land_count < BIOME_INTENT_CELL_DOMINANCE_MIN
-                || majority_count < BIOME_INTENT_CELL_DOMINANCE_MIN
-                || is_arid_transition_cell(&family_counts)
-            {
-                continue;
-            }
-            for dz in 0..BIOME_INTENT_CELL_WIDTH {
-                if cell_z + dz >= height {
-                    break;
-                }
-                for dx in 0..BIOME_INTENT_CELL_WIDTH {
-                    if cell_x + dx >= width {
-                        break;
-                    }
-                    let index = surface_class_index(cell_x + dx, cell_z + dz, width);
-                    let column = &result[index];
-                    if column.water
-                        || is_protected_intent_biome(&column.biome_id)
-                        || (preserve_surface && is_render_locked_photo_biome(column))
-                    {
-                        continue;
-                    }
-                    if column.biome_id != majority_biome {
-                        result[index] = if preserve_surface {
-                            intent_biome_only_replacement(
-                                column,
-                                &majority_biome,
-                                "intent-stabilized-cell",
-                            )
-                        } else {
-                            intent_surface_compatible_replacement(
-                                column,
-                                &majority_biome,
-                                "intent-stabilized-cell",
-                            )
-                        };
-                    }
-                }
-            }
-        }
-    }
+    apply_surface_column_changes(&mut result, changes);
     result
+}
+
+fn stabilize_surface_biome_cells_changes(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+    preserve_surface: bool,
+) -> Vec<(usize, EarthSurfaceColumn)> {
+    let height = columns.len() / width;
+    (0..height.div_ceil(BIOME_INTENT_CELL_WIDTH))
+        .into_par_iter()
+        .map(|cell_row| {
+            let cell_z = cell_row * BIOME_INTENT_CELL_WIDTH;
+            let mut result = Vec::new();
+            for cell_x in (0..width).step_by(BIOME_INTENT_CELL_WIDTH) {
+                // Uniform land already has the only possible majority biome;
+                // a cell with no editable land cannot produce replacements.
+                // Avoid allocating/counting either cell, while mixed editable
+                // cells still use the original Java majority and tie rules.
+                let mut first_biome = None;
+                let mut uniform = true;
+                let mut editable = false;
+                for dz in 0..BIOME_INTENT_CELL_WIDTH.min(height - cell_z) {
+                    for dx in 0..BIOME_INTENT_CELL_WIDTH.min(width - cell_x) {
+                        let column = &columns[surface_class_index(cell_x + dx, cell_z + dz, width)];
+                        if column.water {
+                            continue;
+                        }
+                        let biome = column.biome_id.as_str();
+                        match first_biome {
+                            Some(first) => uniform &= biome == first,
+                            None => first_biome = Some(biome),
+                        }
+                        if !editable {
+                            editable = !is_protected_intent_biome(biome)
+                                && !(preserve_surface && is_render_locked_photo_biome(column));
+                        }
+                    }
+                }
+                if uniform || !editable {
+                    continue;
+                }
+                let mut counts = Vec::<JavaHashStringCount>::new();
+                let mut family_counts = BTreeMap::<&str, i32>::new();
+                let mut land_count = 0;
+                for dz in 0..BIOME_INTENT_CELL_WIDTH {
+                    if cell_z + dz >= height {
+                        break;
+                    }
+                    for dx in 0..BIOME_INTENT_CELL_WIDTH {
+                        if cell_x + dx >= width {
+                            break;
+                        }
+                        let column = &columns[surface_class_index(cell_x + dx, cell_z + dz, width)];
+                        if column.water {
+                            continue;
+                        }
+                        land_count += 1;
+                        increment_java_hash_string_count(&mut counts, &column.biome_id);
+                        *family_counts
+                            .entry(intent_biome_family(&column.biome_id))
+                            .or_insert(0) += 1;
+                    }
+                }
+                let Some((majority_biome, majority_count)) =
+                    java_hashmap_string_majority_with_count(&counts)
+                else {
+                    continue;
+                };
+                if land_count < BIOME_INTENT_CELL_DOMINANCE_MIN
+                    || majority_count < BIOME_INTENT_CELL_DOMINANCE_MIN
+                    || is_arid_transition_cell(&family_counts)
+                {
+                    continue;
+                }
+                for dz in 0..BIOME_INTENT_CELL_WIDTH {
+                    if cell_z + dz >= height {
+                        break;
+                    }
+                    for dx in 0..BIOME_INTENT_CELL_WIDTH {
+                        if cell_x + dx >= width {
+                            break;
+                        }
+                        let index = surface_class_index(cell_x + dx, cell_z + dz, width);
+                        let column = &columns[index];
+                        if column.water
+                            || is_protected_intent_biome(&column.biome_id)
+                            || (preserve_surface && is_render_locked_photo_biome(column))
+                        {
+                            continue;
+                        }
+                        if column.biome_id != majority_biome {
+                            result.push((
+                                index,
+                                if preserve_surface {
+                                    intent_biome_only_replacement(
+                                        column,
+                                        &majority_biome,
+                                        "intent-stabilized-cell",
+                                    )
+                                } else {
+                                    intent_surface_compatible_replacement(
+                                        column,
+                                        &majority_biome,
+                                        "intent-stabilized-cell",
+                                    )
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            result
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn stabilize_small_surface_biome_family_components(
@@ -16587,8 +17135,20 @@ fn stabilize_small_surface_biome_family_components(
     width: usize,
     preserve_surface: bool,
 ) -> Vec<EarthSurfaceColumn> {
-    let height = columns.len() / width;
+    let changes =
+        stabilize_small_surface_biome_family_components_changes(columns, width, preserve_surface);
     let mut result = columns.to_vec();
+    apply_surface_column_changes(&mut result, changes);
+    result
+}
+
+fn stabilize_small_surface_biome_family_components_changes(
+    columns: &[EarthSurfaceColumn],
+    width: usize,
+    preserve_surface: bool,
+) -> Vec<(usize, EarthSurfaceColumn)> {
+    let height = columns.len() / width;
+    let mut result = Vec::new();
     let mut visited = vec![false; columns.len()];
     let mut in_component = vec![false; columns.len()];
     let mut component = Vec::<usize>::with_capacity(columns.len());
@@ -16622,7 +17182,7 @@ fn stabilize_small_surface_biome_family_components(
                 &mut queue,
                 current.wrapping_sub(width),
                 z > 0,
-                &family,
+                family,
                 preserve_surface,
             );
             enqueue_same_intent_family(
@@ -16632,7 +17192,7 @@ fn stabilize_small_surface_biome_family_components(
                 &mut queue,
                 current + width,
                 z < height - 1,
-                &family,
+                family,
                 preserve_surface,
             );
             enqueue_same_intent_family(
@@ -16642,7 +17202,7 @@ fn stabilize_small_surface_biome_family_components(
                 &mut queue,
                 current.wrapping_sub(1),
                 x > 0,
-                &family,
+                family,
                 preserve_surface,
             );
             enqueue_same_intent_family(
@@ -16652,7 +17212,7 @@ fn stabilize_small_surface_biome_family_components(
                 &mut queue,
                 current + 1,
                 x < width - 1,
-                &family,
+                family,
                 preserve_surface,
             );
         }
@@ -16662,22 +17222,22 @@ fn stabilize_small_surface_biome_family_components(
             {
                 if replacement_biome != seed.biome_id
                     && !(component.len() > 16
-                        && is_arid_transition_pair(
-                            &family,
-                            &intent_biome_family(&replacement_biome),
-                        ))
+                        && is_arid_transition_pair(family, intent_biome_family(&replacement_biome)))
                 {
                     for &component_index in &component {
                         if preserve_surface
-                            && is_render_locked_photo_biome(&result[component_index])
+                            && is_render_locked_photo_biome(&columns[component_index])
                         {
                             continue;
                         }
-                        result[component_index] = intent_component_replacement(
-                            &result[component_index],
-                            &replacement_biome,
-                            preserve_surface,
-                        );
+                        result.push((
+                            component_index,
+                            intent_component_replacement(
+                                &columns[component_index],
+                                &replacement_biome,
+                                preserve_surface,
+                            ),
+                        ));
                     }
                 }
             }
@@ -16712,7 +17272,7 @@ fn surface_biome_component_trace(
     }
     if is_protected_intent_biome(&seed.biome_id) {
         return SurfaceBiomeComponentTrace {
-            family: intent_biome_family(&seed.biome_id),
+            family: intent_biome_family(&seed.biome_id).to_string(),
             size: 0,
             min_local_x: 0,
             min_local_z: 0,
@@ -16725,7 +17285,7 @@ fn surface_biome_component_trace(
     }
     if preserve_surface && is_render_locked_photo_biome(seed) {
         return SurfaceBiomeComponentTrace {
-            family: intent_biome_family(&seed.biome_id),
+            family: intent_biome_family(&seed.biome_id).to_string(),
             size: 0,
             min_local_x: 0,
             min_local_z: 0,
@@ -16755,7 +17315,7 @@ fn surface_biome_component_trace(
             &mut queue,
             current.wrapping_sub(width),
             z > 0,
-            &family,
+            family,
             preserve_surface,
         );
         enqueue_same_intent_family(
@@ -16765,7 +17325,7 @@ fn surface_biome_component_trace(
             &mut queue,
             current + width,
             z < height - 1,
-            &family,
+            family,
             preserve_surface,
         );
         enqueue_same_intent_family(
@@ -16775,7 +17335,7 @@ fn surface_biome_component_trace(
             &mut queue,
             current.wrapping_sub(1),
             x > 0,
-            &family,
+            family,
             preserve_surface,
         );
         enqueue_same_intent_family(
@@ -16785,7 +17345,7 @@ fn surface_biome_component_trace(
             &mut queue,
             current + 1,
             x < width - 1,
-            &family,
+            family,
             preserve_surface,
         );
     }
@@ -16820,7 +17380,7 @@ fn surface_biome_component_trace(
         if replacement_biome == production_seed.biome_id {
             "skip-already-majority"
         } else if component.len() > 16
-            && is_arid_transition_pair(&production_family, &intent_biome_family(replacement_biome))
+            && is_arid_transition_pair(production_family, intent_biome_family(replacement_biome))
         {
             "skip-arid-transition-pair"
         } else {
@@ -16828,7 +17388,7 @@ fn surface_biome_component_trace(
         }
     };
     SurfaceBiomeComponentTrace {
-        family,
+        family: family.to_string(),
         size: component.len(),
         min_local_x,
         min_local_z,
@@ -17176,7 +17736,7 @@ fn is_lush_vegetated_intent_biome(biome: &str) -> bool {
     biome.contains("jungle") || biome.contains("forest") || biome.contains("taiga")
 }
 
-fn is_arid_transition_cell(family_counts: &BTreeMap<String, i32>) -> bool {
+fn is_arid_transition_cell(family_counts: &BTreeMap<&str, i32>) -> bool {
     if family_counts.len() <= 1 {
         return false;
     }
@@ -17201,32 +17761,32 @@ fn is_arid_transition_family(family: &str) -> bool {
     matches!(family, "desert" | "badlands" | "savanna" | "grassland")
 }
 
-fn intent_biome_family(biome: &str) -> String {
+fn intent_biome_family(biome: &str) -> &str {
     if biome.contains("desert") {
-        return "desert".to_string();
+        return "desert";
     }
     if biome.contains("badlands") {
-        return "badlands".to_string();
+        return "badlands";
     }
     if biome.contains("savanna") {
-        return "savanna".to_string();
+        return "savanna";
     }
     if biome.contains("jungle") {
-        return "jungle".to_string();
+        return "jungle";
     }
     if biome.contains("forest") {
-        return "forest".to_string();
+        return "forest";
     }
     if biome.contains("swamp") {
-        return "swamp".to_string();
+        return "swamp";
     }
     if biome.contains("taiga") {
-        return "taiga".to_string();
+        return "taiga";
     }
     if biome.contains("plains") || biome.contains("meadow") {
-        return "grassland".to_string();
+        return "grassland";
     }
-    biome.to_string()
+    biome
 }
 
 fn intent_filler_for(top: i32) -> i32 {
@@ -17542,15 +18102,37 @@ fn value_noise(x: f64, z: f64, seed: i64) -> f64 {
     let z0 = fast_floor(z);
     let tx = smooth_step(x - f64::from(x0));
     let tz = smooth_step(z - f64::from(z0));
-    let a = lattice_value(x0, z0, seed);
-    let next_x = x0.wrapping_add(1);
-    let next_z = z0.wrapping_add(1);
-    let b = lattice_value(next_x, z0, seed);
-    let c = lattice_value(x0, next_z, seed);
-    let d = lattice_value(next_x, next_z, seed);
+    let [a, b, c, d] = noise_cell_corners(x0, z0, seed);
     let ab = lerp(a, b, tx);
     let cd = lerp(c, d, tx);
     lerp(ab, cd, tz)
+}
+
+fn noise_cell_corners(x: i32, z: i32, seed: i64) -> [f64; 4] {
+    NOISE_CELL_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let slot = ((seed as u64 ^ (seed as u64 >> 32)) as usize) & (NOISE_CELL_CACHE_ENTRIES - 1);
+        if let Some(cell) = &cache[slot] {
+            if cell.seed == seed && cell.x == x && cell.z == z {
+                return cell.corners;
+            }
+        }
+        let next_x = x.wrapping_add(1);
+        let next_z = z.wrapping_add(1);
+        let corners = [
+            lattice_value(x, z, seed),
+            lattice_value(next_x, z, seed),
+            lattice_value(x, next_z, seed),
+            lattice_value(next_x, next_z, seed),
+        ];
+        cache[slot] = Some(NoiseCell {
+            seed,
+            x,
+            z,
+            corners,
+        });
+        corners
+    })
 }
 
 fn lattice_value(x: i32, z: i32, seed: i64) -> f64 {
@@ -24128,7 +24710,7 @@ mod tests {
         );
 
         let high_relief_windswept_grass = photo_surface_decision_for_top(
-            &PhotoSurfaceInput::new(
+            &PhotoSurfaceContext::from(&PhotoSurfaceInput::new(
                 savanna.clone(),
                 SurfaceMaterialSample::land(
                     RgbColor::of(135, 141, 75),
@@ -24155,7 +24737,7 @@ mod tests {
                 180.0,
                 143,
                 0,
-            ),
+            )),
             block_state_ids::GRASS_BLOCK,
             "photo-texture",
             "source-render-solver",
@@ -25366,6 +25948,60 @@ mod tests {
     }
 
     #[test]
+    fn direct_color_cache_checks_complete_directional_keys_on_collisions() {
+        let mut slots = HashMap::new();
+        let mut collision = None;
+        for index in 0..4096_i32 {
+            let pair = (
+                ((i64::from(index) * i64::from(index) * 1789) & 0xffffff) as i32,
+                ((index * 3407) ^ (index << 12)) & 0xffffff,
+            );
+            let key = photo_ciede_cache_key(pair.0, pair.1);
+            let slot = photo_color_cache_slot(key, PHOTO_CIEDE_CACHE_MAX_ENTRIES);
+            if let Some(previous) = slots.insert(slot, pair) {
+                collision = Some((previous, pair));
+                break;
+            }
+        }
+        let (first, second) = collision.expect("fixture must collide in the bounded table");
+        for (left, right) in [
+            first,
+            second,
+            first,
+            (first.1, first.0),
+            (i32::MIN, i32::MAX),
+            (0, 0),
+        ] {
+            let lab = |color: i32| {
+                photo_rgb_to_lab((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff)
+            };
+            let expected = photo_ciede2000(lab(left), lab(right));
+            for _ in 0..2 {
+                assert_eq!(
+                    photo_ciede2000_rgb_pair_cached(left, right).to_bits(),
+                    expected.to_bits()
+                );
+            }
+        }
+        PHOTO_CIEDE_CACHE
+            .with(|cache| assert_eq!(cache.borrow().len(), PHOTO_CIEDE_CACHE_MAX_ENTRIES));
+    }
+
+    #[test]
+    fn static_carrier_cache_preserves_candidate_order_and_is_bounded() {
+        for index in 0..=STATIC_CARRIER_CACHE_MAX_ENTRIES {
+            let biome = PHOTO_GRASS_RENDER_BIOMES[index % PHOTO_GRASS_RENDER_BIOMES.len()];
+            let target = (index as i32 * 1789) & 0xffffff;
+            let reference = nearest_static_carrier_uncached(target, biome);
+            assert_eq!(nearest_static_carrier(target, biome), reference);
+            assert_eq!(nearest_static_carrier(target, biome), reference);
+        }
+        STATIC_CARRIER_CACHE.with(|cache| {
+            assert!(cache.borrow().len() <= STATIC_CARRIER_CACHE_MAX_ENTRIES);
+        });
+    }
+
+    #[test]
     fn met_terrain_vocabulary_matches_java_exact_and_remap_contracts() {
         assert_eq!(
             MetTerrainVocabulary::exact(RgbColor::unavailable()),
@@ -25404,6 +26040,404 @@ mod tests {
         assert_eq!(exact_unknown.kind, MetTerrainKind::Unknown);
         assert!(!exact_unknown.confident());
         assert_eq!(exact_unknown.color(), RgbColor::unavailable());
+    }
+
+    #[test]
+    fn photo_lab_cache_preserves_float_bits_across_eviction() {
+        for round in 0..2 {
+            for color in (0..=PHOTO_LAB_CACHE_MAX_ENTRIES as i32).chain([
+                0x003200,
+                0x323C1E,
+                0xA79267,
+                0xFAFFFA,
+                0x00ff_ffff,
+                -1,
+            ]) {
+                let expected =
+                    photo_rgb_to_lab((color >> 16) & 255, (color >> 8) & 255, color & 255);
+                assert_eq!(
+                    photo_rgb_i32_to_lab(color).map(f64::to_bits),
+                    expected.map(f64::to_bits),
+                    "round {round}, color {color}"
+                );
+            }
+            PHOTO_LAB_CACHE
+                .with(|cache| assert!(cache.borrow().len() <= PHOTO_LAB_CACHE_MAX_ENTRIES));
+        }
+    }
+
+    #[test]
+    fn cached_noise_cells_preserve_lattice_bits_at_boundaries_collisions_and_wraps() {
+        for seed in [0_i64, 1, 1024, i64::MIN, i64::MAX, 0x3340b42e9c8f1231] {
+            for x in [i32::MIN, -2, -1, 0, 1, i32::MAX] {
+                for z in [i32::MIN, -1, 0, i32::MAX] {
+                    let expected = [
+                        lattice_value(x, z, seed),
+                        lattice_value(x.wrapping_add(1), z, seed),
+                        lattice_value(x, z.wrapping_add(1), seed),
+                        lattice_value(x.wrapping_add(1), z.wrapping_add(1), seed),
+                    ];
+                    assert_eq!(
+                        noise_cell_corners(x, z, seed).map(f64::to_bits),
+                        expected.map(f64::to_bits)
+                    );
+                    // Evict the same direct-mapped slot, then revisit it.
+                    noise_cell_corners(20, -30, seed ^ NOISE_CELL_CACHE_ENTRIES as i64);
+                    assert_eq!(
+                        noise_cell_corners(x, z, seed).map(f64::to_bits),
+                        expected.map(f64::to_bits)
+                    );
+                }
+            }
+            for x in [-1.001, -1.0, -0.001, 0.0, 0.999, 1.0, 127.978] {
+                for z in [-37.5665, -0.001, 0.0, 1.0, 38.119] {
+                    let x0 = fast_floor(x);
+                    let z0 = fast_floor(z);
+                    let tx = smooth_step(x - f64::from(x0));
+                    let tz = smooth_step(z - f64::from(z0));
+                    let expected = lerp(
+                        lerp(
+                            lattice_value(x0, z0, seed),
+                            lattice_value(x0.wrapping_add(1), z0, seed),
+                            tx,
+                        ),
+                        lerp(
+                            lattice_value(x0, z0.wrapping_add(1), seed),
+                            lattice_value(x0.wrapping_add(1), z0.wrapping_add(1), seed),
+                            tx,
+                        ),
+                        tz,
+                    );
+                    assert_eq!(value_noise(x, z, seed).to_bits(), expected.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_static_palette_solves_preserve_candidate_order_and_coastal_bias() {
+        for entry in MET_TERRAIN_ENTRIES.iter().filter(|entry| {
+            matches!(
+                entry.kind,
+                MetTerrainKind::CoarseDirt | MetTerrainKind::Gravel | MetTerrainKind::Rock
+            )
+        }) {
+            for source in [
+                RgbColor::of(136, 137, 137),
+                RgbColor::of(100, 90, 74),
+                RgbColor::of(230, 235, 235),
+            ] {
+                for biome in [
+                    "minecraft:plains",
+                    "minecraft:beach",
+                    "minecraft:desert",
+                    "minecraft:badlands",
+                ] {
+                    for coast in [0.699, 0.70] {
+                        let mut sample = SurfaceMaterialSample::color_only(source);
+                        sample.terrain_token_color =
+                            RgbColor::of(entry.red, entry.green, entry.blue);
+                        sample.terrain_token_source = TerrainTokenSource::JavaStandardPalette;
+                        let owned = PhotoSurfaceInput::new(
+                            surface_column(
+                                false,
+                                75,
+                                i32::MIN,
+                                block_state_ids::STONE,
+                                block_state_ids::STONE,
+                                biome,
+                            ),
+                            sample,
+                            100.0,
+                            127.0,
+                            37.0,
+                            coast,
+                            80.0,
+                            -10,
+                            20,
+                        );
+                        let input = PhotoSurfaceContext::from(&owned);
+                        let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+                        let (context, key) = photo_palette_solve_context(&input, source, token);
+                        let target = photo_blend(
+                            source,
+                            input.sample.terrain_token_color,
+                            java_standard_render_anchor_weight(
+                                source,
+                                input.sample.terrain_token_color,
+                                token,
+                            ),
+                        );
+                        let blocks = if token.kind == MetTerrainKind::CoarseDirt {
+                            &PALETTE_COARSE_DIRT_CANDIDATES[..]
+                        } else {
+                            &PALETTE_ROCK_CANDIDATES[..]
+                        };
+                        let mut expected: Option<PhotoSurfaceSolve> = None;
+                        for &top in blocks {
+                            let candidate = java_standard_palette_candidate(
+                                &input,
+                                source,
+                                target,
+                                token,
+                                top,
+                                compatible_biome_for_palette_non_grass(biome, top),
+                            );
+                            if expected
+                                .as_ref()
+                                .is_none_or(|current| candidate.score < current.score)
+                            {
+                                expected = Some(candidate);
+                            }
+                        }
+                        let expected = expected.unwrap();
+                        for _ in 0..2 {
+                            let actual =
+                                cached_photo_palette_solve(&input, context, token, key.clone())
+                                    .unwrap();
+                            assert_eq!(
+                                (
+                                    actual.top_block_state_id,
+                                    actual.biome_id,
+                                    actual.score.to_bits()
+                                ),
+                                (
+                                    expected.top_block_state_id,
+                                    expected.biome_id.clone(),
+                                    expected.score.to_bits()
+                                )
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn photo_region_change_passes_match_the_public_processing_pipeline() {
+        let width = 16;
+        let mut columns = (0..width * width)
+            .map(|index| {
+                let mut column = surface_column(
+                    index % 13 == 0,
+                    63 + (index % 20) as i32,
+                    63,
+                    [
+                        block_state_ids::GRASS_BLOCK,
+                        block_state_ids::STONE,
+                        block_state_ids::OAK_LEAVES,
+                        block_state_ids::COARSE_DIRT,
+                        block_state_ids::SAND,
+                    ][index % 5],
+                    block_state_ids::DIRT,
+                    [
+                        "minecraft:forest",
+                        "minecraft:savanna",
+                        "minecraft:swamp",
+                        "minecraft:beach",
+                    ][index % 4],
+                );
+                column.terrain_token_source = TerrainTokenSource::JavaStandardPalette;
+                column.decision_source = "photo-palette".to_string();
+                column
+            })
+            .collect::<Vec<_>>();
+        let coasts = (0..columns.len())
+            .map(|index| (index % 11) as f64 / 10.0)
+            .collect::<Vec<_>>();
+        for fallback in [false, true] {
+            if fallback {
+                columns[30].terrain_token_source = TerrainTokenSource::None;
+                columns[30].decision_source = "height-rule".to_string();
+            }
+            let stabilized =
+                stabilize_surface_biome_families_preserving_surfaces(&columns, width).unwrap();
+            let smoothed = smooth_photo_textures(&stabilized, width).unwrap();
+            let components =
+                stabilize_small_surface_biome_family_components(&smoothed, width, true);
+            let expected = clean_coastal_surface_columns(&components, &coasts, width).unwrap();
+            assert_eq!(
+                post_process_surface_region_columns(
+                    &columns,
+                    &coasts,
+                    width,
+                    SurfaceTextureMode::Photo
+                )
+                .unwrap(),
+                expected,
+                "fallback={fallback}"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_palette_solves_preserve_evidence_boundaries_and_coordinate_dither() {
+        let mut inputs = Vec::new();
+        for source in [
+            RgbColor::of(35, 70, 25),
+            RgbColor::of(74, 101, 43),
+            RgbColor::of(135, 141, 75),
+            RgbColor::of(162, 145, 100),
+            RgbColor::of(230, 235, 235),
+            RgbColor::of(18, 20, 18),
+        ] {
+            for biome in [
+                "minecraft:plains",
+                "minecraft:forest",
+                "minecraft:savanna",
+                "minecraft:swamp",
+                "minecraft:beach",
+                "minecraft:desert",
+            ] {
+                for variant in 0..8 {
+                    let mut sample = SurfaceMaterialSample::color_only(source);
+                    sample.terrain_token_color = if variant % 2 == 0 {
+                        RgbColor::of(50, 60, 30)
+                    } else {
+                        RgbColor::of(167, 146, 103)
+                    };
+                    sample.terrain_token_source = TerrainTokenSource::JavaStandardPalette;
+                    sample.climate_class =
+                        [SurfaceMaterialSample::UNKNOWN, 1, 3, 15, 29, 30, 2, 4][variant];
+                    sample.snow_cover = if variant == 4 { 25 } else { 0 };
+                    sample.swamp_cover = if variant == 5 { 25 } else { 0 };
+                    sample.ecoregion_biome_id = if variant == 6 {
+                        "minecraft:taiga".to_string()
+                    } else {
+                        String::new()
+                    };
+                    for (x, z) in [(-513, -512), (0, 0), (1, 1), (17, -33), (511, 512)] {
+                        inputs.push(PhotoSurfaceInput::new(
+                            surface_column(
+                                false,
+                                SEA_LEVEL_Y + 10,
+                                i32::MIN,
+                                block_state_ids::GRASS_BLOCK,
+                                block_state_ids::DIRT,
+                                biome,
+                            ),
+                            sample.clone(),
+                            if variant == 2 { 1_500.0 } else { 749.0 },
+                            127.0,
+                            if variant == 3 { 50.0 } else { 24.0 },
+                            if variant % 2 == 0 { 0.699 } else { 0.70 },
+                            if variant == 7 { 100.0 } else { 99.0 },
+                            x,
+                            z,
+                        ));
+                    }
+                }
+            }
+        }
+        let reference = |input: &PhotoSurfaceInput| {
+            let input = PhotoSurfaceContext::from(input);
+            let source = input.sample.color;
+            let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+            let (context, _) = photo_palette_solve_context(&input, source, token);
+            let baseline =
+                java_standard_vegetation_palette_baseline(&input, context, token).unwrap();
+            let solve =
+                direct_java_standard_vegetation_recipe_solve(&input, source, token, &baseline)
+                    .or_else(|| {
+                        preferred_java_standard_carrier_solve(&input, source, token, &baseline)
+                    })
+                    .unwrap_or(baseline);
+            (
+                solve.top_block_state_id,
+                solve.biome_id,
+                solve.score.to_bits(),
+            )
+        };
+        let expected = inputs.iter().map(reference).collect::<Vec<_>>();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let actual = pool.install(|| {
+                inputs
+                    .par_iter()
+                    .map(|input| {
+                        let input = PhotoSurfaceContext::from(input);
+                        let token = MetTerrainVocabulary::exact(input.sample.terrain_token_color);
+                        let solve = java_standard_vegetation_palette_solve(
+                            &input,
+                            input.sample.color,
+                            token,
+                        )
+                        .unwrap();
+                        (
+                            solve.top_block_state_id,
+                            solve.biome_id,
+                            solve.score.to_bits(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(actual, expected, "{threads} threads");
+        }
+    }
+
+    #[test]
+    fn textured_ecology_box_culling_preserves_noise_outside_and_near_edges() {
+        for (west, east, south, north, edge) in [
+            (-20.0, 38.0, 15.0, 34.0, 5.5),
+            (95.0, 145.0, -11.0, 20.0, 4.5),
+        ] {
+            for seed in [0x3340b42e9c8f1231_i64, 0x6e8ac59a6f19d72b] {
+                for longitude in (-180..=180).step_by(5).map(f64::from).chain([
+                    west - 2.0 * edge,
+                    west - 1.4 * edge,
+                    west,
+                    east,
+                    east + 2.0 * edge,
+                ]) {
+                    for latitude in (-90..=90).step_by(5).map(f64::from).chain([
+                        south - 2.0 * edge,
+                        south,
+                        north,
+                        north + 2.0 * edge,
+                    ]) {
+                        let jitter_x =
+                            (surface_material_ecology_noise(longitude, latitude, 0.38, seed) - 0.5)
+                                * edge
+                                * 2.8;
+                        let jitter_z = (surface_material_ecology_noise(
+                            longitude,
+                            latitude,
+                            0.38,
+                            seed ^ (0x9e3779b97f4a7c15_u64 as i64),
+                        ) - 0.5)
+                            * edge
+                            * 2.8;
+                        let score = smooth_box(
+                            longitude + jitter_x,
+                            latitude + jitter_z,
+                            west,
+                            east,
+                            south,
+                            north,
+                            edge,
+                        );
+                        let texture = surface_material_ecology_noise(
+                            longitude,
+                            latitude,
+                            1.15,
+                            seed ^ (0xbf58476d1ce4e5b9_u64 as i64),
+                        );
+                        let expected = clamp_unit(score + ((texture - 0.5) * 0.20));
+                        assert_eq!(
+                            surface_material_textured_smooth_box(
+                                longitude, latitude, west, east, south, north, edge, seed
+                            )
+                            .to_bits(),
+                            expected.to_bits()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

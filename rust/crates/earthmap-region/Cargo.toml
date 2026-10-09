@@ -8,6 +8,7 @@ license.workspace = true
 earthmap-core = { path = "../earthmap-core" }
 earthmap-minecraft = { path = "../earthmap-minecraft" }
 flate2.workspace = true
+rayon.workspace = true
 xxhash-rust.workspace = true
 zstd.workspace = true
 

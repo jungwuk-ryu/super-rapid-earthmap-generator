@@ -1,8 +1,8 @@
 use crate::block_state_ids as ids;
 use crate::chunk_generation_status::ChunkGenerationStatus;
-use crate::chunk_model::{ChunkModel, SECTION_BIOME_CELL_COUNT};
-use crate::heightmap::Heightmap;
-use crate::heightmap_calculator;
+use crate::chunk_model::{ChunkModel, SECTION_BIOME_CELL_COUNT, SECTION_BLOCK_COUNT};
+use crate::dimension_profile::SECTION_HEIGHT;
+use crate::heightmap::{Heightmap, COLUMN_COUNT};
 use crate::nbt::{self, Compound, Tag};
 use crate::packed_long_array::PackedLongArray;
 use crate::section_palette::SectionPalette;
@@ -27,10 +27,7 @@ pub fn encode(
     last_update: i64,
     status: ChunkGenerationStatus,
 ) -> Result<Compound> {
-    let world_surface = heightmap_calculator::compute_top_y_exclusive(chunk, counts_for_surface)?;
-    let ocean_floor = heightmap_calculator::compute_top_y_exclusive(chunk, counts_for_ocean_floor)?;
-    let motion_blocking_no_leaves =
-        heightmap_calculator::compute_top_y_exclusive(chunk, counts_for_motion_blocking_no_leaves)?;
+    let [world_surface, ocean_floor, motion_blocking_no_leaves] = compute_heightmaps(chunk)?;
 
     let mut root = nbt::compound();
     root.put_int("DataVersion", DATA_VERSION)?
@@ -65,6 +62,47 @@ pub fn encode(
     Ok(root)
 }
 
+fn compute_heightmaps(chunk: &ChunkModel) -> Result<[Heightmap; 3]> {
+    let dimension = chunk.dimension();
+    let sections = (0..chunk.section_count() as i32)
+        .map(|index| chunk.section_block_state_ids(index))
+        .collect::<Result<Vec<_>>>()?;
+    let mut values = [(); 3].map(|_| vec![dimension.min_y(); COLUMN_COUNT]);
+    for column in 0..COLUMN_COUNT {
+        let mut pending = [true; 3];
+        'sections: for (section_index, section) in sections.iter().enumerate().rev() {
+            // All three predicates exclude AIR; an unallocated section is AIR.
+            let Some(section) = section else { continue };
+            for local_y in (0..SECTION_HEIGHT as usize).rev() {
+                let block = section[local_y * COLUMN_COUNT + column];
+                let counts = [
+                    counts_for_surface(block),
+                    counts_for_ocean_floor(block),
+                    counts_for_motion_blocking_no_leaves(block),
+                ];
+                for map in 0..3 {
+                    if pending[map] && counts[map] {
+                        values[map][column] = dimension.min_y()
+                            + section_index as i32 * SECTION_HEIGHT
+                            + local_y as i32
+                            + 1;
+                        pending[map] = false;
+                    }
+                }
+                if pending == [false; 3] {
+                    break 'sections;
+                }
+            }
+        }
+    }
+    let [surface, floor, no_leaves] = values;
+    Ok([
+        Heightmap::new(dimension.clone(), surface)?,
+        Heightmap::new(dimension.clone(), floor)?,
+        Heightmap::new(dimension.clone(), no_leaves)?,
+    ])
+}
+
 fn section_tags(chunk: &ChunkModel) -> Result<Vec<Tag>> {
     let mut sections = Vec::with_capacity(chunk.section_count());
     for section_index in 0..chunk.section_count() as i32 {
@@ -73,15 +111,18 @@ fn section_tags(chunk: &ChunkModel) -> Result<Vec<Tag>> {
         {
             continue;
         }
-        let palette =
-            SectionPalette::pack_block_states(&chunk.copy_section_block_state_ids(section_index)?)?;
+        let palette = SectionPalette::pack_block_states(
+            chunk
+                .section_block_state_ids(section_index)?
+                .unwrap_or(&[ids::AIR; SECTION_BLOCK_COUNT]),
+        )?;
         let mut section = nbt::compound();
         section
             .put_byte("Y", chunk.section_y_for_index(section_index)?)?
             .put_compound("block_states", block_states_tag(&palette)?)?
             .put_compound(
                 "biomes",
-                biome_tag(&chunk.copy_section_biome_ids(section_index)?)?,
+                biome_tag(chunk.section_biome_ids(section_index)?)?,
             )?;
         sections.push(Tag::Compound(section));
     }
@@ -265,24 +306,25 @@ fn block_with_properties(name: &str, properties: &[(&str, &str)]) -> Result<Comp
     Ok(block)
 }
 
-fn biome_tag(biome_ids: &[String]) -> Result<Compound> {
-    if biome_ids.len() != SECTION_BIOME_CELL_COUNT {
+fn biome_tag<'a>(biome_ids: impl ExactSizeIterator<Item = &'a str>) -> Result<Compound> {
+    let biome_count = biome_ids.len();
+    if biome_count != SECTION_BIOME_CELL_COUNT {
         return Err(MinecraftError::invalid(format!(
             "section biomeIds length must be {SECTION_BIOME_CELL_COUNT}"
         )));
     }
-    let mut palette = Vec::<String>::new();
-    let mut indices = vec![0i32; biome_ids.len()];
-    for (index, biome_id) in biome_ids.iter().enumerate() {
+    let mut palette = Vec::<&str>::new();
+    let mut indices = vec![0i32; biome_count];
+    for (index, biome_id) in biome_ids.enumerate() {
         if biome_id.trim().is_empty() {
             return Err(MinecraftError::invalid(format!(
                 "biomeId must not be blank at index {index}"
             )));
         }
-        let palette_index = match palette.iter().position(|candidate| candidate == biome_id) {
+        let palette_index = match palette.iter().position(|candidate| *candidate == biome_id) {
             Some(existing) => existing,
             None => {
-                palette.push(biome_id.clone());
+                palette.push(biome_id);
                 palette.len() - 1
             }
         };
@@ -294,13 +336,12 @@ fn biome_tag(biome_ids: &[String]) -> Result<Compound> {
         "palette",
         Tag::List(nbt::list(
             nbt::TAG_STRING,
-            palette.iter().cloned().map(nbt::string_tag).collect(),
+            palette.iter().copied().map(nbt::string_tag).collect(),
         )?),
     )?;
     let bits_per_entry = biome_bits_per_entry(palette.len())?;
     if bits_per_entry > 0 {
-        let packed =
-            PackedLongArray::pack(biome_ids.len(), bits_per_entry, |index| indices[index])?;
+        let packed = PackedLongArray::pack(biome_count, bits_per_entry, |index| indices[index])?;
         tag.put_long_array("data", packed.copy_data())?;
     }
     Ok(tag)
@@ -363,6 +404,93 @@ fn counts_for_motion_blocking_no_leaves(block_state_id: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_heightmaps_match_independent_scans_in_sparse_and_mixed_chunks() {
+        use crate::dimension_profile::{DimensionProfile, OVERWORLD_1_21_11};
+        use crate::heightmap_calculator::compute_top_y_exclusive;
+
+        for dimension in [
+            OVERWORLD_1_21_11.clone(),
+            DimensionProfile::new("test:short", -32, 64).unwrap(),
+        ] {
+            let mut chunk = ChunkModel::new(dimension.clone(), -7, 9);
+            let compare = |chunk: &ChunkModel| {
+                let actual = compute_heightmaps(chunk).unwrap();
+                for (map, predicate) in actual.iter().zip([
+                    counts_for_surface as fn(i32) -> bool,
+                    counts_for_ocean_floor,
+                    counts_for_motion_blocking_no_leaves,
+                ]) {
+                    assert_eq!(*map, compute_top_y_exclusive(chunk, predicate).unwrap());
+                }
+            };
+            compare(&chunk);
+            let blocks = [
+                ids::AIR,
+                ids::STONE,
+                ids::WATER,
+                ids::LAVA,
+                ids::OAK_LEAVES,
+                ids::JUNGLE_LEAVES,
+                ids::DARK_OAK_LEAVES,
+                ids::SPRUCE_LEAVES,
+            ];
+            for column in 0..COLUMN_COUNT {
+                let x = (column % 16) as i32;
+                let z = (column / 16) as i32;
+                // Leave holes, put fluids and leaves above solids, and cover the
+                // build limits as well as both sides of section boundaries.
+                for offset in [0, 15, 16, 31, dimension.height() - 1] {
+                    chunk
+                        .set_block_state_id(
+                            x,
+                            dimension.min_y() + offset,
+                            z,
+                            blocks[(column + offset as usize) % blocks.len()],
+                        )
+                        .unwrap();
+                }
+            }
+            compare(&chunk);
+            chunk
+                .set_biome_id_at(4, dimension.max_y_inclusive(), 8, "minecraft:forest")
+                .unwrap();
+            compare(&chunk);
+        }
+    }
+
+    #[test]
+    fn borrowed_biome_palette_matches_copy_with_default_cells_and_biome_only_sections() {
+        let mut chunk = ChunkModel::overworld(0, 0);
+        chunk.set_biome_id("minecraft:desert").unwrap();
+        chunk
+            .set_biome_id_at(0, 319, 0, "minecraft:forest")
+            .unwrap();
+        chunk.set_biome_id_at(4, 319, 0, "minecraft:swamp").unwrap();
+        for section in 0..chunk.section_count() as i32 {
+            let copied = chunk.copy_section_biome_ids(section).unwrap();
+            let reference = biome_tag(copied.iter().map(String::as_str)).unwrap();
+            let borrowed = biome_tag(chunk.section_biome_ids(section).unwrap()).unwrap();
+            assert_eq!(reference, borrowed);
+        }
+        let encoded = encode(&chunk, 0, ChunkGenerationStatus::Surface).unwrap();
+        let sections = encoded.get_list("sections").unwrap();
+        assert_eq!(sections.values().len(), 1);
+        let Tag::Compound(section) = &sections.values()[0] else {
+            panic!("section compound")
+        };
+        assert_eq!(
+            section
+                .get_compound("block_states")
+                .unwrap()
+                .get_list("palette")
+                .unwrap()
+                .values()
+                .len(),
+            1
+        );
+    }
 
     #[test]
     fn default_and_delegated_status_match_java() {

@@ -23,6 +23,8 @@ compatibility pointers have been removed; archived external-version pins remain 
 
 ## Active Research Logs
 
+- `LAND-GENERATION-PERFORMANCE.md`: real Korean land benchmarks, exact-output
+  checks, thread/process comparison and reproduction commands.
 - `EXPERIMENTS.md`: concise quality experiment history, newest first.
 - `PERFORMANCE-OPTIMIZATION-TODO.md`: completed optimization notes plus active crash/CPU-utilization follow-up.
 - `photo-nonlight-carriers.csv`: small data table used by photo-material research.
