@@ -7,6 +7,18 @@ Historical entries may mention render carriers such as terracotta, black concret
 research only for production purposes: the 2026-06-01 Natural Surface Contract in `docs/DECISIONS.md` supersedes them
 for generated worlds. Such blocks may remain harness-only, but must not be emitted as terrain ground.
 
+## 2026-10-10 Korean Peninsula 1:200 generation timing
+
+- Current build `ac904f5`, four-CPU quota, one process, default automatic tuning
+  and cache sizing, Linear compression 4, and surface status.
+- Real data covers 124–132°E / 33–39°N: 80 regions generate in 23.94s median over
+  three fresh-process/world runs, including 14.61s startup tuning and 9.39s
+  generation. All compressed files match across repeats.
+- The GUI's full Korean Peninsula + Jeju preset is 130 regions. Its estimated
+  total is 30–40s with comparable data/terrain costs; northern data above 39°N
+  is unavailable here, so this is not a full-peninsula measurement.
+- Evidence: [conditions, projection, and reproduction](KOREAN-PENINSULA-GENERATION-TIME.md).
+
 ## 2026-10-10 topology-aware generation threads
 
 - Automatic generation threads now consider OS-reported performance levels,
