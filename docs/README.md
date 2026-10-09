@@ -26,7 +26,7 @@ compatibility pointers have been removed; archived external-version pins remain 
 ## Active Research Logs
 
 - `KOREAN-PENINSULA-GENERATION-TIME.md`: 1:200 Linear generation timings for the
-  available Korean rasters and a whole-peninsula estimate with coverage limitations.
+  complete Korean Peninsula + Jeju preset, expanded source coverage, and prior regional timings.
 - `CONTINENT-GENERATION-PERFORMANCE.md`: full geography-to-Linear generation
   benchmarks against the current land-optimized baseline, with equal CPU and
   process budgets and complete-file equality checks.

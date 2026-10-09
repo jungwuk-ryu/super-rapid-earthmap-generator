@@ -7,7 +7,22 @@ Historical entries may mention render carriers such as terracotta, black concret
 research only for production purposes: the 2026-06-01 Natural Surface Contract in `docs/DECISIONS.md` supersedes them
 for generated worlds. Such blocks may remain harness-only, but must not be emitted as terrain ground.
 
-## 2026-10-10 Korean Peninsula 1:200 generation timing
+## 2026-10-10 complete Korean Peninsula 1:200 single-run timing
+
+- Downloaded padded real coverage for the entire 130-region GUI preset:
+  123–133°E / 32–45°N, retaining 1-arcsecond elevation and 2-arcsecond RGB.
+- Four-CPU quota, one process, unchanged `ac904f5` release binary and generation
+  quality settings. Exactly one complete-preset invocation: **40.31s total**,
+  including **18.81s tuning** and **21.38s generation**.
+- All 130 Linear files and 133,120 payloads passed validation; no batch failures.
+  Output 63.36 MiB, peak process memory approximately 3.13 GiB.
+- Elevation has no missing pixels in the footprint; land RGB coverage is
+  99.9063%, or 99.9872% north of 39°N. All previously available southern RGB
+  pixels remain identical. Global latitude metadata preserves GUI coordinates
+  without sampling NoData padding.
+- Evidence: [complete measurement, sources, and reproduction](KOREAN-PENINSULA-GENERATION-TIME.md).
+
+## 2026-10-10 initial Korean Peninsula 1:200 regional timing
 
 - Current build `ac904f5`, four-CPU quota, one process, default automatic tuning
   and cache sizing, Linear compression 4, and surface status.
@@ -16,7 +31,8 @@ for generated worlds. Such blocks may remain harness-only, but must not be emitt
   generation. All compressed files match across repeats.
 - The GUI's full Korean Peninsula + Jeju preset is 130 regions. Its estimated
   total is 30–40s with comparable data/terrain costs; northern data above 39°N
-  is unavailable here, so this is not a full-peninsula measurement.
+  was unavailable for this initial benchmark. The complete-preset run above
+  supersedes this projection.
 - Evidence: [conditions, projection, and reproduction](KOREAN-PENINSULA-GENERATION-TIME.md).
 
 ## 2026-10-10 topology-aware generation threads
