@@ -69,7 +69,7 @@ Small generation example:
 ```powershell
 .\scripts\run.ps1 generate-vanilla-delegated-regions-parallel `
   $env:EARTHMAP_HEIGHTMAP (Join-Path $env:EARTHMAP_OUTPUT_ROOT "sample-world") 1000 `
-  26 -10 3 3 linear 8 surface surfaceRaster=auto verticalScale=auto linearCompression=4
+  26 -10 3 3 linear auto surface surfaceRaster=auto verticalScale=auto linearCompression=4
 ```
 
 GUI:

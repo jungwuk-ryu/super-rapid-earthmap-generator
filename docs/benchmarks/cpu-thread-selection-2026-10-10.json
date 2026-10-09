@@ -1,0 +1,286 @@
+{
+  "date": "2026-10-10",
+  "date_timezone": "Asia/Seoul",
+  "source_parent": "64223f9",
+  "purpose": "Validate topology-aware thread selection and exact region output; no speedup claim.",
+  "full_workspace_tests_passed": 403,
+  "workspace_clippy": "passed with -D warnings",
+  "cpu_module_cross_checks": [
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-gnu"
+  ],
+  "windows_managed_probe_compile": "passed under PowerShell 7.5.4 on Linux",
+  "native_hybrid_windows_or_apple_hardware_tested": false,
+  "generation_processes": 1,
+  "cpu_quota": "400000 100000",
+  "cpu_topology": {
+    "computeThreadCandidates": [
+      4
+    ],
+    "cpuBudget": 4,
+    "heterogeneous": false,
+    "logicalProcessors": 5,
+    "performanceLevels": [
+      {
+        "logicalProcessors": 5,
+        "name": "capacity-1024",
+        "physicalCores": 5,
+        "rank": 1024
+      }
+    ],
+    "physicalCores": 5,
+    "placement": "os-scheduler",
+    "preferredComputeThreads": 4,
+    "source": "linux-sysfs"
+  },
+  "binary_sha256": {
+    "previous": "2edb2949f4049d33ccdffad9b233a5546306157ae4314e39345d5b641f7db0bb",
+    "current": "32811bd6f6ee03d9736516aff7a9d1f95642d828f22fb4ca04a3df96b878a362"
+  },
+  "dataset_sha256": {
+    "heightmap": "ed5b371669d9ebdb7fc1d0c1871bd908e206abaec598b50e9bd0b2befe272bb3",
+    "rgb": "0c2473c8044f2b99549d47489cd1f4aabbddb6859544ee45be9214a67bc4d730",
+    "vrt": "6d9fbb44955fb209f334b8f7c84d9c77d0206a1f2b33e86a63c891706335bc1b"
+  },
+  "cases": [
+    {
+      "mode": "auto-with-startup-tuning",
+      "scale": 50,
+      "grid": {
+        "start_x": 552,
+        "start_z": -12,
+        "cols": 8,
+        "rows": 8
+      },
+      "regions": 64,
+      "elapsed_seconds_including_startup_tuning": 23.82003650000115,
+      "complete_files_byte_identical": true,
+      "selected_region_workers": 4,
+      "selected_compute_threads": 4,
+      "compute_override": null,
+      "tuning_mode": "autotuned",
+      "initial_candidates": [
+        {
+          "elapsedMillis": 4013,
+          "millisPerRegion": 501.625,
+          "parallelColumnSampling": false,
+          "rayonThreads": 1,
+          "regionWorkerThreads": 1,
+          "regionsPerHour": 7176.675803638176,
+          "sampleCount": 8,
+          "workerThreads": 1
+        },
+        {
+          "elapsedMillis": 2072,
+          "millisPerRegion": 259.0,
+          "parallelColumnSampling": true,
+          "rayonThreads": 4,
+          "regionWorkerThreads": 1,
+          "regionsPerHour": 13899.6138996139,
+          "sampleCount": 8,
+          "workerThreads": 1
+        },
+        {
+          "elapsedMillis": 1882,
+          "millisPerRegion": 235.25,
+          "parallelColumnSampling": true,
+          "rayonThreads": 2,
+          "regionWorkerThreads": 2,
+          "regionsPerHour": 15302.869287991498,
+          "sampleCount": 8,
+          "workerThreads": 2
+        },
+        {
+          "elapsedMillis": 1284,
+          "millisPerRegion": 160.5,
+          "parallelColumnSampling": true,
+          "rayonThreads": 4,
+          "regionWorkerThreads": 2,
+          "regionsPerHour": 22429.906542056076,
+          "sampleCount": 8,
+          "workerThreads": 2
+        },
+        {
+          "elapsedMillis": 957,
+          "millisPerRegion": 119.625,
+          "parallelColumnSampling": true,
+          "rayonThreads": 4,
+          "regionWorkerThreads": 4,
+          "regionsPerHour": 30094.043887147334,
+          "sampleCount": 8,
+          "workerThreads": 4
+        }
+      ],
+      "confirmation_candidates": [
+        {
+          "elapsedMillis": 1589,
+          "millisPerRegion": 198.625,
+          "parallelColumnSampling": true,
+          "rayonThreads": 2,
+          "regionWorkerThreads": 2,
+          "regionsPerHour": 18124.606670862177,
+          "sampleCount": 8,
+          "workerThreads": 2
+        },
+        {
+          "elapsedMillis": 1308,
+          "millisPerRegion": 163.5,
+          "parallelColumnSampling": true,
+          "rayonThreads": 4,
+          "regionWorkerThreads": 2,
+          "regionsPerHour": 22018.34862385321,
+          "sampleCount": 8,
+          "workerThreads": 2
+        },
+        {
+          "elapsedMillis": 984,
+          "millisPerRegion": 123.0,
+          "parallelColumnSampling": true,
+          "rayonThreads": 4,
+          "regionWorkerThreads": 4,
+          "regionsPerHour": 29268.29268292683,
+          "sampleCount": 8,
+          "workerThreads": 4
+        }
+      ],
+      "region_sha256": {
+        "r.552.-10.linear": "7aefe7867012ae37b0a05a2c9544a7ae7e746048dfb837f397d25d891a7652ee",
+        "r.552.-11.linear": "83108bbe96be8c816217fdbd0d71c167aa24736f03d94c5a803a226467dffedd",
+        "r.552.-12.linear": "fb3b8327bebd429dd1ce37a8e22640a63094739c5150bee3a700d856feb12ba0",
+        "r.552.-5.linear": "53fe9031b61e7a9932baf880a0a1cfe9b928189b5ae8d834eb6841a5963833bf",
+        "r.552.-6.linear": "e53c0882ced42b9cd3d6634031e462e653dba7a5409819fc50ac0a3941dd3826",
+        "r.552.-7.linear": "92bbe6a2e025be8c67fb93dbd1ee1c3bba2455aeb11225b9f559cb5ddd89ac96",
+        "r.552.-8.linear": "2207b07e3a81490872b78c3284c677b5a9f9152ba4cf401bd00a146b10ce4a51",
+        "r.552.-9.linear": "647bee852cb4201afba60296569788dcdfb98ce566b25e0d3a03bb8ca9a38f09",
+        "r.553.-10.linear": "73d9ac86d5080fb0114ae487ef6945a5305a21527da8a4812a6097d00de7e6bc",
+        "r.553.-11.linear": "07a2437706387efe2034bc8e5b9d5cb9a71b1001fabbf8745f9f67bae41f2ac5",
+        "r.553.-12.linear": "2129e1d47aff802a2029085bb9ad8f4e30ff202893102ae07a57b5a9bf85838c",
+        "r.553.-5.linear": "ed44e1c9e45d634f7ad3fa64697be2643fa46f241ec2e6100de10adbf6e018c1",
+        "r.553.-6.linear": "07eac4b60e4805edeb680cc0f2d99852c53e4df0d43a0050f3f8b9ad1afbfea5",
+        "r.553.-7.linear": "d0d560ef65f95a8fcc6911c57a9a92b6d8a75994ec22eb928a86714f3d1d5d55",
+        "r.553.-8.linear": "7a0f6dc92a83f990d90081c5215fe6d957e257b4be60f16cf725d848dca022de",
+        "r.553.-9.linear": "2badeab515e36a660f3c98d0cdbbecc014ad8c416a89606780878835f620543c",
+        "r.554.-10.linear": "cf9319c00769f5ea003a6b35129f77ac2fe2b3d6a8b585e42699de956d4d7b1b",
+        "r.554.-11.linear": "3d5cbf1be4ad5fbe4116da366913786f5e273306d9301b1587db6059ca0072f7",
+        "r.554.-12.linear": "7faa6a3a411ca4a50701fe1c0cddf3c22933ce2aa8372c43b22a29dc0d9735f4",
+        "r.554.-5.linear": "5272bdfb601b081a1c2dc799ee982afdeef95054b391a5583c13fd67d75d0c93",
+        "r.554.-6.linear": "44a1db9ad8ee03b7ca90326afb1e2d6c05f8caf3b998b19019cd92286f73c962",
+        "r.554.-7.linear": "7105348b9e5f92bd8f16fdb5d8fcc9687c9f4369c37804f3cc634591e53af28b",
+        "r.554.-8.linear": "e27561db40636f102ef52c6e6e2b6351baa6942fb539b7b38c333ca93125a2f0",
+        "r.554.-9.linear": "adbd96c3b813008f04f873cb15ef9b63b90d9d147b850d05dc1d35b12314a4b8",
+        "r.555.-10.linear": "474846b7b9068b0bf9b10522a6dd2b3c614be256b3d0551087d4b2c4dfdefe3d",
+        "r.555.-11.linear": "cc75b53a45f931312e1c184be7318f100755820410065fee5bdd6ade7bedb674",
+        "r.555.-12.linear": "b434363b7234bf50eafba0e5d2cca079667c868835852e7eb9d997024830859c",
+        "r.555.-5.linear": "c82f2ed7d9cdbe92a795f094b5ab71193875d82d8d6df42a0597098c1118e6a7",
+        "r.555.-6.linear": "733f24383b2539cbf291cea67b2f235bcb8ab7b0eb57465861a260fc3d0e1322",
+        "r.555.-7.linear": "f775eaa82177471bc2e042ac16a68fc0ca3a99304f6e14ad716e9a3dec130043",
+        "r.555.-8.linear": "126658899f958e701e9a1252350e940af67466b861b8eb19ae5e9735392b3e3f",
+        "r.555.-9.linear": "b2c819aac66cb8b7e4d0ef9565e8d9008379fc57bb0b37ec7f6b1613d1056832",
+        "r.556.-10.linear": "0e9d92933f5357313b46b40d8601d406d01351d2f387d9dc37d10f60285181ae",
+        "r.556.-11.linear": "c6fd85c7650d7731c351060b43464ad4e9090eb413fa8a054f2e1e35b6cbd75c",
+        "r.556.-12.linear": "813f22971db438eb31f2faf35986565d20f86794b8ee7155c0a91df4464b80bc",
+        "r.556.-5.linear": "3ec105b21eb7230ca60f9fbcb64791d10671fc1d7d14cd330364d5e8a0283394",
+        "r.556.-6.linear": "6ef76cee7cce9580a390b7c10240a44ca7e941dbeb5650cbf16c7761a45aa7b9",
+        "r.556.-7.linear": "cc85c6100e2cce62d983c76be7e8c5b54f867f69df0f9806e48bf44883a3c6a1",
+        "r.556.-8.linear": "139724477f8cd6a1de97fbe5a0fda4aaea013a28a5fb09f9623e8a80115a6cb1",
+        "r.556.-9.linear": "63802da5799a56cc98543ce5c6a87f0d8de3f6d31b78803fce2b7be5853a178d",
+        "r.557.-10.linear": "1e278b19dfec558456cc0aa1679d7a3095a6528e1ae6dd8e6ea403aa509a9d00",
+        "r.557.-11.linear": "5f73d01ca99ea7fae7d499b6895b184b6e96a8f8a98d4d39bbd54db272d80001",
+        "r.557.-12.linear": "6747dff68ded80267b4f7b130575aab84387064235f5d503441e87b802759909",
+        "r.557.-5.linear": "ffe3683a8cb9e686a3db3e5f6b8c52452cf7ee8f2c6aa034cf36b6ba256c1ed0",
+        "r.557.-6.linear": "322eeb71b54ba8635c43bc8a7bad1728598412e89eb8a55ec4cdd0647f094014",
+        "r.557.-7.linear": "fe13bbd2b2f11b63e5e5dc7670dd9967e84fdcc95d45ef84ac055cde9bbc8748",
+        "r.557.-8.linear": "4042ca9bc2538adc364e1816262bbe154d26131e1bb2693951d369072619c387",
+        "r.557.-9.linear": "a0801c48405d62cfc42eb0f186c3c2f1f72682ab886bb89a21dc7e95bb7ae2ec",
+        "r.558.-10.linear": "a7026a04dcd909d8bfd462cc5e29566ccef466e1198035a495ba45b62a152f3e",
+        "r.558.-11.linear": "3fbef3c042cff0132c424267df57aa85b2a904f491e6cb1ce89cd5eee9f77d70",
+        "r.558.-12.linear": "6fd85fc96e5022cb239201243f65a0bc8e6587e5f32de456d482422686e1ede8",
+        "r.558.-5.linear": "a0c1d4c39de874bd8282696deb6d2283c37737173c6bba134639e66c0beccfe2",
+        "r.558.-6.linear": "33fa654dd3b91c33a87f7f2e4c69b4fdac69cbf30edfeb3bbff93e67de303dbd",
+        "r.558.-7.linear": "0c0444065e629ffe662f5ea28441d51c94b7ac0f42c20dcfef8655f5f317afdc",
+        "r.558.-8.linear": "84ecedf15084ccab2aa53e890708c7be60f1bc372d507b341ed6225d766c9dd3",
+        "r.558.-9.linear": "b1f594448cdb4b13ca0c3b457f9c858b8c8ecafaf449b159d0c0c5e4d36ee22b",
+        "r.559.-10.linear": "4ff4949774f8a33bdf535c1c876c4643c03bcd05449b7963a5e4b4062ea22c82",
+        "r.559.-11.linear": "62ddd2f1b75b6dd5de9f0c35993ad1b394f3646426e0d026cd710a56a5d96ca3",
+        "r.559.-12.linear": "69144a5cf1bc7d92d01e8757ce4c5fe756b74fbbc2137489608a9be95dda00b4",
+        "r.559.-5.linear": "cdef0b676111acb334f7b96880f28dc72173d5d469862d908602c39781ffccd7",
+        "r.559.-6.linear": "f3c5848bd75fee161ac8bede37e7bda590dcee5633f2b69e3a130663636e603e",
+        "r.559.-7.linear": "bcf5206bfebe7059adfeeff9756a0fc6a997ae01711ece2212408c7b7da89163",
+        "r.559.-8.linear": "cc0662e1a297a95a959fcdc7ff23d3d30b371760f05cc7078f27c4bbd8329c82",
+        "r.559.-9.linear": "5d1f21d4bdc1de200ee661f55a3f864251f2fe0a8ac6241ab7d7481392653c84"
+      }
+    },
+    {
+      "mode": "auto-plan-explicit2",
+      "scale": 50,
+      "grid": {
+        "start_x": 552,
+        "start_z": -12,
+        "cols": 4,
+        "rows": 2,
+        "submission": "CSV plan"
+      },
+      "regions": 8,
+      "elapsed_seconds_including_startup_tuning": 7.262683090000792,
+      "complete_files_byte_identical": true,
+      "selected_region_workers": 2,
+      "selected_compute_threads": 2,
+      "compute_override": 2,
+      "tuning_mode": "autotuned",
+      "initial_candidates": [
+        {
+          "elapsedMillis": 1568,
+          "millisPerRegion": 392.0,
+          "parallelColumnSampling": true,
+          "rayonThreads": 2,
+          "regionWorkerThreads": 1,
+          "regionsPerHour": 9183.673469387755,
+          "sampleCount": 4,
+          "workerThreads": 1
+        },
+        {
+          "elapsedMillis": 1027,
+          "millisPerRegion": 256.75,
+          "parallelColumnSampling": true,
+          "rayonThreads": 2,
+          "regionWorkerThreads": 2,
+          "regionsPerHour": 14021.421616358326,
+          "sampleCount": 4,
+          "workerThreads": 2
+        }
+      ],
+      "confirmation_candidates": [
+        {
+          "elapsedMillis": 1383,
+          "millisPerRegion": 345.75,
+          "parallelColumnSampling": true,
+          "rayonThreads": 2,
+          "regionWorkerThreads": 1,
+          "regionsPerHour": 10412.147505422994,
+          "sampleCount": 4,
+          "workerThreads": 1
+        },
+        {
+          "elapsedMillis": 946,
+          "millisPerRegion": 236.5,
+          "parallelColumnSampling": true,
+          "rayonThreads": 2,
+          "regionWorkerThreads": 2,
+          "regionsPerHour": 15221.98731501057,
+          "sampleCount": 4,
+          "workerThreads": 2
+        }
+      ],
+      "region_sha256": {
+        "r.552.-11.linear": "83108bbe96be8c816217fdbd0d71c167aa24736f03d94c5a803a226467dffedd",
+        "r.552.-12.linear": "fb3b8327bebd429dd1ce37a8e22640a63094739c5150bee3a700d856feb12ba0",
+        "r.553.-11.linear": "07a2437706387efe2034bc8e5b9d5cb9a71b1001fabbf8745f9f67bae41f2ac5",
+        "r.553.-12.linear": "2129e1d47aff802a2029085bb9ad8f4e30ff202893102ae07a57b5a9bf85838c",
+        "r.554.-11.linear": "3d5cbf1be4ad5fbe4116da366913786f5e273306d9301b1587db6059ca0072f7",
+        "r.554.-12.linear": "7faa6a3a411ca4a50701fe1c0cddf3c22933ce2aa8372c43b22a29dc0d9735f4",
+        "r.555.-11.linear": "cc75b53a45f931312e1c184be7318f100755820410065fee5bdd6ade7bedb674",
+        "r.555.-12.linear": "b434363b7234bf50eafba0e5d2cca079667c868835852e7eb9d997024830859c"
+      }
+    }
+  ]
+}

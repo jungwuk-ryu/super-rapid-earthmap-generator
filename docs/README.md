@@ -8,6 +8,8 @@ compatibility pointers have been removed; archived external-version pins remain 
 ## Current Operator Docs
 
 - `OPERATIONS.md`: setup, normal commands, GUI usage, quality batch usage, and recovery notes.
+- `CPU-THREAD-SELECTION.md`: automatic generation threads, hybrid CPU topology,
+  SMT/quota limits, startup tuning, and explicit overrides.
 - `QUALITY-GATES.md`: canonical quality gate and full-generation promotion workflow.
 - `GENERATED-ARTIFACTS.md`: where generated worlds, logs, and quality artifacts belong.
 - `EXTERNAL-DATA.md`: external raster/server/data files that must stay out of the repository.

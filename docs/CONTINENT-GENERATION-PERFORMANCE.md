@@ -1,5 +1,9 @@
 # Large Linear world generation performance
 
+These measurements describe `64223f9`. The subsequent
+[CPU topology and thread-selection change](CPU-THREAD-SELECTION.md) adds hybrid
+CPU detection and automatic thread candidates; it has separate validation.
+
 Evaluated on 2026-10-09 against `7548edcac2b0debc6ae99580a016dce9d78f2bdc`.
 That baseline already contains the earlier land-generation optimizations in
 `LAND-GENERATION-PERFORMANCE.md`. This measurement starts from the current

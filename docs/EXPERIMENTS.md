@@ -7,6 +7,20 @@ Historical entries may mention render carriers such as terracotta, black concret
 research only for production purposes: the 2026-06-01 Natural Surface Contract in `docs/DECISIONS.md` supersedes them
 for generated worlds. Such blocks may remain harness-only, but must not be emitted as terrain ground.
 
+## 2026-10-10 topology-aware generation threads
+
+- Automatic generation threads now consider OS-reported performance levels,
+  physical cores, SMT, affinity and supported CPU quotas. Windows CPU sets,
+  Apple perflevels and Linux topology feed the existing measured startup tuner.
+- Quality: all 64 Linear files in the automatic grid and eight files in an
+  explicit-two-thread CSV plan match the previous build by SHA-256. All 403
+  workspace tests and workspace Clippy pass; the CPU module type-checks for
+  Apple ARM64 and Windows x86-64 targets.
+- Scope: hybrid Intel/Windows and Apple Silicon hardware performance remains
+  unmeasured. The 64-region automatic validation includes startup calibration
+  (23.82s); it does not extend the earlier 3.03× speedup claim.
+- Evidence: [policy and validation](CPU-THREAD-SELECTION.md).
+
 ## 2026-10-09 large Linear generation performance
 
 - Status: accepted performance change; existing world content is preserved.

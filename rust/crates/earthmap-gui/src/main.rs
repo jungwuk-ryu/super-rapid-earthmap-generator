@@ -231,6 +231,8 @@ struct GenerationOptions {
     linear_compression_level: i32,
     mca_compression_level: u32,
     threads: usize,
+    #[serde(default)]
+    auto_threads: bool,
     #[serde(default = "default_shard_processes")]
     shard_processes: usize,
     status: ChunkStatusChoice,
@@ -285,6 +287,7 @@ impl Default for GenerationOptions {
             linear_compression_level: 4,
             mca_compression_level: 6,
             threads: 8,
+            auto_threads: true,
             shard_processes: default_shard_processes(),
             status: ChunkStatusChoice::Surface,
             vertical_scale: DEFAULT_VERTICAL_SCALE.to_string(),
@@ -474,7 +477,11 @@ fn build_generation_args_for_grid(options: &GenerationOptions, grid: RegionGrid)
         grid.cols.max(1).to_string(),
         grid.rows.max(1).to_string(),
         options.format.as_cli_arg().to_string(),
-        options.threads.max(1).to_string(),
+        if options.auto_threads {
+            "auto".to_string()
+        } else {
+            options.threads.max(1).to_string()
+        },
         options.status.as_cli_arg().to_string(),
         options.normalized_surface_raster(),
         options.vertical_scale_option(),
@@ -865,6 +872,7 @@ struct ExistingProjectSettingsPatch {
     linear_compression_level: Option<i32>,
     mca_compression_level: Option<u32>,
     threads: Option<usize>,
+    auto_threads: Option<bool>,
     status: Option<ChunkStatusChoice>,
     vertical_scale: Option<String>,
     loaded_manifest: bool,
@@ -925,6 +933,9 @@ fn apply_existing_project_settings(
     if let Some(value) = patch.threads {
         options.threads = value.max(1);
     }
+    if let Some(value) = patch.auto_threads {
+        options.auto_threads = value;
+    }
     if let Some(value) = patch.status {
         options.status = value;
     }
@@ -967,6 +978,7 @@ impl ExistingProjectSettingsPatch {
             .or(self.linear_compression_level);
         self.mca_compression_level = other.mca_compression_level.or(self.mca_compression_level);
         self.threads = other.threads.or(self.threads);
+        self.auto_threads = other.auto_threads.or(self.auto_threads);
         self.status = other.status.or(self.status);
         self.vertical_scale = other.vertical_scale.or(self.vertical_scale.take());
         self.loaded_manifest |= other.loaded_manifest;
@@ -998,6 +1010,11 @@ fn load_manifest_project_settings(
         .as_deref()
         .and_then(parse_output_format_choice);
     patch.threads = manifest_usize(&values, "generation.threads");
+    patch.auto_threads = match values.get("generation.threadMode").map(String::as_str) {
+        Some("auto") => Some(true),
+        Some("manual") => Some(false),
+        _ => patch.threads.map(|_| false),
+    };
     patch.status = manifest_string(&values, "generation.chunkStatus")
         .as_deref()
         .and_then(parse_chunk_status_choice);
@@ -1477,7 +1494,7 @@ fn target_region_rect(parent: egui::Rect, scale: i32, grid: RegionGrid) -> egui:
 }
 
 fn draw_rect_outline(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let stroke = egui::Stroke::new(1.5, color);
+    let stroke = egui::Stroke::new(1.5_f32, color);
     painter.line_segment([rect.left_top(), rect.right_top()], stroke);
     painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
     painter.line_segment([rect.right_bottom(), rect.left_bottom()], stroke);
@@ -2492,7 +2509,9 @@ impl eframe::App for EarthMapGuiApp {
                 ui.heading("Generation");
                 ui.horizontal(|ui| {
                     ui.label("Threads");
-                    ui.add(egui::DragValue::new(&mut self.options.threads).range(1..=256));
+                    ui.checkbox(&mut self.options.auto_threads, "Auto");
+                    ui.add_enabled(!self.options.auto_threads,
+                        egui::DragValue::new(&mut self.options.threads).range(1..=256));
                 });
                 ui.horizontal(|ui| {
                     ui.label("Shard processes");
@@ -3159,6 +3178,9 @@ fn powershell_arg_needs_quotes(ch: char) -> bool {
 }
 
 fn apply_generation_env(command: &mut Command, options: &GenerationOptions) {
+    if let Some(budget) = automatic_shard_cpu_budget(options) {
+        command.env("EARTHMAP_CPU_BUDGET", budget.to_string());
+    }
     if !options.heightmap_path.trim().is_empty() {
         command.env(HEIGHTMAP_PATH_ENV, options.heightmap_path.trim());
     }
@@ -3193,6 +3215,9 @@ fn apply_generation_env(command: &mut Command, options: &GenerationOptions) {
 
 fn generation_env_preview(options: &GenerationOptions) -> Vec<(String, String)> {
     let mut values = Vec::new();
+    if let Some(budget) = automatic_shard_cpu_budget(options) {
+        values.push(("EARTHMAP_CPU_BUDGET".to_string(), budget.to_string()));
+    }
     if !options.cache_rows.trim().is_empty() {
         values.push((
             "EARTHMAP_HEIGHTMAP_CACHE_ROWS".to_string(),
@@ -3216,6 +3241,23 @@ fn generation_env_preview(options: &GenerationOptions) -> Vec<(String, String)> 
     values
 }
 
+fn automatic_shard_cpu_budget(options: &GenerationOptions) -> Option<usize> {
+    let processes = effective_shard_processes(options);
+    if !options.auto_threads || processes <= 1 {
+        return None;
+    }
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let budget = std::env::var("EARTHMAP_CPU_BUDGET")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(available)
+        .min(available);
+    Some((budget / processes).max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3233,6 +3275,7 @@ mod tests {
         assert_eq!(args[0], "generate-vanilla-delegated-regions-parallel");
         assert_eq!(args[3], "1000");
         assert_eq!(args[8], "linear");
+        assert_eq!(args[9], "auto");
         assert_eq!(args[10], "surface");
         assert_eq!(
             args[11],
@@ -3261,6 +3304,74 @@ mod tests {
         };
         let args = build_generation_args(&options);
         assert_eq!(args[14], "workerAutotune=false");
+    }
+
+    #[test]
+    fn manual_generation_threads_preserve_the_requested_limit() {
+        let options = GenerationOptions {
+            auto_threads: false,
+            threads: 6,
+            ..GenerationOptions::default()
+        };
+        assert_eq!(build_generation_args(&options)[9], "6");
+    }
+
+    #[test]
+    fn old_saved_options_keep_manual_threads() {
+        let mut value = serde_json::to_value(GenerationOptions::default()).unwrap();
+        value.as_object_mut().unwrap().remove("auto_threads");
+        let options: GenerationOptions = serde_json::from_value(value).unwrap();
+        assert!(!options.auto_threads);
+        assert_eq!(build_generation_args(&options)[9], "8");
+    }
+
+    #[test]
+    fn auto_thread_mode_is_restored_from_project_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join(SURVIVAL_MANIFEST_FILE_NAME);
+        std::fs::write(
+            manifest,
+            "generation.threads=24\ngeneration.threadMode=auto\n",
+        )
+        .unwrap();
+        let patch = load_manifest_project_settings(root.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(patch.auto_threads, Some(true));
+    }
+
+    #[test]
+    fn automatic_shards_share_the_available_cpu_budget() {
+        let options = GenerationOptions {
+            shard_processes: 2,
+            ..GenerationOptions::default()
+        };
+        let available = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let inherited = std::env::var("EARTHMAP_CPU_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(available)
+            .min(available);
+        let expected = (inherited / 2).max(1);
+        assert_eq!(automatic_shard_cpu_budget(&options), Some(expected));
+        let mut command = Command::new("earthmap-rs");
+        apply_generation_env(&mut command, &options);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == "EARTHMAP_CPU_BUDGET"
+                && value.is_some_and(|value| value == expected.to_string().as_str())));
+        assert!(generation_env_preview(&options)
+            .contains(&("EARTHMAP_CPU_BUDGET".into(), expected.to_string())));
+        assert_eq!(
+            automatic_shard_cpu_budget(&GenerationOptions {
+                auto_threads: false,
+                ..options
+            }),
+            None
+        );
     }
 
     #[test]
@@ -3665,6 +3776,7 @@ generation.verticalScaleMode=auto\n",
             linear_compression_level: 6,
             mca_compression_level: 5,
             threads: 10,
+            auto_threads: true,
             shard_processes: 4,
             status: ChunkStatusChoice::Surface,
             vertical_scale: "auto".to_string(),
@@ -3685,6 +3797,7 @@ generation.verticalScaleMode=auto\n",
         assert_eq!(decoded.extent_mode, ExtentMode::WholeEarth);
         assert_eq!(decoded.linear_compression_level, 6);
         assert_eq!(decoded.threads, 10);
+        assert!(decoded.auto_threads);
         assert_eq!(decoded.shard_processes, 4);
         assert_eq!(decoded.rayon_threads, "12");
         assert!(!decoded.worker_tuning_enabled);

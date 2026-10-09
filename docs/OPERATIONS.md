@@ -78,6 +78,11 @@ GUI area setup:
 
 GUI generation setup:
 
+- Leave **Threads → Auto** enabled to select compute threads from CPU topology
+  and startup generation measurements. Intel hybrid cores, Apple performance
+  levels, SMT, and supported CPU quotas are considered. A numeric setting is a
+  region-worker limit; `RAYON_NUM_THREADS` fixes the compute pool. See
+  [automatic thread selection](CPU-THREAD-SELECTION.md) for detection and overrides.
 - Choose `linear` for DivineMC Linear region output or `mca` for classic Minecraft region output.
 - Linear compression is zstd level `1..22`; default is `4`. Lower values are faster, higher values can produce smaller
   `.linear` files.
@@ -91,11 +96,11 @@ The same options are available from the CLI:
 ```powershell
 cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
   generate-vanilla-delegated-regions-parallel $env:EARTHMAP_HEIGHTMAP $env:EARTHMAP_OUTPUT_ROOT 1000 `
-  26 -10 3 3 linear 8 surface surfaceRaster=auto verticalScale=auto linearCompression=4
+  26 -10 3 3 linear auto surface surfaceRaster=auto verticalScale=auto linearCompression=4
 
 cargo run --release --manifest-path rust/Cargo.toml -p earthmap-cli --bin earthmap-rs -- `
   generate-vanilla-delegated-regions-parallel $env:EARTHMAP_HEIGHTMAP $env:EARTHMAP_OUTPUT_ROOT 1000 `
-  26 -10 3 3 mca 8 surface surfaceRaster=auto verticalScale=auto mcaCompression=6
+  26 -10 3 3 mca auto surface surfaceRaster=auto verticalScale=auto mcaCompression=6
 ```
 
 `compression=N` can be used instead of the format-specific key; it applies to the selected output format.

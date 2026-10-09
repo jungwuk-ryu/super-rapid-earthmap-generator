@@ -53,6 +53,7 @@ use earthmap_surface::{
 };
 use serde_json::{json, Value};
 
+mod cpu_topology;
 mod usage;
 
 const EXIT_OK: i32 = 0;
@@ -93,7 +94,8 @@ const SURFACE_PHOTO_AUTOTUNE_MAX_PROBES: usize = 96;
 const SURFACE_PHOTO_AUTOTUNE_CONFIRMATION_CANDIDATES: usize = 3;
 const SURFACE_PHOTO_AUTOTUNE_NOISE_RATIO: f64 = 1.05;
 const SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER: usize = 2;
-const SURFACE_PHOTO_RAYON_THREAD_LIMIT: usize = 16;
+const SURFACE_PHOTO_AUTOTUNE_MAX_REGION_WORKERS: usize =
+    SURFACE_PHOTO_AUTOTUNE_MAX_SAMPLE_LIMIT / SURFACE_PHOTO_AUTOTUNE_SAMPLES_PER_MAX_WORKER;
 const DEFAULT_MAX_SUBMITTED_REGIONS: usize = 100_000;
 const PROGRESS_EVENT_SCHEMA_VERSION: u32 = 1;
 const RESUME_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
@@ -163,21 +165,48 @@ fn configure_surface_photo_rayon_threads(requested_threads: usize) {
 }
 
 fn configured_surface_photo_rayon_thread_count(requested_threads: usize) -> usize {
-    if let Some(explicit) = explicit_rayon_num_threads() {
-        return explicit.max(1);
-    }
-    let cpu_budget = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(usize::MAX);
-    default_surface_photo_rayon_thread_count(requested_threads, cpu_budget)
+    photo_compute_thread_count(
+        requested_threads,
+        cpu_topology::current(),
+        explicit_rayon_num_threads(),
+    )
 }
 
-fn default_surface_photo_rayon_thread_count(requested_threads: usize, cpu_budget: usize) -> usize {
+fn photo_compute_thread_ceiling(
+    requested_threads: usize,
+    cpu: &cpu_topology::CpuTopology,
+) -> usize {
     requested_threads
+        .max(1)
         .saturating_mul(SURFACE_PHOTO_RAYON_THREAD_MULTIPLIER)
-        .max(requested_threads.max(1))
-        .min(SURFACE_PHOTO_RAYON_THREAD_LIMIT)
-        .min(cpu_budget.max(1))
+        .min(cpu.cpu_budget.max(1))
+}
+
+fn photo_compute_thread_count(
+    requested_threads: usize,
+    cpu: &cpu_topology::CpuTopology,
+    explicit: Option<usize>,
+) -> usize {
+    explicit.map(|count| count.max(1)).unwrap_or_else(|| {
+        cpu.preferred_threads()
+            .min(photo_compute_thread_ceiling(requested_threads, cpu))
+    })
+}
+
+fn parse_generation_thread_count(text: &str) -> std::result::Result<usize, String> {
+    if text.trim().eq_ignore_ascii_case("auto") {
+        Ok(cpu_topology::current().cpu_budget)
+    } else {
+        parse_positive_usize_string("threads", text)
+    }
+}
+
+fn generation_thread_mode(text: &str) -> &'static str {
+    if text.trim().eq_ignore_ascii_case("auto") {
+        "auto"
+    } else {
+        "manual"
+    }
 }
 
 fn explicit_rayon_num_threads() -> Option<usize> {
@@ -211,8 +240,8 @@ struct SurfacePhotoWorkerCandidateConfig {
 impl SurfacePhotoWorkerCandidateConfig {
     fn new(worker_count: usize, rayon_threads: usize, parallel_column_sampling: bool) -> Self {
         Self {
-            worker_count: worker_count.max(1),
-            rayon_threads: rayon_threads.max(worker_count.max(1)),
+            worker_count: worker_count.max(1).min(rayon_threads.max(1)),
+            rayon_threads: rayon_threads.max(1),
             parallel_column_sampling,
         }
     }
@@ -284,10 +313,10 @@ impl SurfacePhotoWorkerTuning {
         submitted_regions: usize,
         message: impl Into<String>,
     ) -> Self {
+        let selected_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads);
         let selected_worker_count =
-            fallback_surface_photo_worker_count(requested_threads, submitted_regions);
-        let selected_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads)
-            .max(selected_worker_count);
+            fallback_surface_photo_worker_count(requested_threads, submitted_regions)
+                .min(selected_rayon_threads);
         Self {
             mode,
             requested_threads,
@@ -313,10 +342,10 @@ impl SurfacePhotoWorkerTuning {
         submitted_regions: usize,
         message: impl Into<String>,
     ) -> Self {
+        let selected_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads);
         let selected_worker_count =
-            manual_surface_photo_worker_count(requested_threads, submitted_regions);
-        let selected_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads)
-            .max(selected_worker_count);
+            manual_surface_photo_worker_count(requested_threads, submitted_regions)
+                .min(selected_rayon_threads);
         Self {
             mode,
             requested_threads,
@@ -344,6 +373,8 @@ impl SurfacePhotoWorkerTuning {
             "selectedRegionWorkerThreads": self.selected_worker_count,
             "selectedRayonThreads": self.selected_rayon_threads,
             "parallelColumnSampling": self.parallel_column_sampling,
+            "cpuTopology": cpu_topology::current().to_json(),
+            "rayonOverride": explicit_rayon_num_threads(),
             "sampleCount": self.sample_count,
             "landSamples": self.land_samples,
             "oceanSamples": self.ocean_samples,
@@ -386,9 +417,7 @@ fn fallback_surface_photo_worker_count(
     requested_threads: usize,
     submitted_regions: usize,
 ) -> usize {
-    let available = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(requested_threads.max(1));
+    let available = cpu_topology::current().cpu_budget;
     requested_threads
         .min(submitted_regions.max(1))
         .min(available.max(1))
@@ -418,37 +447,67 @@ fn surface_photo_worker_candidates(
     requested_threads: usize,
     submitted_regions: usize,
 ) -> Vec<usize> {
-    let max_workers = requested_threads.min(submitted_regions.max(1)).max(1);
-    let legacy = requested_threads
-        .min(submitted_regions.max(1))
-        .clamp(1, SURFACE_PHOTO_LEGACY_REGION_WORKER_LIMIT);
-    let mut candidates = Vec::new();
-    for worker_count in [1, 2, legacy, max_workers] {
-        let worker_count = worker_count.min(max_workers).max(1);
-        if !candidates.contains(&worker_count) {
-            candidates.push(worker_count);
-        }
-    }
-    candidates.sort_unstable();
-    candidates
+    surface_photo_worker_candidate_configs(requested_threads, submitted_regions)
+        .into_iter()
+        .map(|config| config.worker_count)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn surface_photo_worker_candidate_configs(
     requested_threads: usize,
     submitted_regions: usize,
 ) -> Vec<SurfacePhotoWorkerCandidateConfig> {
-    let region_workers = surface_photo_worker_candidates(requested_threads, submitted_regions);
-    let default_rayon_threads = configured_surface_photo_rayon_thread_count(requested_threads);
+    surface_photo_worker_candidate_configs_for_cpu(
+        requested_threads,
+        submitted_regions,
+        cpu_topology::current(),
+        explicit_rayon_num_threads(),
+    )
+}
+
+fn surface_photo_worker_candidate_configs_for_cpu(
+    requested_threads: usize,
+    submitted_regions: usize,
+    cpu: &cpu_topology::CpuTopology,
+    explicit: Option<usize>,
+) -> Vec<SurfacePhotoWorkerCandidateConfig> {
+    let ceiling = explicit
+        .map(|count| count.max(1))
+        .unwrap_or_else(|| photo_compute_thread_ceiling(requested_threads, cpu));
+    let max_workers = requested_threads
+        .max(1)
+        .min(submitted_regions.max(1))
+        .min(ceiling)
+        .min(SURFACE_PHOTO_AUTOTUNE_MAX_REGION_WORKERS);
+    let mut region_workers =
+        BTreeSet::from([1, 2.min(max_workers), 4.min(max_workers), max_workers]);
+    let mut physical = 0usize;
+    for level in &cpu.levels {
+        physical = physical.saturating_add(level.physical_cores);
+        region_workers.insert(physical.clamp(1, max_workers));
+    }
+    if let Some(physical) = cpu.physical_cores {
+        region_workers.insert(physical.clamp(1, max_workers));
+    }
+    let compute_candidates = if explicit.is_some() {
+        vec![ceiling]
+    } else {
+        cpu.thread_candidates(ceiling)
+    };
     let mut configs = Vec::new();
     for worker_count in region_workers {
-        let mut rayon_candidates = vec![default_rayon_threads.max(worker_count)];
-        if worker_count > 1 {
-            let balanced_rayon_threads = worker_count.min(default_rayon_threads.max(worker_count));
-            rayon_candidates.push(balanced_rayon_threads);
+        let mut rayon_candidates = compute_candidates.clone();
+        if explicit.is_none() {
+            rayon_candidates.push(worker_count);
         }
         rayon_candidates.sort_unstable();
         rayon_candidates.dedup();
-        for rayon_threads in rayon_candidates {
+        for rayon_threads in rayon_candidates
+            .into_iter()
+            .filter(|threads| *threads >= worker_count)
+        {
             configs.push(SurfacePhotoWorkerCandidateConfig::new(
                 worker_count,
                 rayon_threads,
@@ -1213,6 +1272,7 @@ where
     }
 
     match args[0].as_str() {
+        "cpu-info" if args.len() == 1 => write_result(print_cpu_info(stdout)),
         "inspect-heightmap" if args.len() == 1 => {
             match default_heightmap_or_print(stderr, "inspect-heightmap") {
                 Some(heightmap) => write_result(inspect_heightmap(stdout, stderr, &heightmap)),
@@ -4387,7 +4447,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N] [maxSubmittedRegions=N]"
+        "  generate <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads|auto> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N] [maxSubmittedRegions=N]"
     )?;
     writeln!(
         out,
@@ -4411,11 +4471,11 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [maxRegionsThisRun]    (Rust vanilla-delegated alias)"
+        "  generate-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads|auto> [maxRegionsThisRun]    (Rust vanilla-delegated alias)"
     )?;
     writeln!(
         out,
-        "  generate-survival-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun]    (Rust vanilla-delegated alias)"
+        "  generate-survival-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads|auto> <planCsv> [maxRegionsThisRun]    (Rust vanilla-delegated alias)"
     )?;
     writeln!(
         out,
@@ -4423,15 +4483,15 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N] [maxSubmittedRegions=N]"
+        "  generate-vanilla-delegated-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads|auto> [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false] [prefetchMemoryGB=N] [projectGrid=x,z,cols,rows] [remainingShard=i/N] [maxSubmittedRegions=N]"
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false]"
+        "  generate-vanilla-delegated-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads|auto> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false]"
     )?;
     writeln!(
         out,
-        "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false]"
+        "  generate-vanilla-delegated-region-plan-parallel <heightmap> <worldDir> <scale> <mca|linear> <threads|auto> <planCsv> [maxRegionsThisRun] [surface|carvers] [surfaceRaster=auto|path] [verticalScale=auto|legacy|N] [compression=N|linearCompression=N|mcaCompression=N] [workerAutotune=true|false]"
     )?;
     writeln!(
         out,
@@ -4554,7 +4614,7 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     )?;
     writeln!(
         out,
-        "  benchmark-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads>"
+        "  benchmark-survival-regions-parallel <heightmap> <worldDir> <scale> <startRegionX> <startRegionZ> <cols> <rows> <mca|linear> <threads|auto>"
     )?;
     writeln!(
         out,
@@ -4586,6 +4646,27 @@ fn print_help(out: &mut impl Write) -> io::Result<i32> {
     writeln!(
         out,
         "Use quality-candidate for Rust-native visual/statistical/determinism evidence."
+    )?;
+    writeln!(
+        out,
+        "  cpu-info    (CPU topology and automatic thread-count candidates)"
+    )?;
+    Ok(EXIT_OK)
+}
+
+fn print_cpu_info(out: &mut impl Write) -> io::Result<i32> {
+    let cpu = cpu_topology::current();
+    let document = json!({
+        "cpuTopology": cpu.to_json(),
+        "rayonOverride": explicit_rayon_num_threads(),
+        "defaultRayonThreads": configured_surface_photo_rayon_thread_count(cpu.cpu_budget),
+        "candidateConfigs": surface_photo_worker_candidate_configs(cpu.cpu_budget, usize::MAX)
+            .into_iter().map(surface_photo_worker_candidate_config_json).collect::<Vec<_>>(),
+    });
+    writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&document).map_err(io::Error::other)?
     )?;
     Ok(EXIT_OK)
 }
@@ -9913,7 +9994,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
     };
     let project_grid = runtime_options.project_grid.unwrap_or(generation_grid);
     validate_project_grid_contains_generation_grid(project_grid, generation_grid)?;
-    let threads = parse_positive_usize_string("threads", threads_text)?;
+    let threads = parse_generation_thread_count(threads_text)?;
     let region_count = checked_grid_region_count(cols, rows)?;
     validate_submitted_region_limit(
         region_count,
@@ -9970,6 +10051,8 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "type": "workerTuningStarted",
             "enabled": worker_autotune_enabled,
             "requestedThreads": threads,
+            "threadMode": generation_thread_mode(threads_text),
+            "cpuTopology": cpu_topology::current().to_json(),
             "submittedRegions": submitted_region_count,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, submitted_region_count),
             "candidateWorkerConfigs": worker_candidate_configs
@@ -10093,6 +10176,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             runtime_options.compression,
             vertical_scale,
             runtime_options.vertical_scale.label(),
+            generation_thread_mode(threads_text),
         )
         .map_err(|error| error.to_string())?
     };
@@ -10131,6 +10215,7 @@ fn generate_vanilla_delegated_regions_parallel_impl(
             "projectRegionCount": region_count,
             "requestedThreads": threads,
             "workerThreads": worker_count,
+            "threadMode": generation_thread_mode(threads_text),
             "regionWorkerThreads": worker_count,
             "rayonThreads": rayon_threads,
             "parallelColumnSampling": parallel_column_sampling,
@@ -10937,7 +11022,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
     let total_start = Instant::now();
     let format = OutputFormat::parse(format_text).map_err(|error| error.to_string())?;
     let scale = parse_positive_i32_string("scale", scale_text)?;
-    let threads = parse_positive_usize_string("threads", threads_text)?;
+    let threads = parse_generation_thread_count(threads_text)?;
     let plan_path = Path::new(plan_csv);
     let plan_regions = read_region_plan_csv(plan_path)?;
     let (max_regions_this_run, generation_option_offset) =
@@ -10999,6 +11084,8 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "mode": "plan",
             "enabled": worker_autotune_enabled,
             "requestedThreads": threads,
+            "threadMode": generation_thread_mode(threads_text),
+            "cpuTopology": cpu_topology::current().to_json(),
             "submittedRegions": submitted_regions,
             "candidateWorkerThreads": surface_photo_worker_candidates(threads, submitted_regions),
             "candidateWorkerConfigs": worker_candidate_configs
@@ -11077,6 +11164,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
         runtime_options.compression,
         vertical_scale,
         runtime_options.vertical_scale.label(),
+        generation_thread_mode(threads_text),
     )
     .map_err(|error| error.to_string())?;
     let resume = prepare_vanilla_delegated_resume_journal(world, &resume_fingerprint)?;
@@ -11107,6 +11195,7 @@ fn generate_vanilla_delegated_plan_parallel_impl(
             "type": "batchStarted",
             "mode": "plan",
             "worldDir": normalized_path_display(world),
+            "threadMode": generation_thread_mode(threads_text),
             "planCsv": normalized_path_display(plan_path),
             "format": format.java_name(),
             "scale": scale,
@@ -18855,6 +18944,7 @@ fn write_vanilla_delegated_parallel_manifest(
     compression_options: RegionCompressionOptions,
     vertical_scale: f64,
     vertical_scale_mode: &str,
+    thread_mode: &str,
 ) -> io::Result<std::path::PathBuf> {
     let mut values = base_exploration_only_manifest("vanilla-delegated-regions-parallel");
     values.insert("features.surfaceRules".to_string(), "true".to_string());
@@ -18887,6 +18977,7 @@ fn write_vanilla_delegated_parallel_manifest(
     );
     values.insert("generation.regionCols".to_string(), cols.to_string());
     values.insert("generation.regionRows".to_string(), rows.to_string());
+    values.insert("generation.threadMode".to_string(), thread_mode.to_string());
     values.insert(
         "generation.threads".to_string(),
         requested_threads.max(1).to_string(),
@@ -18979,6 +19070,7 @@ fn write_vanilla_delegated_plan_manifest(
     compression_options: RegionCompressionOptions,
     vertical_scale: f64,
     vertical_scale_mode: &str,
+    thread_mode: &str,
 ) -> io::Result<std::path::PathBuf> {
     let mut values = base_exploration_only_manifest("vanilla-delegated-plan-parallel");
     values.insert("features.surfaceRules".to_string(), "true".to_string());
@@ -19013,6 +19105,7 @@ fn write_vanilla_delegated_plan_manifest(
         "generation.submittedRegions".to_string(),
         submitted_regions.to_string(),
     );
+    values.insert("generation.threadMode".to_string(), thread_mode.to_string());
     values.insert(
         "generation.threads".to_string(),
         requested_threads.max(1).to_string(),
@@ -19261,11 +19354,28 @@ mod tests {
         )
     }
 
+    fn photo_test_cpu(physical: usize, logical: usize, budget: usize) -> cpu_topology::CpuTopology {
+        cpu_topology::CpuTopology {
+            source: "fixture",
+            logical_processors: logical,
+            physical_cores: Some(physical),
+            cpu_budget: budget,
+            levels: Vec::new(),
+        }
+    }
+
     #[test]
-    fn surface_photo_worker_candidates_keep_legacy_and_requested_options() {
-        assert_eq!(surface_photo_worker_candidates(10, 100), vec![1, 2, 4, 10]);
-        assert_eq!(surface_photo_worker_candidates(3, 100), vec![1, 2, 3]);
-        assert_eq!(surface_photo_worker_candidates(10, 2), vec![1, 2]);
+    fn surface_photo_worker_candidates_respect_process_cpu_limits() {
+        let cpu = photo_test_cpu(16, 32, 4);
+        let configs = surface_photo_worker_candidate_configs_for_cpu(10, 100, &cpu, None);
+        let workers = configs
+            .iter()
+            .map(|config| config.worker_count)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(workers, BTreeSet::from([1, 2, 4]));
+        assert!(configs.iter().all(|config| config.rayon_threads <= 4));
+        let tiny = surface_photo_worker_candidate_configs_for_cpu(10, 2, &cpu, None);
+        assert!(tiny.iter().all(|config| config.worker_count <= 2));
     }
 
     fn surface_photo_candidate_result(
@@ -19284,70 +19394,92 @@ mod tests {
     }
 
     #[test]
-    fn default_photo_rayon_threads_respect_cpu_budget_and_existing_limits() {
-        for (requested, cpu_budget, expected) in [
-            (0, 0, 1),
-            (1, 1, 1),
-            (1, 8, 2),
-            (4, 4, 4),
-            (4, 8, 8),
-            (10, 4, 4),
-            (10, 32, 16),
-            (usize::MAX, 4, 4),
-            (usize::MAX, usize::MAX, 16),
-        ] {
-            assert_eq!(
-                default_surface_photo_rayon_thread_count(requested, cpu_budget),
-                expected
-            );
-        }
+    fn default_photo_threads_use_physical_cores_without_exceeding_cpu_or_requested_limits() {
+        let cpu = photo_test_cpu(16, 32, 32);
+        assert_eq!(photo_compute_thread_count(1, &cpu, None), 2);
+        assert_eq!(photo_compute_thread_count(4, &cpu, None), 8);
+        assert_eq!(photo_compute_thread_count(32, &cpu, None), 16);
+        assert_eq!(photo_compute_thread_count(usize::MAX, &cpu, None), 16);
+        assert_eq!(
+            photo_compute_thread_count(32, &photo_test_cpu(16, 32, 4), None),
+            4
+        );
+        assert_eq!(photo_compute_thread_count(32, &cpu, Some(3)), 3);
     }
 
     #[test]
-    fn surface_photo_worker_candidate_configs_compare_legacy_and_requested_parallel_workers() {
-        let configs = surface_photo_worker_candidate_configs(10, 100);
-        let tuned_rayon = configured_surface_photo_rayon_thread_count(10).max(4);
-        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
-            4,
-            4,
-            surface_photo_parallel_column_sampling(4, 4)
-        )));
-        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
-            4,
-            tuned_rayon,
-            surface_photo_parallel_column_sampling(4, tuned_rayon)
-        )));
-        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
-            10,
-            10,
-            surface_photo_parallel_column_sampling(10, 10)
-        )));
-        assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
-            10,
-            tuned_rayon.max(10),
-            surface_photo_parallel_column_sampling(10, tuned_rayon.max(10))
-        )));
-        assert_eq!(
-            configs
-                .iter()
-                .filter(|config| config.worker_count == 1)
-                .count(),
-            1
-        );
-        for workers in [2, 4, 10] {
-            assert_eq!(
-                configs
-                    .iter()
-                    .filter(|config| config.worker_count == workers)
-                    .count(),
-                if tuned_rayon > workers { 2 } else { 1 },
-            );
+    fn hybrid_photo_candidates_include_fastest_all_physical_and_smt_counts() {
+        let mut cpu = photo_test_cpu(16, 24, 24);
+        cpu.levels = vec![
+            cpu_topology::PerformanceLevel {
+                name: "performance".into(),
+                rank: Some(1),
+                physical_cores: 8,
+                logical_processors: 16,
+            },
+            cpu_topology::PerformanceLevel {
+                name: "efficiency".into(),
+                rank: Some(0),
+                physical_cores: 8,
+                logical_processors: 8,
+            },
+        ];
+        assert_eq!(photo_compute_thread_count(24, &cpu, None), 8);
+        let configs = surface_photo_worker_candidate_configs_for_cpu(24, 100, &cpu, None);
+        for compute_threads in [4, 8, 16, 24] {
+            assert!(configs.contains(&SurfacePhotoWorkerCandidateConfig::new(
+                4,
+                compute_threads,
+                true
+            )));
         }
+        assert!(configs.iter().any(|config| config.worker_count == 8));
+        assert!(configs.iter().any(|config| config.worker_count == 16));
+        assert!(configs.iter().all(
+            |config| config.worker_count <= config.rayon_threads && config.rayon_threads <= 24
+        ));
+    }
+
+    #[test]
+    fn explicit_compute_threads_are_fixed_for_every_tuning_candidate() {
+        let cpu = photo_test_cpu(16, 24, 4);
+        for explicit in [1, 2, 8] {
+            let configs =
+                surface_photo_worker_candidate_configs_for_cpu(24, 100, &cpu, Some(explicit));
+            assert!(configs
+                .iter()
+                .all(|config| config.rayon_threads == explicit && config.worker_count <= explicit));
+        }
+        let config = SurfacePhotoWorkerCandidateConfig::new(8, 2, true);
+        assert_eq!((config.worker_count, config.rayon_threads), (2, 2));
+    }
+
+    #[test]
+    fn generation_threads_accept_auto_and_preserve_positive_integer_validation() {
+        assert_eq!(
+            parse_generation_thread_count(" AuTo ").unwrap(),
+            cpu_topology::current().cpu_budget
+        );
+        assert_eq!(parse_generation_thread_count("3").unwrap(), 3);
+        for invalid in ["0", "-1", "many"] {
+            assert!(parse_generation_thread_count(invalid).is_err());
+        }
+        let (code, output, error) = run_capture(&["cpu-info"]);
+        assert_eq!(code, EXIT_OK, "{error}");
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            value["cpuTopology"]["cpuBudget"],
+            cpu_topology::current().cpu_budget
+        );
+        assert!(value["candidateConfigs"]
+            .as_array()
+            .is_some_and(|values| !values.is_empty()));
     }
 
     #[test]
     fn surface_photo_worker_tune_sample_target_scales_with_max_worker_candidate() {
-        let configs = surface_photo_worker_candidate_configs(8, 100);
+        let configs =
+            surface_photo_worker_candidate_configs_for_cpu(8, 100, &photo_test_cpu(8, 8, 8), None);
         assert_eq!(surface_photo_worker_tune_sample_target(&configs, 100), 16);
         assert_eq!(surface_photo_worker_tune_sample_target(&configs, 8), 8);
     }
@@ -19908,6 +20040,7 @@ mod tests {
             },
             4.0,
             "auto",
+            "manual",
         )
         .unwrap();
         let plan_manifest = write_vanilla_delegated_plan_manifest(
@@ -19927,6 +20060,7 @@ mod tests {
             },
             4.0,
             "auto",
+            "manual",
         )
         .unwrap();
 
@@ -21907,7 +22041,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_worker_tuning_uses_requested_threads_without_legacy_cap() {
+    fn disabled_worker_tuning_keeps_the_configured_compute_budget() {
         let available = std::thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(8);
@@ -21920,7 +22054,16 @@ mod tests {
             "manual",
         );
 
-        assert_eq!(tuning.selected_worker_count, requested_threads);
+        assert_eq!(
+            tuning.selected_worker_count,
+            requested_threads.min(configured_surface_photo_rayon_thread_count(
+                requested_threads
+            ))
+        );
+        assert_eq!(
+            tuning.selected_rayon_threads,
+            configured_surface_photo_rayon_thread_count(requested_threads)
+        );
         assert_eq!(tuning.mode, "fallback-disabled");
     }
 
